@@ -1,6 +1,6 @@
 {
   "identifier": "desktop",
-  "description": "Desktop-specific permissions for ZeroClaw",
+  "description": "Desktop-specific permissions for DaemonClaw",
   "windows": ["main"],
   "permissions": [
     "core:default",

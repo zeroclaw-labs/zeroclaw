@@ -1,4 +1,4 @@
-# ZeroClaw-dokumentaation yhteenveto (Yhtenäinen sisällysluettelo)
+# DaemonClaw-dokumentaation yhteenveto (Yhtenäinen sisällysluettelo)
 
 Tämä tiedosto muodostaa dokumentaatiojärjestelmän kanonisen sisällysluettelon.
 

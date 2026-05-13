@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability set for ZeroClaw Desktop",
+  "description": "Default capability set for DaemonClaw Desktop",
   "windows": ["main"],
   "permissions": [
     "core:default",

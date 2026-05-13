@@ -44,7 +44,7 @@ model_routing_config = "Varsayılan model ayarlarını, senaryo tabanlı sağlay
 notion = "Notion ile etkileşim: veritabanlarını sorgulama, sayfaları okuma/oluşturma/güncelleme ve çalışma alanında arama."
 pdf_read = "Çalışma alanındaki bir PDF dosyasından düz metin çıkarma. Tüm okunabilir metni döndürür. Yalnızca resim içeren veya şifrelenmiş PDF'ler boş sonuç döndürür. 'rag-pdf' build özelliği gerektirir."
 project_intel = "Proje teslimat istihbaratı: durum raporları oluşturma, riskleri tespit etme, müşteri güncellemeleri hazırlama, sprintleri özetleme ve iş gücü tahmini. Salt okunur analiz aracı."
-proxy_config = "ZeroClaw proxy ayarlarını yönetme (kapsam: environment | zeroclaw | services), çalışma zamanı ve süreç ortamı uygulaması dahil"
+proxy_config = "DaemonClaw proxy ayarlarını yönetme (kapsam: environment | daemonclaw | services), çalışma zamanı ve süreç ortamı uygulaması dahil"
 pushover = "Cihazınıza bir Pushover bildirimi gönderme. .env dosyasında PUSHOVER_TOKEN ve PUSHOVER_USER_KEY gerektirir."
 schedule = """Yalnızca shell olan planlanmış görevleri yönetme. Eylemler: create/add/once/list/get/cancel/remove/pause/resume. UYARI: Bu araç, çıktısı yalnızca günlüğe kaydedilen ve herhangi bir kanala TESLİM EDİLMEYEN shell görevleri oluşturur. Discord/Telegram/Slack/Matrix'e planlanmış mesaj göndermek için job_type='agent' ve {"mode":"announce","channel":"discord","to":"<channel_id>"} gibi bir teslimat yapılandırmasıyla cron_add aracını kullanın."""
 screenshot = "Geçerli ekranın ekran görüntüsünü alma. Dosya yolunu ve base64 kodlanmış PNG verilerini döndürür."

@@ -1,6 +1,6 @@
 # Skill: github-pr
 
-Open or update a GitHub Pull Request for ZeroClaw. Handles creating new PRs with a fully filled-out template body, and updating existing PRs (title, body sections, labels, comments). Use this skill whenever the user wants to open a PR, create a pull request, update a PR, edit PR description, add labels to a PR, or sync a PR after new commits — even if they don't say "PR" explicitly (e.g., "submit this for review", "push and open for merge").
+Open or update a GitHub Pull Request for DaemonClaw. Handles creating new PRs with a fully filled-out template body, and updating existing PRs (title, body sections, labels, comments). Use this skill whenever the user wants to open a PR, create a pull request, update a PR, edit PR description, add labels to a PR, or sync a PR after new commits — even if they don't say "PR" explicitly (e.g., "submit this for review", "push and open for merge").
 
 ## Instructions
 
@@ -226,7 +226,7 @@ Return the PR URL.
 - **Always read `.github/pull_request_template.md`** before filling or editing a PR body. Never assume section names, fields, or structure — derive everything from the template. It's the source of truth and may change.
 - **For updates, only modify requested sections.** Preserve everything else exactly as-is.
 - **Always show diffs before applying body edits.** Present current vs proposed for each changed section.
-- **Never include personal/sensitive data** in PR content per ZeroClaw's privacy contract.
+- **Never include personal/sensitive data** in PR content per DaemonClaw's privacy contract.
 - **For label changes**, only use labels that exist in the repository. Check with `gh label list` if unsure.
 - **Fetch the latest body before editing** to avoid clobbering concurrent changes.
 - **For new PRs**, push the branch before creating (with `-u` to set upstream tracking).

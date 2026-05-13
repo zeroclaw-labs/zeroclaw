@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::transcription::*;
+pub use daemonclaw_channels::transcription::*;

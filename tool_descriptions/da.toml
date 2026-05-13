@@ -43,7 +43,7 @@ model_routing_config = "Administrer standardmodelindstillinger, scenariebaserede
 notion = "Interager med Notion: forespørg databaser, læs/opret/opdater sider og søg i arbejdsområdet."
 pdf_read = "Udtræk ren tekst fra en PDF-fil i arbejdsområdet. Returnerer al læsbar tekst. PDF-filer med kun billeder eller krypterede PDF-filer returnerer et tomt resultat. Kræver 'rag-pdf'-build-funktionen."
 project_intel = "Projektleveringsintelligens: generer statusrapporter, opdag risici, udkast til kundeopdateringer, opsummer sprints og estimer indsats. Skrivebeskyttet analyseværktøj."
-proxy_config = "Administrer ZeroClaw-proxyindstillinger (scope: environment | zeroclaw | services), herunder runtime- og processmiljøanvendelse"
+proxy_config = "Administrer DaemonClaw-proxyindstillinger (scope: environment | daemonclaw | services), herunder runtime- og processmiljøanvendelse"
 pushover = "Send en Pushover-notifikation til din enhed. Kræver PUSHOVER_TOKEN og PUSHOVER_USER_KEY i .env-filen."
 schedule = """Administrer planlagte shell-opgaver. Handlinger: create/add/once/list/get/cancel/remove/pause/resume. ADVARSEL: Dette værktøj opretter shell-jobs hvis output kun logges, IKKE leveres til nogen kanal. For at sende en planlagt besked til Discord/Telegram/Slack/Matrix, brug cron_add-værktøjet med job_type='agent' og en delivery-konfiguration som {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Tag et skærmbillede af den aktuelle skærm. Returnerer filstien og base64-kodet PNG-data."

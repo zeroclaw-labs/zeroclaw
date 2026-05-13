@@ -1,4 +1,4 @@
-# Riepilogo della Documentazione ZeroClaw (Indice Unificato)
+# Riepilogo della Documentazione DaemonClaw (Indice Unificato)
 
 Questo file è l'indice canonico del sistema di documentazione.
 

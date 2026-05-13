@@ -1,16 +1,16 @@
-# ZeroClaw Architecture Diagrams
+# DaemonClaw Architecture Diagrams
 
-This document provides visual representations of ZeroClaw's architecture, execution modes, and data flows.
+This document provides visual representations of DaemonClaw's architecture, execution modes, and data flows.
 
 ---
 
 ## 1. Execution Modes
 
-**Ways ZeroClaw can be run:**
+**Ways DaemonClaw can be run:**
 
 ```mermaid
 flowchart TD
-    Start[zeroclaw CLI] --> Onboard[onboard<br/>Setup wizard]
+    Start[daemonclaw CLI] --> Onboard[onboard<br/>Setup wizard]
     Start --> Agent[agent<br/>Interactive CLI]
     Start --> Gateway[gateway<br/>HTTP server]
     Start --> Daemon[daemon<br/>Long-running runtime]
@@ -211,7 +211,7 @@ flowchart TD
 
 ```mermaid
 flowchart TB
-    Start[[zeroclaw daemon]] --> SpawnComponents
+    Start[[daemonclaw daemon]] --> SpawnComponents
 
     SpawnComponents --> SpawnState[Spawn State Writer<br/>5s flush interval]
     SpawnComponents --> SpawnGateway[Spawn Gateway Supervisor]
@@ -292,7 +292,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Client[HTTP Client] --> Gateway[ZeroClaw Gateway]
+    Client[HTTP Client] --> Gateway[DaemonClaw Gateway]
 
     Gateway --> PairPOST[POST /pair<br/>Exchange one-time code<br/>for bearer token]
     Gateway --> HealthGET[GET /health<br/>Status check]
@@ -617,7 +617,7 @@ flowchart TB
     Load --> Parse[TOML parse]
     Parse --> Defaults[Apply defaults<br/>Config::default]
 
-    Defaults --> EnvOverrides[apply_env_overrides<br/>ZEROCLAW_* env vars]
+    Defaults --> EnvOverrides[apply_env_overrides<br/>DAEMONCLAW_* env vars]
 
     EnvOverrides --> Validate[Schema validation]
 
@@ -779,7 +779,7 @@ flowchart TB
 
 ```mermaid
 mindmap
-    root((ZeroClaw))
+    root((DaemonClaw))
         Modes
             Agent CLI
                 Interactive
@@ -829,4 +829,4 @@ mindmap
 
 ---
 
-*Generated for ZeroClaw v0.1.0 - Architecture Documentation*
+*Generated for DaemonClaw v0.1.0 - Architecture Documentation*

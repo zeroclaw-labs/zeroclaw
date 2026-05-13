@@ -1,4 +1,4 @@
-# AGENTS.md — ZeroClaw
+# AGENTS.md — DaemonClaw
 
 Cross-tool agent instructions for any AI coding assistant working on this repository.
 
@@ -20,19 +20,19 @@ Docs-only changes: run markdown lint and link-integrity checks. If touching boot
 
 ## Project Snapshot
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+DaemonClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
 
 Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
 
 Key extension points:
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
-- `crates/zeroclaw-api/src/channel.rs` (`Channel`)
-- `crates/zeroclaw-api/src/tool.rs` (`Tool`)
-- `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
-- `crates/zeroclaw-api/src/observability_traits.rs` (`Observer`)
-- `crates/zeroclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
-- `crates/zeroclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+- `crates/daemonclaw-api/src/provider.rs` (`Provider`)
+- `crates/daemonclaw-api/src/channel.rs` (`Channel`)
+- `crates/daemonclaw-api/src/tool.rs` (`Tool`)
+- `crates/daemonclaw-api/src/memory_traits.rs` (`Memory`)
+- `crates/daemonclaw-api/src/observability_traits.rs` (`Observer`)
+- `crates/daemonclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
+- `crates/daemonclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## Stability Tiers
 
@@ -40,20 +40,20 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 
 | Crate | Tier | Notes |
 |-------|------|-------|
-| `zeroclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
-| `zeroclaw-config` | Beta | Stable at v0.8.0 |
-| `zeroclaw-providers` | Beta | — |
-| `zeroclaw-memory` | Beta | — |
-| `zeroclaw-infra` | Beta | — |
-| `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
-| `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
-| `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
-| `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
-| `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
-| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
-| `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
-| `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
-| `zeroclaw-macros` | Beta | Tightly coupled to config schema |
+| `daemonclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
+| `daemonclaw-config` | Beta | Stable at v0.8.0 |
+| `daemonclaw-providers` | Beta | — |
+| `daemonclaw-memory` | Beta | — |
+| `daemonclaw-infra` | Beta | — |
+| `daemonclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
+| `daemonclaw-channels` | Experimental | Plugin migration at v1.0.0 |
+| `daemonclaw-tools` | Experimental | Plugin migration at v1.0.0 |
+| `daemonclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
+| `daemonclaw-gateway` | Experimental | Separate binary at v0.9.0 |
+| `daemonclaw-tui` | Experimental | TUI onboarding wizard |
+| `daemonclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
+| `daemonclaw-hardware` | Experimental | USB discovery, peripherals, serial |
+| `daemonclaw-macros` | Beta | Tightly coupled to config schema |
 
 **Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
 
@@ -63,21 +63,21 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - `src/main.rs` — CLI entrypoint and command routing
 - `src/lib.rs` — module re-exports and CLI command enum definitions
-- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
-- `crates/zeroclaw-config/` — schema, config loading/merging
-- `crates/zeroclaw-macros/` — Configurable derive macro
-- `crates/zeroclaw-providers/` — model providers and resilient wrapper
-- `crates/zeroclaw-channels/` — messaging platform integrations (30+ channels)
-- `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
-- `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
-- `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
-- `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
-- `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
-- `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
-- `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zeroclaw-tui/` — TUI onboarding wizard
-- `crates/zeroclaw-plugins/` — WASM plugin system
-- `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `crates/daemonclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `crates/daemonclaw-config/` — schema, config loading/merging
+- `crates/daemonclaw-macros/` — Configurable derive macro
+- `crates/daemonclaw-providers/` — model providers and resilient wrapper
+- `crates/daemonclaw-channels/` — messaging platform integrations (30+ channels)
+- `crates/daemonclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
+- `crates/daemonclaw-tools/` — tool execution surface (shell, file, memory, browser)
+- `crates/daemonclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
+- `crates/daemonclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
+- `crates/daemonclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `crates/daemonclaw-gateway/` — webhook/gateway server (separate binary)
+- `crates/daemonclaw-hardware/` — USB discovery, peripherals, serial, GPIO
+- `crates/daemonclaw-tui/` — TUI onboarding wizard
+- `crates/daemonclaw-plugins/` — WASM plugin system
+- `crates/daemonclaw-tool-call-parser/` — tool call parsing
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -85,7 +85,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - **Low risk**: docs/chore/tests-only changes
 - **Medium risk**: most `crates/*/src/**` behavior changes without boundary/security impact
-- **High risk**: `crates/zeroclaw-runtime/src/**` (especially `src/security/`), `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
+- **High risk**: `crates/daemonclaw-runtime/src/**` (especially `src/security/`), `crates/daemonclaw-gateway/src/**`, `crates/daemonclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
 
 When uncertain, classify as higher risk.
 

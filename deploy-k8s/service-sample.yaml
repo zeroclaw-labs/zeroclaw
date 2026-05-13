@@ -1,15 +1,15 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: zeroclaw
-  namespace: zeroclaw
+  name: daemonclaw
+  namespace: daemonclaw
   labels:
-    app.kubernetes.io/name: zeroclaw
-    app.kubernetes.io/part-of: zeroclaw
+    app.kubernetes.io/name: daemonclaw
+    app.kubernetes.io/part-of: daemonclaw
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: zeroclaw
+    app.kubernetes.io/name: daemonclaw
   ports:
     - name: gateway
       port: 42617

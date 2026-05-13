@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentasjonssammendrag (Samlet innholdsfortegnelse)
+# DaemonClaw Dokumentasjonssammendrag (Samlet innholdsfortegnelse)
 
 Denne filen er den kanoniske innholdsfortegnelsen for dokumentasjonssystemet.
 

@@ -1,15 +1,15 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: zeroclaw-config
-  namespace: zeroclaw
+  name: daemonclaw-config
+  namespace: daemonclaw
   labels:
-    app.kubernetes.io/name: zeroclaw
-    app.kubernetes.io/part-of: zeroclaw
+    app.kubernetes.io/name: daemonclaw
+    app.kubernetes.io/part-of: daemonclaw
 data:
   config.toml: |
-    workspace_dir = "/zeroclaw-data/workspace"
-    config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+    workspace_dir = "/daemonclaw-data/workspace"
+    config_path = "/daemonclaw-data/.daemonclaw/config.toml"
     default_provider = "anthropic"
     default_model = "claude-sonnet-4-20250514"
     default_temperature = 0.7
@@ -19,7 +19,7 @@ data:
     host = "[::]"
     allow_public_bind = true
     require_pairing = true
-    web_dist_dir = "/zeroclaw-data/web/dist"
+    web_dist_dir = "/daemonclaw-data/web/dist"
 
     [autonomy]
     level = "supervised"

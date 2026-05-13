@@ -43,7 +43,7 @@ model_routing_config = "ניהול הגדרות מודל ברירת מחדל, מ
 notion = "אינטראקציה עם Notion: שאילתת בסיסי נתונים, קריאה/יצירה/עדכון דפים וחיפוש בסביבת העבודה."
 pdf_read = "חילוץ טקסט רגיל מקובץ PDF בסביבת העבודה. מחזיר את כל הטקסט הקריא. קובצי PDF מבוססי תמונה בלבד או מוצפנים מחזירים תוצאה ריקה. דורש תכונת בנייה 'rag-pdf'."
 project_intel = "מודיעין מסירת פרויקט: הפקת דוחות סטטוס, זיהוי סיכונים, טיוטת עדכונים ללקוח, סיכום ספרינטים והערכת מאמץ. כלי ניתוח לקריאה בלבד."
-proxy_config = "ניהול הגדרות proxy של ZeroClaw (היקף: environment | zeroclaw | services), כולל יישום על runtime ומשתני סביבה של תהליך"
+proxy_config = "ניהול הגדרות proxy של DaemonClaw (היקף: environment | daemonclaw | services), כולל יישום על runtime ומשתני סביבה של תהליך"
 pushover = "שליחת התראת Pushover למכשיר שלך. דורש PUSHOVER_TOKEN ו-PUSHOVER_USER_KEY בקובץ .env."
 schedule = """ניהול משימות מתוזמנות ל-shell בלבד. פעולות: create/add/once/list/get/cancel/remove/pause/resume. אזהרה: כלי זה יוצר משימות shell שהפלט שלהן רק נרשם ביומן ולא נמסר לשום ערוץ. לשליחת הודעה מתוזמנת ל-Discord/Telegram/Slack/Matrix, השתמש בכלי cron_add עם job_type='agent' והגדרת delivery כמו {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "צילום מסך של המסך הנוכחי. מחזיר את נתיב הקובץ ונתוני PNG מקודדים ב-base64."

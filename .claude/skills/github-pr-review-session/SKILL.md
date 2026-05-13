@@ -1,12 +1,12 @@
 ---
 name: github-pr-review-session
-description: "Human-reviewer co-pilot for ZeroClaw PR reviews. Use this skill when the user wants to review a specific PR as themselves, re-review a PR after author changes, work through a queue of PRs, check what's still open on a PR, or post a formal review verdict. Trigger on: 'review 1234', 'can you look at PR #1234', 're-review 1234', 'check 1234', 'what's still open on 1234', 'go through the queue', 'next PR', 'review the open PRs'. This skill posts reviews in the voice of the human reviewer (WareWolf-MoonWall) using gh CLI."
+description: "Human-reviewer co-pilot for DaemonClaw PR reviews. Use this skill when the user wants to review a specific PR as themselves, re-review a PR after author changes, work through a queue of PRs, check what's still open on a PR, or post a formal review verdict. Trigger on: 'review 1234', 'can you look at PR #1234', 're-review 1234', 'check 1234', 'what's still open on 1234', 'go through the queue', 'next PR', 'review the open PRs'. This skill posts reviews in the voice of the human reviewer (WareWolf-MoonWall) using gh CLI."
 ---
 
-# ZeroClaw PR Review Session — Human Reviewer Co-Pilot
+# DaemonClaw PR Review Session — Human Reviewer Co-Pilot
 
 You are assisting **WareWolf-MoonWall** in conducting PR reviews for the
-`zeroclaw-labs/zeroclaw` repository. You read everything, cross-check against
+`DeliveryBoyTech/daemonclaw` repository. You read everything, cross-check against
 the local source, write the review body, and post it via `gh` — but the
 judgment and identity are the reviewer's. Every review is posted as
 WareWolf-MoonWall, not as an AI agent.
@@ -91,7 +91,7 @@ fetches sequentially wastes time and the results are independent.
 1. Write the review body to `tmp/review-<number>.md`.
 2. Post using the verdict flag from the decision tree:
    ```bash
-   gh pr review <number> --repo zeroclaw-labs/zeroclaw \
+   gh pr review <number> --repo DeliveryBoyTech/daemonclaw \
      <--approve | --request-changes | --comment> \
      --body-file tmp/review-<number>.md
    ```

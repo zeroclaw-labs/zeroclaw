@@ -1,3 +1,3 @@
-//! Configuration schema — re-exported from `zeroclaw-config`.
+//! Configuration schema — re-exported from `daemonclaw-config`.
 
-pub use zeroclaw_config::schema::*;
+pub use daemonclaw_config::schema::*;

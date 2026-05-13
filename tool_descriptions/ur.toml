@@ -44,7 +44,7 @@ model_routing_config = "پہلے سے طے شدہ ماڈل سیٹنگز، منظ
 notion = "Notion کے ساتھ تعامل کریں: ڈیٹا بیسز سے استفسار کریں، صفحات پڑھیں/بنائیں/اپ ڈیٹ کریں، اور ورک اسپیس تلاش کریں۔"
 pdf_read = "ورک اسپیس میں PDF فائل سے سادہ متن نکالیں۔ تمام پڑھنے کے قابل متن واپس کرتا ہے۔ صرف تصویری یا خفیہ PDF خالی نتیجہ واپس کرتے ہیں۔ 'rag-pdf' بلڈ فیچر ضروری ہے۔"
 project_intel = "پروجیکٹ ڈیلیوری انٹیلی جنس: اسٹیٹس رپورٹس بنائیں، خطرات کا پتہ لگائیں، کلائنٹ اپ ڈیٹس کا مسودہ تیار کریں، سپرنٹس کا خلاصہ کریں، اور محنت کا تخمینہ لگائیں۔ صرف پڑھنے کا تجزیاتی ٹول۔"
-proxy_config = "ZeroClaw پراکسی ترتیبات کا انتظام کریں (دائرہ: environment | zeroclaw | services)، بشمول رن ٹائم اور پراسیس ماحول کا اطلاق"
+proxy_config = "DaemonClaw پراکسی ترتیبات کا انتظام کریں (دائرہ: environment | daemonclaw | services)، بشمول رن ٹائم اور پراسیس ماحول کا اطلاق"
 pushover = "اپنے آلے پر Pushover اطلاع بھیجیں۔ .env فائل میں PUSHOVER_TOKEN اور PUSHOVER_USER_KEY ضروری ہیں۔"
 schedule = """صرف shell مقررہ کام منظم کریں۔ ایکشنز: create/add/once/list/get/cancel/remove/pause/resume۔ انتباہ: یہ ٹول shell جابز بناتا ہے جن کا آؤٹ پٹ صرف لاگ ہوتا ہے، کسی چینل پر نہیں بھیجا جاتا۔ Discord/Telegram/Slack/Matrix پر مقررہ پیغام بھیجنے کے لیے cron_add ٹول استعمال کریں جس میں job_type='agent' اور delivery ترتیب ہو جیسے {"mode":"announce","channel":"discord","to":"<channel_id>"}۔"""
 screenshot = "موجودہ اسکرین کا اسکرین شاٹ لیں۔ فائل پاتھ اور base64 انکوڈڈ PNG ڈیٹا واپس کرتا ہے۔"

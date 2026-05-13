@@ -2,9 +2,9 @@
 //!
 //! Validates V1→V2 migration via V1Compat, including the full validation pipeline.
 
-use zeroclaw::config::migration::{self, CURRENT_SCHEMA_VERSION, V1Compat};
+use daemonclaw::config::migration::{self, CURRENT_SCHEMA_VERSION, V1Compat};
 
-fn migrate(toml_str: &str) -> zeroclaw::config::Config {
+fn migrate(toml_str: &str) -> daemonclaw::config::Config {
     let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
     migration::prepare_table(&mut table);
     let prepared = toml::to_string(&table).expect("failed to re-serialize");
@@ -271,7 +271,7 @@ allowed_users = ["@u:m"]
 
 #[test]
 fn exhaustive_walk_no_props_lost() {
-    use zeroclaw::config::{Config, ModelProviderConfig};
+    use daemonclaw::config::{Config, ModelProviderConfig};
 
     let v0 = migrate(
         r#"
@@ -448,7 +448,7 @@ require_pairing = true
 
     // Legacy keys must not trigger unknown-key warnings.
     let known_keys = {
-        let mut keys: Vec<String> = toml::to_string(&zeroclaw::config::Config::default())
+        let mut keys: Vec<String> = toml::to_string(&daemonclaw::config::Config::default())
             .ok()
             .and_then(|s| s.parse::<toml::Table>().ok())
             .map(|t| t.keys().cloned().collect())

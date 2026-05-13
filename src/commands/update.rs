@@ -1,13 +1,13 @@
-//! `zeroclaw update` — self-update pipeline with rollback.
+//! `daemonclaw update` — self-update pipeline with rollback.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use tracing::{info, warn};
 
 const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
+    "https://api.github.com/repos/DeliveryBoyTech/daemonclaw/releases/latest";
 const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+    "https://api.github.com/repos/DeliveryBoyTech/daemonclaw/releases/tags";
 
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -24,7 +24,7 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
-        .user_agent(format!("zeroclaw/{current}"))
+        .user_agent(format!("daemonclaw/{current}"))
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
@@ -96,7 +96,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     // Phase 2: Download
     info!("Phase 2/6: Downloading...");
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
-    let download_path = temp_dir.path().join("zeroclaw_new");
+    let download_path = temp_dir.path().join("daemonclaw_new");
     download_binary(&download_url, &download_path).await?;
 
     // Phase 3: Backup
@@ -192,7 +192,7 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
 
 async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("daemonclaw/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
@@ -207,7 +207,7 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
 
     let bytes = resp.bytes().await.context("failed to read download body")?;
 
-    // Release assets are .tar.gz archives containing a single `zeroclaw` binary.
+    // Release assets are .tar.gz archives containing a single `daemonclaw` binary.
     // Extract the binary from the archive instead of writing the raw tarball.
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
         extract_tar_gz(&bytes, dest).context("failed to extract binary from tar.gz archive")?;
@@ -228,7 +228,7 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract the `zeroclaw` binary from a `.tar.gz` archive.
+/// Extract the `daemonclaw` binary from a `.tar.gz` archive.
 fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -241,10 +241,10 @@ fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
         let mut entry = entry.context("failed to read tar entry")?;
         let path = entry.path().context("failed to read entry path")?;
 
-        // The archive contains a single binary named "zeroclaw" (or "zeroclaw.exe" on Windows).
+        // The archive contains a single binary named "daemonclaw" (or "daemonclaw.exe" on Windows).
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if file_name == "zeroclaw" || file_name == "zeroclaw.exe" {
+        if file_name == "daemonclaw" || file_name == "daemonclaw.exe" {
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -254,7 +254,7 @@ fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
         }
     }
 
-    bail!("archive does not contain a 'zeroclaw' binary")
+    bail!("archive does not contain a 'daemonclaw' binary")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {
@@ -282,8 +282,8 @@ async fn validate_binary(path: &Path) -> Result<()> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains("zeroclaw") {
-        bail!("downloaded binary does not appear to be zeroclaw");
+    if !stdout.contains("daemonclaw") {
+        bail!("downloaded binary does not appear to be daemonclaw");
     }
 
     Ok(())
@@ -439,11 +439,11 @@ mod tests {
     #[test]
     fn find_asset_url_picks_correct_gnu_over_android() {
         let release = make_release(&[
-            "zeroclaw-aarch64-linux-android.tar.gz",
-            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
-            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
-            "zeroclaw-x86_64-apple-darwin.tar.gz",
-            "zeroclaw-aarch64-apple-darwin.tar.gz",
+            "daemonclaw-aarch64-linux-android.tar.gz",
+            "daemonclaw-aarch64-unknown-linux-gnu.tar.gz",
+            "daemonclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "daemonclaw-x86_64-apple-darwin.tar.gz",
+            "daemonclaw-aarch64-apple-darwin.tar.gz",
         ]);
 
         let url = find_asset_url(&release);
@@ -530,8 +530,8 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Build a tar.gz in memory containing a fake "zeroclaw" binary.
-        let fake_binary = b"#!/bin/sh\necho zeroclaw";
+        // Build a tar.gz in memory containing a fake "daemonclaw" binary.
+        let fake_binary = b"#!/bin/sh\necho daemonclaw";
         let mut tar_buf = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_buf);
@@ -540,7 +540,7 @@ mod tests {
             header.set_mode(0o755);
             header.set_cksum();
             builder
-                .append_data(&mut header, "zeroclaw", &fake_binary[..])
+                .append_data(&mut header, "daemonclaw", &fake_binary[..])
                 .unwrap();
             builder.finish().unwrap();
         }
@@ -553,7 +553,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("zeroclaw_extracted");
+        let dest = tmp.path().join("daemonclaw_extracted");
         extract_tar_gz(&gz_buf, &dest).unwrap();
 
         let content = std::fs::read(&dest).unwrap();
@@ -566,7 +566,7 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Build a tar.gz with a file that is NOT named "zeroclaw".
+        // Build a tar.gz with a file that is NOT named "daemonclaw".
         let mut tar_buf = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_buf);
@@ -588,7 +588,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("zeroclaw_extracted");
+        let dest = tmp.path().join("daemonclaw_extracted");
         let result = extract_tar_gz(&gz_buf, &dest);
         assert!(result.is_err());
         assert!(

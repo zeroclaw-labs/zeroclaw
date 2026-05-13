@@ -1,52 +1,52 @@
-# ZeroClaw Docker Compose Example
+# DaemonClaw Docker Compose Example
 # 
 # Quick start:
 #   1. Copy this file and set your API key
 #   2. Run: docker compose up -d
 #   3. Access gateway at http://localhost:42617
 #
-# For more info: https://github.com/zeroclaw-labs/zeroclaw
+# For more info: https://github.com/DeliveryBoyTech/daemonclaw
 
 services:
-  zeroclaw:
-    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+  daemonclaw:
+    image: ghcr.io/DeliveryBoyTech/daemonclaw:latest
     # For ARM64 environments where the distroless image exits immediately,
     # switch to the Debian compatibility image instead:
-    # image: ghcr.io/zeroclaw-labs/zeroclaw:debian
+    # image: ghcr.io/DeliveryBoyTech/daemonclaw:debian
     # Or build locally (distroless, no shell):
     # build: .
     # Or build the Debian variant (includes bash, git, curl):
     # build:
     #   context: .
     #   dockerfile: Dockerfile.debian
-    container_name: zeroclaw
+    container_name: daemonclaw
     restart: unless-stopped
     
     environment:
       # Required: Your LLM provider API key
       - API_KEY=${API_KEY:-}
       # Or use the prefixed version:
-      # - ZEROCLAW_API_KEY=${ZEROCLAW_API_KEY:-}
+      # - DAEMONCLAW_API_KEY=${DAEMONCLAW_API_KEY:-}
       
       # Optional: LLM provider (default: openrouter)
       # Options: openrouter, openai, anthropic, ollama
       - PROVIDER=${PROVIDER:-openrouter}
       
       # Allow public bind inside Docker (required for container networking)
-      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      - DAEMONCLAW_ALLOW_PUBLIC_BIND=true
       # Default gateway port inside container
-      - ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-42617}
+      - DAEMONCLAW_GATEWAY_PORT=${DAEMONCLAW_GATEWAY_PORT:-42617}
       
       # Optional: Model override
-      # - ZEROCLAW_MODEL=anthropic/claude-sonnet-4-20250514
+      # - DAEMONCLAW_MODEL=anthropic/claude-sonnet-4-20250514
       
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
-      - zeroclaw-data:/zeroclaw-data
+      - daemonclaw-data:/daemonclaw-data
       
     ports:
       # Gateway API port (override HOST_PORT if 42617 is taken)
-      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+      - "${HOST_PORT:-42617}:${DAEMONCLAW_GATEWAY_PORT:-42617}"
     
     # Resource limits
     deploy:
@@ -61,11 +61,11 @@ services:
     # Health check — uses lightweight status instead of full diagnostics.
     # For images with curl, prefer: curl -f http://localhost:42617/health
     healthcheck:
-      test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+      test: ["CMD", "daemonclaw", "status", "--format=exit-code"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 10s
 
 volumes:
-  zeroclaw-data:
+  daemonclaw-data:

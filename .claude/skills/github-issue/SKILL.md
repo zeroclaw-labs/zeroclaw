@@ -1,14 +1,14 @@
 # Skill: github-issue
 
-File a structured GitHub issue (bug report or feature request) for ZeroClaw interactively from Claude Code.
+File a structured GitHub issue (bug report or feature request) for DaemonClaw interactively from Claude Code.
 
 ## When to Use
 
-Trigger when the user wants to file a GitHub issue, report a bug, or request a feature for ZeroClaw. Keywords: "file issue", "report bug", "feature request", "open issue", "create issue", "github issue".
+Trigger when the user wants to file a GitHub issue, report a bug, or request a feature for DaemonClaw. Keywords: "file issue", "report bug", "feature request", "open issue", "create issue", "github issue".
 
 ## Instructions
 
-You are filing a GitHub issue against the ZeroClaw repository using structured issue forms. Follow this workflow exactly.
+You are filing a GitHub issue against the DaemonClaw repository using structured issue forms. Follow this workflow exactly.
 
 ### Step 1: Detect Issue Type and Read the Template
 
@@ -41,7 +41,7 @@ git diff --stat HEAD~1 2>/dev/null
 uname -s -r -m                          # OS info
 sw_vers 2>/dev/null                     # macOS version
 rustc --version 2>/dev/null             # Rust version
-cargo metadata --format-version=1 --no-deps 2>/dev/null | jq -r '.packages[] | select(.name=="zeroclaw") | .version' 2>/dev/null   # ZeroClaw version
+cargo metadata --format-version=1 --no-deps 2>/dev/null | jq -r '.packages[] | select(.name=="daemonclaw") | .version' 2>/dev/null   # DaemonClaw version
 git rev-parse --short HEAD              # commit SHA fallback
 ```
 
@@ -127,7 +127,7 @@ Return the resulting issue URL to the user.
 
 - **Always read the template file** — never assume field names, options, or structure. The templates are the source of truth and may change over time.
 - **Never include personal/sensitive data** in the issue. Redact secrets, tokens, emails, real names.
-- **Use neutral project-scoped placeholders** per ZeroClaw's privacy contract.
+- **Use neutral project-scoped placeholders** per DaemonClaw's privacy contract.
 - **One concept per issue** — enforce the scope guard.
 - **Auto-detect, don't guess** — use real command output for environment fields.
 - **Quote observed output verbatim** — error messages, stack traces, warnings, and command output must be copy-pasted into the relevant fields (`Steps to reproduce`, `Observed behavior`, `Logs`) exactly as they appeared. Do not paraphrase. Do not summarize. The maintainer searching for this bug later will grep for the exact string; paraphrase breaks that search. If the output is long, include the head and tail with a `...` marker in the middle rather than rewriting it.

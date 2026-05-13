@@ -1,23 +1,23 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::skills::*;
+pub use daemonclaw_runtime::skills::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 pub mod creator {
     #[allow(unused_imports)]
-    pub use zeroclaw_runtime::skills::creator::*;
+    pub use daemonclaw_runtime::skills::creator::*;
 }
 pub mod audit {
     #[allow(unused_imports)]
-    pub use zeroclaw_runtime::skills::audit::*;
+    pub use daemonclaw_runtime::skills::audit::*;
 }
 pub mod skill_tool {
     #[allow(unused_imports)]
-    pub use zeroclaw_runtime::skills::skill_tool::*;
+    pub use daemonclaw_runtime::skills::skill_tool::*;
 }
 pub mod skill_http {
     #[allow(unused_imports)]
-    pub use zeroclaw_runtime::skills::skill_http::*;
+    pub use daemonclaw_runtime::skills::skill_http::*;
 }
 
 #[allow(dead_code)]
@@ -29,12 +29,12 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             if skills.is_empty() {
                 println!("No skills installed.");
                 println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
+                println!("  Create one: mkdir -p ~/.daemonclaw/workspace/skills/my-skill");
                 println!(
-                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md"
+                    "              echo '# My Skill' > ~/.daemonclaw/workspace/skills/my-skill/SKILL.md"
                 );
                 println!();
-                println!("  Or install: zeroclaw skills install <source>");
+                println!("  Or install: daemonclaw skills install <source>");
             } else {
                 println!("Installed skills ({}):", skills.len());
                 println!();

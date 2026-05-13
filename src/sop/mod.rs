@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::sop::*;
+pub use daemonclaw_runtime::sop::*;
 
 use anyhow::Result;
 
@@ -376,14 +376,14 @@ type = "manual"
 
     #[test]
     fn resolve_sops_dir_default() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
+        let ws = Path::new("/home/user/.daemonclaw/workspace");
         let dir = resolve_sops_dir(ws, None);
         assert_eq!(dir, ws.join("sops"));
     }
 
     #[test]
     fn resolve_sops_dir_override() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
+        let ws = Path::new("/home/user/.daemonclaw/workspace");
         let dir = resolve_sops_dir(ws, Some("/custom/sops"));
         assert_eq!(dir, PathBuf::from("/custom/sops"));
     }

@@ -4,8 +4,8 @@
 //! through the public Provider trait, ensuring the agent loop selects the
 //! right tool-calling strategy (prompt-guided, not native).
 
-use zeroclaw::providers::create_provider_with_url;
-use zeroclaw::providers::traits::Provider;
+use daemonclaw::providers::create_provider_with_url;
+use daemonclaw::providers::traits::Provider;
 
 fn gemini_provider() -> Box<dyn Provider> {
     create_provider_with_url("gemini", Some("test-key"), None)
@@ -54,8 +54,8 @@ fn gemini_supports_vision_returns_true() {
 
 #[test]
 fn gemini_convert_tools_returns_prompt_guided() {
-    use zeroclaw::providers::traits::ToolsPayload;
-    use zeroclaw::tools::ToolSpec;
+    use daemonclaw::providers::traits::ToolsPayload;
+    use daemonclaw::tools::ToolSpec;
 
     let provider = gemini_provider();
     let tools = vec![ToolSpec {

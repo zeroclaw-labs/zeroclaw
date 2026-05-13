@@ -1,6 +1,6 @@
-# ZeroClaw Commands Reference
+# DaemonClaw Commands Reference
 
-This reference is derived from the current CLI surface (`zeroclaw --help`).
+This reference is derived from the current CLI surface (`daemonclaw --help`).
 
 Last verified: **March 26, 2026**.
 
@@ -33,13 +33,13 @@ Last verified: **March 26, 2026**.
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --reinit`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `daemonclaw onboard`
+- `daemonclaw onboard --channels-only`
+- `daemonclaw onboard --force`
+- `daemonclaw onboard --reinit`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
@@ -47,15 +47,15 @@ Last verified: **March 26, 2026**.
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
-- Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
-- Use `zeroclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
+- Use `daemonclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `daemonclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `daemonclaw agent`
+- `daemonclaw agent -m "Hello"`
+- `daemonclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `daemonclaw agent --peripheral <board:path>`
 
 Tip:
 
@@ -63,9 +63,9 @@ Tip:
 
 ### `acp`
 
-- `zeroclaw acp`
-- `zeroclaw acp --max-sessions <N>`
-- `zeroclaw acp --session-timeout <SECONDS>`
+- `daemonclaw acp`
+- `daemonclaw acp --max-sessions <N>`
+- `daemonclaw acp --session-timeout <SECONDS>`
 
 Start the ACP (Agent Control Protocol) server for IDE and tool integration.
 
@@ -77,21 +77,21 @@ Start the ACP (Agent Control Protocol) server for IDE and tool integration.
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `daemonclaw gateway [--host <HOST>] [--port <PORT>]`
+- `daemonclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `estop`
 
-- `zeroclaw estop` (engage `kill-all`)
-- `zeroclaw estop --level network-kill`
-- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
-- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
-- `zeroclaw estop status`
-- `zeroclaw estop resume`
-- `zeroclaw estop resume --network`
-- `zeroclaw estop resume --domain "*.chase.com"`
-- `zeroclaw estop resume --tool shell`
-- `zeroclaw estop resume --otp <123456>`
+- `daemonclaw estop` (engage `kill-all`)
+- `daemonclaw estop --level network-kill`
+- `daemonclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `daemonclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `daemonclaw estop status`
+- `daemonclaw estop resume`
+- `daemonclaw estop resume --network`
+- `daemonclaw estop resume --domain "*.chase.com"`
+- `daemonclaw estop resume --tool shell`
+- `daemonclaw estop resume --otp <123456>`
 
 Notes:
 
@@ -101,23 +101,23 @@ Notes:
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `daemonclaw service install`
+- `daemonclaw service start`
+- `daemonclaw service stop`
+- `daemonclaw service restart`
+- `daemonclaw service status`
+- `daemonclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `daemonclaw cron list`
+- `daemonclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `daemonclaw cron add-at <rfc3339_timestamp> <command>`
+- `daemonclaw cron add-every <every_ms> <command>`
+- `daemonclaw cron once <delay> <command>`
+- `daemonclaw cron remove <id>`
+- `daemonclaw cron pause <id>`
+- `daemonclaw cron resume <id>`
 
 Notes:
 
@@ -126,29 +126,29 @@ Notes:
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `daemonclaw models refresh`
+- `daemonclaw models refresh --provider <ID>`
+- `daemonclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
 ### `doctor`
 
-- `zeroclaw doctor`
-- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
-- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
-- `zeroclaw doctor traces --id <TRACE_ID>`
+- `daemonclaw doctor`
+- `daemonclaw doctor models [--provider <ID>] [--use-cache]`
+- `daemonclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `daemonclaw doctor traces --id <TRACE_ID>`
 
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `daemonclaw channel list`
+- `daemonclaw channel start`
+- `daemonclaw channel doctor`
+- `daemonclaw channel bind-telegram <IDENTITY>`
+- `daemonclaw channel add <type> <json>`
+- `daemonclaw channel remove <name>`
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
@@ -169,14 +169,14 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `daemonclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills audit <source_or_name>`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `daemonclaw skills list`
+- `daemonclaw skills audit <source_or_name>`
+- `daemonclaw skills install <source>`
+- `daemonclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
@@ -192,20 +192,20 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `daemonclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config list` — list all properties with current values
-- `zeroclaw config list --secrets` — list only secret (encrypted) fields
-- `zeroclaw config list --filter channels.matrix` — filter by path prefix
-- `zeroclaw config get <path>` — get a single property value (secrets show set/unset status)
-- `zeroclaw config set <path> <value>` — set a property value
-- `zeroclaw config set <path>` — secret fields prompt for masked input; enum fields offer interactive selection
-- `zeroclaw config set --no-interactive <path> <value>` — scripted mode, no prompts
-- `zeroclaw config init <section>` — create an unconfigured section with defaults (`enabled=false`)
-- `zeroclaw config init` — initialize all unconfigured sections
-- `zeroclaw config schema` — print JSON Schema (draft 2020-12) to stdout
+- `daemonclaw config list` — list all properties with current values
+- `daemonclaw config list --secrets` — list only secret (encrypted) fields
+- `daemonclaw config list --filter channels.matrix` — filter by path prefix
+- `daemonclaw config get <path>` — get a single property value (secrets show set/unset status)
+- `daemonclaw config set <path> <value>` — set a property value
+- `daemonclaw config set <path>` — secret fields prompt for masked input; enum fields offer interactive selection
+- `daemonclaw config set --no-interactive <path> <value>` — scripted mode, no prompts
+- `daemonclaw config init <section>` — create an unconfigured section with defaults (`enabled=false`)
+- `daemonclaw config init` — initialize all unconfigured sections
+- `daemonclaw config schema` — print JSON Schema (draft 2020-12) to stdout
 
 Secret fields (API keys, tokens, passwords) are automatically detected via `#[secret]`
 annotations. When setting a secret, input is masked regardless of whether a value is
@@ -214,35 +214,35 @@ provided on the command line.
 Enum fields (e.g. `stream-mode`, `search-mode`) offer interactive selection via arrow
 keys when the value is omitted. Provide the value directly to skip the prompt.
 
-Shell tab-completion for property paths is included in `zeroclaw completions <shell>`.
+Shell tab-completion for property paths is included in `daemonclaw completions <shell>`.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `daemonclaw completions bash`
+- `daemonclaw completions fish`
+- `daemonclaw completions zsh`
+- `daemonclaw completions powershell`
+- `daemonclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `daemonclaw hardware discover`
+- `daemonclaw hardware introspect <path>`
+- `daemonclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `daemonclaw peripheral list`
+- `daemonclaw peripheral add <board> <path>`
+- `daemonclaw peripheral flash [--port <serial_port>]`
+- `daemonclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `daemonclaw peripheral flash-nucleo`
 
 ### `props` (deprecated)
 
-`zeroclaw props` has been renamed to `zeroclaw config`. Replace `props` with `config` in your commands.
+`daemonclaw props` has been renamed to `daemonclaw config`. Replace `props` with `config` in your commands.
 
 #### Adding new config fields
 
@@ -255,6 +255,6 @@ New enum types require a one-line `HasPropKind` impl. See `CONTRIBUTING.md` for 
 To verify docs against your current binary quickly:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+daemonclaw --help
+daemonclaw <command> --help
 ```

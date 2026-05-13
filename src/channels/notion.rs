@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::notion::*;
+pub use daemonclaw_channels::notion::*;

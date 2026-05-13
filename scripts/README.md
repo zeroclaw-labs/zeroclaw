@@ -1,14 +1,14 @@
 # scripts/ — Raspberry Pi Deployment Guide
 
-This directory contains everything needed to cross-compile ZeroClaw and deploy it to a Raspberry Pi over SSH.
+This directory contains everything needed to cross-compile DaemonClaw and deploy it to a Raspberry Pi over SSH.
 
 ## Contents
 
 | File | Purpose |
 |------|---------|
 | `deploy-rpi.sh` | One-shot cross-compile and deploy script |
-| `rpi-config.toml` | Production config template deployed to `~/.zeroclaw/config.toml` |
-| `zeroclaw.service` | systemd unit file installed on the Pi |
+| `rpi-config.toml` | Production config template deployed to `~/.daemonclaw/config.toml` |
+| `daemonclaw.service` | systemd unit file installed on the Pi |
 | `99-act-led.rules` | udev rule for ACT LED sysfs access without sudo |
 
 ---
@@ -64,7 +64,7 @@ After the first deploy, you must set your API key on the Pi (see [First-Time Set
 | `RPI_HOST` | `raspberrypi.local` | Pi hostname or IP address |
 | `RPI_USER` | `pi` | SSH username |
 | `RPI_PORT` | `22` | SSH port |
-| `RPI_DIR` | `~/zeroclaw` | Remote directory for the binary and `.env` |
+| `RPI_DIR` | `~/daemonclaw` | Remote directory for the binary and `.env` |
 | `RPI_PASS` | _(unset)_ | SSH password — uses `sshpass` if set; key auth used otherwise |
 | `CROSS_TOOL` | _(auto-detect)_ | Force `zigbuild` or `cross` |
 
@@ -73,12 +73,12 @@ After the first deploy, you must set your API key on the Pi (see [First-Time Set
 ## What the Deploy Script Does
 
 1. **Cross-compile** — builds a release binary for `aarch64-unknown-linux-gnu` with `--features hardware,peripheral-rpi`.
-2. **Stop service** — runs `sudo systemctl stop zeroclaw` on the Pi (continues if not yet installed).
+2. **Stop service** — runs `sudo systemctl stop daemonclaw` on the Pi (continues if not yet installed).
 3. **Create remote directory** — ensures `$RPI_DIR` exists on the Pi.
-4. **Copy binary** — SCPs the compiled binary to `$RPI_DIR/zeroclaw`.
+4. **Copy binary** — SCPs the compiled binary to `$RPI_DIR/daemonclaw`.
 5. **Create `.env`** — writes an `.env` skeleton with an `ANTHROPIC_API_KEY=` placeholder to `$RPI_DIR/.env` with mode `600`. Skipped if the file already exists so an existing key is not overwritten.
-6. **Deploy config** — copies `rpi-config.toml` to `~/.zeroclaw/config.toml`, preserving any `api_key` already present in the file.
-7. **Install systemd service** — copies `zeroclaw.service` to `/etc/systemd/system/`, then enables and restarts it.
+6. **Deploy config** — copies `rpi-config.toml` to `~/.daemonclaw/config.toml`, preserving any `api_key` already present in the file.
+7. **Install systemd service** — copies `daemonclaw.service` to `/etc/systemd/system/`, then enables and restarts it.
 8. **Hardware permissions** — adds the deploy user to the `gpio` group, copies `99-act-led.rules` to `/etc/udev/rules.d/`, and resets the ACT LED trigger.
 
 ---
@@ -89,16 +89,16 @@ After the first successful deploy, SSH into the Pi and fill in your API key:
 
 ```bash
 ssh pi@raspberrypi.local
-nano ~/zeroclaw/.env
+nano ~/daemonclaw/.env
 # Set: ANTHROPIC_API_KEY=sk-ant-...
-sudo systemctl restart zeroclaw
+sudo systemctl restart daemonclaw
 ```
 
 The `.env` is loaded by the systemd service as an `EnvironmentFile`.
 
 ---
 
-## Interacting with ZeroClaw on the Pi
+## Interacting with DaemonClaw on the Pi
 
 Once the service is running the gateway listens on port **8080**.
 
@@ -128,7 +128,7 @@ curl -N -s -X POST http://raspberrypi.local:8080/api/chat \
 ### Follow service logs
 
 ```bash
-ssh pi@raspberrypi.local 'journalctl -u zeroclaw -f'
+ssh pi@raspberrypi.local 'journalctl -u daemonclaw -f'
 ```
 
 ---
@@ -137,7 +137,7 @@ ssh pi@raspberrypi.local 'journalctl -u zeroclaw -f'
 
 ### GPIO tools
 
-ZeroClaw is deployed with the `peripheral-rpi` feature, which enables two LLM-callable tools:
+DaemonClaw is deployed with the `peripheral-rpi` feature, which enables two LLM-callable tools:
 
 - **`gpio_read`** — reads a GPIO pin value via sysfs (`/sys/class/gpio/...`).
 - **`gpio_write`** — writes a GPIO pin value.
@@ -165,10 +165,10 @@ If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I
 
 | Remote path | Source | Description |
 |------------|--------|-------------|
-| `~/zeroclaw/zeroclaw` | compiled binary | Main agent binary |
-| `~/zeroclaw/.env` | created on first deploy | API key and environment variables |
-| `~/.zeroclaw/config.toml` | `rpi-config.toml` | Agent configuration |
-| `/etc/systemd/system/zeroclaw.service` | `zeroclaw.service` | systemd service unit |
+| `~/daemonclaw/daemonclaw` | compiled binary | Main agent binary |
+| `~/daemonclaw/.env` | created on first deploy | API key and environment variables |
+| `~/.daemonclaw/config.toml` | `rpi-config.toml` | Agent configuration |
+| `/etc/systemd/system/daemonclaw.service` | `daemonclaw.service` | systemd service unit |
 | `/etc/udev/rules.d/99-act-led.rules` | `99-act-led.rules` | ACT LED permissions |
 
 ---
@@ -182,7 +182,7 @@ If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I
 - **Autonomy**: `full`
 - **Allowed shell commands**: `git`, `cargo`, `npm`, `mkdir`, `touch`, `cp`, `mv`, `ls`, `cat`, `grep`, `find`, `echo`, `pwd`, `wc`, `head`, `tail`, `date`
 
-To customise, edit `~/.zeroclaw/config.toml` directly on the Pi and restart the service.
+To customise, edit `~/.daemonclaw/config.toml` directly on the Pi and restart the service.
 
 ---
 
@@ -191,8 +191,8 @@ To customise, edit `~/.zeroclaw/config.toml` directly on the Pi and restart the 
 ### Service won't start
 
 ```bash
-ssh pi@raspberrypi.local 'sudo systemctl status zeroclaw'
-ssh pi@raspberrypi.local 'journalctl -u zeroclaw -n 50 --no-pager'
+ssh pi@raspberrypi.local 'sudo systemctl status daemonclaw'
+ssh pi@raspberrypi.local 'journalctl -u daemonclaw -n 50 --no-pager'
 ```
 
 ### GPIO permission denied
@@ -211,7 +211,7 @@ If the group was just added, log out and back in, or run `newgrp gpio`.
 Re-run the deploy script. Confirm the target:
 
 ```bash
-ssh pi@raspberrypi.local 'file ~/zeroclaw/zeroclaw'
+ssh pi@raspberrypi.local 'file ~/daemonclaw/daemonclaw'
 # Expected: ELF 64-bit LSB pie executable, ARM aarch64
 ```
 

@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::project_intel::*;
+pub use daemonclaw_tools::project_intel::*;

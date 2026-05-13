@@ -12,16 +12,16 @@ Dành cho cài đặt lần đầu và làm quen nhanh.
 
 | Tình huống | Lệnh |
 |----------|---------|
-| Có API key, muốn cài nhanh nhất | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| Muốn được hướng dẫn từng bước | `zeroclaw onboard` |
-| Đã có config, chỉ cần sửa kênh | `zeroclaw onboard --channels-only` |
+| Có API key, muốn cài nhanh nhất | `daemonclaw onboard --api-key sk-... --provider openrouter` |
+| Muốn được hướng dẫn từng bước | `daemonclaw onboard` |
+| Đã có config, chỉ cần sửa kênh | `daemonclaw onboard --channels-only` |
 | Dùng xác thực subscription | Xem [Subscription Auth](../../README.vi.md#subscription-auth-openai-codex--claude-code) |
 
 ## Thiết lập và kiểm tra
 
-- Thiết lập nhanh: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
-- Thiết lập hướng dẫn: `zeroclaw onboard`
-- Kiểm tra môi trường: `zeroclaw status` + `zeroclaw doctor`
+- Thiết lập nhanh: `daemonclaw onboard --api-key "sk-..." --provider openrouter`
+- Thiết lập hướng dẫn: `daemonclaw onboard`
+- Kiểm tra môi trường: `daemonclaw status` + `daemonclaw doctor`
 
 ## Tiếp theo
 

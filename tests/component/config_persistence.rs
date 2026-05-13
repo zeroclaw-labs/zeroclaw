@@ -7,7 +7,7 @@
 //! and config file round-trips to verify workspace discovery and persistence.
 
 use std::fs;
-use zeroclaw::config::{AgentConfig, Config, MemoryConfig};
+use daemonclaw::config::{AgentConfig, Config, MemoryConfig};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config default construction
@@ -132,7 +132,7 @@ fn memory_config_default_vector_keyword_weights_sum_to_one() {
 
 #[test]
 fn config_toml_roundtrip_preserves_provider() {
-    use zeroclaw::config::ModelProviderConfig;
+    use daemonclaw::config::ModelProviderConfig;
     let mut config = Config::default();
     config.providers.fallback = Some("deepseek".into());
     config.providers.models.insert(
@@ -145,7 +145,7 @@ fn config_toml_roundtrip_preserves_provider() {
     );
 
     let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
-    let compat: zeroclaw::config::migration::V1Compat =
+    let compat: daemonclaw::config::migration::V1Compat =
         toml::from_str(&toml_str).expect("TOML should deserialize back");
     let parsed = compat.into_config();
 
@@ -207,7 +207,7 @@ fn config_toml_roundtrip_preserves_memory_config() {
 
 #[test]
 fn config_file_write_read_roundtrip() {
-    use zeroclaw::config::ModelProviderConfig;
+    use daemonclaw::config::ModelProviderConfig;
     let tmp = tempfile::TempDir::new().expect("tempdir creation should succeed");
     let config_path = tmp.path().join("config.toml");
 
@@ -226,7 +226,7 @@ fn config_file_write_read_roundtrip() {
     fs::write(&config_path, &toml_str).expect("config file write should succeed");
 
     let read_back = fs::read_to_string(&config_path).expect("config file read should succeed");
-    let compat: zeroclaw::config::migration::V1Compat =
+    let compat: daemonclaw::config::migration::V1Compat =
         toml::from_str(&read_back).expect("TOML should parse back");
     let parsed = compat.into_config();
 

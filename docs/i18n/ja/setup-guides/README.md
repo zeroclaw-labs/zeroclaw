@@ -14,19 +14,19 @@
 
 | シナリオ | コマンド |
 |----------|---------|
-| APIキーを持っていて、最速でセットアップしたい | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| ガイド付きプロンプトを使用したい | `zeroclaw onboard` |
-| 設定は存在し、チャンネルの修正だけしたい | `zeroclaw onboard --channels-only` |
-| 設定は存在し、意図的にフル上書きしたい | `zeroclaw onboard --force` |
+| APIキーを持っていて、最速でセットアップしたい | `daemonclaw onboard --api-key sk-... --provider openrouter` |
+| ガイド付きプロンプトを使用したい | `daemonclaw onboard` |
+| 設定は存在し、チャンネルの修正だけしたい | `daemonclaw onboard --channels-only` |
+| 設定は存在し、意図的にフル上書きしたい | `daemonclaw onboard --force` |
 | サブスクリプション認証を使用する | [サブスクリプション認証](../../../README.ja.md#サブスクリプション認証oauth) を参照 |
 
 ## オンボーディングと検証
 
-- クイックオンボーディング: `zeroclaw onboard --api-key "sk-..." --provider openrouter`
-- ガイド付きオンボーディング: `zeroclaw onboard`
+- クイックオンボーディング: `daemonclaw onboard --api-key "sk-..." --provider openrouter`
+- ガイド付きオンボーディング: `daemonclaw onboard`
 - 既存設定の保護: 再実行には明示的な確認が必要です（非対話型フローでは `--force` が必要）。
 - Ollama クラウドモデル (`:cloud`) にはリモートの `api_url` と API キーが必要です (例: `api_url = "https://ollama.com"`)。
-- 環境の検証: `zeroclaw status` + `zeroclaw doctor`
+- 環境の検証: `daemonclaw status` + `daemonclaw doctor`
 
 ## 次のステップ
 

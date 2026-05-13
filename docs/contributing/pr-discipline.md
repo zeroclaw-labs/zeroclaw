@@ -1,6 +1,6 @@
 # PR Discipline
 
-Rules for pull request quality, attribution, privacy, and handoff in ZeroClaw.
+Rules for pull request quality, attribution, privacy, and handoff in DaemonClaw.
 
 ## Privacy / Sensitive Data (Required)
 
@@ -10,11 +10,11 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Prohibited data includes (non-exhaustive): real names, personal emails, phone numbers, addresses, access tokens, API keys, credentials, IDs, and private URLs.
 - Use neutral project-scoped placeholders (e.g., `user_a`, `test_user`, `project_bot`, `example.com`) instead of real identity data.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
-- If identity-like context is unavoidable, use ZeroClaw-scoped roles/labels only (e.g., `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
+- If identity-like context is unavoidable, use DaemonClaw-scoped roles/labels only (e.g., `DaemonClawAgent`, `DaemonClawOperator`, `daemonclaw_user`).
 - Recommended identity-safe naming palette:
-    - actor labels: `ZeroClawAgent`, `ZeroClawOperator`, `ZeroClawMaintainer`, `zeroclaw_user`
-    - service/runtime labels: `zeroclaw_bot`, `zeroclaw_service`, `zeroclaw_runtime`, `zeroclaw_node`
-    - environment labels: `zeroclaw_project`, `zeroclaw_workspace`, `zeroclaw_channel`
+    - actor labels: `DaemonClawAgent`, `DaemonClawOperator`, `DaemonClawMaintainer`, `daemonclaw_user`
+    - service/runtime labels: `daemonclaw_bot`, `daemonclaw_service`, `daemonclaw_runtime`, `daemonclaw_node`
+    - environment labels: `daemonclaw_project`, `daemonclaw_workspace`, `daemonclaw_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 

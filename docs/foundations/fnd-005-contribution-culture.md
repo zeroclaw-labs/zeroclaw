@@ -2,14 +2,14 @@
 ### Starting v0.7.0 · Type: Culture · Rev. 1
 
 > **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)
+> Discussion thread and full revision history: [#5615](https://github.com/DeliveryBoyTech/daemonclaw/issues/5615)
 
 
 ---
 
 > **A note to the team before you read this.**
 >
-> This is the fifth document in ZeroClaw's maturity framework. The other four address
+> This is the fifth document in DaemonClaw's maturity framework. The other four address
 > architecture, documentation, governance, and engineering infrastructure — the structural
 > layers that make a project work. This one addresses something those four take for granted
 > but never explicitly teach: how to work together.
@@ -33,7 +33,7 @@
 
 ## The Maturity Framework Suite
 
-This RFC is the fifth in a set of five documents that together form ZeroClaw's maturity
+This RFC is the fifth in a set of five documents that together form DaemonClaw's maturity
 framework. They are designed to be read as a whole, though each stands on its own.
 
 | RFC | Scope | Issue |
@@ -416,7 +416,7 @@ the approach contradicts an architectural decision made three months ago. It wil
 ask whether you have thought through the security implications. It will not notice that
 you are solving the wrong problem.
 
-ZeroClaw itself is a useful example. The initial codebase was bootstrapped with AI
+DaemonClaw itself is a useful example. The initial codebase was bootstrapped with AI
 assistance. The result, as the architecture RFC describes it, is "impressively functional
 but architecturally accidental." The code does what it needs to do today — but it was
 not designed, it accumulated. That is not a failure of AI tools. It is a predictable

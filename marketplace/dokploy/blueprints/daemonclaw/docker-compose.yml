@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  daemonclaw:
+    image: ghcr.io/DeliveryBoyTech/daemonclaw:0.7.1
+    restart: unless-stopped
+    environment:
+      - API_KEY=${API_KEY}
+      - PROVIDER=${PROVIDER:-openrouter}
+      - DAEMONCLAW_ALLOW_PUBLIC_BIND=true
+      - DAEMONCLAW_GATEWAY_PORT=42617
+    volumes:
+      - daemonclaw-data:/daemonclaw-data
+    expose:
+      - 42617
+volumes:
+  daemonclaw-data: {}

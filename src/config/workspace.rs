@@ -1,1 +1,1 @@
-pub use zeroclaw_config::workspace::*;
+pub use daemonclaw_config::workspace::*;

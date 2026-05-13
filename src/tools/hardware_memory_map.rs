@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::hardware_memory_map::*;
+pub use daemonclaw_tools::hardware_memory_map::*;

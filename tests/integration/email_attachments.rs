@@ -1,6 +1,6 @@
 use mail_parser::{MessageParser, MimeHeaders};
-use zeroclaw::channels::SendMessage;
-use zeroclaw::channels::media_pipeline::MediaAttachment;
+use daemonclaw::channels::SendMessage;
+use daemonclaw::channels::media_pipeline::MediaAttachment;
 
 /// Test that extract_attachments correctly parses binary attachments from multipart MIME
 #[test]

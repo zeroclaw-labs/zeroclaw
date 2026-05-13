@@ -1,2 +1,2 @@
 #[allow(unused_imports)]
-pub use zeroclaw_providers::multimodal::*;
+pub use daemonclaw_providers::multimodal::*;

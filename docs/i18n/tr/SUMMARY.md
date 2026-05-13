@@ -1,4 +1,4 @@
-# ZeroClaw Dokümantasyon Özeti (Birleşik İçindekiler)
+# DaemonClaw Dokümantasyon Özeti (Birleşik İçindekiler)
 
 Bu dosya, dokümantasyon sisteminin kanonik içindekiler tablosudur.
 

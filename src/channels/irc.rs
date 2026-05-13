@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::irc::*;
+pub use daemonclaw_channels::irc::*;

@@ -2,7 +2,7 @@
 ### Starting v0.7.0 · Type: Governance · Rev. 2
 
 > **Canonical reference** · Ratified by the team · Rev. 2
-> Discussion thread and full revision history: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
+> Discussion thread and full revision history: [#5577](https://github.com/DeliveryBoyTech/daemonclaw/issues/5577)
 
 
 ---
@@ -54,7 +54,7 @@ Every project without an intentional coordination system develops an accidental 
 
 This is not a criticism of anyone's effort. It is a description of what happens by default. The solution is not more process — it is the right process, applied at the right level for the size and maturity of the team.
 
-ZeroClaw needs three things:
+DaemonClaw needs three things:
 
 1. **A pipeline** for turning ideas into shipped code, with visible stages and clear gates at each transition
 2. **A parking lot** for capturing ideas that are not ready for the pipeline yet, without losing them or cluttering the active work
@@ -199,7 +199,7 @@ Enable GitHub Discussions on the repository. Create the following categories:
 | ❓ **Q&A** | Question/Answer | How do I do X? Answered by contributors and core team |
 | 🐛 **Bug Reports (pre-triage)** | Open-ended discussion | For bug reports that need more information before becoming issues |
 | 🌐 **Translations** | Open-ended discussion | Community-maintained translations and localization coordination |
-| 🎉 **Show and Tell** | Open-ended discussion | What are you building with ZeroClaw? Community showcases |
+| 🎉 **Show and Tell** | Open-ended discussion | What are you building with DaemonClaw? Community showcases |
 
 ### 4.2 The Idea-to-Issue Promotion Process
 
@@ -333,7 +333,7 @@ Team membership is recorded in two places:
 
 **`CONTRIBUTORS.md`** at the repository root — a public record of everyone who has contributed, organized by tier. Updated by Core Team members as contributors are recognized.
 
-**GitHub Teams** in the organization settings — `zeroclaw-core` and `zeroclaw-contributors` teams, referenced in CODEOWNERS and used for notification routing.
+**GitHub Teams** in the organization settings — `daemonclaw-core` and `daemonclaw-contributors` teams, referenced in CODEOWNERS and used for notification routing.
 
 ---
 
@@ -352,29 +352,29 @@ Create `.github/CODEOWNERS`:
 
 # ── High Risk: requires Core Team approval ──────────────────────────────────
 
-src/security/**                 @zeroclaw-labs/zeroclaw-core
-src/gateway/**                  @zeroclaw-labs/zeroclaw-core
-src/runtime/**                  @zeroclaw-labs/zeroclaw-core
-src/tools/shell.rs              @zeroclaw-labs/zeroclaw-core
-src/tools/file_write.rs         @zeroclaw-labs/zeroclaw-core
-src/tools/security_ops.rs       @zeroclaw-labs/zeroclaw-core
+src/security/**                 @DeliveryBoyTech/daemonclaw-core
+src/gateway/**                  @DeliveryBoyTech/daemonclaw-core
+src/runtime/**                  @DeliveryBoyTech/daemonclaw-core
+src/tools/shell.rs              @DeliveryBoyTech/daemonclaw-core
+src/tools/file_write.rs         @DeliveryBoyTech/daemonclaw-core
+src/tools/security_ops.rs       @DeliveryBoyTech/daemonclaw-core
 
 # ── Governance and configuration: requires Core Team approval ───────────────
 
-.github/**                      @zeroclaw-labs/zeroclaw-core
-CODEOWNERS                      @zeroclaw-labs/zeroclaw-core
-Cargo.toml                      @zeroclaw-labs/zeroclaw-core
-deny.toml                       @zeroclaw-labs/zeroclaw-core
+.github/**                      @DeliveryBoyTech/daemonclaw-core
+CODEOWNERS                      @DeliveryBoyTech/daemonclaw-core
+Cargo.toml                      @DeliveryBoyTech/daemonclaw-core
+deny.toml                       @DeliveryBoyTech/daemonclaw-core
 
 # ── Architecture documents: requires Core Team review ───────────────────────
 
-docs/proposals/**               @zeroclaw-labs/zeroclaw-core
-docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
-AGENTS.md                       @zeroclaw-labs/zeroclaw-core
+docs/proposals/**               @DeliveryBoyTech/daemonclaw-core
+docs/architecture/decisions/**  @DeliveryBoyTech/daemonclaw-core
+AGENTS.md                       @DeliveryBoyTech/daemonclaw-core
 
 # ── Default: any Contributor or Core Team member can review ─────────────────
 
-*                               @zeroclaw-labs/zeroclaw-contributors
+*                               @DeliveryBoyTech/daemonclaw-contributors
 ```
 
 As specific Core Team members take ownership of components, add their individual handles alongside the team handle. Specificity wins in CODEOWNERS — a more specific path rule overrides a more general one.
@@ -407,7 +407,7 @@ fmt                     ← cargo fmt --all -- --check
 clippy                  ← cargo clippy --all-targets -- -D warnings
 ```
 
-As the workspace decomposes into crates (per the architecture RFC), add per-crate checks. A change to `crates/zeroclaw-api` should run that crate's test suite independently.
+As the workspace decomposes into crates (per the architecture RFC), add per-crate checks. A change to `crates/daemonclaw-api` should run that crate's test suite independently.
 
 ### 6.4 Architectural Compliance: Human Review, AI Support
 
@@ -421,7 +421,7 @@ This section exists because the question will come up — it already has — and
 
 **There are two fundamentally different kinds of quality enforcement, and they require different mechanisms.**
 
-The first kind is *structural compliance*: does this code violate a mechanical rule? Does `zeroclaw-kernel` import `TelegramChannel`? Do the dependency graph edges point the wrong way? Are there clippy warnings? These are binary questions. Either the code violates the rule or it does not. The compiler, `cargo deny`, and `cargo clippy --workspace` already enforce this. No human is needed. No AI is needed. The machine is authoritative, fast, and never wrong about a factual violation.
+The first kind is *structural compliance*: does this code violate a mechanical rule? Does `daemonclaw-kernel` import `TelegramChannel`? Do the dependency graph edges point the wrong way? Are there clippy warnings? These are binary questions. Either the code violates the rule or it does not. The compiler, `cargo deny`, and `cargo clippy --workspace` already enforce this. No human is needed. No AI is needed. The machine is authoritative, fast, and never wrong about a factual violation.
 
 The second kind is *architectural intent*: does this decision belong here? Is this abstraction at the right layer? Does this trade-off align with the vision? Is this coupling going to be painful in Phase 3? Will this PR create a maintenance burden that isn't visible in the diff today? These questions require judgment, context, and an understanding of *why* the architecture exists — not just what the rules are. No automated tool can answer them reliably, because the answer depends on information that is not in the diff: the roadmap, the team's current priorities, the contributor's intent, and the long-term cost of the decision.
 
@@ -490,7 +490,7 @@ body:
       label: Steps to reproduce
       description: The exact steps to reproduce the bug.
       placeholder: |
-        1. Run `zeroclaw ...`
+        1. Run `daemonclaw ...`
         2. With config `...`
         3. See error
     validations:
@@ -506,7 +506,7 @@ body:
     attributes:
       label: Environment
       placeholder: |
-        - ZeroClaw version:
+        - DaemonClaw version:
         - OS and version:
         - Rust version (if built from source):
         - Provider:
@@ -596,7 +596,7 @@ body:
     id: proposal-pr
     attributes:
       label: Link to the proposal document PR
-      placeholder: "https://github.com/zeroclaw-labs/zeroclaw/pull/..."
+      placeholder: "https://github.com/DeliveryBoyTech/daemonclaw/pull/..."
     validations:
       required: true
   - type: textarea
@@ -679,7 +679,7 @@ body:
         ## ⚠️ Do not report security vulnerabilities as public issues.
 
         Security vulnerabilities disclosed publicly before a fix is available
-        put all ZeroClaw users at risk. Please follow the private disclosure
+        put all DaemonClaw users at risk. Please follow the private disclosure
         process described in [SECURITY.md](../SECURITY.md).
 
         If you have already filed this as a public issue by mistake, please
@@ -1003,7 +1003,7 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 - [ ] Add the `CONTRIBUTORS.md` file with current team members in their tiers
 - [ ] Implement the auto-label by path Actions workflow
 - [ ] Implement the stale issue management workflow
-- [ ] Create the `zeroclaw-core` and `zeroclaw-contributors` GitHub Teams
+- [ ] Create the `daemonclaw-core` and `daemonclaw-contributors` GitHub Teams
 
 **Success signal:** The team is using the board daily. Items move through stages with visible gate checks. The RFC for the microkernel architecture has a recorded vote outcome.
 
@@ -1073,6 +1073,6 @@ By v1.0.0, the governance model should be self-sustaining — the team should no
 
 ---
 
-*This proposal was developed in the context of ZeroClaw v0.6.8 and the two preceding architecture and documentation RFCs. The governance model proposed here is intentionally lightweight for a student-led project at an early stage of community growth. It is designed to scale — adding process as the team grows, not all at once.*
+*This proposal was developed in the context of DaemonClaw v0.6.8 and the two preceding architecture and documentation RFCs. The governance model proposed here is intentionally lightweight for a student-led project at an early stage of community growth. It is designed to scale — adding process as the team grows, not all at once.*
 
 *The best governance model is the simplest one the team will actually follow. Start here. Adjust based on what you learn.*

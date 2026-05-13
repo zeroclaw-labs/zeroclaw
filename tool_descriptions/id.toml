@@ -44,7 +44,7 @@ model_routing_config = "Mengelola pengaturan model default, rute penyedia/model 
 notion = "Berinteraksi dengan Notion: melakukan kueri database, membaca/membuat/memperbarui halaman, dan mencari di ruang kerja."
 pdf_read = "Mengekstrak teks biasa dari file PDF di ruang kerja. Mengembalikan semua teks yang dapat dibaca. PDF yang hanya berisi gambar atau PDF terenkripsi mengembalikan hasil kosong. Memerlukan fitur build 'rag-pdf'."
 project_intel = "Intelijen pengiriman proyek: menghasilkan laporan status, mendeteksi risiko, menyusun pembaruan klien, meringkas sprint, dan memperkirakan upaya. Alat analisis hanya-baca."
-proxy_config = "Mengelola pengaturan proxy ZeroClaw (cakupan: environment | zeroclaw | services), termasuk penerapan lingkungan runtime dan proses"
+proxy_config = "Mengelola pengaturan proxy DaemonClaw (cakupan: environment | daemonclaw | services), termasuk penerapan lingkungan runtime dan proses"
 pushover = "Mengirim notifikasi Pushover ke perangkat Anda. Memerlukan PUSHOVER_TOKEN dan PUSHOVER_USER_KEY di file .env."
 schedule = """Mengelola tugas terjadwal khusus shell. Aksi: create/add/once/list/get/cancel/remove/pause/resume. PERINGATAN: Alat ini membuat tugas shell yang outputnya hanya dicatat dalam log dan TIDAK dikirim ke kanal manapun. Untuk mengirim pesan terjadwal ke Discord/Telegram/Slack/Matrix, gunakan alat cron_add dengan job_type='agent' dan konfigurasi pengiriman seperti {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Mengambil tangkapan layar dari layar saat ini. Mengembalikan jalur file dan data PNG yang dikodekan base64."

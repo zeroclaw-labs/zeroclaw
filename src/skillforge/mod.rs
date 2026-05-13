@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::skillforge::*;
+pub use daemonclaw_runtime::skillforge::*;
 
 #[cfg(test)]
 mod tests {

@@ -96,7 +96,7 @@ Nếu bất kỳ yêu cầu intake nào thất bại, để lại một comment 
 - Đường dẫn rollback cụ thể (không chỉ là "revert").
 - Tác động tương thích/migration rõ ràng.
 - Không có rò rỉ dữ liệu cá nhân/nhạy cảm trong diff artifact; ví dụ/test giữ trung lập và theo phạm vi dự án.
-- Nếu có ngôn ngữ giống danh tính, nó sử dụng vai trò gốc ZeroClaw/dự án (không phải danh tính cá nhân hay thực tế).
+- Nếu có ngôn ngữ giống danh tính, nó sử dụng vai trò gốc DaemonClaw/dự án (không phải danh tính cá nhân hay thực tế).
 - Quy ước đặt tên và ranh giới kiến trúc tuân theo hợp đồng dự án (`AGENTS.md`, `CONTRIBUTING.md`).
 
 ### 3.3 Checklist review sâu (rủi ro cao)

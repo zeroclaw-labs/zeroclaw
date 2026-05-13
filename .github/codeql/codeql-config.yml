@@ -1,4 +1,4 @@
-# CodeQL configuration for ZeroClaw
+# CodeQL configuration for DaemonClaw
 #
 # We intentionally ignore integration tests under `tests/` because they often
 # contain security-focused fixtures (example secrets, malformed payloads, etc.)

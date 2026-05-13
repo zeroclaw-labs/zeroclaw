@@ -6,7 +6,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 // We test both backends through the public memory module
-use zeroclaw::memory::{Memory, MemoryCategory, markdown::MarkdownMemory, sqlite::SqliteMemory};
+use daemonclaw::memory::{Memory, MemoryCategory, markdown::MarkdownMemory, sqlite::SqliteMemory};
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -93,7 +93,7 @@ async fn compare_recall_quality() {
         ("tz", "Timezone is EST, works 9-5", MemoryCategory::Core),
         (
             "proj1",
-            "Working on ZeroClaw AI assistant",
+            "Working on DaemonClaw AI assistant",
             MemoryCategory::Daily,
         ),
         (

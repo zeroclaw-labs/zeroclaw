@@ -1,6 +1,6 @@
-# ZeroClaw i18n Coverage and Structure
+# DaemonClaw i18n Coverage and Structure
 
-This document defines the localization structure for ZeroClaw docs and tracks current coverage.
+This document defines the localization structure for DaemonClaw docs and tracks current coverage.
 
 Last refreshed: **February 21, 2026**.
 

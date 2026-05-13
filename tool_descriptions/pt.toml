@@ -43,7 +43,7 @@ model_routing_config = "Gerir configurações de modelo padrão, rotas de provid
 notion = "Interagir com Notion: consultar bases de dados, ler/criar/atualizar páginas e pesquisar o workspace."
 pdf_read = "Extrair texto simples de um arquivo PDF no workspace. Retorna todo o texto legível. PDFs apenas com imagem ou encriptados retornam resultado vazio. Requer a build feature 'rag-pdf'."
 project_intel = "Inteligência de entrega de projetos: gerar relatórios de status, detetar riscos, rascunhar atualizações para clientes, resumir sprints e estimar esforço. Ferramenta de análise somente leitura."
-proxy_config = "Gerir configurações de proxy ZeroClaw (scope: environment | zeroclaw | services), incluindo aplicação em runtime e variáveis de ambiente de processo"
+proxy_config = "Gerir configurações de proxy DaemonClaw (scope: environment | daemonclaw | services), incluindo aplicação em runtime e variáveis de ambiente de processo"
 pushover = "Enviar uma notificação Pushover para o seu dispositivo. Requer PUSHOVER_TOKEN e PUSHOVER_USER_KEY no arquivo .env."
 schedule = """Gerir tarefas agendadas apenas shell. Ações: create/add/once/list/get/cancel/remove/pause/resume. AVISO: Esta ferramenta cria jobs shell cuja saída é apenas registada em log, NÃO entregue a nenhum canal. Para enviar uma mensagem agendada ao Discord/Telegram/Slack/Matrix, use a ferramenta cron_add com job_type='agent' e uma configuração de delivery como {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Capturar uma screenshot do ecrã atual. Retorna o caminho do arquivo e dados PNG codificados em base64."

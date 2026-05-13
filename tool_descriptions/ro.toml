@@ -44,7 +44,7 @@ model_routing_config = "Gestionați setările implicite ale modelului, rutele fu
 notion = "Interacționați cu Notion: interogați baze de date, citiți/creați/actualizați pagini și căutați în spațiul de lucru."
 pdf_read = "Extrageți text simplu dintr-un fișier PDF din spațiul de lucru. Returnează tot textul lizibil. PDF-urile doar cu imagini sau criptate returnează un rezultat gol. Necesită funcția de build 'rag-pdf'."
 project_intel = "Inteligență de livrare proiecte: generați rapoarte de stare, detectați riscuri, redactați actualizări pentru clienți, sumarizați sprinturi și estimați efortul. Instrument de analiză doar citire."
-proxy_config = "Gestionați setările proxy ZeroClaw (domeniu: environment | zeroclaw | services), inclusiv aplicarea la runtime și mediul de proces"
+proxy_config = "Gestionați setările proxy DaemonClaw (domeniu: environment | daemonclaw | services), inclusiv aplicarea la runtime și mediul de proces"
 pushover = "Trimiteți o notificare Pushover pe dispozitivul dvs. Necesită PUSHOVER_TOKEN și PUSHOVER_USER_KEY în fișierul .env."
 schedule = """Gestionați sarcini programate doar shell. Acțiuni: create/add/once/list/get/cancel/remove/pause/resume. ATENȚIE: Acest instrument creează joburi shell a căror ieșire este doar înregistrată în jurnal, NU livrată către niciun canal. Pentru a trimite un mesaj programat către Discord/Telegram/Slack/Matrix, folosiți instrumentul cron_add cu job_type='agent' și o configurare de livrare precum {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Capturați o captură de ecran a ecranului curent. Returnează calea fișierului și datele PNG codificate base64."

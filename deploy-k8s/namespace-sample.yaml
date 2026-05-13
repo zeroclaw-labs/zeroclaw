@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: zeroclaw
+  name: daemonclaw
   labels:
-    app.kubernetes.io/name: zeroclaw
-    app.kubernetes.io/part-of: zeroclaw
+    app.kubernetes.io/name: daemonclaw
+    app.kubernetes.io/part-of: daemonclaw

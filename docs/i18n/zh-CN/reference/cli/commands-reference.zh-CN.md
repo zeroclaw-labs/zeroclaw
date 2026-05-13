@@ -1,6 +1,6 @@
-# ZeroClaw 命令参考文档
+# DaemonClaw 命令参考文档
 
-本参考文档派生自当前 CLI 界面（`zeroclaw --help`）。
+本参考文档派生自当前 CLI 界面（`daemonclaw --help`）。
 
 最后验证时间：**2026年3月26日**。
 
@@ -33,13 +33,13 @@
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --reinit`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `daemonclaw onboard`
+- `daemonclaw onboard --channels-only`
+- `daemonclaw onboard --force`
+- `daemonclaw onboard --reinit`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `daemonclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` 安全行为：
 
@@ -47,15 +47,15 @@
   - 完整引导（覆盖 `config.toml`）
   - 仅更新提供商（更新提供商/模型/API 密钥，同时保留现有渠道、隧道、内存、钩子和其他设置）
 - 在非交互式环境中，现有 `config.toml` 会导致安全拒绝，除非传递 `--force`。
-- 当你只需要轮换渠道令牌/白名单时，使用 `zeroclaw onboard --channels-only`。
-- 使用 `zeroclaw onboard --reinit` 重新开始。这会备份现有配置目录并添加时间戳后缀，然后从头创建新配置。
+- 当你只需要轮换渠道令牌/白名单时，使用 `daemonclaw onboard --channels-only`。
+- 使用 `daemonclaw onboard --reinit` 重新开始。这会备份现有配置目录并添加时间戳后缀，然后从头创建新配置。
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m \"Hello\"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `daemonclaw agent`
+- `daemonclaw agent -m \"Hello\"`
+- `daemonclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `daemonclaw agent --peripheral <board:path>`
 
 提示：
 
@@ -63,9 +63,9 @@
 
 ### `acp`
 
-- `zeroclaw acp`
-- `zeroclaw acp --max-sessions <N>`
-- `zeroclaw acp --session-timeout <SECONDS>`
+- `daemonclaw acp`
+- `daemonclaw acp --max-sessions <N>`
+- `daemonclaw acp --session-timeout <SECONDS>`
 
 启动 ACP（Agent Control Protocol）服务器，用于 IDE 和工具集成。
 
@@ -77,21 +77,21 @@
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `daemonclaw gateway [--host <HOST>] [--port <PORT>]`
+- `daemonclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `estop`
 
-- `zeroclaw estop`（启动 `kill-all`）
-- `zeroclaw estop --level network-kill`
-- `zeroclaw estop --level domain-block --domain \"*.chase.com\" [--domain \"*.paypal.com\"]`
-- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
-- `zeroclaw estop status`
-- `zeroclaw estop resume`
-- `zeroclaw estop resume --network`
-- `zeroclaw estop resume --domain \"*.chase.com\"`
-- `zeroclaw estop resume --tool shell`
-- `zeroclaw estop resume --otp <123456>`
+- `daemonclaw estop`（启动 `kill-all`）
+- `daemonclaw estop --level network-kill`
+- `daemonclaw estop --level domain-block --domain \"*.chase.com\" [--domain \"*.paypal.com\"]`
+- `daemonclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `daemonclaw estop status`
+- `daemonclaw estop resume`
+- `daemonclaw estop resume --network`
+- `daemonclaw estop resume --domain \"*.chase.com\"`
+- `daemonclaw estop resume --tool shell`
+- `daemonclaw estop resume --otp <123456>`
 
 注意事项：
 
@@ -101,23 +101,23 @@
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `daemonclaw service install`
+- `daemonclaw service start`
+- `daemonclaw service stop`
+- `daemonclaw service restart`
+- `daemonclaw service status`
+- `daemonclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `daemonclaw cron list`
+- `daemonclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `daemonclaw cron add-at <rfc3339_timestamp> <command>`
+- `daemonclaw cron add-every <every_ms> <command>`
+- `daemonclaw cron once <delay> <command>`
+- `daemonclaw cron remove <id>`
+- `daemonclaw cron pause <id>`
+- `daemonclaw cron resume <id>`
 
 注意事项：
 
@@ -126,29 +126,29 @@
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `daemonclaw models refresh`
+- `daemonclaw models refresh --provider <ID>`
+- `daemonclaw models refresh --force`
 
 `models refresh` 当前支持以下提供商 ID 的实时目录刷新：`openrouter`、`openai`、`anthropic`、`groq`、`mistral`、`deepseek`、`xai`、`together-ai`、`gemini`、`ollama`、`llamacpp`、`sglang`、`vllm`、`astrai`、`venice`、`fireworks`、`cohere`、`moonshot`、`glm`、`zai`、`qwen` 和 `nvidia`。
 
 ### `doctor`
 
-- `zeroclaw doctor`
-- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
-- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
-- `zeroclaw doctor traces --id <TRACE_ID>`
+- `daemonclaw doctor`
+- `daemonclaw doctor models [--provider <ID>] [--use-cache]`
+- `daemonclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `daemonclaw doctor traces --id <TRACE_ID>`
 
 `doctor traces` 从 `observability.runtime_trace_path` 读取运行时工具/模型诊断信息。
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `daemonclaw channel list`
+- `daemonclaw channel start`
+- `daemonclaw channel doctor`
+- `daemonclaw channel bind-telegram <IDENTITY>`
+- `daemonclaw channel add <type> <json>`
+- `daemonclaw channel remove <name>`
 
 运行时聊天内命令（渠道服务器运行时的 Telegram/Discord）：
 
@@ -169,14 +169,14 @@
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `daemonclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills audit <source_or_name>`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `daemonclaw skills list`
+- `daemonclaw skills audit <source_or_name>`
+- `daemonclaw skills install <source>`
+- `daemonclaw skills remove <name>`
 
 `<source>` 接受 git 远程地址（`https://...`、`http://...`、`ssh://...` 和 `git@host:owner/repo.git`）或本地文件系统路径。
 
@@ -192,43 +192,43 @@
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `daemonclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config schema`
+- `daemonclaw config schema`
 
 `config schema` 将完整 `config.toml` 契约的 JSON Schema（草案 2020-12）打印到 stdout。
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `daemonclaw completions bash`
+- `daemonclaw completions fish`
+- `daemonclaw completions zsh`
+- `daemonclaw completions powershell`
+- `daemonclaw completions elvish`
 
 `completions` 设计为仅输出到 stdout，因此脚本可以直接被 source 而不会被日志/警告污染。
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `daemonclaw hardware discover`
+- `daemonclaw hardware introspect <path>`
+- `daemonclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `daemonclaw peripheral list`
+- `daemonclaw peripheral add <board> <path>`
+- `daemonclaw peripheral flash [--port <serial_port>]`
+- `daemonclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `daemonclaw peripheral flash-nucleo`
 
 ## 验证提示
 
 要快速针对当前二进制文件验证文档：
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+daemonclaw --help
+daemonclaw <command> --help
 ```

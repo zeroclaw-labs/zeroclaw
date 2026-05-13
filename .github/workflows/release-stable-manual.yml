@@ -158,7 +158,7 @@ jobs:
             ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
               | sort -uf \
               | grep -v '^$' \
-              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^DaemonClaw Bot|^DaemonClaw Runner|^DaemonClaw Agent|^blacksmith' \
               | while IFS= read -r name; do echo "- ${name}"; done || true)
 
             BODY=$(cat <<NOTES_EOF
@@ -195,18 +195,18 @@ jobs:
           # ensuring compatibility with Ubuntu 22.04+ (#3573).
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
           - os: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
@@ -214,7 +214,7 @@ jobs:
             skip_prometheus: true
           - os: ubuntu-22.04
             target: arm-unknown-linux-gnueabihf
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
@@ -222,11 +222,11 @@ jobs:
             skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
           - os: ubuntu-latest
             target: aarch64-linux-android
-            artifact: zeroclaw
+            artifact: daemonclaw
             ext: tar.gz
             ndk: true
             experimental: true
@@ -234,7 +234,7 @@ jobs:
             cargo_features: "channel-matrix,channel-lark"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: zeroclaw.exe
+            artifact: daemonclaw.exe
             ext: zip
     continue-on-error: ${{ matrix.experimental || false }}
     steps:
@@ -297,7 +297,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           cp -r web/dist staging/web/dist
           cd staging
-          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
+          tar czf ../daemonclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -307,12 +307,12 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           cp -r web/dist staging/web/dist
           cd staging
-          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
+          7z a ../daemonclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zeroclaw-${{ matrix.target }}
-          path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          name: daemonclaw-${{ matrix.target }}
+          path: daemonclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
   build-desktop:
@@ -358,9 +358,9 @@ jobs:
       - name: Prepare desktop release assets
         run: |
           mkdir -p desktop-assets
-          find target -name '*.dmg' -exec cp {} desktop-assets/ZeroClaw.dmg \; 2>/dev/null || true
-          find target -name '*.app.tar.gz' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz \; 2>/dev/null || true
-          find target -name '*.app.tar.gz.sig' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz.sig \; 2>/dev/null || true
+          find target -name '*.dmg' -exec cp {} desktop-assets/DaemonClaw.dmg \; 2>/dev/null || true
+          find target -name '*.app.tar.gz' -exec cp {} desktop-assets/DaemonClaw-macos.app.tar.gz \; 2>/dev/null || true
+          find target -name '*.app.tar.gz.sig' -exec cp {} desktop-assets/DaemonClaw-macos.app.tar.gz.sig \; 2>/dev/null || true
           echo "--- Desktop assets ---"
           ls -lh desktop-assets/
 
@@ -384,7 +384,7 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: zeroclaw-*
+          pattern: daemonclaw-*
           path: artifacts
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -396,14 +396,14 @@ jobs:
         shell: bash
         run: |
           required_assets=(
-            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
-            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
-            "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
-            "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
-            "zeroclaw-aarch64-apple-darwin.tar.gz"
-            "zeroclaw-aarch64-linux-android.tar.gz"
-            "zeroclaw-x86_64-pc-windows-msvc.zip"
-            "ZeroClaw.dmg"
+            "daemonclaw-x86_64-unknown-linux-gnu.tar.gz"
+            "daemonclaw-aarch64-unknown-linux-gnu.tar.gz"
+            "daemonclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+            "daemonclaw-arm-unknown-linux-gnueabihf.tar.gz"
+            "daemonclaw-aarch64-apple-darwin.tar.gz"
+            "daemonclaw-aarch64-linux-android.tar.gz"
+            "daemonclaw-x86_64-pc-windows-msvc.zip"
+            "DaemonClaw.dmg"
           )
           missing=0
           for asset in "${required_assets[@]}"; do
@@ -490,8 +490,8 @@ jobs:
           curl -fsSL -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
-            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
+            https://api.github.com/repos/DeliveryBoyTech/daemonclaw-website/dispatches \
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image
@@ -500,30 +500,30 @@ jobs:
     timeout-minutes: 15
     environment:
       name: docker
-      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
+      url: https://github.com/${{ github.repository }}/pkgs/container/daemonclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: zeroclaw-x86_64-unknown-linux-gnu
+          name: daemonclaw-x86_64-unknown-linux-gnu
           path: artifacts/
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: zeroclaw-aarch64-unknown-linux-gnu
+          name: daemonclaw-aarch64-unknown-linux-gnu
           path: artifacts/
 
       - name: Prepare Docker context with pre-built binaries
         run: |
           mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
-          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
-          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+          tar xzf artifacts/daemonclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/daemonclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
 
-          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          mkdir -p docker-ctx/daemonclaw-data/.daemonclaw docker-ctx/daemonclaw-data/workspace
           printf '%s\n' \
-            'workspace_dir = "/zeroclaw-data/workspace"' \
-            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'workspace_dir = "/daemonclaw-data/workspace"' \
+            'config_path = "/daemonclaw-data/.daemonclaw/config.toml"' \
             'api_key = ""' \
             'default_provider = "openrouter"' \
             'default_model = "anthropic/claude-sonnet-4-20250514"' \
@@ -533,8 +533,8 @@ jobs:
             'port = 42617' \
             'host = "[::]"' \
             'allow_public_bind = true' \
-            'web_dist_dir = "/zeroclaw-data/web/dist"' \
-            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+            'web_dist_dir = "/daemonclaw-data/web/dist"' \
+            > docker-ctx/daemonclaw-data/.daemonclaw/config.toml
 
           cp Dockerfile.ci docker-ctx/Dockerfile
           cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
@@ -618,7 +618,7 @@ jobs:
     uses: ./.github/workflows/tweet-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
-      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/DeliveryBoyTech/daemonclaw/releases/tag/${{ needs.validate.outputs.tag }}
     secrets: inherit
 
   discord:
@@ -628,5 +628,5 @@ jobs:
     uses: ./.github/workflows/discord-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
-      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/DeliveryBoyTech/daemonclaw/releases/tag/${{ needs.validate.outputs.tag }}
     secrets: inherit

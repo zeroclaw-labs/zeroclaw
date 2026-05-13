@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::slack::*;
+pub use daemonclaw_channels::slack::*;

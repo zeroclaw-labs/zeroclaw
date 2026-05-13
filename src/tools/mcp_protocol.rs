@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::mcp_protocol::*;
+pub use daemonclaw_tools::mcp_protocol::*;

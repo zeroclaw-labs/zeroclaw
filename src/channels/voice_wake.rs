@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::voice_wake::*;
+pub use daemonclaw_channels::voice_wake::*;

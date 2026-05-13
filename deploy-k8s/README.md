@@ -1,6 +1,6 @@
-# ZeroClaw OpenShift deployment
+# DaemonClaw OpenShift deployment
 
-Deploy a minimal ZeroClaw agent on OpenShift with an external LLM
+Deploy a minimal DaemonClaw agent on OpenShift with an external LLM
 provider (Anthropic, OpenAI, or any OpenAI-compatible API).
 
 ## Prerequisites
@@ -20,7 +20,7 @@ provider (Anthropic, OpenAI, or any OpenAI-compatible API).
 1. Edit `secret.yaml` and replace `REPLACE_WITH_YOUR_API_KEY` with
    your actual API key
 1. Update the `image` field in `deployment.yaml` to point to your
-   registry (e.g., `ghcr.io/youruser/zeroclaw:latest`)
+   registry (e.g., `ghcr.io/youruser/daemonclaw:latest`)
 1. Update the `namespace` in all files if you want a different name
 1. Optionally edit `configmap.yaml` to change the provider or model
 1. Apply all manifests:
@@ -37,14 +37,14 @@ customizations stay local.
 Check that the pod is running and the route is accessible:
 
 ```bash
-oc -n zeroclaw get pods
-oc -n zeroclaw get route zeroclaw
+oc -n daemonclaw get pods
+oc -n daemonclaw get route daemonclaw
 ```
 
 Test the health endpoint:
 
 ```bash
-ROUTE=$(oc -n zeroclaw get route zeroclaw -o jsonpath='{.spec.host}')
+ROUTE=$(oc -n daemonclaw get route daemonclaw -o jsonpath='{.spec.host}')
 curl -sf "https://${ROUTE}/health"
 ```
 
@@ -71,7 +71,7 @@ After editing, re-apply and restart the pod:
 
 ```bash
 oc apply -f deploy-k8s/configmap.yaml
-oc -n zeroclaw rollout restart deployment zeroclaw
+oc -n daemonclaw rollout restart deployment daemonclaw
 ```
 
 ## Notes
@@ -87,5 +87,5 @@ oc -n zeroclaw rollout restart deployment zeroclaw
 ## Cleanup
 
 ```bash
-oc delete namespace zeroclaw
+oc delete namespace daemonclaw
 ```

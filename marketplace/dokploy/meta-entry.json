@@ -1,13 +1,13 @@
 {
-  "id": "zeroclaw",
-  "name": "ZeroClaw",
+  "id": "daemonclaw",
+  "name": "DaemonClaw",
   "version": "0.7.1",
   "description": "Fast, small, and fully autonomous AI personal assistant infrastructure. Deploy anywhere, swap anything. 100% Rust.",
-  "logo": "zeroclaw.png",
+  "logo": "daemonclaw.png",
   "links": {
-    "github": "https://github.com/zeroclaw-labs/zeroclaw",
-    "website": "https://zeroclaw.com/",
-    "docs": "https://github.com/zeroclaw-labs/zeroclaw#readme"
+    "github": "https://github.com/DeliveryBoyTech/daemonclaw",
+    "website": "https://daemonclaw.com/",
+    "docs": "https://github.com/DeliveryBoyTech/daemonclaw#readme"
   },
   "tags": ["ai", "self-hosted"]
 }

@@ -1,13 +1,13 @@
-pub use zeroclaw_channels::orchestrator::*;
+pub use daemonclaw_channels::orchestrator::*;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
 pub mod session_backend {
-    pub use zeroclaw_infra::session_backend::*;
+    pub use daemonclaw_infra::session_backend::*;
 }
 pub mod session_sqlite {
-    pub use zeroclaw_infra::session_sqlite::*;
+    pub use daemonclaw_infra::session_sqlite::*;
 }
 
 use crate::config::Config;
@@ -47,9 +47,9 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                     "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
                 );
             }
-            println!("\nTo start channels: zeroclaw channel start");
-            println!("To check health:    zeroclaw channel doctor");
-            println!("To configure:      zeroclaw onboard");
+            println!("\nTo start channels: daemonclaw channel start");
+            println!("To check health:    daemonclaw channel doctor");
+            println!("To configure:      daemonclaw onboard");
             Ok(())
         }
         crate::ChannelCommands::Add {
@@ -57,11 +57,11 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `daemonclaw onboard` to configure channels"
             );
         }
         crate::ChannelCommands::Remove { name } => {
-            anyhow::bail!("Remove channel '{name}' — edit ~/.zeroclaw/config.toml directly");
+            anyhow::bail!("Remove channel '{name}' — edit ~/.daemonclaw/config.toml directly");
         }
         crate::ChannelCommands::BindTelegram { identity } => {
             Box::pin(bind_telegram_identity(config, &identity)).await

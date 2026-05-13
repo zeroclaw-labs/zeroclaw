@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-# ── ZeroClaw installer ───────────────────────────────────────────
-# Builds and installs ZeroClaw from source.
+# ── DaemonClaw installer ───────────────────────────────────────────
+# Builds and installs DaemonClaw from source.
 # All feature lists and version info read from Cargo.toml — nothing hardcoded.
 # POSIX sh — no bash required. Works on Alpine, Debian, macOS, everywhere.
 
-REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+REPO_URL="https://github.com/DeliveryBoyTech/daemonclaw.git"
 
 # ── Output helpers (terminal-aware) ──────────────────────────────
 
@@ -53,7 +53,7 @@ validate_feature() {
 list_features() {
   parse_cargo_toml "$1"
   echo
-  printf "%s — available build features\n" "$(bold "ZeroClaw v${VERSION}")"
+  printf "%s — available build features\n" "$(bold "DaemonClaw v${VERSION}")"
   echo
 
   printf "  %s\n" "$(bold "Default") (included unless --minimal):"
@@ -157,7 +157,7 @@ install_prebuilt() {
   fi
 
   # Resolve latest release version via GitHub API
-  version=$(curl -fsSL "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest" \
+  version=$(curl -fsSL "https://api.github.com/repos/DeliveryBoyTech/daemonclaw/releases/latest" \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
 
   if [ -z "$version" ]; then
@@ -165,19 +165,19 @@ install_prebuilt() {
     return 1
   fi
 
-  asset_name="zeroclaw-${triple}.tar.gz"
-  asset_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/${asset_name}"
-  sha256_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/SHA256SUMS"
+  asset_name="daemonclaw-${triple}.tar.gz"
+  asset_url="https://github.com/DeliveryBoyTech/daemonclaw/releases/download/${version}/${asset_name}"
+  sha256_url="https://github.com/DeliveryBoyTech/daemonclaw/releases/download/${version}/SHA256SUMS"
 
   echo
-  printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
+  printf "%s\n" "$(bold "Installing DaemonClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
   echo
 
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
-    info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install to $CARGO_HOME/bin/daemonclaw"
     return 0
   fi
 
@@ -215,7 +215,7 @@ install_prebuilt() {
 
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
-  install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+  install -m 755 "$tmp_dir/daemonclaw" "$CARGO_HOME/bin/daemonclaw"
 
   rm -rf "$tmp_dir"
   trap - EXIT
@@ -226,7 +226,7 @@ install_prebuilt() {
 
 usage() {
   cat <<EOF
-$(bold "ZeroClaw installer")
+$(bold "DaemonClaw installer")
 
 Usage: $0 [options]
 
@@ -240,7 +240,7 @@ Options:
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
   --skip-onboard       Skip the setup wizard after install
-  --uninstall          Remove ZeroClaw binary and optionally config/data
+  --uninstall          Remove DaemonClaw binary and optionally config/data
   -h, --help           Show this help
   -V, --version        Show version from Cargo.toml
 
@@ -253,11 +253,11 @@ Examples:
   $0 --skip-onboard                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
-  $0 --uninstall                               # remove ZeroClaw
+  $0 --uninstall                               # remove DaemonClaw
 
 Environment:
-  ZEROCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.zeroclaw/src)
-  ZEROCLAW_CARGO_FEATURES  Extra cargo features (legacy; prefer --features)
+  DAEMONCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.daemonclaw/src)
+  DAEMONCLAW_CARGO_FEATURES  Extra cargo features (legacy; prefer --features)
 EOF
 }
 
@@ -265,10 +265,10 @@ EOF
 
 do_uninstall() {
   echo
-  printf "%s\n" "$(bold "Uninstalling ZeroClaw")"
+  printf "%s\n" "$(bold "Uninstalling DaemonClaw")"
   echo
 
-  local bin="$CARGO_HOME/bin/zeroclaw"
+  local bin="$CARGO_HOME/bin/daemonclaw"
 
   if [ -f "$bin" ]; then
     "$bin" service stop 2>/dev/null || true
@@ -279,7 +279,7 @@ do_uninstall() {
     warn "Binary not found at $bin"
   fi
 
-  local config_dir="$PREFIX/.zeroclaw"
+  local config_dir="$PREFIX/.daemonclaw"
   if [ -d "$config_dir" ]; then
     if [ -t 0 ]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
@@ -293,19 +293,19 @@ do_uninstall() {
     fi
   fi
 
-  # Check if another zeroclaw still lurks in PATH
+  # Check if another daemonclaw still lurks in PATH
   local other_bin
-  other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  other_bin=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
   if [ -n "$other_bin" ]; then
     local other_version
     other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
     echo
-    warn "Another zeroclaw found at $other_bin (v$other_version)"
+    warn "Another daemonclaw found at $other_bin (v$other_version)"
     warn "Remove it manually if you want a full uninstall"
   fi
 
   echo
-  info "ZeroClaw uninstalled"
+  info "DaemonClaw uninstalled"
   exit 0
 }
 
@@ -321,8 +321,8 @@ PREFIX="$HOME"
 INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 
 # Support legacy env var
-if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
-  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$ZEROCLAW_CARGO_FEATURES"
+if [ -n "${DAEMONCLAW_CARGO_FEATURES:-}" ]; then
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$DAEMONCLAW_CARGO_FEATURES"
 fi
 
 while [ $# -gt 0 ]; do
@@ -348,7 +348,7 @@ while [ $# -gt 0 ]; do
     -V|--version)
       if [ -f "Cargo.toml" ]; then
         parse_cargo_toml "Cargo.toml"
-        echo "install.sh for ZeroClaw v$VERSION"
+        echo "install.sh for DaemonClaw v$VERSION"
       else
         echo "install.sh (version unknown — not in repo)"
       fi
@@ -362,7 +362,7 @@ done
 
 CARGO_HOME="${CARGO_HOME:-$PREFIX/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$PREFIX/.rustup}"
-INSTALL_DIR="${ZEROCLAW_INSTALL_DIR:-$PREFIX/.zeroclaw/src}"
+INSTALL_DIR="${DAEMONCLAW_INSTALL_DIR:-$PREFIX/.daemonclaw/src}"
 ORIGINAL_PATH="$PATH"
 PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_HOME RUSTUP_HOME PATH
@@ -394,7 +394,7 @@ if [ "$INSTALL_MODE" = "" ]; then
   if [ -n "$triple" ]; then
     if [ -t 0 ]; then
       echo
-      printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
+      printf "  %s\n" "$(bold "How would you like to install DaemonClaw?")"
       printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
       printf "  [s] Build from source — custom features, latest code\n"
       printf "\n  Choice [P/s]: "
@@ -423,7 +423,7 @@ if [ "$INSTALL_MODE" = "prebuilt" ]; then
 fi
 
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
-  BIN="$CARGO_HOME/bin/zeroclaw"
+  BIN="$CARGO_HOME/bin/daemonclaw"
   if [ -f "$BIN" ]; then
     NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
     SIZE=$(du -h "$BIN" | awk '{print $1}')
@@ -442,13 +442,13 @@ fi
 if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
 echo
-printf "%s\n" "$(bold "ZeroClaw — source install")"
+printf "%s\n" "$(bold "DaemonClaw — source install")"
 if [ "$PREFIX" != "$HOME" ]; then
   printf "  prefix: %s\n" "$(bold "$PREFIX")"
 fi
 echo
 
-if [ -f "Cargo.toml" ] && grep -q "zeroclaw" "Cargo.toml" 2>/dev/null; then
+if [ -f "Cargo.toml" ] && grep -q "daemonclaw" "Cargo.toml" 2>/dev/null; then
   INSTALL_DIR="$(pwd)"
   info "Building from $(pwd)"
 elif [ -d "$INSTALL_DIR/.git" ]; then
@@ -495,7 +495,7 @@ fi
 if [ "$DRY_RUN" != true ]; then
   RUST_VERSION=$(rustc --version | awk '{print $2}')
   if ! version_gte "$RUST_VERSION" "$MSRV"; then
-    die "Rust $RUST_VERSION is too old. ZeroClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
+    die "Rust $RUST_VERSION is too old. DaemonClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
   fi
   info "Rust $RUST_VERSION (>= $MSRV)"
 fi
@@ -541,12 +541,12 @@ fi
 
 # ── Detect existing installs ──────────────────────────────────────
 
-PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
 if [ -n "$PATH_BIN" ]; then
   PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-  TARGET_BIN="$CARGO_HOME/bin/zeroclaw"
+  TARGET_BIN="$CARGO_HOME/bin/daemonclaw"
   if [ "$PATH_BIN" != "$TARGET_BIN" ]; then
-    warn "zeroclaw found at $PATH_BIN (v$PATH_VERSION)"
+    warn "daemonclaw found at $PATH_BIN (v$PATH_VERSION)"
     warn "This install targets $TARGET_BIN"
     warn "The old binary will shadow the new one unless removed or PATH is reordered"
   else
@@ -570,8 +570,8 @@ if [ "$DRY_RUN" = true ]; then
   printf "%s\n" "$(bold "Dry run — nothing will be built or installed")"
   echo
   info "Source:   $INSTALL_DIR"
-  info "Binary:   $CARGO_HOME/bin/zeroclaw"
-  info "Config:   $PREFIX/.zeroclaw/"
+  info "Binary:   $CARGO_HOME/bin/daemonclaw"
+  info "Config:   $PREFIX/.daemonclaw/"
   info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
   echo
   if [ -n "$CARGO_FLAGS" ]; then
@@ -592,7 +592,7 @@ fi
 # ── Build and install ─────────────────────────────────────────────
 
 echo
-printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
+printf "%s\n" "$(bold "Building DaemonClaw v$VERSION")"
 if [ -n "$CARGO_FLAGS" ]; then
   info "Feature flags: $CARGO_FLAGS"
 else
@@ -605,18 +605,18 @@ cargo install --path . --locked --force $CARGO_FLAGS
 
 # ── Summary ───────────────────────────────────────────────────────
 
-BIN="$CARGO_HOME/bin/zeroclaw"
+BIN="$CARGO_HOME/bin/daemonclaw"
 if [ -f "$BIN" ]; then
   SIZE=$(du -h "$BIN" | awk '{print $1}')
   NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
   echo
   info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
 
-  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
   if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
     ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
     echo
-    warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
+    warn "$(bold "WARNING:") daemonclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
     warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
     warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
   fi
@@ -626,7 +626,7 @@ fi
 
 fi  # end source build block
 
-BIN="$CARGO_HOME/bin/zeroclaw"
+BIN="$CARGO_HOME/bin/daemonclaw"
 
 # ── PATH guidance ─────────────────────────────────────────────────
 
@@ -661,12 +661,12 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
     echo
     printf "%s\n" "$(bold "Running setup wizard...")"
     echo
-    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
+    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'daemonclaw onboard' manually"
   else
-    info "Non-interactive — skipping onboard wizard. Run 'zeroclaw onboard' to configure."
+    info "Non-interactive — skipping onboard wizard. Run 'daemonclaw onboard' to configure."
   fi
 fi
 
 echo
-info "Done. Run $(bold "zeroclaw agent") to start chatting."
+info "Done. Run $(bold "daemonclaw agent") to start chatting."
 echo

@@ -1,26 +1,26 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: zeroclaw
-  namespace: zeroclaw
+  name: daemonclaw
+  namespace: daemonclaw
   labels:
-    app.kubernetes.io/name: zeroclaw
-    app.kubernetes.io/part-of: zeroclaw
+    app.kubernetes.io/name: daemonclaw
+    app.kubernetes.io/part-of: daemonclaw
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: zeroclaw
+      app.kubernetes.io/name: daemonclaw
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: zeroclaw
-        app.kubernetes.io/part-of: zeroclaw
+        app.kubernetes.io/name: daemonclaw
+        app.kubernetes.io/part-of: daemonclaw
     spec:
       containers:
-        - name: zeroclaw
-          # For production, pin to a version tag (e.g. ghcr.io/zeroclaw-labs/zeroclaw:v0.7.1)
-          image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+        - name: daemonclaw
+          # For production, pin to a version tag (e.g. ghcr.io/DeliveryBoyTech/daemonclaw:v0.7.1)
+          image: ghcr.io/DeliveryBoyTech/daemonclaw:latest
           args: ["daemon"]
           ports:
             - name: gateway
@@ -30,25 +30,25 @@ spec:
             - name: API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: zeroclaw-api-key
+                  name: daemonclaw-api-key
                   key: api-key
             - name: LANG
               value: "C.UTF-8"
             - name: HOME
-              value: "/zeroclaw-data"
-            - name: ZEROCLAW_WORKSPACE
-              value: "/zeroclaw-data/workspace"
-            - name: ZEROCLAW_GATEWAY_PORT
+              value: "/daemonclaw-data"
+            - name: DAEMONCLAW_WORKSPACE
+              value: "/daemonclaw-data/workspace"
+            - name: DAEMONCLAW_GATEWAY_PORT
               value: "42617"
           volumeMounts:
             - name: state
-              mountPath: /zeroclaw-data/.zeroclaw
+              mountPath: /daemonclaw-data/.daemonclaw
             - name: config
-              mountPath: /zeroclaw-data/.zeroclaw/config.toml
+              mountPath: /daemonclaw-data/.daemonclaw/config.toml
               subPath: config.toml
               readOnly: true
             - name: workspace
-              mountPath: /zeroclaw-data/workspace
+              mountPath: /daemonclaw-data/workspace
           resources:
             requests:
               memory: "64Mi"
@@ -82,7 +82,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: zeroclaw-config
+            name: daemonclaw-config
         - name: state
           emptyDir: {}
         - name: workspace

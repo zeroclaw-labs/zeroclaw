@@ -12,7 +12,7 @@ RUN npm run build
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+ARG DAEMONCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -40,11 +40,11 @@ RUN mkdir -p src benches apps/tauri/src \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/tauri/build.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+RUN --mount=type=cache,id=daemonclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=daemonclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=daemonclaw-target,target=/app/target,sharing=locked \
+    if [ -n "$DAEMONCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$DAEMONCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi
@@ -55,27 +55,27 @@ COPY src/ src/
 COPY benches/ benches/
 COPY *.rs .
 RUN touch src/main.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+RUN --mount=type=cache,id=daemonclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=daemonclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=daemonclaw-target,target=/app/target,sharing=locked \
+    rm -rf target/release/.fingerprint/daemonclawlabs-* \
+           target/release/deps/daemonclawlabs-* \
+           target/release/incremental/daemonclawlabs-* && \
+    if [ -n "$DAEMONCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --locked --features "$DAEMONCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    strip /app/zeroclaw
-RUN size=$(stat -c%s /app/zeroclaw) && \
+    cp target/release/daemonclaw /app/daemonclaw && \
+    strip /app/daemonclaw
+RUN size=$(stat -c%s /app/daemonclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage)
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+RUN mkdir -p /daemonclaw-data/.daemonclaw /daemonclaw-data/workspace && \
     printf '%s\n' \
-        'workspace_dir = "/zeroclaw-data/workspace"' \
-        'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+        'workspace_dir = "/daemonclaw-data/workspace"' \
+        'config_path = "/daemonclaw-data/.daemonclaw/config.toml"' \
         'api_key = ""' \
         'default_provider = "openrouter"' \
         'default_model = "anthropic/claude-sonnet-4-20250514"' \
@@ -86,13 +86,13 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'host = "[::]"' \
         'allow_public_bind = true' \
         'require_pairing = false' \
-        'web_dist_dir = "/zeroclaw-data/web/dist"' \
+        'web_dist_dir = "/daemonclaw-data/web/dist"' \
         '' \
         '[autonomy]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
-        > /zeroclaw-data/.zeroclaw/config.toml && \
-    chown -R 65534:65534 /zeroclaw-data
+        > /daemonclaw-data/.daemonclaw/config.toml && \
+    chown -R 65534:65534 /daemonclaw-data
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
 FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
@@ -103,59 +103,59 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /zeroclaw-data /zeroclaw-data
-COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+COPY --from=builder /daemonclaw-data /daemonclaw-data
+COPY --from=builder /app/daemonclaw /usr/local/bin/daemonclaw
+COPY --from=web-builder /web/dist /daemonclaw-data/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
-COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
-RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
+COPY dev/config.template.toml /daemonclaw-data/.daemonclaw/config.toml
+RUN chown 65534:65534 /daemonclaw-data/.daemonclaw/config.toml
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
 # Use consistent workspace path
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
-ENV HOME=/zeroclaw-data
+ENV DAEMONCLAW_WORKSPACE=/daemonclaw-data/workspace
+ENV HOME=/daemonclaw-data
 # Defaults for local dev (Ollama) - matches config.template.toml
 ENV PROVIDER="ollama"
-ENV ZEROCLAW_MODEL="llama3.2"
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV DAEMONCLAW_MODEL="llama3.2"
+ENV DAEMONCLAW_GATEWAY_PORT=42617
 
 # Note: API_KEY is intentionally NOT set here to avoid confusion.
 # It is set in config.toml as the Ollama URL.
 
-WORKDIR /zeroclaw-data
+WORKDIR /daemonclaw-data
 USER 65534:65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
-    CMD ["zeroclaw", "status", "--format=exit-code"]
-ENTRYPOINT ["zeroclaw"]
+    CMD ["daemonclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["daemonclaw"]
 CMD ["daemon"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
-COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=builder /zeroclaw-data /zeroclaw-data
-COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+COPY --from=builder /app/daemonclaw /usr/local/bin/daemonclaw
+COPY --from=builder /daemonclaw-data /daemonclaw-data
+COPY --from=web-builder /web/dist /daemonclaw-data/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
-ENV HOME=/zeroclaw-data
+ENV DAEMONCLAW_WORKSPACE=/daemonclaw-data/workspace
+ENV HOME=/daemonclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden
 #ENV PROVIDER=
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV DAEMONCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
-WORKDIR /zeroclaw-data
+WORKDIR /daemonclaw-data
 USER 65534:65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
-    CMD ["zeroclaw", "status", "--format=exit-code"]
-ENTRYPOINT ["zeroclaw"]
+    CMD ["daemonclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["daemonclaw"]
 CMD ["daemon"]

@@ -93,7 +93,7 @@ Paginate in batches of 100 commits. Use `pageInfo.endCursor` when
 
 ```graphql
 {
-  repository(owner: "zeroclaw-labs", name: "zeroclaw") {
+  repository(owner: "DeliveryBoyTech", name: "daemonclaw") {
     ref(qualifiedName: "refs/heads/master") {
       target {
         ... on Commit {
@@ -234,7 +234,7 @@ before committing.
 
 ### Push
 
-Push to the open release PR branch on `zeroclaw-labs/zeroclaw`:
+Push to the open release PR branch on `DeliveryBoyTech/daemonclaw`:
 
 ```bash
 git push upstream <branch>

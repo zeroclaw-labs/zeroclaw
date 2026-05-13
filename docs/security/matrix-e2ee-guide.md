@@ -1,6 +1,6 @@
 # Matrix E2EE Guide
 
-This guide explains how to run ZeroClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
+This guide explains how to run DaemonClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 
 It focuses on the common failure mode reported by users:
 
@@ -26,7 +26,7 @@ Before testing message flow, make sure all of the following are true:
 2. The access token belongs to the same bot account.
 3. `room_id` is correct:
    - preferred: canonical room ID (`!room:server`)
-   - supported: room alias (`#alias:server`) and ZeroClaw will resolve it
+   - supported: room alias (`#alias:server`) and DaemonClaw will resolve it
 4. `allowed_users` allows the sender (`["*"]` for open testing).
 5. For E2EE rooms, the bot device has received encryption keys for the room.
 
@@ -34,7 +34,7 @@ Before testing message flow, make sure all of the following are true:
 
 ## 2. Configuration
 
-Use `~/.zeroclaw/config.toml`:
+Use `~/.daemonclaw/config.toml`:
 
 ```toml
 [channels_config.matrix]
@@ -42,7 +42,7 @@ homeserver = "https://matrix.example.com"
 access_token = "syt_your_token"
 
 # Optional but recommended for E2EE stability:
-user_id = "@zeroclaw:matrix.example.com"
+user_id = "@daemonclaw:matrix.example.com"
 device_id = "DEVICEID123"
 
 # Room ID or alias
@@ -55,7 +55,7 @@ allowed_users = ["*"]
 
 ### About `user_id` and `device_id`
 
-- ZeroClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
+- DaemonClaw attempts to read identity from Matrix `/_matrix/client/v3/account/whoami`.
 - If `whoami` does not return `device_id`, set `device_id` manually.
 - These hints are especially important for E2EE session restore.
 
@@ -66,13 +66,13 @@ allowed_users = ["*"]
 1. Run channel setup and daemon:
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+daemonclaw onboard --channels-only
+daemonclaw daemon
 ```
 
 2. Send a plain text message in the configured Matrix room.
 
-3. Confirm ZeroClaw logs contain Matrix listener startup and no repeated sync/auth errors.
+3. Confirm DaemonClaw logs contain Matrix listener startup and no repeated sync/auth errors.
 
 4. In an encrypted room, verify the bot can read and reply to encrypted messages from allowed users.
 
@@ -105,7 +105,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - If `device_id` is missing, set `channels_config.matrix.device_id` manually.
 - To update the access token without re-running onboard:
   ```bash
-  zeroclaw config set channels.matrix.access-token
+  daemonclaw config set channels.matrix.access-token
   ```
 
 ### D. E2EE-specific checks
@@ -118,17 +118,17 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 ### E. Log levels
 
-ZeroClaw suppresses `matrix_sdk`, `matrix_sdk_base`, and `matrix_sdk_crypto` to `warn` by default because they are extremely noisy at `info`. To restore SDK-level output for debugging:
+DaemonClaw suppresses `matrix_sdk`, `matrix_sdk_base`, and `matrix_sdk_crypto` to `warn` by default because they are extremely noisy at `info`. To restore SDK-level output for debugging:
 
 ```bash
-RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info zeroclaw daemon
+RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info daemonclaw daemon
 ```
 
 ### F. Message formatting (Markdown)
 
-- ZeroClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
+- DaemonClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
 - Matrix clients that support `formatted_body` should render emphasis, lists, and code blocks.
-- If formatting appears as plain text, check client capability first, then confirm ZeroClaw is running a build that includes markdown-enabled Matrix output.
+- If formatting appears as plain text, check client capability first, then confirm DaemonClaw is running a build that includes markdown-enabled Matrix output.
 
 ### G. Fresh start test
 
@@ -136,7 +136,7 @@ After updating config, restart daemon and send a new message (not just old timel
 
 ### H. Finding your `device_id`
 
-ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new device is registered on every restart, breaking key sharing and device verification.
+DaemonClaw needs a stable `device_id` for E2EE session restore. Without it, a new device is registered on every restart, breaking key sharing and device verification.
 
 #### Option 1: From `whoami` (easiest)
 
@@ -158,7 +158,7 @@ If `device_id` is missing, the token was created without a device login (e.g., v
 ```bash
 curl -sS -X POST "https://your.homeserver/_matrix/client/v3/login" \
   -H "Content-Type: application/json" \
-  -d '{"type": "m.login.password", "user": "@bot:example.com", "password": "...", "initial_device_display_name": "ZeroClaw"}'
+  -d '{"type": "m.login.password", "user": "@bot:example.com", "password": "...", "initial_device_display_name": "DaemonClaw"}'
 ```
 
 Response:
@@ -187,13 +187,13 @@ Keep `device_id` stable — changing it forces a new device registration, which 
 
 ### H. One-time key (OTK) upload conflict
 
-**Symptom:** ZeroClaw logs `Matrix one-time key upload conflict detected; stopping sync to avoid infinite retry loop.` and the Matrix channel becomes unavailable.
+**Symptom:** DaemonClaw logs `Matrix one-time key upload conflict detected; stopping sync to avoid infinite retry loop.` and the Matrix channel becomes unavailable.
 
 **Cause:** The bot's local crypto store was reset (e.g., deleted data directory, reinstalled) without deregistering the old device on the homeserver. The homeserver still has old one-time keys for this device, and the SDK fails to upload new ones.
 
 #### Fix
 
-1. Stop ZeroClaw.
+1. Stop DaemonClaw.
 
 2. Deregister the stale device. From a session with admin access to the bot account:
 
@@ -212,7 +212,7 @@ curl -sS -X DELETE -H "Authorization: Bearer $MATRIX_TOKEN" \
 3. Delete the local crypto store. The log message includes the store path, typically:
 
 ```
-~/.zeroclaw/state/matrix/
+~/.daemonclaw/state/matrix/
 ```
 
 Delete this directory.
@@ -221,13 +221,13 @@ Delete this directory.
 
 5. Update `config.toml` with the new `access_token` and `device_id`.
 
-6. Restart ZeroClaw.
+6. Restart DaemonClaw.
 
 **Prevention:** Do not delete the local state directory without also deregistering the device. If you need a fresh start, always deregister first.
 
 ### I. Recovery key (recommended for E2EE)
 
-A recovery key lets ZeroClaw automatically restore room keys and cross-signing secrets from server-side backup. This means device resets, crypto store deletions, and fresh installs recover automatically — no emoji verification, no manual key sharing.
+A recovery key lets DaemonClaw automatically restore room keys and cross-signing secrets from server-side backup. This means device resets, crypto store deletions, and fresh installs recover automatically — no emoji verification, no manual key sharing.
 
 #### Step 1: Get your recovery key from Element
 
@@ -237,14 +237,14 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 4. If backup is not set up, click "Set up Secure Backup" and choose "Generate a Security Key". Save the key — it looks like `EsTj 3yST y93F SLpB ...`
 5. Log out of Element when done
 
-#### Step 2: Add the recovery key to ZeroClaw
+#### Step 2: Add the recovery key to DaemonClaw
 
 Option A — during onboarding:
 
 ```bash
-zeroclaw onboard
+daemonclaw onboard
 # or
-zeroclaw onboard --channels-only
+daemonclaw onboard --channels-only
 ```
 
 When configuring the Matrix channel, the wizard prompts:
@@ -258,7 +258,7 @@ Paste the recovery key (input is masked). It will be encrypted and stored in `co
 Option B — via the secret CLI (recommended for existing installs):
 
 ```bash
-zeroclaw config set channels.matrix.recovery-key
+daemonclaw config set channels.matrix.recovery-key
 ```
 
 Input is masked. The value is encrypted at rest immediately.
@@ -272,7 +272,7 @@ recovery_key = "EsTj 3yST y93F SLpB jJsz ..."
 
 If `secrets.encrypt = true` (the default), the value will be encrypted on next config save. Note: until a save is triggered, the value remains in plaintext. Using Option A or B is preferred.
 
-#### Step 3: Restart ZeroClaw
+#### Step 3: Restart DaemonClaw
 
 On startup you should see:
 
@@ -280,16 +280,16 @@ On startup you should see:
 Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup.
 ```
 
-From now on, even if the local crypto store is deleted, ZeroClaw will recover automatically on next startup.
+From now on, even if the local crypto store is deleted, DaemonClaw will recover automatically on next startup.
 
 ---
 
 ## 5. Debug Logging
 
-For detailed E2EE diagnostics, run ZeroClaw with debug-level logging for the Matrix channel:
+For detailed E2EE diagnostics, run DaemonClaw with debug-level logging for the Matrix channel:
 
 ```bash
-RUST_LOG=zeroclaw::channels::matrix=debug zeroclaw daemon
+RUST_LOG=daemonclaw::channels::matrix=debug daemonclaw daemon
 ```
 
 This surfaces:
@@ -302,7 +302,7 @@ This surfaces:
 For even more detail from the Matrix SDK itself:
 
 ```bash
-RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemon
+RUST_LOG=daemonclaw::channels::matrix=debug,matrix_sdk_crypto=debug daemonclaw daemon
 ```
 
 ---
@@ -312,7 +312,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `allowed_users`, then tighten to explicit user IDs.
 - Prefer canonical room IDs in production to avoid alias drift.
-- **Threading behavior:** ZeroClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
+- **Threading behavior:** DaemonClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
 
 ---
 

@@ -13,7 +13,7 @@ Last updated: **May 2026** (post-v0.7.4 cleanup).
 
 ## Branching Model
 
-ZeroClaw uses a single default branch: `master`. All contributor PRs target
+DaemonClaw uses a single default branch: `master`. All contributor PRs target
 `master` directly. There is no `dev` or promotion branch.
 
 Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.

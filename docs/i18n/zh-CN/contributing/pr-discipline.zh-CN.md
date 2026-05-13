@@ -1,6 +1,6 @@
 # PR 规范
 
-ZeroClaw 拉取请求的质量、署名、隐私和交接规则。
+DaemonClaw 拉取请求的质量、署名、隐私和交接规则。
 
 ## 隐私/敏感数据（必填）
 
@@ -10,11 +10,11 @@ ZeroClaw 拉取请求的质量、署名、隐私和交接规则。
 - 禁止的数据包括（非详尽）：真实姓名、个人邮箱、电话号码、地址、访问令牌、API 密钥、凭证、ID 和私有 URL。
 - 使用中立的项目范围占位符（例如 `user_a`、`test_user`、`project_bot`、`example.com`）代替真实身份数据。
 - 测试名称/消息/夹具必须是非个人的、以系统为中心的；避免第一人称或特定身份的语言。
-- 如果不可避免需要类似身份的上下文，仅使用 ZeroClaw 范围的角色/标签（例如 `ZeroClawAgent`、`ZeroClawOperator`、`zeroclaw_user`）。
+- 如果不可避免需要类似身份的上下文，仅使用 DaemonClaw 范围的角色/标签（例如 `DaemonClawAgent`、`DaemonClawOperator`、`daemonclaw_user`）。
 - 推荐的身份安全命名调色板：
-    - 参与者标签：`ZeroClawAgent`、`ZeroClawOperator`、`ZeroClawMaintainer`、`zeroclaw_user`
-    - 服务/运行时标签：`zeroclaw_bot`、`zeroclaw_service`、`zeroclaw_runtime`、`zeroclaw_node`
-    - 环境标签：`zeroclaw_project`、`zeroclaw_workspace`、`zeroclaw_channel`
+    - 参与者标签：`DaemonClawAgent`、`DaemonClawOperator`、`DaemonClawMaintainer`、`daemonclaw_user`
+    - 服务/运行时标签：`daemonclaw_bot`、`daemonclaw_service`、`daemonclaw_runtime`、`daemonclaw_node`
+    - 环境标签：`daemonclaw_project`、`daemonclaw_workspace`、`daemonclaw_channel`
 - 如果复现外部事件，提交前脱敏和匿名化所有有效负载。
 - 推送前，专门审查 `git diff --cached` 查找意外的敏感字符串和身份泄露。
 

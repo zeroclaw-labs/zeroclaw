@@ -225,7 +225,7 @@ impl SandboxingStrategy {
 
 | 功能 | 代码大小 | RAM 开销 | 状态 |
 |---------|-----------|--------------|--------|
-| **基础 ZeroClaw** | 3.4MB | <5MB | ✅ 当前 |
+| **基础 DaemonClaw** | 3.4MB | <5MB | ✅ 当前 |
 | **+ Landlock** | +50KB | +100KB | ✅ Linux 5.13+ |
 | **+ Firejail 包装** | +20KB | +0KB（外部） | ✅ Linux + firejail |
 | **+ 内存监控** | +30KB | +50KB | ✅ 所有平台 |
@@ -234,7 +234,7 @@ impl SandboxingStrategy {
 
 ### 10美元硬件兼容性
 
-| 硬件 | RAM | ZeroClaw（基础） | ZeroClaw（完整安全） | 状态 |
+| 硬件 | RAM | DaemonClaw（基础） | DaemonClaw（完整安全） | 状态 |
 |----------|-----|-----------------|--------------------------|--------|
 | **树莓派 Zero** | 512MB | ✅ 2% | ✅ 2.5% | 可运行 |
 | **Orange Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | 可运行 |
@@ -242,13 +242,13 @@ impl SandboxingStrategy {
 | **C.H.I.P.** | 512MB | ✅ 2% | ✅ 2.5% | 可运行 |
 | **Rock64** | 1GB | ✅ 1% | ✅ 1.2% | 可运行 |
 
-**即使使用完整安全功能，ZeroClaw 在 10美元板卡上的 RAM 占用也 <5%。**
+**即使使用完整安全功能，DaemonClaw 在 10美元板卡上的 RAM 占用也 <5%。**
 
 ---
 
 ## 5. 不可知交换：所有内容保持可插拔
 
-### ZeroClaw 的核心承诺：任意替换
+### DaemonClaw 的核心承诺：任意替换
 
 ```rust
 // 提供商（已可插拔）

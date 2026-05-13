@@ -32,7 +32,7 @@ cargo +nightly install cargo-slicer --profile release-rustc \
   --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
   --features rustc-driver
 
-# 使用 syn 预分析构建（在 zeroclaw 根目录执行）
+# 使用 syn 预分析构建（在 daemonclaw 根目录执行）
 cargo-slicer pre-analyze
 CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
@@ -40,7 +40,7 @@ CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
 
 # 使用 MIR 精确模式构建（更多桩实现，更大节省）
 # 步骤 1：生成 .mir-cache（首次构建使用 MIR_PRECISE）
-CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=daemonclaw,daemonclaw_robot_kit \
   CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
   cargo +nightly build --release

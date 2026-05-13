@@ -6,7 +6,7 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:
+DaemonClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:
 - Làm cạn kiệt bộ nhớ khả dụng
 - Quay CPU liên tục ở 100%
 - Lấp đầy ổ đĩa bằng log/output
@@ -16,7 +16,7 @@ ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài 
 ## Các giải pháp đề xuất
 
 ### Tùy chọn 1: cgroups v2 (Linux, khuyến nghị)
-Tự động tạo cgroup cho zeroclaw với các giới hạn.
+Tự động tạo cgroup cho daemonclaw với các giới hạn.
 
 ```bash
 # Tạo systemd service với giới hạn

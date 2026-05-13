@@ -1,6 +1,6 @@
 # Skill: squash-merge
 
-Squash-merge a PR into `upstream/master` (zeroclaw-labs/zeroclaw) with fully preserved commit history in the squash message body. Use this skill when the user explicitly mentions squash-merging, merging a specific PR number, or landing a PR by number — e.g. "squash-merge #123", "merge PR 456", "land #789", "/squash-merge 123". Do **not** trigger on vague phrases like "ship it" or "merge it" without a PR number or clear upstream-merge context.
+Squash-merge a PR into `upstream/master` (DeliveryBoyTech/daemonclaw) with fully preserved commit history in the squash message body. Use this skill when the user explicitly mentions squash-merging, merging a specific PR number, or landing a PR by number — e.g. "squash-merge #123", "merge PR 456", "land #789", "/squash-merge 123". Do **not** trigger on vague phrases like "ship it" or "merge it" without a PR number or clear upstream-merge context.
 
 ## Why This Exists
 
@@ -25,13 +25,13 @@ Accept a PR number or URL from the user. If none is given, attempt auto-detectio
 Capture the PR number into `$NUMBER` for all subsequent steps:
 
 ```bash
-NUMBER=$(gh pr view <PR_NUMBER_OR_URL> --repo zeroclaw-labs/zeroclaw --json number --jq '.number')
+NUMBER=$(gh pr view <PR_NUMBER_OR_URL> --repo DeliveryBoyTech/daemonclaw --json number --jq '.number')
 ```
 
 Then fetch PR metadata:
 
 ```bash
-gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw \
   --json number,title,headRefName,baseRefName,state,author,mergeable,reviewDecision
 ```
 
@@ -46,7 +46,7 @@ Run pre-flight checks. **Stop at the first failure** and explain clearly:
 Then fetch the review decision:
 
 ```bash
-REVIEW_DECISION=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+REVIEW_DECISION=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw \
   --json reviewDecision --jq '.reviewDecision // ""')
 ```
 
@@ -57,7 +57,7 @@ REVIEW_DECISION=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 ### Step 2: Get Commit History
 
 ```bash
-COMMITS=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+COMMITS=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw \
   --json commits \
   --jq '[.commits[] | "- \(.oid[:7]) \(.messageHeadline)"] | join("\n")')
 ```
@@ -65,8 +65,8 @@ COMMITS=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 If `gh` returns no commit data or hashes are missing, fall back to local git. This requires the contributor's branch to be locally available — fetch first:
 
 ```bash
-BASE_REF=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json baseRefName --jq '.baseRefName')
-HEAD_REF=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json headRefName --jq '.headRefName')
+BASE_REF=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw --json baseRefName --jq '.baseRefName')
+HEAD_REF=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw --json headRefName --jq '.headRefName')
 
 git fetch upstream
 git fetch origin
@@ -79,7 +79,7 @@ If `origin/${HEAD_REF}` doesn't exist (contributor's branch is on their own fork
 **Single-commit PRs:** If `$COMMITS` is exactly one line, use the full commit body instead of the bullet list. Get it with:
 
 ```bash
-SHA=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json commits --jq '.commits[-1].oid')
+SHA=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw --json commits --jq '.commits[-1].oid')
 COMMITS=$(git log -1 --format="%b" "$SHA")
 ```
 
@@ -90,7 +90,7 @@ Note: commits from the API are in API order, which is typically chronological bu
 ### Step 3: Derive the Squash Commit Subject
 
 ```bash
-PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
+PR_TITLE=$(gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw --json title --jq '.title')
 SUBJECT="${PR_TITLE} (#${NUMBER})"
 ```
 
@@ -106,7 +106,7 @@ Present the following to the user with `$NUMBER`, `$SUBJECT`, and `$COMMITS` sub
 
 **About to run:**
 ```
-gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
+gh pr merge $NUMBER --repo DeliveryBoyTech/daemonclaw --squash \
   --subject "$SUBJECT" \
   --body "$COMMITS"
 ```
@@ -131,7 +131,7 @@ Do not infer consent from silence, prior approval of the commit message, or any 
 Only after explicit confirmation in Step 4:
 
 ```bash
-gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash \
+gh pr merge "$NUMBER" --repo DeliveryBoyTech/daemonclaw --squash \
   --subject "$SUBJECT" \
   --body "$COMMITS"
 ```
@@ -141,7 +141,7 @@ If the command exits non-zero, stop and report the full error output verbatim. D
 ### Step 6: Verify
 
 ```bash
-gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+gh pr view "$NUMBER" --repo DeliveryBoyTech/daemonclaw \
   --json state,mergedAt,mergeCommit \
   --jq '"State: \(.state) | Merged at: \(.mergedAt) | Commit: \(if .mergeCommit then .mergeCommit.oid[:7] else "N/A" end)"'
 ```

@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentáció Összefoglaló (Egységes tartalomjegyzék)
+# DaemonClaw Dokumentáció Összefoglaló (Egységes tartalomjegyzék)
 
 Ez a fájl a dokumentációs rendszer kanonikus tartalomjegyzéke.
 

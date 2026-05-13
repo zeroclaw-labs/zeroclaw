@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::onboard::*;
+pub use daemonclaw_runtime::onboard::*;
 
 #[cfg(test)]
 mod tests {

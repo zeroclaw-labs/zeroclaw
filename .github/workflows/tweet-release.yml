@@ -127,7 +127,7 @@ jobs:
             fi
 
             # Build tweet — feature-focused style
-            TWEET=$(printf "🦀 ZeroClaw %s\n\n%s\n\nZero overhead. Zero compromise. 100%% Rust.\n\n#zeroclaw #rust #ai #opensource" \
+            TWEET=$(printf "🦀 DaemonClaw %s\n\n%s\n\nZero overhead. Zero compromise. 100%% Rust.\n\n#daemonclaw #rust #ai #opensource" \
               "$RELEASE_TAG" "$FEAT_LIST")
           fi
 
@@ -300,7 +300,7 @@ jobs:
           if resp.status_code == 201:
               data = resp.json()
               tweet_id = data["data"]["id"]
-              print(f"Tweet posted: https://x.com/zeroclawlabs/status/{tweet_id}")
+              print(f"Tweet posted: https://x.com/daemonclawlabs/status/{tweet_id}")
           else:
               print(f"Failed to post tweet: {resp.status_code}", file=sys.stderr)
               print(resp.text, file=sys.stderr)

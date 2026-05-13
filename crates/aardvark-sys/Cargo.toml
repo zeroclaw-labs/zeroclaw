@@ -5,9 +5,9 @@ edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Low-level bindings for the Total Phase Aardvark I2C/SPI/GPIO USB adapter"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository = "https://github.com/DeliveryBoyTech/daemonclaw"
 
-# NOTE: This crate is the ONLY place in ZeroClaw where unsafe code is permitted.
+# NOTE: This crate is the ONLY place in DaemonClaw where unsafe code is permitted.
 # The rest of the workspace remains #![forbid(unsafe_code)].
 #
 # Stub implementation: the Total Phase SDK (aardvark.h + aardvark.so) is NOT

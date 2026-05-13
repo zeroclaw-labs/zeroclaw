@@ -1,0 +1,27 @@
+{
+    "version": "0.5.9",
+    "description": "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.",
+    "homepage": "https://github.com/DeliveryBoyTech/daemonclaw",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/DeliveryBoyTech/daemonclaw/releases/download/v0.5.9/daemonclaw-x86_64-pc-windows-msvc.zip",
+            "hash": "",
+            "bin": "daemonclaw.exe"
+        }
+    },
+    "checkver": {
+        "github": "https://github.com/DeliveryBoyTech/daemonclaw"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/DeliveryBoyTech/daemonclaw/releases/download/v$version/daemonclaw-x86_64-pc-windows-msvc.zip"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/DeliveryBoyTech/daemonclaw/releases/download/v$version/SHA256SUMS",
+            "regex": "([a-f0-9]{64})\\s+daemonclaw-x86_64-pc-windows-msvc\\.zip"
+        }
+    }
+}

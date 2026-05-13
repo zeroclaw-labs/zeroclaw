@@ -44,7 +44,7 @@ jobs:
         run: >
           cargo clippy
           --workspace
-          --exclude zeroclaw-desktop
+          --exclude daemonclaw-desktop
           --all-targets
           --features ci-all
           -- -D warnings

@@ -1,4 +1,4 @@
-# Ringkasan Dokumentasi ZeroClaw (Daftar Isi Terpadu)
+# Ringkasan Dokumentasi DaemonClaw (Daftar Isi Terpadu)
 
 File ini adalah daftar isi kanonik untuk sistem dokumentasi.
 

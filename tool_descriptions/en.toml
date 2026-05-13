@@ -43,7 +43,7 @@ model_routing_config = "Manage default model settings, scenario-based provider/m
 notion = "Interact with Notion: query databases, read/create/update pages, and search the workspace."
 pdf_read = "Extract plain text from a PDF file in the workspace. Returns all readable text. Image-only or encrypted PDFs return an empty result. Requires the 'rag-pdf' build feature."
 project_intel = "Project delivery intelligence: generate status reports, detect risks, draft client updates, summarize sprints, and estimate effort. Read-only analysis tool."
-proxy_config = "Manage ZeroClaw proxy settings (scope: environment | zeroclaw | services), including runtime and process env application"
+proxy_config = "Manage DaemonClaw proxy settings (scope: environment | daemonclaw | services), including runtime and process env application"
 pushover = "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file."
 schedule = """Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data."

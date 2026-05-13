@@ -1,5 +1,5 @@
-pub use zeroclaw_config::migration;
-pub use zeroclaw_config::providers;
+pub use daemonclaw_config::migration;
+pub use daemonclaw_config::providers;
 pub mod schema;
 pub mod traits;
 pub mod workspace;

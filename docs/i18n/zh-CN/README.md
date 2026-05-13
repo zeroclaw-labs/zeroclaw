@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/docs/assets/daemonclaw-banner.png" alt="DaemonClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — 个人AI助手</h1>
+<h1 align="center">🦀 DaemonClaw — 个人AI助手</h1>
 
 <p align="center">
   <strong>零开销。零妥协。100% Rust。100% 无绑定。</strong><br>
@@ -10,14 +10,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/DeliveryBoyTech/daemonclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.7.1-blue" alt="Version v0.7.1" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.7.1-blue" alt="Version v0.7.1" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/DeliveryBoyTech/daemonclaw?color=green" alt="Contributors" /></a>
+  <a href="https://x.com/daemonclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40daemonclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @daemonclawlabs" /></a>
   <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <a href="https://www.reddit.com/r/daemonclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fdaemonclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/daemonclawlabs" /></a>
 </p>
 
 <p align="center">
@@ -59,12 +59,12 @@
   <a href="../nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-ZeroClaw 是一个运行在你自己设备上的个人AI助手。它在你已经使用的频道上回复你（WhatsApp、Telegram、Slack、Discord、Signal、iMessage、Matrix、IRC、Email、Bluesky、Nostr、Mattermost、Nextcloud Talk、DingTalk、Lark、QQ、Reddit、LinkedIn、Twitter、MQTT、WeChat Work 等）。它有一个用于实时控制的网页仪表板，可以连接硬件外设（ESP32、STM32、Arduino、Raspberry Pi）。Gateway 只是控制平面——产品是助手本身。
+DaemonClaw 是一个运行在你自己设备上的个人AI助手。它在你已经使用的频道上回复你（WhatsApp、Telegram、Slack、Discord、Signal、iMessage、Matrix、IRC、Email、Bluesky、Nostr、Mattermost、Nextcloud Talk、DingTalk、Lark、QQ、Reddit、LinkedIn、Twitter、MQTT、WeChat Work 等）。它有一个用于实时控制的网页仪表板，可以连接硬件外设（ESP32、STM32、Arduino、Raspberry Pi）。Gateway 只是控制平面——产品是助手本身。
 
 如果你想要一个本地化、快速、始终在线的个人单用户助手，这就是它。
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">官网</a> ·
+  <a href="https://daemonclawlabs.ai">官网</a> ·
   <a href="docs/README.md">文档</a> ·
   <a href="docs/architecture.md">架构</a> ·
   <a href="#快速开始简版">入门指南</a> ·
@@ -73,7 +73,7 @@ ZeroClaw 是一个运行在你自己设备上的个人AI助手。它在你已经
   <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **推荐设置方式：** 在终端运行 `zeroclaw onboard`。ZeroClaw Onboard 会引导你逐步设置网关、工作区、频道和提供者。这是推荐的设置路径，支持 macOS、Linux 和 Windows（通过 WSL2）。首次安装？从这里开始：[入门指南](#快速开始简版)
+> **推荐设置方式：** 在终端运行 `daemonclaw onboard`。DaemonClaw Onboard 会引导你逐步设置网关、工作区、频道和提供者。这是推荐的设置路径，支持 macOS、Linux 和 Windows（通过 WSL2）。首次安装？从这里开始：[入门指南](#快速开始简版)
 
 ### 订阅认证（OAuth）
 
@@ -93,18 +93,18 @@ ZeroClaw 是一个运行在你自己设备上的个人AI助手。它在你已经
 ### Homebrew（macOS/Linuxbrew）
 
 ```bash
-brew install zeroclaw
+brew install daemonclaw
 ```
 
 ### 一键安装
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/DeliveryBoyTech/daemonclaw.git
+cd daemonclaw
 ./install.sh
 ```
 
-`zeroclaw onboard` 在安装后自动运行，配置你的工作区和提供者。
+`daemonclaw onboard` 在安装后自动运行，配置你的工作区和提供者。
 
 ## 快速开始（简版）
 
@@ -115,67 +115,67 @@ cd zeroclaw
 ./install.sh --api-key "sk-..." --provider openrouter
 
 # 启动网关（webhook 服务器 + 网页仪表板）
-zeroclaw gateway                # 默认：127.0.0.1:42617
-zeroclaw gateway --port 0       # 随机端口（安全加固）
+daemonclaw gateway                # 默认：127.0.0.1:42617
+daemonclaw gateway --port 0       # 随机端口（安全加固）
 
 # 与助手对话
-zeroclaw agent -m "Hello, ZeroClaw!"
+daemonclaw agent -m "Hello, DaemonClaw!"
 
 # 交互模式
-zeroclaw agent
+daemonclaw agent
 
 # 启动完整自主运行时（网关 + 频道 + 定时任务 + 手）
-zeroclaw daemon
+daemonclaw daemon
 
 # 检查状态
-zeroclaw status
+daemonclaw status
 
 # 运行诊断
-zeroclaw doctor
+daemonclaw doctor
 ```
 
-升级？更新后运行 `zeroclaw doctor`。
+升级？更新后运行 `daemonclaw doctor`。
 
 ### 从源码构建（开发）
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/DeliveryBoyTech/daemonclaw.git
+cd daemonclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+daemonclaw onboard
 ```
 
 > **开发替代方案（无全局安装）：** 命令前加 `cargo run --release --`（示例：`cargo run --release -- status`）。
 
 ## 从 OpenClaw 迁移
 
-ZeroClaw 可以导入你的 OpenClaw 工作区、记忆和配置：
+DaemonClaw 可以导入你的 OpenClaw 工作区、记忆和配置：
 
 ```bash
 # 预览将迁移的内容（安全，只读）
-zeroclaw migrate openclaw --dry-run
+daemonclaw migrate openclaw --dry-run
 
 # 执行迁移
-zeroclaw migrate openclaw
+daemonclaw migrate openclaw
 ```
 
-这会将你的记忆条目、工作区文件和配置从 `~/.openclaw/` 迁移到 `~/.zeroclaw/`。配置会自动从 JSON 转换为 TOML。
+这会将你的记忆条目、工作区文件和配置从 `~/.openclaw/` 迁移到 `~/.daemonclaw/`。配置会自动从 JSON 转换为 TOML。
 
 ## 安全默认设置（DM 访问）
 
-ZeroClaw 连接到真实的消息平台。将入站 DM 视为不可信输入。
+DaemonClaw 连接到真实的消息平台。将入站 DM 视为不可信输入。
 
 完整安全指南：[SECURITY.md](SECURITY.md)
 
 所有频道的默认行为：
 
 - **DM 配对**（默认）：未知发送者会收到一个短配对码，机器人不会处理他们的消息。
-- 使用以下命令批准：`zeroclaw pairing approve <channel> <code>`（然后发送者会被添加到本地允许列表）。
+- 使用以下命令批准：`daemonclaw pairing approve <channel> <code>`（然后发送者会被添加到本地允许列表）。
 - 公共入站 DM 需要在 `config.toml` 中显式启用。
-- 运行 `zeroclaw doctor` 来检测有风险或配置错误的 DM 策略。
+- 运行 `daemonclaw doctor` 来检测有风险或配置错误的 DM 策略。
 
 **自主级别：**
 
@@ -196,7 +196,7 @@ ZeroClaw 连接到真实的消息平台。将入站 DM 视为不可信输入。
 
 | 日期 (UTC) | 级别 | 通知 | 操作 |
 | ---------- | ---- | ---- | ---- |
-| 2026-02-19 | _严重_ | 我们与 `openagen/zeroclaw`、`zeroclaw.org` 或 `zeroclaw.net` **无任何关联**。`zeroclaw.org` 和 `zeroclaw.net` 域名目前指向 `openagen/zeroclaw` 分支，该域名/仓库正在冒充我们的官方网站/项目。 | 不要信任来自这些来源的信息、二进制文件、筹款或公告。仅使用[本仓库](https://github.com/zeroclaw-labs/zeroclaw)和我们经过验证的社交账号。 |
+| 2026-02-19 | _严重_ | 我们与 `openagen/daemonclaw`、`daemonclaw.org` 或 `daemonclaw.net` **无任何关联**。`daemonclaw.org` 和 `daemonclaw.net` 域名目前指向 `openagen/daemonclaw` 分支，该域名/仓库正在冒充我们的官方网站/项目。 | 不要信任来自这些来源的信息、二进制文件、筹款或公告。仅使用[本仓库](https://github.com/DeliveryBoyTech/daemonclaw)和我们经过验证的社交账号。 |
 | 2026-02-19 | _重要_ | Anthropic 于 2026-02-19 更新了认证和凭证使用条款。Claude Code OAuth 令牌（Free、Pro、Max）仅供 Claude Code 和 Claude.ai 专用；在任何其他产品、工具或服务（包括 Agent SDK）中使用 Claude Free/Pro/Max 的 OAuth 令牌是不允许的，可能违反消费者服务条款。 | 请暂时避免 Claude Code OAuth 集成以防止潜在损失。原始条款：[Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## 亮点
@@ -216,18 +216,18 @@ ZeroClaw 连接到真实的消息平台。将入站 DM 视为不可信输入。
 - **技能平台** — 内置、社区和工作区技能，带安全审计。
 - **隧道支持** — Cloudflare、Tailscale、ngrok、OpenVPN 和自定义隧道用于远程访问。
 
-### 团队为什么选择 ZeroClaw
+### 团队为什么选择 DaemonClaw
 
 - **默认精简：** 小型 Rust 二进制文件，快速启动，低内存占用。
 - **安全设计：** 配对、严格沙箱、显式允许列表、工作区范围限定。
 - **完全可替换：** 核心系统都是 trait（提供者、频道、工具、记忆、隧道）。
 - **无锁定：** 支持 OpenAI 兼容提供者 + 可插拔自定义端点。
 
-## 基准测试快照（ZeroClaw 对比 OpenClaw，可复现）
+## 基准测试快照（DaemonClaw 对比 OpenClaw，可复现）
 
 本地机器快速基准测试（macOS arm64，2026年2月），针对 0.8GHz 边缘硬件标准化。
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | DaemonClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **语言**                  | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -235,20 +235,20 @@ ZeroClaw 连接到真实的消息平台。将入站 DM 视为不可信输入。
 | **二进制大小**            | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
 | **成本**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **任何硬件 $10**     |
 
-> 注意：ZeroClaw 的结果使用 `/usr/bin/time -l` 在发布构建上测量。OpenClaw 需要 Node.js 运行时（通常约 390MB 额外内存开销），而 NanoBot 需要 Python 运行时。PicoClaw 和 ZeroClaw 是静态二进制文件。上述 RAM 数据为运行时内存；构建时编译需求更高。
+> 注意：DaemonClaw 的结果使用 `/usr/bin/time -l` 在发布构建上测量。OpenClaw 需要 Node.js 运行时（通常约 390MB 额外内存开销），而 NanoBot 需要 Python 运行时。PicoClaw 和 DaemonClaw 是静态二进制文件。上述 RAM 数据为运行时内存；构建时编译需求更高。
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/daemonclaw-comparison.jpeg" alt="DaemonClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### 可复现的本地测量
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/daemonclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/daemonclaw --help
+/usr/bin/time -l target/release/daemonclaw status
 ```
 
 ## 我们迄今为止构建的一切
@@ -324,7 +324,7 @@ React 19 + Vite 6 + Tailwind CSS 4 网页仪表板直接从 Gateway 提供：
 
 ## 配置
 
-最小 `~/.zeroclaw/config.toml`：
+最小 `~/.daemonclaw/config.toml`：
 
 ```toml
 default_provider = "anthropic"
@@ -392,35 +392,35 @@ kind = "cloudflare"  # or "tailscale", "ngrok", "openvpn", "custom", "none"
 
 ## 订阅认证（OpenAI Codex / Claude Code / Gemini）
 
-ZeroClaw 支持订阅原生认证配置文件（多账户，静态加密）。
+DaemonClaw 支持订阅原生认证配置文件（多账户，静态加密）。
 
-- 存储文件：`~/.zeroclaw/auth-profiles.json`
-- 加密密钥：`~/.zeroclaw/.secret_key`
+- 存储文件：`~/.daemonclaw/auth-profiles.json`
+- 加密密钥：`~/.daemonclaw/.secret_key`
 - 配置文件 ID 格式：`<provider>:<profile_name>`（示例：`openai-codex:work`）
 
 ```bash
 # OpenAI Codex OAuth（ChatGPT 订阅）
-zeroclaw auth login --provider openai-codex --device-code
+daemonclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+daemonclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+daemonclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # 检查 / 刷新 / 切换配置文件
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+daemonclaw auth status
+daemonclaw auth refresh --provider openai-codex --profile default
+daemonclaw auth use --provider openai-codex --profile work
 
 # 使用订阅认证运行代理
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+daemonclaw agent --provider openai-codex -m "hello"
+daemonclaw agent --provider anthropic -m "hello"
 ```
 
 ## 代理工作区 + 技能
 
-工作区根目录：`~/.zeroclaw/workspace/`（可通过配置自定义）。
+工作区根目录：`~/.daemonclaw/workspace/`（可通过配置自定义）。
 
 注入的提示文件：
 - `IDENTITY.md` — 代理人格和角色
@@ -429,74 +429,74 @@ zeroclaw agent --provider anthropic -m "hello"
 - `AGENTS.md` — 会话约定和初始化规则
 - `SOUL.md` — 核心身份和运作原则
 
-技能：`~/.zeroclaw/workspace/skills/<skill>/SKILL.md` 或 `SKILL.toml`。
+技能：`~/.daemonclaw/workspace/skills/<skill>/SKILL.md` 或 `SKILL.toml`。
 
 ```bash
 # 列出已安装的技能
-zeroclaw skills list
+daemonclaw skills list
 
 # 从 git 安装
-zeroclaw skills install https://github.com/user/my-skill.git
+daemonclaw skills install https://github.com/user/my-skill.git
 
 # 安装前安全审计
-zeroclaw skills audit https://github.com/user/my-skill.git
+daemonclaw skills audit https://github.com/user/my-skill.git
 
 # 移除技能
-zeroclaw skills remove my-skill
+daemonclaw skills remove my-skill
 ```
 
 ## CLI 命令
 
 ```bash
 # 工作区管理
-zeroclaw onboard              # 引导设置向导
-zeroclaw status               # 显示守护进程/代理状态
-zeroclaw doctor               # 运行系统诊断
+daemonclaw onboard              # 引导设置向导
+daemonclaw status               # 显示守护进程/代理状态
+daemonclaw doctor               # 运行系统诊断
 
 # 网关 + 守护进程
-zeroclaw gateway              # 启动网关服务器（127.0.0.1:42617）
-zeroclaw daemon               # 启动完整自主运行时
+daemonclaw gateway              # 启动网关服务器（127.0.0.1:42617）
+daemonclaw daemon               # 启动完整自主运行时
 
 # 代理
-zeroclaw agent                # 交互式聊天模式
-zeroclaw agent -m "message"   # 单条消息模式
+daemonclaw agent                # 交互式聊天模式
+daemonclaw agent -m "message"   # 单条消息模式
 
 # 服务管理
-zeroclaw service install      # 作为系统服务安装（launchd/systemd）
-zeroclaw service start|stop|restart|status
+daemonclaw service install      # 作为系统服务安装（launchd/systemd）
+daemonclaw service start|stop|restart|status
 
 # 频道
-zeroclaw channel list         # 列出已配置的频道
-zeroclaw channel doctor       # 检查频道健康状况
-zeroclaw channel bind-telegram 123456789
+daemonclaw channel list         # 列出已配置的频道
+daemonclaw channel doctor       # 检查频道健康状况
+daemonclaw channel bind-telegram 123456789
 
 # 定时任务 + 调度
-zeroclaw cron list            # 列出计划任务
-zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
-zeroclaw cron remove <id>
+daemonclaw cron list            # 列出计划任务
+daemonclaw cron add "*/5 * * * *" --prompt "Check system health"
+daemonclaw cron remove <id>
 
 # 记忆
-zeroclaw memory list          # 列出记忆条目
-zeroclaw memory get <key>     # 检索记忆
-zeroclaw memory stats         # 记忆统计
+daemonclaw memory list          # 列出记忆条目
+daemonclaw memory get <key>     # 检索记忆
+daemonclaw memory stats         # 记忆统计
 
 # 认证配置文件
-zeroclaw auth login --provider <name>
-zeroclaw auth status
-zeroclaw auth use --provider <name> --profile <profile>
+daemonclaw auth login --provider <name>
+daemonclaw auth status
+daemonclaw auth use --provider <name> --profile <profile>
 
 # 硬件外设
-zeroclaw hardware discover    # 扫描已连接的设备
-zeroclaw peripheral list      # 列出已连接的外设
-zeroclaw peripheral flash     # 向设备刷写固件
+daemonclaw hardware discover    # 扫描已连接的设备
+daemonclaw peripheral list      # 列出已连接的外设
+daemonclaw peripheral flash     # 向设备刷写固件
 
 # 迁移
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+daemonclaw migrate openclaw --dry-run
+daemonclaw migrate openclaw
 
 # Shell 补全
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(daemonclaw completions bash)
+daemonclaw completions zsh > ~/.zfunc/_daemonclaw
 ```
 
 完整命令参考：[docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -564,10 +564,10 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 #### 一行安装
 
-或者跳过上述步骤，使用单条命令安装所有内容（系统依赖、Rust、ZeroClaw）：
+或者跳过上述步骤，使用单条命令安装所有内容（系统依赖、Rust、DaemonClaw）：
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/install.sh | bash
 ```
 
 #### 编译资源需求
@@ -610,7 +610,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 - Windows: `x86_64`
 
 从以下位置下载最新资产：
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/DeliveryBoyTech/daemonclaw/releases/latest>
 
 ## 文档
 
@@ -620,7 +620,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 - 阅读[架构概述](docs/architecture.md)了解完整系统模型。
 - 使用[配置参考](docs/reference/api/config-reference.md)查阅所有键和示例。
 - 按照[运维手册](docs/ops/operations-runbook.md)运行 Gateway。
-- 按照 [ZeroClaw Onboard](#快速开始简版) 进行引导设置。
+- 按照 [DaemonClaw Onboard](#快速开始简版) 进行引导设置。
 - 使用[故障排除指南](docs/ops/troubleshooting.md)调试常见故障。
 - 在暴露任何内容之前查看[安全指南](docs/security/README.md)。
 
@@ -652,12 +652,12 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 ## Icy Crab 🦀
 
-ZeroClaw 为 smooth crab 🦀 而构建，一个快速高效的 AI 助手。由 Argenis De La Rosa 和社区共同构建。
+DaemonClaw 为 smooth crab 🦀 而构建，一个快速高效的 AI 助手。由 Argenis De La Rosa 和社区共同构建。
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [daemonclawlabs.ai](https://daemonclawlabs.ai)
+- [@daemonclawlabs](https://x.com/daemonclawlabs)
 
-## 支持 ZeroClaw
+## 支持 DaemonClaw
 
 ### 🙏 特别感谢
 
@@ -672,7 +672,7 @@ ZeroClaw 为 smooth crab 🦀 而构建，一个快速高效的 AI 助手。由 
 
 ## 贡献
 
-ZeroClaw 新手？寻找标记为 [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) 的问题 — 参阅我们的[贡献指南](CONTRIBUTING.md#first-time-contributors)了解如何开始。欢迎 AI/vibe-coded PR！🤖
+DaemonClaw 新手？寻找标记为 [`good first issue`](https://github.com/DeliveryBoyTech/daemonclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) 的问题 — 参阅我们的[贡献指南](CONTRIBUTING.md#first-time-contributors)了解如何开始。欢迎 AI/vibe-coded PR！🤖
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CLA.md](docs/contributing/cla.md)。实现一个 trait，提交 PR：
 
@@ -684,26 +684,26 @@ ZeroClaw 新手？寻找标记为 [`good first issue`](https://github.com/zerocl
 - 新 `Memory` → `src/memory/`
 - 新 `Tunnel` → `src/tunnel/`
 - 新 `Peripheral` → `src/peripherals/`
-- 新 `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- 新 `Skill` → `~/.daemonclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ 官方仓库和冒充警告
 
-**这是唯一的 ZeroClaw 官方仓库：**
+**这是唯一的 DaemonClaw 官方仓库：**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/DeliveryBoyTech/daemonclaw
 
-任何其他声称是"ZeroClaw"或暗示与 ZeroClaw Labs 有关联的仓库、组织、域名或包都是**未经授权的，与本项目无关**。已知的未授权分支将在 [TRADEMARK.md](docs/maintainers/trademark.md) 中列出。
+任何其他声称是"DaemonClaw"或暗示与 DaemonClaw Labs 有关联的仓库、组织、域名或包都是**未经授权的，与本项目无关**。已知的未授权分支将在 [TRADEMARK.md](docs/maintainers/trademark.md) 中列出。
 
-如果你遇到冒充或商标滥用，请[提交问题](https://github.com/zeroclaw-labs/zeroclaw/issues)。
+如果你遇到冒充或商标滥用，请[提交问题](https://github.com/DeliveryBoyTech/daemonclaw/issues)。
 
 ---
 
 ## 许可证
 
-ZeroClaw 采用双重许可，以实现最大开放性和贡献者保护：
+DaemonClaw 采用双重许可，以实现最大开放性和贡献者保护：
 
 | 许可证 | 使用场景 |
 |--------|----------|
@@ -714,7 +714,7 @@ ZeroClaw 采用双重许可，以实现最大开放性和贡献者保护：
 
 ### 商标
 
-**ZeroClaw** 名称和标志是 ZeroClaw Labs 的商标。此许可证不授予使用它们暗示背书或关联的权限。参见 [TRADEMARK.md](docs/maintainers/trademark.md) 了解允许和禁止的使用。
+**DaemonClaw** 名称和标志是 DaemonClaw Labs 的商标。此许可证不授予使用它们暗示背书或关联的权限。参见 [TRADEMARK.md](docs/maintainers/trademark.md) 了解允许和禁止的使用。
 
 ### 贡献者保护
 
@@ -725,12 +725,12 @@ ZeroClaw 采用双重许可，以实现最大开放性和贡献者保护：
 
 ---
 
-**ZeroClaw** — 零开销。零妥协。随处部署。任意替换。🦀
+**DaemonClaw** — 零开销。零妥协。随处部署。任意替换。🦀
 
 ## 贡献者
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+<a href="https://github.com/DeliveryBoyTech/daemonclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=DeliveryBoyTech/daemonclaw" alt="DaemonClaw contributors" />
 </a>
 
 此列表从 GitHub 贡献者图表生成，自动更新。
@@ -738,11 +738,11 @@ ZeroClaw 采用双重许可，以实现最大开放性和贡献者保护：
 ## Star 历史
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#DeliveryBoyTech/daemonclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

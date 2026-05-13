@@ -1,6 +1,6 @@
-# Triển khai mạng — ZeroClaw trên Raspberry Pi và mạng nội bộ
+# Triển khai mạng — DaemonClaw trên Raspberry Pi và mạng nội bộ
 
-Tài liệu này hướng dẫn triển khai ZeroClaw trên Raspberry Pi hoặc host khác trong mạng nội bộ, với các channel Telegram và webhook tùy chọn.
+Tài liệu này hướng dẫn triển khai DaemonClaw trên Raspberry Pi hoặc host khác trong mạng nội bộ, với các channel Telegram và webhook tùy chọn.
 
 ---
 
@@ -8,17 +8,17 @@ Tài liệu này hướng dẫn triển khai ZeroClaw trên Raspberry Pi hoặc 
 
 | Chế độ | Cần cổng đến? | Trường hợp dùng |
 |------|----------------------|----------|
-| **Telegram polling** | Không | ZeroClaw poll Telegram API; hoạt động từ bất kỳ đâu |
-| **Matrix sync (kể cả E2EE)** | Không | ZeroClaw sync qua Matrix client API; không cần webhook đến |
+| **Telegram polling** | Không | DaemonClaw poll Telegram API; hoạt động từ bất kỳ đâu |
+| **Matrix sync (kể cả E2EE)** | Không | DaemonClaw sync qua Matrix client API; không cần webhook đến |
 | **Discord/Slack** | Không | Tương tự — chỉ outbound |
 | **Gateway webhook** | Có | POST /webhook, WhatsApp, v.v. cần public URL |
 | **Gateway pairing** | Có | Nếu bạn pair client qua gateway |
 
-**Lưu ý:** Telegram, Discord và Slack dùng **long-polling** — ZeroClaw thực hiện các request ra ngoài. Không cần port forwarding hoặc public IP.
+**Lưu ý:** Telegram, Discord và Slack dùng **long-polling** — DaemonClaw thực hiện các request ra ngoài. Không cần port forwarding hoặc public IP.
 
 ---
 
-## 2. ZeroClaw trên Raspberry Pi
+## 2. DaemonClaw trên Raspberry Pi
 
 ### 2.1 Điều kiện tiên quyết
 
@@ -37,7 +37,7 @@ cargo build --release --features hardware
 
 ### 2.3 Cấu hình
 
-Chỉnh sửa `~/.zeroclaw/config.toml`:
+Chỉnh sửa `~/.daemonclaw/config.toml`:
 
 ```toml
 [peripherals]
@@ -67,11 +67,11 @@ allow_public_bind = false
 ### 2.4 Chạy Daemon (chỉ cục bộ)
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+daemonclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 - Gateway bind vào `127.0.0.1` — không tiếp cận được từ máy khác
-- Channel Telegram hoạt động: ZeroClaw poll Telegram API (outbound)
+- Channel Telegram hoạt động: DaemonClaw poll Telegram API (outbound)
 - Không cần tường lửa hay port forwarding
 
 ---
@@ -90,7 +90,7 @@ allow_public_bind = true
 ```
 
 ```bash
-zeroclaw daemon --host 0.0.0.0 --port 3000
+daemonclaw daemon --host 0.0.0.0 --port 3000
 ```
 
 **Bảo mật:** `allow_public_bind = true` phơi bày gateway với mạng nội bộ của bạn. Chỉ dùng trên mạng LAN tin cậy.
@@ -101,7 +101,7 @@ Nếu bạn cần **public URL** (ví dụ: webhook WhatsApp, client bên ngoài
 
 1. Chạy gateway trên localhost:
    ```bash
-   zeroclaw daemon --host 127.0.0.1 --port 3000
+   daemonclaw daemon --host 127.0.0.1 --port 3000
    ```
 
 2. Khởi động tunnel:
@@ -109,9 +109,9 @@ Nếu bạn cần **public URL** (ví dụ: webhook WhatsApp, client bên ngoài
    [tunnel]
    provider = "tailscale"   # or "ngrok", "cloudflare"
    ```
-   Hoặc dùng `zeroclaw tunnel` (xem tài liệu tunnel).
+   Hoặc dùng `daemonclaw tunnel` (xem tài liệu tunnel).
 
-3. ZeroClaw sẽ từ chối `0.0.0.0` trừ khi `allow_public_bind = true` hoặc có tunnel đang hoạt động.
+3. DaemonClaw sẽ từ chối `0.0.0.0` trừ khi `allow_public_bind = true` hoặc có tunnel đang hoạt động.
 
 ---
 
@@ -119,7 +119,7 @@ Nếu bạn cần **public URL** (ví dụ: webhook WhatsApp, client bên ngoài
 
 Telegram dùng **long-polling** theo mặc định:
 
-- ZeroClaw gọi `https://api.telegram.org/bot{token}/getUpdates`
+- DaemonClaw gọi `https://api.telegram.org/bot{token}/getUpdates`
 - Không cần cổng đến hoặc public IP
 - Hoạt động sau NAT, trên RPi, trong home lab
 
@@ -131,12 +131,12 @@ bot_token = "YOUR_BOT_TOKEN"
 allowed_users = []            # deny-by-default, bind identities explicitly
 ```
 
-Chạy `zeroclaw daemon` — channel Telegram khởi động tự động.
+Chạy `daemonclaw daemon` — channel Telegram khởi động tự động.
 
 Để cho phép một tài khoản Telegram lúc runtime:
 
 ```bash
-zeroclaw channel bind-telegram <IDENTITY>
+daemonclaw channel bind-telegram <IDENTITY>
 ```
 
 `<IDENTITY>` có thể là Telegram user ID dạng số hoặc username (không có `@`).
@@ -145,7 +145,7 @@ zeroclaw channel bind-telegram <IDENTITY>
 
 Telegram Bot API `getUpdates` chỉ hỗ trợ một poller hoạt động cho mỗi bot token.
 
-- Chỉ chạy một instance runtime cho cùng token (khuyến nghị: service `zeroclaw daemon`).
+- Chỉ chạy một instance runtime cho cùng token (khuyến nghị: service `daemonclaw daemon`).
 - Không chạy `cargo run -- channel start` hay tiến trình bot khác cùng lúc.
 
 Nếu gặp lỗi này:
@@ -192,7 +192,7 @@ Cấu hình Cloudflare Tunnel để forward đến `127.0.0.1:3000`, sau đó đ
 
 - [ ] Build với `--features hardware` (và `peripheral-rpi` nếu dùng native GPIO)
 - [ ] Cấu hình `[peripherals]` và `[channels_config.telegram]`
-- [ ] Chạy `zeroclaw daemon --host 127.0.0.1 --port 3000` (Telegram hoạt động không cần 0.0.0.0)
+- [ ] Chạy `daemonclaw daemon --host 127.0.0.1 --port 3000` (Telegram hoạt động không cần 0.0.0.0)
 - [ ] Để truy cập LAN: `--host 0.0.0.0` + `allow_public_bind = true` trong config
 - [ ] Để dùng webhook: dùng Tailscale, ngrok hoặc Cloudflare tunnel
 

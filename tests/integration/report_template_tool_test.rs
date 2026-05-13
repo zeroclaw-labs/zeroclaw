@@ -1,7 +1,7 @@
 //! Integration tests for ReportTemplateTool.
 
 use serde_json::json;
-use zeroclaw::tools::{ReportTemplateTool, Tool};
+use daemonclaw::tools::{ReportTemplateTool, Tool};
 
 #[tokio::test]
 async fn render_weekly_status_en() {

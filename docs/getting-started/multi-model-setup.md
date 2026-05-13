@@ -1,6 +1,6 @@
 # Multi-Model Setup and Fallback Chains
 
-This guide introduces multi-model concepts in ZeroClaw, including fallback provider chains, model-level fallbacks, and API key rotation for resilience.
+This guide introduces multi-model concepts in DaemonClaw, including fallback provider chains, model-level fallbacks, and API key rotation for resilience.
 
 **Last verified: March 28, 2026**
 
@@ -19,16 +19,16 @@ Multi-model configuration is useful for:
 
 ### Fallback Provider Chains
 
-When a provider experiences a transient error (timeout, connection failure, auth issue), ZeroClaw automatically attempts fallback providers in the order specified.
+When a provider experiences a transient error (timeout, connection failure, auth issue), DaemonClaw automatically attempts fallback providers in the order specified.
 
-**Example**: If your primary provider is `openai` but it's temporarily unavailable, ZeroClaw can automatically fall back to `anthropic`, then `groq`.
+**Example**: If your primary provider is `openai` but it's temporarily unavailable, DaemonClaw can automatically fall back to `anthropic`, then `groq`.
 
 ```toml
 [reliability]
 fallback_providers = ["anthropic", "groq", "openrouter"]
 ```
 
-When the primary provider recovers, ZeroClaw resumes using it (no sticky failover).
+When the primary provider recovers, DaemonClaw resumes using it (no sticky failover).
 
 ### Model-Level Fallbacks
 
@@ -39,11 +39,11 @@ Some models may not be available in all regions, or you might want to use a fast
 model_fallbacks = { "claude-opus-4-20250514" = ["claude-sonnet-4-20250514", "gpt-4o"] }
 ```
 
-If `claude-opus-4-20250514` fails or is unavailable, ZeroClaw tries the fallback models in order while staying within the same provider (unless a provider-level fallback is also configured).
+If `claude-opus-4-20250514` fails or is unavailable, DaemonClaw tries the fallback models in order while staying within the same provider (unless a provider-level fallback is also configured).
 
 ### API Key Rotation
 
-For providers that frequently encounter rate limits, you can supply additional API keys that ZeroClaw will rotate through on `429` responses.
+For providers that frequently encounter rate limits, you can supply additional API keys that DaemonClaw will rotate through on `429` responses.
 
 ```toml
 [reliability]
@@ -88,7 +88,7 @@ default_model = "gpt-4o"
 fallback_providers = ["anthropic"]
 ```
 
-**Behavior**: If OpenAI times out or returns an error, ZeroClaw will retry twice with exponential backoff, then attempt the same request using Anthropic.
+**Behavior**: If OpenAI times out or returns an error, DaemonClaw will retry twice with exponential backoff, then attempt the same request using Anthropic.
 
 ### High-Reliability Multi-Provider Setup
 
@@ -210,13 +210,13 @@ Then query traces:
 
 ```bash
 # Show all fallback events
-zeroclaw doctor traces --contains "fallback"
+daemonclaw doctor traces --contains "fallback"
 
 # Show provider retry details
-zeroclaw doctor traces --contains "provider"
+daemonclaw doctor traces --contains "provider"
 
 # Show rate-limit rotation
-zeroclaw doctor traces --contains "429"
+daemonclaw doctor traces --contains "429"
 ```
 
 ## Best Practices
@@ -235,7 +235,7 @@ Each fallback provider resolves credentials independently using the standard res
 
 1. Explicit credential from config/CLI
 2. Provider-specific environment variable
-3. Generic fallback: `ZEROCLAW_API_KEY`, then `API_KEY`
+3. Generic fallback: `DAEMONCLAW_API_KEY`, then `API_KEY`
 
 **Important**: The primary provider's API key is not automatically reused by fallback providers. Set credentials for each provider separately.
 

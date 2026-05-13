@@ -117,15 +117,15 @@ jobs:
           body = os.environ['MSG_BODY']
 
           embed = {
-              'title': f'ZeroClaw {tag} Released',
+              'title': f'DaemonClaw {tag} Released',
               'description': body + '\n\nZero overhead. Zero compromise. 100% Rust.',
               'url': url,
               'color': 0xF97316,
-              'footer': {'text': 'ZeroClaw Release Bot'},
+              'footer': {'text': 'DaemonClaw Release Bot'},
           }
 
           payload = {
-              'username': 'ZeroClaw Releases',
+              'username': 'DaemonClaw Releases',
               'embeds': [embed],
           }
           print(json.dumps(payload))

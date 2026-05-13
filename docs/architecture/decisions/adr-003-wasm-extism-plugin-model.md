@@ -3,8 +3,8 @@ type: adr
 status: accepted
 last-reviewed: 2026-04-19
 relates-to:
-  - crates/zeroclaw-plugins
-  - crates/zeroclaw-api
+  - crates/daemonclaw-plugins
+  - crates/daemonclaw-api
 ---
 
 # ADR-003: WASM + Extism Plugin Execution Model
@@ -19,12 +19,12 @@ was written.
 
 ## Context
 
-ZeroClaw compiles 70+ tools and 30+ channels into a single monolithic binary.
+DaemonClaw compiles 70+ tools and 30+ channels into a single monolithic binary.
 Every user pays the compile time and binary size for capabilities they may never
-use. Third-party developers cannot extend ZeroClaw without forking the
+use. Third-party developers cannot extend DaemonClaw without forking the
 repository and writing Rust code against internal APIs.
 
-The [Intentional Architecture RFC](https://github.com/zeroclaw-labs/zeroclaw/wiki/14.1-Intentional-Architecture)
+The [Intentional Architecture RFC](https://github.com/DeliveryBoyTech/daemonclaw/wiki/14.1-Intentional-Architecture)
 defines a microkernel target where non-core tools and channels become loadable
 plugins. This requires a sandboxed execution model that:
 
@@ -84,7 +84,7 @@ unsigned). Signatures use the `ring` crate.
 ### Plugin authoring
 
 Plugin authors depend on `extism-pdk` (the Extism project's guest SDK) and
-compile to `wasm32-wasip1`. No ZeroClaw-specific SDK crate is required — the
+compile to `wasm32-wasip1`. No DaemonClaw-specific SDK crate is required — the
 protocol is documented and the JSON contracts are simple enough to implement
 directly.
 
@@ -117,7 +117,7 @@ directly.
 
 ### Neutral
 
-- Plugin discovery uses the existing `~/.zeroclaw/plugins/` directory
+- Plugin discovery uses the existing `~/.daemonclaw/plugins/` directory
   convention. No registry server is required yet (registry is a Phase 4
   deliverable).
 
@@ -131,11 +131,11 @@ lower-trust surface than native tools:
 - **SSRF in `zc_http_request`** — the host function forwards any plugin-supplied
   URL to `reqwest` without private-IP, loopback, or link-local restriction. A
   plugin granted `http_client` can reach cloud IMDS endpoints, local admin
-  services, or the ZeroClaw gateway itself. Tracked in [#5918](https://github.com/zeroclaw-labs/zeroclaw/issues/5918).
+  services, or the DaemonClaw gateway itself. Tracked in [#5918](https://github.com/DeliveryBoyTech/daemonclaw/issues/5918).
   Native `HttpRequestTool::is_private_or_local_host()` is the reuse target.
 - **Unbounded `zc_env_read`** — `env_read` permission grants access to *any*
   variable by name, including unrelated secrets (`AWS_SECRET_ACCESS_KEY`,
-  `ANTHROPIC_API_KEY`, etc.). Tracked in [#5919](https://github.com/zeroclaw-labs/zeroclaw/issues/5919).
+  `ANTHROPIC_API_KEY`, etc.). Tracked in [#5919](https://github.com/DeliveryBoyTech/daemonclaw/issues/5919).
   Preferred fix: per-plugin manifest allowlist (`env_read_vars = [...]`).
 - **CPU exhaustion** — no fuel limit or epoch interruption on Extism plugins.
   An adversarial plugin can loop indefinitely and hold a blocking-pool thread
@@ -150,12 +150,12 @@ from sources they already trust at the manifest level.
 
 ## References
 
-- `crates/zeroclaw-plugins/src/runtime.rs` — Extism execution bridge
-- `crates/zeroclaw-plugins/src/wasm_tool.rs` — Tool trait bridge
-- `crates/zeroclaw-plugins/src/host.rs` — Plugin discovery and manifest loading
-- `crates/zeroclaw-plugins/src/signature.rs` — Ed25519 verification
-- `crates/zeroclaw-config/src/schema.rs` — `PluginsConfig`, `ImageGenConfig`
-- `crates/zeroclaw-runtime/src/tools/mod.rs` — Plugin tool registration
+- `crates/daemonclaw-plugins/src/runtime.rs` — Extism execution bridge
+- `crates/daemonclaw-plugins/src/wasm_tool.rs` — Tool trait bridge
+- `crates/daemonclaw-plugins/src/host.rs` — Plugin discovery and manifest loading
+- `crates/daemonclaw-plugins/src/signature.rs` — Ed25519 verification
+- `crates/daemonclaw-config/src/schema.rs` — `PluginsConfig`, `ImageGenConfig`
+- `crates/daemonclaw-runtime/src/tools/mod.rs` — Plugin tool registration
 - `plugins/image-gen-fal/` — Reference plugin implementation (lands in a follow-up PR)
 - [Extism documentation](https://extism.org/docs/overview)
-- [Intentional Architecture RFC](https://github.com/zeroclaw-labs/zeroclaw/wiki/14.1-Intentional-Architecture)
+- [Intentional Architecture RFC](https://github.com/DeliveryBoyTech/daemonclaw/wiki/14.1-Intentional-Architecture)

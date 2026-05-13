@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/config.schema.json",
-  "productName": "ZeroClaw",
+  "productName": "DaemonClaw",
   "version": "0.7.1",
-  "identifier": "ai.zeroclawlabs.desktop",
+  "identifier": "ai.daemonclawlabs.desktop",
   "build": {
     "devUrl": "http://127.0.0.1:42617/_app/",
     "frontendDist": "http://127.0.0.1:42617/_app/"
@@ -10,7 +10,7 @@
   "app": {
     "windows": [
       {
-        "title": "ZeroClaw",
+        "title": "DaemonClaw",
         "width": 1200,
         "height": 800,
         "resizable": true,

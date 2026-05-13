@@ -1,4 +1,4 @@
-# ZeroClaw Release Process
+# DaemonClaw Release Process
 
 This runbook defines the maintainers' standard release flow.
 
@@ -107,7 +107,7 @@ Run `Pub Homebrew Core` manually:
 Required repository settings for non-dry-run:
 
 - secret: `HOMEBREW_CORE_BOT_TOKEN` (token from a dedicated bot account, not a personal maintainer account)
-- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `zeroclaw-release-bot/homebrew-core`)
+- variable: `HOMEBREW_CORE_BOT_FORK_REPO` (for example `daemonclaw-release-bot/homebrew-core`)
 - optional variable: `HOMEBREW_CORE_BOT_EMAIL`
 
 Workflow guardrails:
@@ -127,13 +127,13 @@ Run `Pub Scoop Manifest` manually:
 Required repository settings for non-dry-run:
 
 - secret: `SCOOP_BUCKET_TOKEN` (PAT with push access to the bucket repo)
-- variable: `SCOOP_BUCKET_REPO` (for example `zeroclaw-labs/scoop-zeroclaw`)
+- variable: `SCOOP_BUCKET_REPO` (for example `DeliveryBoyTech/scoop-daemonclaw`)
 
 Workflow guardrails:
 
 - release tag must be `vX.Y.Z` format
 - Windows binary SHA256 extracted from `SHA256SUMS` release asset
-- manifest pushed to `bucket/zeroclaw.json` in the Scoop bucket repo
+- manifest pushed to `bucket/daemonclaw.json` in the Scoop bucket repo
 
 ### 8) Publish AUR package (Arch Linux)
 
@@ -150,7 +150,7 @@ Workflow guardrails:
 
 - release tag must be `vX.Y.Z` format
 - source tarball SHA256 computed from the tagged release
-- PKGBUILD and .SRCINFO pushed to AUR `zeroclaw` package
+- PKGBUILD and .SRCINFO pushed to AUR `daemonclaw` package
 
 ## Emergency / Recovery Path
 

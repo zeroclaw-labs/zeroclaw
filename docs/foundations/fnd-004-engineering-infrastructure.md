@@ -2,7 +2,7 @@
 ### Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
 
 > **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
+> Discussion thread and full revision history: [#5579](https://github.com/DeliveryBoyTech/daemonclaw/issues/5579)
 
 
 ---
@@ -86,13 +86,13 @@ PR #5559 surfaced twelve RUSTSEC-2026 advisories simultaneously. Without tooling
 
 `ci-run.yml` includes a job that runs `scripts/ci/rust_strict_delta_gate.sh` — a custom script that compares clippy output against the base SHA of the PR. The concept is sound: you want to know whether this PR introduced new warnings, not just whether warnings exist in the codebase. The implementation works well for small, focused PRs against a monolithic crate.
 
-A PR that moves 260,000 lines of code across 10 new crates, touching hundreds of files, puts this script in territory it was not designed for. The changed-file surface is too large for an incremental comparison to produce a meaningful signal. The script needs to understand workspace structure — specifically that a change to a file in `crates/zeroclaw-channels/` should be evaluated in the context of that crate, not the root.
+A PR that moves 260,000 lines of code across 10 new crates, touching hundreds of files, puts this script in territory it was not designed for. The changed-file surface is too large for an incremental comparison to produce a meaningful signal. The script needs to understand workspace structure — specifically that a change to a file in `crates/daemonclaw-channels/` should be evaluated in the context of that crate, not the root.
 
 ### 2.5 No Workspace-Aware Caching or Scoping
 
 The current Rust cache configuration (`Swatinem/rust-cache`) is adequate for a single crate. For a multi-crate workspace, cache effectiveness depends on understanding which crates changed and which compiled artifacts can be reused. Without explicit workspace scoping, a change to any crate can invalidate caches that other crates depend on, producing full recompilation on every PR.
 
-More significantly, there is no mechanism for running CI only against the crates affected by a given change. A PR that fixes a typo in `zeroclaw-tool-call-parser` does not need to rebuild and retest the gateway. As the workspace grows toward the 30+ crate model the architecture RFC envisions, the cost of running the full pipeline on every PR becomes a meaningful obstacle to contribution.
+More significantly, there is no mechanism for running CI only against the crates affected by a given change. A PR that fixes a typo in `daemonclaw-tool-call-parser` does not need to rebuild and retest the gateway. As the workspace grows toward the 30+ crate model the architecture RFC envisions, the cost of running the full pipeline on every PR becomes a meaningful obstacle to contribution.
 
 ### 2.6 Action Pinning Is Good — But Undocumented
 
@@ -152,17 +152,17 @@ For a workspace growing toward 30+ crates, running the full test suite on every 
 The mechanism is straightforward: compare the files changed in the PR against the workspace member list, identify which crates contain changed files, expand the set to include all crates that depend on any changed crate (downstream impact), and run tests only for that set.
 
 ```
-PR changes: crates/zeroclaw-tool-call-parser/src/lib.rs
+PR changes: crates/daemonclaw-tool-call-parser/src/lib.rs
 
 Affected crates:
-  zeroclaw-tool-call-parser     ← directly changed
-  zeroclaw-misc                 ← depends on it
-  zeroclawlabs (root)           ← depends on it
+  daemonclaw-tool-call-parser     ← directly changed
+  daemonclaw-misc                 ← depends on it
+  daemonclawlabs (root)           ← depends on it
 
 Not affected:
-  zeroclaw-channels             ← no dependency path
-  zeroclaw-memory               ← no dependency path
-  zeroclaw-providers            ← no dependency path
+  daemonclaw-channels             ← no dependency path
+  daemonclaw-memory               ← no dependency path
+  daemonclaw-providers            ← no dependency path
 ```
 
 This is implemented using `cargo metadata` to extract the dependency graph and a short script to walk it. The full test suite continues to run on pushes to `master` and on release branches. PRs run the affected-crate subset.
@@ -228,7 +228,7 @@ This approach transforms security scanning from a binary pass/fail into a docume
 
 When a new advisory appears in the dependency tree — whether from a PR or from the daily advisory database update — the process is:
 
-1. **Classify the advisory**: Is the affected crate a direct dependency or transitive? Does ZeroClaw call the vulnerable code path? Is there a fixed version available?
+1. **Classify the advisory**: Is the affected crate a direct dependency or transitive? Does DaemonClaw call the vulnerable code path? Is there a fixed version available?
 2. **Determine the response**:
    - *Vulnerability in a direct dep with a fix available* → update the dep, no ignore needed
    - *Vulnerability in a transitive dep with a fix available* → pin the transitive version or wait for the direct dep to update; open a tracking issue
@@ -299,7 +299,7 @@ The architecture RFC §4.4.1 specifies `release-plz` as the release automation t
 
 - On push to `master`, `release-plz` opens a "Release PR" that bumps the workspace version, updates changelogs from conventional commit history, and lists all crates that have changed since the last release
 - When the Release PR is merged, the release pipeline triggers automatically
-- Crates with `version.workspace = true` are bumped together; independently-versioned crates (`zeroclaw-api`, hardware library crates) are handled separately per the versioning policy
+- Crates with `version.workspace = true` are bumped together; independently-versioned crates (`daemonclaw-api`, hardware library crates) are handled separately per the versioning policy
 
 The Release PR serves as a review checkpoint: the team sees exactly what version will be published and what the changelog says before anything goes out. This replaces manual version bumps and the `version-sync.yml` workflow.
 
@@ -330,7 +330,7 @@ The update process: use `dependabot` or `renovate` configured for GitHub Actions
 
 SLSA (Supply-chain Levels for Software Artifacts, pronounced "salsa") is a framework developed by Google and adopted across the industry for securing the software supply chain. It defines four levels of build integrity, from basic to hermetic.
 
-For ZeroClaw's current scale and team size, **SLSA Level 2** is the appropriate target:
+For DaemonClaw's current scale and team size, **SLSA Level 2** is the appropriate target:
 
 - Builds run on a hosted CI platform (already true — GitHub Actions)
 - Build scripts are version-controlled (already true)
@@ -344,7 +344,7 @@ GitHub Actions supports SLSA Level 2 provenance generation natively through the 
 
 The architecture RFC's versioning policy and release-plz integration both depend on conventional commit format for changelog generation. The governance RFC already references PR title conventions. This RFC formalises the connection: conventional commit format in commit messages and PR titles is a requirement, not a suggestion, because it is the input that drives automated changelog generation.
 
-The categories that matter for ZeroClaw's changelog:
+The categories that matter for DaemonClaw's changelog:
 
 | Prefix | Changelog section | Version impact |
 |---|---|---|
@@ -441,7 +441,7 @@ Add `daily-audit.yml` as a scheduled workflow running `cargo deny check advisori
 
 **Theme:** The pipeline understands the workspace. Fast feedback for focused changes.
 
-**Why this phase:** By v0.8.0 the workspace will have grown further. Running the full pipeline on every PR will be increasingly expensive. Contributors to `zeroclaw-tool-call-parser` should not wait 30 minutes for a gateway rebuild.
+**Why this phase:** By v0.8.0 the workspace will have grown further. Running the full pipeline on every PR will be increasingly expensive. Contributors to `daemonclaw-tool-call-parser` should not wait 30 minutes for a gateway rebuild.
 
 #### Deliverables
 
@@ -463,7 +463,7 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 #### Success Metrics for Phase 2
 
-- A PR touching only `zeroclaw-tool-call-parser` runs tests for that crate and its dependents, not the full workspace
+- A PR touching only `daemonclaw-tool-call-parser` runs tests for that crate and its dependents, not the full workspace
 - Cache hit rate on CI above 80% for incremental builds
 - Reusable workflows in place for build, test, and security jobs
 
@@ -473,13 +473,13 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 **Theme:** Release automation that matches the distribution model.
 
-**Why this phase:** Phase 3 of the architecture RFC extracts `zeroclaw-gw` as a separate binary. The first multi-artifact release happens here. The release pipeline must be ready before it is needed.
+**Why this phase:** Phase 3 of the architecture RFC extracts `daemonclaw-gw` as a separate binary. The first multi-artifact release happens here. The release pipeline must be ready before it is needed.
 
 #### Deliverables
 
 **D1: Introduce `release-plz` and remove `version-sync.yml`**
 
-Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `zeroclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
+Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `daemonclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
 
 **D2: Build the structured release pipeline in `release.yml`**
 

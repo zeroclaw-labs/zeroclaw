@@ -1,20 +1,20 @@
 # macOS Update and Uninstall Guide
 
-This page documents supported update and uninstall procedures for ZeroClaw on macOS (OS X).
+This page documents supported update and uninstall procedures for DaemonClaw on macOS (OS X).
 
 Last verified: **February 22, 2026**.
 
 ## 1) Check current install method
 
 ```bash
-which zeroclaw
-zeroclaw --version
+which daemonclaw
+daemonclaw --version
 ```
 
 Typical locations:
 
-- Homebrew: `/opt/homebrew/bin/zeroclaw` (Apple Silicon) or `/usr/local/bin/zeroclaw` (Intel)
-- Cargo/bootstrap/manual: `~/.cargo/bin/zeroclaw`
+- Homebrew: `/opt/homebrew/bin/daemonclaw` (Apple Silicon) or `/usr/local/bin/daemonclaw` (Intel)
+- Cargo/bootstrap/manual: `~/.cargo/bin/daemonclaw`
 
 If both exist, your shell `PATH` order decides which one runs.
 
@@ -24,8 +24,8 @@ If both exist, your shell `PATH` order decides which one runs.
 
 ```bash
 brew update
-brew upgrade zeroclaw
-zeroclaw --version
+brew upgrade daemonclaw
+daemonclaw --version
 ```
 
 ### B) Clone + bootstrap install
@@ -35,7 +35,7 @@ From your local repository checkout:
 ```bash
 git pull --ff-only
 ./install.sh --skip-onboard
-zeroclaw --version
+daemonclaw --version
 ```
 
 ### C) Manual prebuilt binary install
@@ -43,7 +43,7 @@ zeroclaw --version
 Re-run your download/install flow with the latest release asset, then verify:
 
 ```bash
-zeroclaw --version
+daemonclaw --version
 ```
 
 ## 3) Uninstall on macOS
@@ -53,27 +53,27 @@ zeroclaw --version
 This prevents the daemon from continuing to run after binary removal.
 
 ```bash
-zeroclaw service stop || true
-zeroclaw service uninstall || true
+daemonclaw service stop || true
+daemonclaw service uninstall || true
 ```
 
 Service artifacts removed by `service uninstall`:
 
-- `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`
+- `~/Library/LaunchAgents/com.daemonclaw.daemon.plist`
 
 ### B) Remove the binary by install method
 
 Homebrew:
 
 ```bash
-brew uninstall zeroclaw
+brew uninstall daemonclaw
 ```
 
-Cargo/bootstrap/manual (`~/.cargo/bin/zeroclaw`):
+Cargo/bootstrap/manual (`~/.cargo/bin/daemonclaw`):
 
 ```bash
-cargo uninstall zeroclaw || true
-rm -f ~/.cargo/bin/zeroclaw
+cargo uninstall daemonclaw || true
+rm -f ~/.cargo/bin/daemonclaw
 ```
 
 ### C) Optional: remove local runtime data
@@ -81,20 +81,20 @@ rm -f ~/.cargo/bin/zeroclaw
 Only run this if you want a full cleanup of config, auth profiles, logs, and workspace state.
 
 ```bash
-rm -rf ~/.zeroclaw
+rm -rf ~/.daemonclaw
 ```
 
 ## 4) Verify uninstall completed
 
 ```bash
-command -v zeroclaw || echo "zeroclaw binary not found"
-pgrep -fl zeroclaw || echo "No running zeroclaw process"
+command -v daemonclaw || echo "daemonclaw binary not found"
+pgrep -fl daemonclaw || echo "No running daemonclaw process"
 ```
 
 If `pgrep` still finds a process, stop it manually and re-check:
 
 ```bash
-pkill -f zeroclaw
+pkill -f daemonclaw
 ```
 
 ## Related docs

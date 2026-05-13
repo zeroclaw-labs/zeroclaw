@@ -1,6 +1,6 @@
 # Operations & Deployment Docs
 
-For operators running ZeroClaw in persistent or production-like environments.
+For operators running DaemonClaw in persistent or production-like environments.
 
 ## Core Operations
 

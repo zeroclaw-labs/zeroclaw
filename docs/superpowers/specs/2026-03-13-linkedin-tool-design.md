@@ -6,13 +6,13 @@
 
 ## Summary
 
-Native LinkedIn integration tool for ZeroClaw. Enables the agent to create posts,
+Native LinkedIn integration tool for DaemonClaw. Enables the agent to create posts,
 list its own posts, comment, react, delete posts, view post engagement, and retrieve
 profile info — all through LinkedIn's official REST API with OAuth2 authentication.
 
 ## Motivation
 
-Enable ZeroClaw to autonomously publish LinkedIn content on a schedule (via cron),
+Enable DaemonClaw to autonomously publish LinkedIn content on a schedule (via cron),
 drawing from the user's memory, project history, and Medium feed. Removes dependency
 on third-party platforms like Composio for social media posting.
 

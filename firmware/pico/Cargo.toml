@@ -1,4 +1,4 @@
-# ZeroClaw Pico firmware — JSON-over-serial peripheral.
+# DaemonClaw Pico firmware — JSON-over-serial peripheral.
 #
 # Listens for newline-delimited JSON on UART0 (GP0=TX, GP1=RX).
 # Protocol: same as Nucleo/Arduino/ESP32 — ping, capabilities, gpio_read, gpio_write.
@@ -14,7 +14,7 @@ name = "pico"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "ZeroClaw Pico peripheral firmware — GPIO over JSON serial"
+description = "DaemonClaw Pico peripheral firmware — GPIO over JSON serial"
 
 [dependencies]
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "defmt"] }
@@ -26,7 +26,7 @@ defmt = "0.3"
 defmt-rtt = "0.4"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 heapless = { version = "0.9", default-features = false }
-zeroclaw-fw-protocol = { path = "../zeroclaw-fw-protocol" }
+daemonclaw-fw-protocol = { path = "../daemonclaw-fw-protocol" }
 
 [profile.release]
 opt-level = "s"

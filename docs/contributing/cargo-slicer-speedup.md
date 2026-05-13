@@ -32,7 +32,7 @@ cargo +nightly install cargo-slicer --profile release-rustc \
   --bin cargo-slicer-rustc --bin cargo_slicer_dispatch \
   --features rustc-driver
 
-# Build with syn pre-analysis (from zeroclaw root)
+# Build with syn pre-analysis (from daemonclaw root)
 cargo-slicer pre-analyze
 CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
@@ -40,7 +40,7 @@ CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
 
 # Build with MIR-precise analysis (more stubs, bigger savings)
 # Step 1: generate .mir-cache (first build with MIR_PRECISE)
-CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=zeroclaw,zeroclaw_robot_kit \
+CARGO_SLICER_MIR_PRECISE=1 CARGO_SLICER_WORKSPACE_CRATES=daemonclaw,daemonclaw_robot_kit \
   CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
   RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
   cargo +nightly build --release

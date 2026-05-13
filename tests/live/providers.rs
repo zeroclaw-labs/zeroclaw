@@ -3,18 +3,18 @@
 //! All tests in this module require real external API credentials and are
 //! marked with `#[ignore]`. Run with: `cargo test --test live -- --ignored`
 
-use zeroclaw::providers::ProviderRuntimeOptions;
-use zeroclaw::providers::traits::{ChatMessage, Provider};
+use daemonclaw::providers::ProviderRuntimeOptions;
+use daemonclaw::providers::traits::{ChatMessage, Provider};
 
 /// Sends a real multi-turn conversation to OpenAI Codex and verifies
 /// the model retains context from earlier messages.
 ///
-/// Requires valid OAuth credentials in `~/.zeroclaw/`.
+/// Requires valid OAuth credentials in `~/.daemonclaw/`.
 /// Run manually: `cargo test e2e_live_openai_codex_multi_turn -- --ignored`
 #[tokio::test]
 #[ignore = "requires live OpenAI Codex OAuth credentials"]
 async fn e2e_live_openai_codex_multi_turn() {
-    use zeroclaw::providers::openai_codex::OpenAiCodexProvider;
+    use daemonclaw::providers::openai_codex::OpenAiCodexProvider;
 
     let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None).unwrap();
     let model = "gpt-5.3-codex";

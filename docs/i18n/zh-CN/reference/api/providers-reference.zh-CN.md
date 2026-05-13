@@ -1,4 +1,4 @@
-# ZeroClaw 提供商参考文档
+# DaemonClaw 提供商参考文档
 
 本文档映射提供商 ID、别名和凭证环境变量。
 
@@ -7,7 +7,7 @@
 ## 如何列出提供商
 
 ```bash
-zeroclaw providers
+daemonclaw providers
 ```
 
 ## 凭证解析顺序
@@ -16,7 +16,7 @@ zeroclaw providers
 
 1. 配置/CLI 中的显式凭证
 2. 提供商特定的环境变量
-3. 通用回退环境变量：`ZEROCLAW_API_KEY` 然后是 `API_KEY`
+3. 通用回退环境变量：`DAEMONCLAW_API_KEY` 然后是 `API_KEY`
 
 对于弹性回退链（`reliability.fallback_providers`），每个回退提供商独立解析凭证。主提供商的显式凭证不会重用于回退提供商。
 
@@ -81,14 +81,14 @@ zeroclaw providers
 
 - 提供商 ID：`ollama`
 - 通过用户消息图像标记支持视觉输入：``[IMAGE:<source>]``。
-- 多模态归一化后，ZeroClaw 通过 Ollama 原生的 `messages[].images` 字段发送图像负载。
-- 如果选择了不支持视觉的提供商，ZeroClaw 会返回结构化能力错误，而不是静默忽略图像。
+- 多模态归一化后，DaemonClaw 通过 Ollama 原生的 `messages[].images` 字段发送图像负载。
+- 如果选择了不支持视觉的提供商，DaemonClaw 会返回结构化能力错误，而不是静默忽略图像。
 
 ### Ollama 云路由说明
 
 - 仅在使用远程 Ollama 端点时使用 `:cloud` 模型后缀。
 - 远程端点应在 `api_url` 中设置（例如：`https://ollama.com`）。
-- ZeroClaw 会自动归一化 `api_url` 中末尾的 `/api`。
+- DaemonClaw 会自动归一化 `api_url` 中末尾的 `/api`。
 - 如果 `default_model` 以 `:cloud` 结尾，而 `api_url` 是本地的或未设置，配置验证会提前失败并返回可操作的错误。
 - 本地 Ollama 模型发现会故意排除 `:cloud` 条目，以避免在本地模式下选择仅云端可用的模型。
 
@@ -97,7 +97,7 @@ zeroclaw providers
 - 提供商 ID：`llamacpp`（别名：`llama.cpp`）
 - 默认端点：`http://localhost:8080/v1`
 - 默认情况下 API 密钥是可选的；仅当 `llama-server` 使用 `--api-key` 启动时才需要设置 `LLAMACPP_API_KEY`。
-- 模型发现：`zeroclaw models refresh --provider llamacpp`
+- 模型发现：`daemonclaw models refresh --provider llamacpp`
 
 ### SGLang 服务器说明
 
@@ -105,21 +105,21 @@ zeroclaw providers
 - 默认端点：`http://localhost:30000/v1`
 - 默认情况下 API 密钥是可选的；仅当服务器需要认证时才设置 `SGLANG_API_KEY`。
 - 工具调用需要使用 `--tool-call-parser` 启动 SGLang（例如 `hermes`、`llama3`、`qwen25`）。
-- 模型发现：`zeroclaw models refresh --provider sglang`
+- 模型发现：`daemonclaw models refresh --provider sglang`
 
 ### vLLM 服务器说明
 
 - 提供商 ID：`vllm`
 - 默认端点：`http://localhost:8000/v1`
 - 默认情况下 API 密钥是可选的；仅当服务器需要认证时才设置 `VLLM_API_KEY`。
-- 模型发现：`zeroclaw models refresh --provider vllm`
+- 模型发现：`daemonclaw models refresh --provider vllm`
 
 ### Osaurus 服务器说明
 
 - 提供商 ID：`osaurus`
 - 默认端点：`http://localhost:1337/v1`
 - API 密钥默认为 `"osaurus"` 但可选；设置 `OSAURUS_API_KEY` 覆盖或留空实现无密钥访问。
-- 模型发现：`zeroclaw models refresh --provider osaurus`
+- 模型发现：`daemonclaw models refresh --provider osaurus`
 - [Osaurus](https://github.com/dinoki-ai/osaurus) 是适用于 macOS（Apple Silicon）的统一 AI 边缘运行时，将本地 MLX 推理与云提供商代理通过单个端点结合。
 - 同时支持多种 API 格式：兼容 OpenAI（`/v1/chat/completions`）、Anthropic（`/messages`）、Ollama（`/chat`）和开放响应（`/v1/responses`）。
 - 内置 MCP（模型上下文协议）支持，用于工具和上下文服务器连接。
@@ -163,7 +163,7 @@ reasoning_enabled = false
 - 标准提供商 ID：`nvidia`
 - 别名：`nvidia-nim`、`build.nvidia.com`
 - 基础 API URL：`https://integrate.api.nvidia.com/v1`
-- 模型发现：`zeroclaw models refresh --provider nvidia`
+- 模型发现：`daemonclaw models refresh --provider nvidia`
 
 推荐的入门模型 ID（2026年2月18日针对 NVIDIA API 目录验证）：
 
@@ -302,8 +302,8 @@ api_key = \"sk-route-specific\"
 1. 保持调用站点稳定（`hint:reasoning`、`hint:semantic`）。
 2. 仅更改 `[[model_routes]]` 或 `[[embedding_routes]]` 下的目标模型。
 3. 运行：
-   - `zeroclaw doctor`
-   - `zeroclaw status`
+   - `daemonclaw doctor`
+   - `daemonclaw status`
 4. 在部署前冒烟测试一个代表性流程（聊天 + 内存检索）。
 
 这最大程度减少了中断，因为模型 ID 升级时集成和提示不需要更改。

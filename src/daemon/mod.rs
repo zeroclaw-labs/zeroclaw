@@ -1,2 +1,2 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::daemon::*;
+pub use daemonclaw_runtime::daemon::*;

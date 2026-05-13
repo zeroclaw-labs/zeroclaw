@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::telegram::*;
+pub use daemonclaw_channels::telegram::*;

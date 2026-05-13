@@ -44,7 +44,7 @@ model_routing_config = "Alapértelmezett modellbeállítások, forgatókönyv-al
 notion = "Interakció a Notion-nel: adatbázisok lekérdezése, oldalak olvasása/létrehozása/frissítése és munkaterületi keresés."
 pdf_read = "Egyszerű szöveg kinyerése PDF fájlból a munkaterületen. Minden olvasható szöveget visszaad. Csak képeket tartalmazó vagy titkosított PDF-ek üres eredményt adnak. A 'rag-pdf' build funkció szükséges."
 project_intel = "Projektszállítási intelligencia: állapotjelentések generálása, kockázatok felismerése, ügyfélfrissítések vázlata, sprintek összefoglalása és erőfeszítés becslése. Csak olvasható elemzőeszköz."
-proxy_config = "ZeroClaw proxy beállítások kezelése (hatókör: environment | zeroclaw | services), beleértve a runtime és folyamatkörnyezeti alkalmazást"
+proxy_config = "DaemonClaw proxy beállítások kezelése (hatókör: environment | daemonclaw | services), beleértve a runtime és folyamatkörnyezeti alkalmazást"
 pushover = "Pushover értesítés küldése az eszközére. PUSHOVER_TOKEN és PUSHOVER_USER_KEY szükséges a .env fájlban."
 schedule = """Csak shell ütemezett feladatok kezelése. Műveletek: create/add/once/list/get/cancel/remove/pause/resume. FIGYELMEZTETÉS: Ez az eszköz shell feladatokat hoz létre, amelyek kimenete csak naplózva van, NEM kézbesítve semmilyen csatornára. Ütemezett üzenet küldéséhez Discord/Telegram/Slack/Matrix csatornára használja a cron_add eszközt job_type='agent' és kézbesítési konfigurációval, mint {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Képernyőkép készítése az aktuális képernyőről. A fájl elérési útját és base64 kódolású PNG adatokat ad vissza."

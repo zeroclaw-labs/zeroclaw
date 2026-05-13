@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::email_channel::*;
+pub use daemonclaw_channels::email_channel::*;

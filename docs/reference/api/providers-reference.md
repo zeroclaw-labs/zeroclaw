@@ -1,4 +1,4 @@
-# ZeroClaw Providers Reference
+# DaemonClaw Providers Reference
 
 This document maps provider IDs, aliases, and credential environment variables.
 
@@ -7,7 +7,7 @@ Last verified: **March 12, 2026**.
 ## How to List Providers
 
 ```bash
-zeroclaw providers
+daemonclaw providers
 ```
 
 ## Credential Resolution Order
@@ -16,7 +16,7 @@ Runtime resolution order is:
 
 1. Explicit credential from config/CLI
 2. Provider-specific env var(s)
-3. Generic fallback env vars: `ZEROCLAW_API_KEY` then `API_KEY`
+3. Generic fallback env vars: `DAEMONCLAW_API_KEY` then `API_KEY`
 
 For resilient fallback chains (`reliability.fallback_providers`), each fallback
 provider resolves credentials independently. The primary provider's explicit
@@ -24,7 +24,7 @@ credential is not reused for fallback providers.
 
 ## Fallback Provider Chains
 
-ZeroClaw supports automatic failover to alternative providers when the primary encounters:
+DaemonClaw supports automatic failover to alternative providers when the primary encounters:
 
 - Timeout or connection errors
 - Service unavailability (503)
@@ -74,7 +74,7 @@ When OpenAI times out:
 
 ### API Key Rotation on Rate Limits
 
-When a provider returns 429 (rate limit), ZeroClaw:
+When a provider returns 429 (rate limit), DaemonClaw:
 
 1. Rotates to the next API key in `reliability.api_keys` (on the same provider/model)
 2. If all keys exhausted, proceeds to `fallback_providers`
@@ -167,14 +167,14 @@ For detailed setup guidance, see [Multi-Model Setup and Fallback Chains](/docs/g
 
 - Provider ID: `ollama`
 - Vision input is supported through user message image markers: ``[IMAGE:<source>]``.
-- After multimodal normalization, ZeroClaw sends image payloads through Ollama's native `messages[].images` field.
-- If a non-vision provider is selected, ZeroClaw returns a structured capability error instead of silently ignoring images.
+- After multimodal normalization, DaemonClaw sends image payloads through Ollama's native `messages[].images` field.
+- If a non-vision provider is selected, DaemonClaw returns a structured capability error instead of silently ignoring images.
 
 ### Ollama Cloud Routing Notes
 
 - Use `:cloud` model suffix only with a remote Ollama endpoint.
 - Remote endpoint should be set in `api_url` (example: `https://ollama.com`).
-- ZeroClaw normalizes a trailing `/api` in `api_url` automatically.
+- DaemonClaw normalizes a trailing `/api` in `api_url` automatically.
 - If `default_model` ends with `:cloud` while `api_url` is local or unset, config validation fails early with an actionable error.
 - Local Ollama model discovery intentionally excludes `:cloud` entries to avoid selecting cloud-only models in local mode.
 
@@ -183,7 +183,7 @@ For detailed setup guidance, see [Multi-Model Setup and Fallback Chains](/docs/g
 - Provider ID: `llamacpp` (alias: `llama.cpp`)
 - Default endpoint: `http://localhost:8080/v1`
 - API key is optional by default; set `LLAMACPP_API_KEY` only when `llama-server` is started with `--api-key`.
-- Model discovery: `zeroclaw models refresh --provider llamacpp`
+- Model discovery: `daemonclaw models refresh --provider llamacpp`
 
 ### SGLang Server Notes
 
@@ -191,21 +191,21 @@ For detailed setup guidance, see [Multi-Model Setup and Fallback Chains](/docs/g
 - Default endpoint: `http://localhost:30000/v1`
 - API key is optional by default; set `SGLANG_API_KEY` only when the server requires authentication.
 - Tool calling requires launching SGLang with `--tool-call-parser` (e.g. `hermes`, `llama3`, `qwen25`).
-- Model discovery: `zeroclaw models refresh --provider sglang`
+- Model discovery: `daemonclaw models refresh --provider sglang`
 
 ### vLLM Server Notes
 
 - Provider ID: `vllm`
 - Default endpoint: `http://localhost:8000/v1`
 - API key is optional by default; set `VLLM_API_KEY` only when the server requires authentication.
-- Model discovery: `zeroclaw models refresh --provider vllm`
+- Model discovery: `daemonclaw models refresh --provider vllm`
 
 ### Osaurus Server Notes
 
 - Provider ID: `osaurus`
 - Default endpoint: `http://localhost:1337/v1`
 - API key defaults to `"osaurus"` but is optional; set `OSAURUS_API_KEY` to override or leave unset for keyless access.
-- Model discovery: `zeroclaw models refresh --provider osaurus`
+- Model discovery: `daemonclaw models refresh --provider osaurus`
 - [Osaurus](https://github.com/dinoki-ai/osaurus) is a unified AI edge runtime for macOS (Apple Silicon) that combines local MLX inference with cloud provider proxying through a single endpoint.
 - Supports multiple API formats simultaneously: OpenAI-compatible (`/v1/chat/completions`), Anthropic (`/messages`), Ollama (`/chat`), and Open Responses (`/v1/responses`).
 - Built-in MCP (Model Context Protocol) support for tool and context server connectivity.
@@ -249,7 +249,7 @@ Behavior:
 - Canonical provider ID: `nvidia`
 - Aliases: `nvidia-nim`, `build.nvidia.com`
 - Base API URL: `https://integrate.api.nvidia.com/v1`
-- Model discovery: `zeroclaw models refresh --provider nvidia`
+- Model discovery: `daemonclaw models refresh --provider nvidia`
 
 Recommended starter model IDs (verified against NVIDIA API catalog on February 18, 2026):
 
@@ -388,8 +388,8 @@ Recommended workflow:
 1. Keep call sites stable (`hint:reasoning`, `hint:semantic`).
 2. Change only the target model under `[[model_routes]]` or `[[embedding_routes]]`.
 3. Run:
-   - `zeroclaw doctor`
-   - `zeroclaw status`
+   - `daemonclaw doctor`
+   - `daemonclaw status`
 4. Smoke test one representative flow (chat + memory retrieval) before rollout.
 
 This minimizes breakage because integrations and prompts do not need to change when model IDs are upgraded.

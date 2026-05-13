@@ -1,15 +1,15 @@
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: zeroclaw
-  namespace: zeroclaw
+  name: daemonclaw
+  namespace: daemonclaw
   labels:
-    app.kubernetes.io/name: zeroclaw
-    app.kubernetes.io/part-of: zeroclaw
+    app.kubernetes.io/name: daemonclaw
+    app.kubernetes.io/part-of: daemonclaw
 spec:
   to:
     kind: Service
-    name: zeroclaw
+    name: daemonclaw
     weight: 100
   port:
     targetPort: gateway

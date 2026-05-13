@@ -1,17 +1,17 @@
-# Thiết kế Hardware Peripherals — ZeroClaw
+# Thiết kế Hardware Peripherals — DaemonClaw
 
-ZeroClaw cho phép các vi điều khiển (MCU) và máy tính nhúng (SBC) **phân tích lệnh ngôn ngữ tự nhiên theo thời gian thực**, tổng hợp code phù hợp với từng phần cứng, và thực thi tương tác với ngoại vi trực tiếp.
+DaemonClaw cho phép các vi điều khiển (MCU) và máy tính nhúng (SBC) **phân tích lệnh ngôn ngữ tự nhiên theo thời gian thực**, tổng hợp code phù hợp với từng phần cứng, và thực thi tương tác với ngoại vi trực tiếp.
 
 ## 1. Tầm nhìn
 
-**Mục tiêu:** ZeroClaw đóng vai trò là AI agent có hiểu biết về phần cứng, cụ thể:
+**Mục tiêu:** DaemonClaw đóng vai trò là AI agent có hiểu biết về phần cứng, cụ thể:
 - Nhận lệnh ngôn ngữ tự nhiên (ví dụ: "Di chuyển cánh tay X", "Bật LED") qua các kênh như WhatsApp, Telegram
 - Truy xuất tài liệu phần cứng chính xác (datasheet, register map)
 - Tổng hợp code/logic Rust bằng LLM (Gemini, các mô hình mã nguồn mở)
 - Thực thi logic để điều khiển ngoại vi (GPIO, I2C, SPI)
 - Lưu trữ code tối ưu để tái sử dụng về sau
 
-**Hình dung trực quan:** ZeroClaw = bộ não hiểu phần cứng. Ngoại vi = tay chân mà nó điều khiển.
+**Hình dung trực quan:** DaemonClaw = bộ não hiểu phần cứng. Ngoại vi = tay chân mà nó điều khiển.
 
 ## 2. Hai chế độ vận hành
 
@@ -19,11 +19,11 @@ ZeroClaw cho phép các vi điều khiển (MCU) và máy tính nhúng (SBC) **p
 
 **Mục tiêu:** Các board có WiFi (ESP32, Raspberry Pi).
 
-ZeroClaw chạy **trực tiếp trên thiết bị**. Board khởi động server gRPC/nanoRPC và giao tiếp với ngoại vi ngay tại chỗ.
+DaemonClaw chạy **trực tiếp trên thiết bị**. Board khởi động server gRPC/nanoRPC và giao tiếp với ngoại vi ngay tại chỗ.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
+│  DaemonClaw on ESP32 / Raspberry Pi (Edge-Native)                             │
 │                                                                             │
 │  ┌─────────────┐    ┌──────────────┐    ┌─────────────────────────────────┐ │
 │  │ Channels    │───►│ Agent Loop   │───►│ RAG: datasheets, register maps  │ │
@@ -41,7 +41,7 @@ ZeroClaw chạy **trực tiếp trên thiết bị**. Board khởi động serve
 
 **Luồng xử lý:**
 1. Người dùng gửi WhatsApp: *"Turn on LED on pin 13"*
-2. ZeroClaw truy xuất tài liệu theo board (ví dụ: bản đồ GPIO của ESP32)
+2. DaemonClaw truy xuất tài liệu theo board (ví dụ: bản đồ GPIO của ESP32)
 3. LLM tổng hợp code Rust
 4. Code chạy trong sandbox (Wasm hoặc dynamic linking)
 5. GPIO được bật/tắt; kết quả trả về người dùng
@@ -53,11 +53,11 @@ ZeroClaw chạy **trực tiếp trên thiết bị**. Board khởi động serve
 
 **Mục tiêu:** Phần cứng kết nối qua USB / J-Link / Aardvark với máy chủ (macOS, Linux).
 
-ZeroClaw chạy trên **máy chủ** và duy trì kết nối phần cứng tới thiết bị mục tiêu. Dùng cho phát triển, kiểm tra nội tâm, và nạp firmware.
+DaemonClaw chạy trên **máy chủ** và duy trì kết nối phần cứng tới thiết bị mục tiêu. Dùng cho phát triển, kiểm tra nội tâm, và nạp firmware.
 
 ```
 ┌─────────────────────┐                    ┌──────────────────────────────────┐
-│  ZeroClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
+│  DaemonClaw on Mac    │   USB / J-Link /   │  STM32 Nucleo-F401RE              │
 │                     │   Aardvark         │  (or other MCU)                    │
 │  - Channels         │ ◄────────────────► │  - Memory map                     │
 │  - LLM              │                    │  - Peripherals (GPIO, ADC, I2C)    │
@@ -68,17 +68,17 @@ ZeroClaw chạy trên **máy chủ** và duy trì kết nối phần cứng tớ
 
 **Luồng xử lý:**
 1. Người dùng gửi Telegram: *"What are the readable memory addresses on this USB device?"*
-2. ZeroClaw nhận diện phần cứng đang kết nối (VID/PID, kiến trúc)
+2. DaemonClaw nhận diện phần cứng đang kết nối (VID/PID, kiến trúc)
 3. Thực hiện ánh xạ bộ nhớ; gợi ý các vùng địa chỉ khả dụng
 4. Trả kết quả về người dùng
 
 **Hoặc:**
 1. Người dùng: *"Flash this firmware to the Nucleo"*
-2. ZeroClaw ghi/nạp firmware qua OpenOCD hoặc probe-rs
+2. DaemonClaw ghi/nạp firmware qua OpenOCD hoặc probe-rs
 3. Xác nhận thành công
 
 **Hoặc:**
-1. ZeroClaw tự phát hiện: *"STM32 Nucleo on /dev/ttyACM0, ARM Cortex-M4"*
+1. DaemonClaw tự phát hiện: *"STM32 Nucleo on /dev/ttyACM0, ARM Cortex-M4"*
 2. Gợi ý: *"I can read/write GPIO, ADC, flash. What would you like to do?"*
 
 ---
@@ -87,7 +87,7 @@ ZeroClaw chạy trên **máy chủ** và duy trì kết nối phần cứng tớ
 
 | Khía cạnh | Edge-Native | Host-Mediated |
 |-----------|-------------|---------------|
-| ZeroClaw chạy trên | Thiết bị (ESP32, RPi) | Máy chủ (Mac, Linux) |
+| DaemonClaw chạy trên | Thiết bị (ESP32, RPi) | Máy chủ (Mac, Linux) |
 | Kết nối phần cứng | Cục bộ (GPIO, I2C, SPI) | USB, J-Link, Aardvark |
 | LLM | Trên thiết bị hoặc cloud (Gemini) | Máy chủ (cloud hoặc local) |
 | Trường hợp sử dụng | Sản xuất, độc lập | Phát triển, gỡ lỗi, kiểm tra |
@@ -99,11 +99,11 @@ Dành cho các board không có WiFi hoặc trước khi Edge-Native hoàn chỉ
 
 ### Chế độ A: Host + Remote Peripheral (STM32 qua serial)
 
-Máy chủ chạy ZeroClaw; ngoại vi chạy firmware tối giản. JSON đơn giản qua serial.
+Máy chủ chạy DaemonClaw; ngoại vi chạy firmware tối giản. JSON đơn giản qua serial.
 
 ### Chế độ B: RPi làm Host (Native GPIO)
 
-ZeroClaw trên Pi; GPIO qua rppal hoặc sysfs. Không cần firmware riêng.
+DaemonClaw trên Pi; GPIO qua rppal hoặc sysfs. Không cần firmware riêng.
 
 ## 4. Yêu cầu kỹ thuật
 
@@ -139,15 +139,15 @@ ZeroClaw trên Pi; GPIO qua rppal hoặc sysfs. Không cần firmware riêng.
 
 ```bash
 # Edge-Native: run on device (ESP32, RPi)
-zeroclaw agent --mode edge
+daemonclaw agent --mode edge
 
 # Host-Mediated: connect to USB/J-Link target
-zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
-zeroclaw agent --probe jlink
+daemonclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
+daemonclaw agent --probe jlink
 
 # Hardware introspection
-zeroclaw hardware discover
-zeroclaw hardware introspect /dev/ttyACM0
+daemonclaw hardware discover
+daemonclaw hardware introspect /dev/ttyACM0
 ```
 
 ### Config (config.toml)
@@ -171,7 +171,7 @@ transport = "native"
 [[peripherals.boards]]
 board = "esp32"
 transport = "wifi"
-# Edge-Native: ZeroClaw runs on ESP32
+# Edge-Native: DaemonClaw runs on ESP32
 ```
 
 ## 6. Kiến trúc: Peripheral là điểm mở rộng
@@ -194,7 +194,7 @@ pub trait Peripheral: Send + Sync {
 
 ### Luồng xử lý
 
-1. **Khởi động:** ZeroClaw nạp config, đọc `peripherals.boards`.
+1. **Khởi động:** DaemonClaw nạp config, đọc `peripherals.boards`.
 2. **Kết nối:** Với mỗi board, tạo impl `Peripheral`, gọi `connect()`.
 3. **Tools:** Thu thập tools từ tất cả peripheral đã kết nối; gộp với tools mặc định.
 4. **Vòng lặp agent:** Agent có thể gọi `gpio_write`, `sensor_read`, v.v. — các lệnh này chuyển tiếp tới peripheral.
@@ -212,7 +212,7 @@ pub trait Peripheral: Send + Sync {
 
 ### gRPC / nanoRPC (Edge-Native, Host-Mediated)
 
-Dành cho RPC có kiểu dữ liệu, độ trễ thấp giữa ZeroClaw và các peripheral:
+Dành cho RPC có kiểu dữ liệu, độ trễ thấp giữa DaemonClaw và các peripheral:
 
 - **nanoRPC** hoặc **tonic** (gRPC): Dịch vụ định nghĩa bằng Protobuf.
 - Phương thức: `GpioWrite`, `GpioRead`, `I2cTransfer`, `SpiTransfer`, `MemoryRead`, `FlashWrite`, v.v.
@@ -234,25 +234,25 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 
 ## 8. Firmware (Repo hoặc Crate riêng)
 
-- **zeroclaw-firmware** hoặc **zeroclaw-peripheral** — một crate/workspace riêng biệt.
+- **daemonclaw-firmware** hoặc **daemonclaw-peripheral** — một crate/workspace riêng biệt.
 - Targets: `thumbv7em-none-eabihf` (STM32), `armv7-unknown-linux-gnueabihf` (RPi), v.v.
 - Dùng `embassy` hoặc Zephyr cho STM32.
 - Triển khai giao thức nêu trên.
-- Người dùng nạp lên board; ZeroClaw kết nối và tự phát hiện khả năng.
+- Người dùng nạp lên board; DaemonClaw kết nối và tự phát hiện khả năng.
 
 ## 9. Các giai đoạn triển khai
 
 ### Phase 1: Skeleton ✅ (Hoàn thành)
 
-- [x] Thêm trait `Peripheral`, config schema, CLI (`zeroclaw peripheral list/add`)
+- [x] Thêm trait `Peripheral`, config schema, CLI (`daemonclaw peripheral list/add`)
 - [x] Thêm flag `--peripheral` cho agent
 - [x] Ghi tài liệu vào AGENTS.md
 
 ### Phase 2: Host-Mediated — Phát hiện phần cứng ✅ (Hoàn thành)
 
-- [x] `zeroclaw hardware discover`: liệt kê thiết bị USB (VID/PID)
+- [x] `daemonclaw hardware discover`: liệt kê thiết bị USB (VID/PID)
 - [x] Board registry: ánh xạ VID/PID → kiến trúc, tên (ví dụ: Nucleo-F401RE)
-- [x] `zeroclaw hardware introspect <path>`: memory map, danh sách peripheral
+- [x] `daemonclaw hardware introspect <path>`: memory map, danh sách peripheral
 
 ### Phase 3: Host-Mediated — Serial / J-Link
 
@@ -270,7 +270,7 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 
 ### Phase 5: Edge-Native — RPi ✅ (Hoàn thành)
 
-- [x] ZeroClaw trên Raspberry Pi (native GPIO qua rppal)
+- [x] DaemonClaw trên Raspberry Pi (native GPIO qua rppal)
 - [ ] Server gRPC/nanoRPC cho truy cập peripheral cục bộ
 - [ ] Lưu trữ code (lưu các đoạn code đã tổng hợp)
 
@@ -279,7 +279,7 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 - [x] ESP32 qua Host-Mediated (serial transport) — cùng giao thức JSON như STM32
 - [x] Crate firmware `esp32` (`firmware/esp32`) — GPIO qua UART
 - [x] ESP32 trong hardware registry (CH340 VID/PID)
-- [ ] ZeroClaw *chạy trực tiếp trên* ESP32 (WiFi + LLM, edge-native) — tương lai
+- [ ] DaemonClaw *chạy trực tiếp trên* ESP32 (WiFi + LLM, edge-native) — tương lai
 - [ ] Thực thi Wasm hoặc dựa trên template cho logic do LLM tạo ra
 
 **Cách dùng:** Nạp `firmware/esp32` vào ESP32, thêm `board = "esp32"`, `transport = "serial"`, `path = "/dev/ttyUSB0"` vào config.
@@ -298,7 +298,7 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 
 ## 11. Ngoài phạm vi (Hiện tại)
 
-- Chạy ZeroClaw đầy đủ *trực tiếp trên* STM32 bare-metal (không có WiFi, RAM hạn chế) — dùng Host-Mediated thay thế
+- Chạy DaemonClaw đầy đủ *trực tiếp trên* STM32 bare-metal (không có WiFi, RAM hạn chế) — dùng Host-Mediated thay thế
 - Đảm bảo thời gian thực — peripheral hoạt động theo kiểu best-effort
 - Thực thi code native tùy ý từ LLM — ưu tiên Wasm hoặc templates
 
@@ -319,6 +319,6 @@ JSON đơn giản qua serial cho các board không hỗ trợ gRPC:
 
 ## 14. Tóm tắt ý tưởng gốc
 
-> *"Các board như ESP, Raspberry Pi, hoặc các board có WiFi có thể kết nối với LLM (Gemini hoặc mã nguồn mở). ZeroClaw chạy trên thiết bị, tạo gRPC riêng, khởi động nó, và giao tiếp với ngoại vi. Người dùng hỏi qua WhatsApp: 'di chuyển cánh tay X' hoặc 'bật LED'. ZeroClaw lấy tài liệu chính xác, viết code, thực thi, lưu trữ tối ưu, chạy, và bật LED — tất cả trên board phát triển.*
+> *"Các board như ESP, Raspberry Pi, hoặc các board có WiFi có thể kết nối với LLM (Gemini hoặc mã nguồn mở). DaemonClaw chạy trên thiết bị, tạo gRPC riêng, khởi động nó, và giao tiếp với ngoại vi. Người dùng hỏi qua WhatsApp: 'di chuyển cánh tay X' hoặc 'bật LED'. DaemonClaw lấy tài liệu chính xác, viết code, thực thi, lưu trữ tối ưu, chạy, và bật LED — tất cả trên board phát triển.*
 >
-> *Với STM Nucleo kết nối qua USB/J-Link/Aardvark vào Mac: ZeroClaw từ Mac truy cập phần cứng, cài đặt hoặc ghi những gì cần thiết lên thiết bị, và trả kết quả. Ví dụ: 'Hey ZeroClaw, những địa chỉ khả dụng/đọc được trên thiết bị USB này là gì?' Nó có thể tự tìm ra thiết bị nào đang kết nối ở đâu và đưa ra gợi ý."*
+> *Với STM Nucleo kết nối qua USB/J-Link/Aardvark vào Mac: DaemonClaw từ Mac truy cập phần cứng, cài đặt hoặc ghi những gì cần thiết lên thiết bị, và trả kết quả. Ví dụ: 'Hey DaemonClaw, những địa chỉ khả dụng/đọc được trên thiết bị USB này là gì?' Nó có thể tự tìm ra thiết bị nào đang kết nối ở đâu và đưa ra gợi ý."*

@@ -1,4 +1,4 @@
-# The ZeroClaw Maturity Framework
+# The DaemonClaw Maturity Framework
 
 *A letter to whoever finds this.*
 
@@ -8,7 +8,7 @@ If you are reading this, you have found your way into a folder that represents s
 this team is genuinely proud of — not because the documents here are perfect, but
 because they are honest.
 
-ZeroClaw started as something accidental. It was bootstrapped from an existing codebase,
+DaemonClaw started as something accidental. It was bootstrapped from an existing codebase,
 shaped by AI tools working faster than anyone could fully understand, and grew into a
 codebase that was impressively functional and architecturally unplanned. Nobody chose
 that outcome. It accumulated. Most software does.
@@ -46,12 +46,12 @@ code well at the sentence level.
 
 | # | Document | What It Answers | Discussion Thread |
 |---|----------|-----------------|-------------------|
-| 1 | [Intentional Architecture — Microkernel Transition](./fnd-001-intentional-architecture.md) | What are we building, and what shape should it take? | [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) |
-| 2 | [Documentation Standards and Knowledge Architecture](./fnd-002-documentation-standards.md) | How do we record and transfer what we know? | [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576) |
-| 3 | [Team Organization and Project Governance](./fnd-003-governance.md) | How do we coordinate and make decisions together? | [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577) |
-| 4 | [Engineering Infrastructure — CI/CD Pipeline](./fnd-004-engineering-infrastructure.md) | How do we build, test, and ship reliably? | [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579) |
-| 5 | [Contribution Culture — Human Collaboration and AI Partnership](./fnd-005-contribution-culture.md) | How do we work together and grow? | [#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615) |
-| 6 | [Zero Compromise in Practice — Code Health, Error Discipline, and the Production Readiness Standard](./fnd-006-zero-compromise-in-practice.md) | How do we write code that lasts? | [#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653) |
+| 1 | [Intentional Architecture — Microkernel Transition](./fnd-001-intentional-architecture.md) | What are we building, and what shape should it take? | [#5574](https://github.com/DeliveryBoyTech/daemonclaw/issues/5574) |
+| 2 | [Documentation Standards and Knowledge Architecture](./fnd-002-documentation-standards.md) | How do we record and transfer what we know? | [#5576](https://github.com/DeliveryBoyTech/daemonclaw/issues/5576) |
+| 3 | [Team Organization and Project Governance](./fnd-003-governance.md) | How do we coordinate and make decisions together? | [#5577](https://github.com/DeliveryBoyTech/daemonclaw/issues/5577) |
+| 4 | [Engineering Infrastructure — CI/CD Pipeline](./fnd-004-engineering-infrastructure.md) | How do we build, test, and ship reliably? | [#5579](https://github.com/DeliveryBoyTech/daemonclaw/issues/5579) |
+| 5 | [Contribution Culture — Human Collaboration and AI Partnership](./fnd-005-contribution-culture.md) | How do we work together and grow? | [#5615](https://github.com/DeliveryBoyTech/daemonclaw/issues/5615) |
+| 6 | [Zero Compromise in Practice — Code Health, Error Discipline, and the Production Readiness Standard](./fnd-006-zero-compromise-in-practice.md) | How do we write code that lasts? | [#5653](https://github.com/DeliveryBoyTech/daemonclaw/issues/5653) |
 
 The first five documents answer structural and human questions. The sixth answers the
 question that sits inside all of them: given the structure, given the team, given the
@@ -99,7 +99,7 @@ That is the investment this series is making in you. Welcome to the team.
 
 ---
 
-*The ZeroClaw Maturity Framework is a living body of work. New documents are added when
+*The DaemonClaw Maturity Framework is a living body of work. New documents are added when
 the team has learned something worth preserving. Each begins as a public RFC discussion
 and earns its place here through the same process as the six above: open conversation,
 honest disagreement, and the team's collective decision to carry it forward.*

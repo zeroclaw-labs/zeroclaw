@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::gmail_push::*;
+pub use daemonclaw_channels::gmail_push::*;

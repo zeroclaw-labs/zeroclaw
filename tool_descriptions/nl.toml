@@ -44,7 +44,7 @@ model_routing_config = "Standaardmodelinstellingen beheren, scenariogebaseerde p
 notion = "Interactie met Notion: databases bevragen, pagina's lezen/aanmaken/bijwerken en de werkruimte doorzoeken."
 pdf_read = "Platte tekst extraheren uit een PDF-bestand in de werkruimte. Retourneert alle leesbare tekst. PDF's met alleen afbeeldingen of versleutelde PDF's retourneren een leeg resultaat. Vereist de 'rag-pdf' build feature."
 project_intel = "Projectleveringsintelligentie: statusrapporten genereren, risico's detecteren, klantenupdates opstellen, sprints samenvatten en inspanning schatten. Alleen-lezen analysetools."
-proxy_config = "ZeroClaw proxy-instellingen beheren (bereik: environment | zeroclaw | services), inclusief runtime- en procesomgevingstoepassing"
+proxy_config = "DaemonClaw proxy-instellingen beheren (bereik: environment | daemonclaw | services), inclusief runtime- en procesomgevingstoepassing"
 pushover = "Een Pushover-melding naar uw apparaat sturen. Vereist PUSHOVER_TOKEN en PUSHOVER_USER_KEY in het .env-bestand."
 schedule = """Geplande taken (alleen shell) beheren. Acties: create/add/once/list/get/cancel/remove/pause/resume. WAARSCHUWING: Dit gereedschap maakt shell-taken aan waarvan de uitvoer alleen wordt gelogd en NIET wordt bezorgd aan een kanaal. Om een gepland bericht naar Discord/Telegram/Slack/Matrix te sturen, gebruik het cron_add-gereedschap met job_type='agent' en een bezorgconfiguratie zoals {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Een schermafbeelding maken van het huidige scherm. Retourneert het bestandspad en base64-gecodeerde PNG-gegevens."

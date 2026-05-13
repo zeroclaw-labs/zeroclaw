@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       UPSTREAM_REPO: Homebrew/homebrew-core
-      FORMULA_PATH: Formula/z/zeroclaw.rb
+      FORMULA_PATH: Formula/z/daemonclaw.rb
       RELEASE_TAG: ${{ inputs.release_tag }}
       DRY_RUN: ${{ inputs.dry_run }}
       BOT_FORK_REPO: ${{ vars.HOMEBREW_CORE_BOT_FORK_REPO }}
@@ -152,7 +152,7 @@ jobs:
               upstream_ref="master"
             fi
             git -C "$repo_dir" fetch --depth=1 upstream "$upstream_ref"
-            branch_name="zeroclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
+            branch_name="daemonclaw-${RELEASE_TAG}-${GITHUB_RUN_ID}"
             git -C "$repo_dir" checkout -B "$branch_name" "upstream/$upstream_ref"
             echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
           fi
@@ -214,11 +214,11 @@ jobs:
           git -C "$repo_dir" config user.name "$fork_owner"
           git -C "$repo_dir" config user.email "$bot_email"
           git -C "$repo_dir" add "$FORMULA_PATH"
-          git -C "$repo_dir" commit -m "zeroclaw ${TAG_VERSION}"
+          git -C "$repo_dir" commit -m "daemonclaw ${TAG_VERSION}"
           gh auth setup-git
           git -C "$repo_dir" push --set-upstream origin "$BRANCH_NAME"
 
-          pr_body="Automated formula bump from ZeroClaw release workflow.
+          pr_body="Automated formula bump from DaemonClaw release workflow.
 
           - Release tag: ${RELEASE_TAG}
           - Source tarball: ${TARBALL_URL}
@@ -228,7 +228,7 @@ jobs:
             --repo "$UPSTREAM_REPO" \
             --base main \
             --head "${fork_owner}:${BRANCH_NAME}" \
-            --title "zeroclaw ${TAG_VERSION}" \
+            --title "daemonclaw ${TAG_VERSION}" \
             --body "$pr_body"
 
       - name: Summary

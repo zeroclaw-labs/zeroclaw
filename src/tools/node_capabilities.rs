@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::node_capabilities::*;
+pub use daemonclaw_tools::node_capabilities::*;

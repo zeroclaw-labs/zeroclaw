@@ -1,6 +1,6 @@
-//! Mobile entry point for ZeroClaw Desktop (iOS/Android).
+//! Mobile entry point for DaemonClaw Desktop (iOS/Android).
 
 #[tauri::mobile_entry_point]
 fn main() {
-    zeroclaw_desktop::run();
+    daemonclaw_desktop::run();
 }

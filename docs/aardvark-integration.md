@@ -85,7 +85,7 @@ Drop(handle)
 
 **File:** `src/hardware/aardvark.rs`
 
-The rest of ZeroClaw speaks a single language: `ZcCommand` → `ZcResponse`.
+The rest of DaemonClaw speaks a single language: `ZcCommand` → `ZcResponse`.
 `AardvarkTransport` translates between that protocol and the aardvark-sys calls above.
 
 **Algorithm:**
@@ -174,7 +174,7 @@ GpioAardvarkTool.call(args)
 DatasheetTool.call(args)
   → action = args["action"]: "search" | "download" | "list" | "read"
   → "search":   return a Google/vendor search URL for the device
-  → "download": fetch PDF from args["url"] → save to ~/.zeroclaw/hardware/datasheets/
+  → "download": fetch PDF from args["url"] → save to ~/.daemonclaw/hardware/datasheets/
   → "list":     scan the datasheets directory → return filenames
   → "read":     open a saved PDF and return its text
 ```
@@ -259,7 +259,7 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
 ## Full Flow Diagram
 
 ```
- SDK FILES          aardvark-sys            ZeroClaw core
+ SDK FILES          aardvark-sys            DaemonClaw core
  (vendor/)          (crates/)               (src/)
 ─────────────────────────────────────────────────────────────────
 

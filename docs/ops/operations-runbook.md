@@ -1,4 +1,4 @@
-# ZeroClaw Operations Runbook
+# DaemonClaw Operations Runbook
 
 This runbook is for operators who maintain availability, security posture, and incident response.
 
@@ -19,15 +19,15 @@ For first-time installation, start from [one-click-bootstrap.md](../setup-guides
 
 | Mode | Command | When to use |
 |---|---|---|
-| Foreground runtime | `zeroclaw daemon` | local debugging, short-lived sessions |
-| Foreground gateway only | `zeroclaw gateway` | webhook endpoint testing |
-| User service | `zeroclaw service install && zeroclaw service start` | persistent operator-managed runtime |
+| Foreground runtime | `daemonclaw daemon` | local debugging, short-lived sessions |
+| Foreground gateway only | `daemonclaw gateway` | webhook endpoint testing |
+| User service | `daemonclaw service install && daemonclaw service start` | persistent operator-managed runtime |
 | Docker / Podman | `docker compose up -d` | containerized deployment |
 
 ## Docker / Podman Runtime
 
 If you installed via `./install.sh --docker`, the container exits after onboarding. To run
-ZeroClaw as a long-lived container, use the repository `docker-compose.yml` or start a
+DaemonClaw as a long-lived container, use the repository `docker-compose.yml` or start a
 container manually against the persisted data directory.
 
 ### Recommended: docker-compose
@@ -49,27 +49,27 @@ Replace `docker` with `podman` if using Podman.
 
 ```bash
 # Start a new container from the bootstrap image
-docker run -d --name zeroclaw \
+docker run -d --name daemonclaw \
   --restart unless-stopped \
-  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw" \
-  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace" \
-  -e HOME=/zeroclaw-data \
-  -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+  -v "$PWD/.daemonclaw-docker/.daemonclaw:/daemonclaw-data/.daemonclaw" \
+  -v "$PWD/.daemonclaw-docker/workspace:/daemonclaw-data/workspace" \
+  -e HOME=/daemonclaw-data \
+  -e DAEMONCLAW_WORKSPACE=/daemonclaw-data/workspace \
   -p 42617:42617 \
-  zeroclaw-bootstrap:local \
+  daemonclaw-bootstrap:local \
   gateway
 
 # Stop (preserves config and workspace)
-docker stop zeroclaw
+docker stop daemonclaw
 
 # Restart a stopped container
-docker start zeroclaw
+docker start daemonclaw
 
 # View logs
-docker logs -f zeroclaw
+docker logs -f daemonclaw
 
 # Health check
-docker exec zeroclaw zeroclaw status
+docker exec daemonclaw daemonclaw status
 ```
 
 For Podman, add `--userns keep-id --user "$(id -u):$(id -g)"` and append `:Z` to volume mounts.
@@ -86,50 +86,50 @@ For full setup instructions, see [one-click-bootstrap.md](../setup-guides/one-cl
 1. Validate configuration:
 
 ```bash
-zeroclaw status
+daemonclaw status
 ```
 
 2. Verify diagnostics:
 
 ```bash
-zeroclaw doctor
-zeroclaw channel doctor
+daemonclaw doctor
+daemonclaw channel doctor
 ```
 
 3. Start runtime:
 
 ```bash
-zeroclaw daemon
+daemonclaw daemon
 ```
 
 4. For persistent user session service:
 
 ```bash
-zeroclaw service install
-zeroclaw service start
-zeroclaw service status
+daemonclaw service install
+daemonclaw service start
+daemonclaw service status
 ```
 
 ## Health and State Signals
 
 | Signal | Command / File | Expected |
 |---|---|---|
-| Config validity | `zeroclaw doctor` | no critical errors |
-| Channel connectivity | `zeroclaw channel doctor` | configured channels healthy |
-| Runtime summary | `zeroclaw status` | expected provider/model/channels |
-| Daemon heartbeat/state | `~/.zeroclaw/daemon_state.json` | file updates periodically |
+| Config validity | `daemonclaw doctor` | no critical errors |
+| Channel connectivity | `daemonclaw channel doctor` | configured channels healthy |
+| Runtime summary | `daemonclaw status` | expected provider/model/channels |
+| Daemon heartbeat/state | `~/.daemonclaw/daemon_state.json` | file updates periodically |
 
 ## Logs and Diagnostics
 
 ### macOS / Windows (service wrapper logs)
 
-- `~/.zeroclaw/logs/daemon.stdout.log`
-- `~/.zeroclaw/logs/daemon.stderr.log`
+- `~/.daemonclaw/logs/daemon.stdout.log`
+- `~/.daemonclaw/logs/daemon.stderr.log`
 
 ### Linux (systemd user service)
 
 ```bash
-journalctl --user -u zeroclaw.service -f
+journalctl --user -u daemonclaw.service -f
 ```
 
 ## Incident Triage Flow (Fast Path)
@@ -137,25 +137,25 @@ journalctl --user -u zeroclaw.service -f
 1. Snapshot system state:
 
 ```bash
-zeroclaw status
-zeroclaw doctor
-zeroclaw channel doctor
+daemonclaw status
+daemonclaw doctor
+daemonclaw channel doctor
 ```
 
 2. Check service state:
 
 ```bash
-zeroclaw service status
+daemonclaw service status
 ```
 
 3. If service is unhealthy, restart cleanly:
 
 ```bash
-zeroclaw service stop
-zeroclaw service start
+daemonclaw service stop
+daemonclaw service start
 ```
 
-4. If channels still fail, verify allowlists and credentials in `~/.zeroclaw/config.toml`.
+4. If channels still fail, verify allowlists and credentials in `~/.daemonclaw/config.toml`.
 
 5. If gateway is involved, verify bind/auth settings (`[gateway]`) and local reachability.
 
@@ -163,9 +163,9 @@ zeroclaw service start
 
 Before applying config changes:
 
-1. backup `~/.zeroclaw/config.toml`
+1. backup `~/.daemonclaw/config.toml`
 2. apply one logical change at a time
-3. run `zeroclaw doctor`
+3. run `daemonclaw doctor`
 4. restart daemon/service
 5. verify with `status` + `channel doctor`
 

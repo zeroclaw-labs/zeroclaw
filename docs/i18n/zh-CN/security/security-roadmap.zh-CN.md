@@ -1,4 +1,4 @@
-# ZeroClaw 安全改进路线图
+# DaemonClaw 安全改进路线图
 
 > ⚠️ **状态：提案 / 路线图**
 >
@@ -7,7 +7,7 @@
 
 ## 当前状态：坚实基础
 
-ZeroClaw 已经具备**出色的应用层安全**：
+DaemonClaw 已经具备**出色的应用层安全**：
 
 ✅ 命令白名单（而非黑名单）
 ✅ 路径遍历保护
@@ -29,9 +29,9 @@ ZeroClaw 已经具备**出色的应用层安全**：
 
 ---
 
-## 对比：ZeroClaw vs PicoClaw vs 生产级别
+## 对比：DaemonClaw vs PicoClaw vs 生产级别
 
-| 功能 | PicoClaw | 当前 ZeroClaw | 路线图实现后的 ZeroClaw | 生产目标 |
+| 功能 | PicoClaw | 当前 DaemonClaw | 路线图实现后的 DaemonClaw | 生产目标 |
 |---------|----------|--------------|-------------------|-------------------|
 | **二进制大小** | ~8MB | **3.4MB** ✅ | 3.5-4MB | < 5MB |
 | **RAM 占用** | < 10MB | **< 5MB** ✅ | < 10MB | < 20MB |
@@ -97,7 +97,7 @@ ZeroClaw 已经具备**出色的应用层安全**：
 | 渠道的证书固定 | 2 天 | 中 |
 | 签名配置验证 | 2 天 | 中 |
 | 兼容 SIEM 的审计导出 | 2 天 | 中 |
-| 安全自检（`zeroclaw audit --check`） | 1 天 | 低 |
+| 安全自检（`daemonclaw audit --check`） | 1 天 | 低 |
 
 **交付成果：**
 - 可选的基于 Docker 的执行隔离
@@ -129,7 +129,7 @@ max_subprocesses = 10
 # 审计日志
 [security.audit]
 enabled = true
-log_path = \"~/.config/zeroclaw/audit.log\"
+log_path = \"~/.config/daemonclaw/audit.log\"
 sign_events = true
 max_size_mb = 100
 
@@ -149,18 +149,18 @@ max_actions_per_hour = 20
 
 ```bash
 # 安全状态检查
-zeroclaw security --check
+daemonclaw security --check
 # → ✓ Sandbox: Firejail active
 # → ✓ Audit logging enabled (42 events today)
 # → → Resource limits: 512MB mem, 50% CPU
 
 # 审计日志查询
-zeroclaw audit --user @alice --since 24h
-zeroclaw audit --risk high --violations-only
-zeroclaw audit --verify-signatures
+daemonclaw audit --user @alice --since 24h
+daemonclaw audit --risk high --violations-only
+daemonclaw audit --verify-signatures
 
 # 沙箱测试
-zeroclaw sandbox --test
+daemonclaw sandbox --test
 # → Testing isolation...
 #   ✓ Cannot read /etc/passwd
 #   ✓ Cannot access ~/.ssh
@@ -171,18 +171,18 @@ zeroclaw sandbox --test
 
 ## 总结
 
-**ZeroClaw 已经比 PicoClaw 更安全**，具备：
+**DaemonClaw 已经比 PicoClaw 更安全**，具备：
 - 小 50% 的二进制文件（3.4MB vs 8MB）
 - 少 50% 的 RAM 占用（< 5MB vs < 10MB）
 - 快 100 倍的启动速度（< 10ms vs < 1s）
 - 全面的安全策略引擎
 - 广泛的测试覆盖
 
-**通过实现本路线图**，ZeroClaw 将成为：
+**通过实现本路线图**，DaemonClaw 将成为：
 - 具备操作系统级沙箱的生产级产品
 - 具备内存/CPU 防护的资源感知系统
 - 具备防篡改日志的审计就绪系统
 - 具备可配置安全级别的企业级产品
 
 **预计工作量：** 完整实现需要 4-7 周
-**价值：** 将 ZeroClaw 从「适合测试」转变为「适合生产」
+**价值：** 将 DaemonClaw 从「适合测试」转变为「适合生产」

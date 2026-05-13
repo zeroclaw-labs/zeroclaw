@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/docs/assets/daemonclaw-banner.png" alt="DaemonClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Assistente Pessoal de IA</h1>
+<h1 align="center">🦀 DaemonClaw — Assistente Pessoal de IA</h1>
 
 <p align="center">
   <strong>Zero overhead. Zero compromisso. 100% Rust. 100% Agnóstico.</strong><br>
@@ -10,14 +10,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/DeliveryBoyTech/daemonclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.7.1-blue" alt="Version v0.7.1" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.7.1-blue" alt="Version v0.7.1" /></a>
+  <a href="https://github.com/DeliveryBoyTech/daemonclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/DeliveryBoyTech/daemonclaw?color=green" alt="Contributors" /></a>
+  <a href="https://x.com/daemonclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40daemonclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @daemonclawlabs" /></a>
   <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
+  <a href="https://www.reddit.com/r/daemonclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fdaemonclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/daemonclawlabs" /></a>
 </p>
 
 <p align="center">
@@ -59,12 +59,12 @@ Construído por estudantes e membros das comunidades de Harvard, MIT e Sundai.Cl
   <a href="../nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-ZeroClaw é um assistente pessoal de IA que você executa nos seus próprios dispositivos. Ele responde nos canais que você já usa (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work e mais). Tem um painel web para controle em tempo real e pode se conectar a periféricos de hardware (ESP32, STM32, Arduino, Raspberry Pi). O Gateway é apenas o plano de controle — o produto é o assistente.
+DaemonClaw é um assistente pessoal de IA que você executa nos seus próprios dispositivos. Ele responde nos canais que você já usa (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work e mais). Tem um painel web para controle em tempo real e pode se conectar a periféricos de hardware (ESP32, STM32, Arduino, Raspberry Pi). O Gateway é apenas o plano de controle — o produto é o assistente.
 
 Se você quer um assistente pessoal, para um único usuário, que seja local, rápido e sempre ativo, é isso.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Site</a> ·
+  <a href="https://daemonclawlabs.ai">Site</a> ·
   <a href="docs/README.md">Documentação</a> ·
   <a href="docs/architecture.md">Arquitetura</a> ·
   <a href="#início-rápido">Primeiros passos</a> ·
@@ -73,7 +73,7 @@ Se você quer um assistente pessoal, para um único usuário, que seja local, r�
   <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **Configuração preferida:** execute `zeroclaw onboard` no seu terminal. O ZeroClaw Onboard guia você passo a passo na configuração do gateway, workspace, canais e provedor. É o caminho de configuração recomendado e funciona no macOS, Linux e Windows (via WSL2). Nova instalação? Comece aqui: [Primeiros passos](#início-rápido)
+> **Configuração preferida:** execute `daemonclaw onboard` no seu terminal. O DaemonClaw Onboard guia você passo a passo na configuração do gateway, workspace, canais e provedor. É o caminho de configuração recomendado e funciona no macOS, Linux e Windows (via WSL2). Nova instalação? Comece aqui: [Primeiros passos](#início-rápido)
 
 ### Autenticação por assinatura (OAuth)
 
@@ -93,18 +93,18 @@ Requisito: toolchain estável do Rust. Um único binário, sem dependências de 
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install daemonclaw
 ```
 
 ### Bootstrap com um clique
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/DeliveryBoyTech/daemonclaw.git
+cd daemonclaw
 ./install.sh
 ```
 
-`zeroclaw onboard` executa automaticamente após a instalação para configurar seu workspace e provedor.
+`daemonclaw onboard` executa automaticamente após a instalação para configurar seu workspace e provedor.
 
 ## Início rápido (TL;DR)
 
@@ -115,67 +115,67 @@ Guia completo para iniciantes (autenticação, pareamento, canais): [Primeiros p
 ./install.sh --api-key "sk-..." --provider openrouter
 
 # Iniciar o gateway (servidor webhook + painel web)
-zeroclaw gateway                # padrão: 127.0.0.1:42617
-zeroclaw gateway --port 0       # porta aleatória (segurança reforçada)
+daemonclaw gateway                # padrão: 127.0.0.1:42617
+daemonclaw gateway --port 0       # porta aleatória (segurança reforçada)
 
 # Falar com o assistente
-zeroclaw agent -m "Hello, ZeroClaw!"
+daemonclaw agent -m "Hello, DaemonClaw!"
 
 # Modo interativo
-zeroclaw agent
+daemonclaw agent
 
 # Iniciar runtime autônomo completo (gateway + canais + cron + hands)
-zeroclaw daemon
+daemonclaw daemon
 
 # Verificar status
-zeroclaw status
+daemonclaw status
 
 # Executar diagnósticos
-zeroclaw doctor
+daemonclaw doctor
 ```
 
-Atualizando? Execute `zeroclaw doctor` após atualizar.
+Atualizando? Execute `daemonclaw doctor` após atualizar.
 
 ### A partir do código-fonte (desenvolvimento)
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/DeliveryBoyTech/daemonclaw.git
+cd daemonclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+daemonclaw onboard
 ```
 
 > **Alternativa para desenvolvimento (sem instalação global):** prefixe comandos com `cargo run --release --` (exemplo: `cargo run --release -- status`).
 
 ## Migração do OpenClaw
 
-O ZeroClaw pode importar seu workspace, memória e configuração do OpenClaw:
+O DaemonClaw pode importar seu workspace, memória e configuração do OpenClaw:
 
 ```bash
 # Pré-visualizar o que será migrado (seguro, somente leitura)
-zeroclaw migrate openclaw --dry-run
+daemonclaw migrate openclaw --dry-run
 
 # Executar a migração
-zeroclaw migrate openclaw
+daemonclaw migrate openclaw
 ```
 
-Isso migra suas entradas de memória, arquivos do workspace e configuração de `~/.openclaw/` para `~/.zeroclaw/`. A configuração é convertida de JSON para TOML automaticamente.
+Isso migra suas entradas de memória, arquivos do workspace e configuração de `~/.openclaw/` para `~/.daemonclaw/`. A configuração é convertida de JSON para TOML automaticamente.
 
 ## Padrões de segurança (acesso por DM)
 
-O ZeroClaw conecta-se a superfícies de mensagens reais. Trate DMs recebidas como entrada não confiável.
+O DaemonClaw conecta-se a superfícies de mensagens reais. Trate DMs recebidas como entrada não confiável.
 
 Guia completo de segurança: [SECURITY.md](SECURITY.md)
 
 Comportamento padrão em todos os canais:
 
 - **Pareamento por DM** (padrão): remetentes desconhecidos recebem um código de pareamento curto e o bot não processa sua mensagem.
-- Aprovar com: `zeroclaw pairing approve <channel> <code>` (então o remetente é adicionado a uma lista de permitidos local).
+- Aprovar com: `daemonclaw pairing approve <channel> <code>` (então o remetente é adicionado a uma lista de permitidos local).
 - DMs públicas recebidas requerem uma ativação explícita em `config.toml`.
-- Execute `zeroclaw doctor` para detectar políticas de DM arriscadas ou mal configuradas.
+- Execute `daemonclaw doctor` para detectar políticas de DM arriscadas ou mal configuradas.
 
 **Níveis de autonomia:**
 
@@ -196,7 +196,7 @@ Use este quadro para avisos importantes (mudanças incompatíveis, avisos de seg
 
 | Data (UTC) | Nível       | Aviso                                                                                                                                                                                                                                                                                                                                                 | Ação                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Crítico_  | **Não somos afiliados** a `openagen/zeroclaw`, `zeroclaw.org` ou `zeroclaw.net`. Os domínios `zeroclaw.org` e `zeroclaw.net` atualmente apontam para o fork `openagen/zeroclaw`, e esse domínio/repositório estão se passando pelo nosso site/projeto oficial.                                                                                       | Não confie em informações, binários, arrecadações de fundos ou anúncios dessas fontes. Use apenas [este repositório](https://github.com/zeroclaw-labs/zeroclaw) e nossas contas sociais verificadas.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 2026-02-19 | _Crítico_  | **Não somos afiliados** a `openagen/daemonclaw`, `daemonclaw.org` ou `daemonclaw.net`. Os domínios `daemonclaw.org` e `daemonclaw.net` atualmente apontam para o fork `openagen/daemonclaw`, e esse domínio/repositório estão se passando pelo nosso site/projeto oficial.                                                                                       | Não confie em informações, binários, arrecadações de fundos ou anúncios dessas fontes. Use apenas [este repositório](https://github.com/DeliveryBoyTech/daemonclaw) e nossas contas sociais verificadas.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | 2026-02-19 | _Importante_ | A Anthropic atualizou os termos de Autenticação e Uso de Credenciais em 2026-02-19. Os tokens OAuth do Claude Code (Free, Pro, Max) são destinados exclusivamente ao Claude Code e Claude.ai; usar tokens OAuth do Claude Free/Pro/Max em qualquer outro produto, ferramenta ou serviço (incluindo Agent SDK) não é permitido e pode violar os Termos de Serviço do Consumidor. | Por favor, evite temporariamente as integrações OAuth do Claude Code para prevenir perdas potenciais. Cláusula original: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Destaques
@@ -216,18 +216,18 @@ Use este quadro para avisos importantes (mudanças incompatíveis, avisos de seg
 - **Plataforma de skills** — skills incluídos, comunitários e do workspace com auditoria de segurança.
 - **Suporte a túneis** — Cloudflare, Tailscale, ngrok, OpenVPN e túneis personalizados para acesso remoto.
 
-### Por que equipes escolhem o ZeroClaw
+### Por que equipes escolhem o DaemonClaw
 
 - **Leve por padrão:** binário Rust pequeno, inicialização rápida, baixo consumo de memória.
 - **Seguro por design:** pareamento, sandboxing rigoroso, listas de permissão explícitas, escopo do workspace.
 - **Totalmente intercambiável:** sistemas centrais são traits (provedores, canais, ferramentas, memória, túneis).
 - **Sem vendor lock-in:** suporte a provedores compatíveis com OpenAI + endpoints personalizados plugáveis.
 
-## Resumo de benchmarks (ZeroClaw vs OpenClaw, reproduzível)
+## Resumo de benchmarks (DaemonClaw vs OpenClaw, reproduzível)
 
 Benchmark rápido em máquina local (macOS arm64, fev 2026) normalizado para hardware edge de 0.8GHz.
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | DaemonClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **Linguagem**             | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -235,20 +235,20 @@ Benchmark rápido em máquina local (macOS arm64, fev 2026) normalizado para har
 | **Tamanho do binário**    | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
 | **Custo**                 | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Qualquer hardware $10** |
 
-> Notas: Os resultados do ZeroClaw são medidos em builds release usando `/usr/bin/time -l`. O OpenClaw requer o runtime Node.js (tipicamente ~390MB de overhead adicional de memória), enquanto o NanoBot requer o runtime Python. PicoClaw e ZeroClaw são binários estáticos. Os valores de RAM acima são memória em runtime; os requisitos de compilação são maiores.
+> Notas: Os resultados do DaemonClaw são medidos em builds release usando `/usr/bin/time -l`. O OpenClaw requer o runtime Node.js (tipicamente ~390MB de overhead adicional de memória), enquanto o NanoBot requer o runtime Python. PicoClaw e DaemonClaw são binários estáticos. Os valores de RAM acima são memória em runtime; os requisitos de compilação são maiores.
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/daemonclaw-comparison.jpeg" alt="DaemonClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Medição local reproduzível
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/daemonclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/daemonclaw --help
+/usr/bin/time -l target/release/daemonclaw status
 ```
 
 ## Tudo o que construímos até agora
@@ -324,7 +324,7 @@ Painel web React 19 + Vite 6 + Tailwind CSS 4 servido diretamente pelo Gateway:
 
 ## Configuração
 
-`~/.zeroclaw/config.toml` mínimo:
+`~/.daemonclaw/config.toml` mínimo:
 
 ```toml
 default_provider = "anthropic"
@@ -392,35 +392,35 @@ Defina `runtime.kind = "docker"` para sandboxing rigoroso ou isolamento de rede.
 
 ## Autenticação por assinatura (OpenAI Codex / Claude Code / Gemini)
 
-O ZeroClaw suporta perfis de autenticação nativos de assinatura (multi-conta, criptografados em repouso).
+O DaemonClaw suporta perfis de autenticação nativos de assinatura (multi-conta, criptografados em repouso).
 
-- Arquivo de armazenamento: `~/.zeroclaw/auth-profiles.json`
-- Chave de criptografia: `~/.zeroclaw/.secret_key`
+- Arquivo de armazenamento: `~/.daemonclaw/auth-profiles.json`
+- Chave de criptografia: `~/.daemonclaw/.secret_key`
 - Formato de id do perfil: `<provider>:<profile_name>` (exemplo: `openai-codex:work`)
 
 ```bash
 # OpenAI Codex OAuth (assinatura ChatGPT)
-zeroclaw auth login --provider openai-codex --device-code
+daemonclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+daemonclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+daemonclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # Verificar / atualizar / trocar perfil
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+daemonclaw auth status
+daemonclaw auth refresh --provider openai-codex --profile default
+daemonclaw auth use --provider openai-codex --profile work
 
 # Executar o agente com autenticação por assinatura
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+daemonclaw agent --provider openai-codex -m "hello"
+daemonclaw agent --provider anthropic -m "hello"
 ```
 
 ## Workspace do agente + skills
 
-Raiz do workspace: `~/.zeroclaw/workspace/` (configurável via config).
+Raiz do workspace: `~/.daemonclaw/workspace/` (configurável via config).
 
 Arquivos de prompt injetados:
 - `IDENTITY.md` — personalidade e papel do agente
@@ -429,74 +429,74 @@ Arquivos de prompt injetados:
 - `AGENTS.md` — convenções de sessão e regras de inicialização
 - `SOUL.md` — identidade central e princípios operacionais
 
-Skills: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` ou `SKILL.toml`.
+Skills: `~/.daemonclaw/workspace/skills/<skill>/SKILL.md` ou `SKILL.toml`.
 
 ```bash
 # Listar skills instalados
-zeroclaw skills list
+daemonclaw skills list
 
 # Instalar do git
-zeroclaw skills install https://github.com/user/my-skill.git
+daemonclaw skills install https://github.com/user/my-skill.git
 
 # Auditoria de segurança antes de instalar
-zeroclaw skills audit https://github.com/user/my-skill.git
+daemonclaw skills audit https://github.com/user/my-skill.git
 
 # Remover um skill
-zeroclaw skills remove my-skill
+daemonclaw skills remove my-skill
 ```
 
 ## Comandos CLI
 
 ```bash
 # Gerenciamento do workspace
-zeroclaw onboard              # Assistente de configuração guiada
-zeroclaw status               # Mostrar status do daemon/agente
-zeroclaw doctor               # Executar diagnósticos do sistema
+daemonclaw onboard              # Assistente de configuração guiada
+daemonclaw status               # Mostrar status do daemon/agente
+daemonclaw doctor               # Executar diagnósticos do sistema
 
 # Gateway + daemon
-zeroclaw gateway              # Iniciar servidor gateway (127.0.0.1:42617)
-zeroclaw daemon               # Iniciar runtime autônomo completo
+daemonclaw gateway              # Iniciar servidor gateway (127.0.0.1:42617)
+daemonclaw daemon               # Iniciar runtime autônomo completo
 
 # Agente
-zeroclaw agent                # Modo de chat interativo
-zeroclaw agent -m "message"   # Modo de mensagem única
+daemonclaw agent                # Modo de chat interativo
+daemonclaw agent -m "message"   # Modo de mensagem única
 
 # Gerenciamento de serviços
-zeroclaw service install      # Instalar como serviço do SO (launchd/systemd)
-zeroclaw service start|stop|restart|status
+daemonclaw service install      # Instalar como serviço do SO (launchd/systemd)
+daemonclaw service start|stop|restart|status
 
 # Canais
-zeroclaw channel list         # Listar canais configurados
-zeroclaw channel doctor       # Verificar saúde dos canais
-zeroclaw channel bind-telegram 123456789
+daemonclaw channel list         # Listar canais configurados
+daemonclaw channel doctor       # Verificar saúde dos canais
+daemonclaw channel bind-telegram 123456789
 
 # Cron + agendamento
-zeroclaw cron list            # Listar trabalhos agendados
-zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
-zeroclaw cron remove <id>
+daemonclaw cron list            # Listar trabalhos agendados
+daemonclaw cron add "*/5 * * * *" --prompt "Check system health"
+daemonclaw cron remove <id>
 
 # Memória
-zeroclaw memory list          # Listar entradas de memória
-zeroclaw memory get <key>     # Recuperar uma memória
-zeroclaw memory stats         # Estatísticas de memória
+daemonclaw memory list          # Listar entradas de memória
+daemonclaw memory get <key>     # Recuperar uma memória
+daemonclaw memory stats         # Estatísticas de memória
 
 # Perfis de autenticação
-zeroclaw auth login --provider <name>
-zeroclaw auth status
-zeroclaw auth use --provider <name> --profile <profile>
+daemonclaw auth login --provider <name>
+daemonclaw auth status
+daemonclaw auth use --provider <name> --profile <profile>
 
 # Periféricos de hardware
-zeroclaw hardware discover    # Escanear dispositivos conectados
-zeroclaw peripheral list      # Listar periféricos conectados
-zeroclaw peripheral flash     # Flashear firmware no dispositivo
+daemonclaw hardware discover    # Escanear dispositivos conectados
+daemonclaw peripheral list      # Listar periféricos conectados
+daemonclaw peripheral flash     # Flashear firmware no dispositivo
 
 # Migração
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+daemonclaw migrate openclaw --dry-run
+daemonclaw migrate openclaw
 
 # Completação de shell
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(daemonclaw completions bash)
+daemonclaw completions zsh > ~/.zfunc/_daemonclaw
 ```
 
 Referência completa de comandos: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -564,10 +564,10 @@ Referência completa de comandos: [docs/reference/cli/commands-reference.md](doc
 
 #### Instalador em uma linha
 
-Ou pule os passos acima e instale tudo (dependências do sistema, Rust, ZeroClaw) em um único comando:
+Ou pule os passos acima e instale tudo (dependências do sistema, Rust, DaemonClaw) em um único comando:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/install.sh | bash
 ```
 
 #### Requisitos de recursos para compilação
@@ -610,7 +610,7 @@ Os assets de release são publicados para:
 - Windows: `x86_64`
 
 Baixe os últimos assets em:
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/DeliveryBoyTech/daemonclaw/releases/latest>
 
 ## Documentação
 
@@ -620,7 +620,7 @@ Use estes recursos quando tiver passado pelo fluxo de onboarding e quiser a refe
 - Leia a [visão geral da arquitetura](docs/architecture.md) para o modelo completo do sistema.
 - Use a [referência de configuração](docs/reference/api/config-reference.md) quando precisar de cada chave e exemplo.
 - Execute o Gateway conforme o livro com o [runbook operacional](docs/ops/operations-runbook.md).
-- Siga o [ZeroClaw Onboard](#início-rápido) para uma configuração guiada.
+- Siga o [DaemonClaw Onboard](#início-rápido) para uma configuração guiada.
 - Depure falhas comuns com o [guia de solução de problemas](docs/ops/troubleshooting.md).
 - Revise a [orientação de segurança](docs/security/README.md) antes de expor qualquer coisa.
 
@@ -652,12 +652,12 @@ Use estes recursos quando tiver passado pelo fluxo de onboarding e quiser a refe
 
 ## Icy Crab 🦀
 
-O ZeroClaw foi construído para o caranguejo suave 🦀, um assistente de IA rápido e eficiente. Construído por Argenis De La Rosa e a comunidade.
+O DaemonClaw foi construído para o caranguejo suave 🦀, um assistente de IA rápido e eficiente. Construído por Argenis De La Rosa e a comunidade.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [daemonclawlabs.ai](https://daemonclawlabs.ai)
+- [@daemonclawlabs](https://x.com/daemonclawlabs)
 
-## Apoie o ZeroClaw
+## Apoie o DaemonClaw
 
 ### 🙏 Agradecimentos especiais
 
@@ -672,7 +672,7 @@ Estamos construindo abertamente porque as melhores ideias vêm de todos os lugar
 
 ## Contribuir
 
-Novo no ZeroClaw? Procure issues rotulados como [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — veja nosso [Guia de contribuição](CONTRIBUTING.md#first-time-contributors) para saber como começar. PRs com IA/vibe-coded são bem-vindos! 🤖
+Novo no DaemonClaw? Procure issues rotulados como [`good first issue`](https://github.com/DeliveryBoyTech/daemonclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — veja nosso [Guia de contribuição](CONTRIBUTING.md#first-time-contributors) para saber como começar. PRs com IA/vibe-coded são bem-vindos! 🤖
 
 Veja [CONTRIBUTING.md](CONTRIBUTING.md) e [CLA.md](docs/contributing/cla.md). Implemente um trait, envie um PR:
 
@@ -684,26 +684,26 @@ Veja [CONTRIBUTING.md](CONTRIBUTING.md) e [CLA.md](docs/contributing/cla.md). Im
 - Novo `Memory` → `src/memory/`
 - Novo `Tunnel` → `src/tunnel/`
 - Novo `Peripheral` → `src/peripherals/`
-- Novo `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- Novo `Skill` → `~/.daemonclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Repositório oficial e aviso de falsificação
 
-**Este é o único repositório oficial do ZeroClaw:**
+**Este é o único repositório oficial do DaemonClaw:**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/DeliveryBoyTech/daemonclaw
 
-Qualquer outro repositório, organização, domínio ou pacote que afirme ser "ZeroClaw" ou implique afiliação com ZeroClaw Labs **não é autorizado e não é afiliado a este projeto**. Forks não autorizados conhecidos serão listados em [TRADEMARK.md](docs/maintainers/trademark.md).
+Qualquer outro repositório, organização, domínio ou pacote que afirme ser "DaemonClaw" ou implique afiliação com DaemonClaw Labs **não é autorizado e não é afiliado a este projeto**. Forks não autorizados conhecidos serão listados em [TRADEMARK.md](docs/maintainers/trademark.md).
 
-Se encontrar falsificação ou uso indevido de marca, por favor [abra um issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Se encontrar falsificação ou uso indevido de marca, por favor [abra um issue](https://github.com/DeliveryBoyTech/daemonclaw/issues).
 
 ---
 
 ## Licença
 
-O ZeroClaw tem licença dupla para máxima abertura e proteção dos contribuidores:
+O DaemonClaw tem licença dupla para máxima abertura e proteção dos contribuidores:
 
 | Licença | Caso de uso |
 |---|---|
@@ -714,7 +714,7 @@ Você pode escolher qualquer uma das licenças. **Os contribuidores automaticame
 
 ### Marca registrada
 
-O nome e logo do **ZeroClaw** são marcas registradas da ZeroClaw Labs. Esta licença não concede permissão para usá-los para implicar endosso ou afiliação. Veja [TRADEMARK.md](docs/maintainers/trademark.md) para usos permitidos e proibidos.
+O nome e logo do **DaemonClaw** são marcas registradas da DaemonClaw Labs. Esta licença não concede permissão para usá-los para implicar endosso ou afiliação. Veja [TRADEMARK.md](docs/maintainers/trademark.md) para usos permitidos e proibidos.
 
 ### Proteções para contribuidores
 
@@ -725,12 +725,12 @@ O nome e logo do **ZeroClaw** são marcas registradas da ZeroClaw Labs. Esta lic
 
 ---
 
-**ZeroClaw** — Zero overhead. Zero compromisso. Implante em qualquer lugar. Troque qualquer coisa. 🦀
+**DaemonClaw** — Zero overhead. Zero compromisso. Implante em qualquer lugar. Troque qualquer coisa. 🦀
 
 ## Contribuidores
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+<a href="https://github.com/DeliveryBoyTech/daemonclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=DeliveryBoyTech/daemonclaw" alt="DaemonClaw contributors" />
 </a>
 
 Esta lista é gerada a partir do gráfico de contribuidores do GitHub e é atualizada automaticamente.
@@ -738,11 +738,11 @@ Esta lista é gerada a partir do gráfico de contribuidores do GitHub e é atual
 ## Histórico de estrelas
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#DeliveryBoyTech/daemonclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=DeliveryBoyTech/daemonclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

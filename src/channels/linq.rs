@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::linq::*;
+pub use daemonclaw_channels::linq::*;

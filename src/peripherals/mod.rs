@@ -1,6 +1,6 @@
 #[allow(unused_imports)]
 #[cfg(feature = "hardware")]
-pub use zeroclaw_hardware::peripherals::*;
+pub use daemonclaw_hardware::peripherals::*;
 
 use crate::config::{Config, PeripheralBoardConfig};
 use anyhow::Result;
@@ -16,8 +16,8 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
             if boards.is_empty() {
                 println!("No peripherals configured.");
                 println!();
-                println!("Add one with: zeroclaw peripheral add <board> <path>");
-                println!("  Example: zeroclaw peripheral add nucleo-f401re /dev/ttyACM0");
+                println!("Add one with: daemonclaw peripheral add <board> <path>");
+                println!("  Example: daemonclaw peripheral add nucleo-f401re /dev/ttyACM0");
                 println!();
                 println!("Or add to config.toml:");
                 println!("  [peripherals]");

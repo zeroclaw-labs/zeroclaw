@@ -1,20 +1,20 @@
 # One-Click Bootstrap
 
-This page defines the fastest supported path to install and initialize ZeroClaw.
+This page defines the fastest supported path to install and initialize DaemonClaw.
 
 Last verified: **April 12, 2026**.
 
 ## Option 0: Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install daemonclaw
 ```
 
 ## Option A (Recommended): Clone + local script
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/DeliveryBoyTech/daemonclaw.git
+cd daemonclaw
 ./install.sh
 ```
 
@@ -23,12 +23,12 @@ What it does:
 1. Installs Rust via rustup if missing
 2. Validates Rust version against project MSRV
 3. `cargo install --path . --locked --force`
-4. Runs `zeroclaw onboard` (interactive setup wizard)
+4. Runs `daemonclaw onboard` (interactive setup wizard)
 
 ## Option B: Remote one-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DeliveryBoyTech/daemonclaw/master/install.sh | bash
 ```
 
 For high-security environments, prefer Option A so you can review the script before execution.
@@ -57,7 +57,7 @@ Use `--prefix` to install everything into a scratch directory without touching y
 
 ```bash
 ./install.sh --prefix /tmp/zc-test --skip-onboard
-/tmp/zc-test/.cargo/bin/zeroclaw --version
+/tmp/zc-test/.cargo/bin/daemonclaw --version
 
 # Clean up
 rm -rf /tmp/zc-test
@@ -75,7 +75,7 @@ Use `--dry-run` to preview what would happen without building:
 ./install.sh --skip-onboard
 ```
 
-Configure later with `zeroclaw onboard`.
+Configure later with `daemonclaw onboard`.
 
 ## Uninstall
 
@@ -83,17 +83,17 @@ Configure later with `zeroclaw onboard`.
 ./install.sh --uninstall
 ```
 
-Removes the binary and optionally the config/data directory (`~/.zeroclaw/`).
+Removes the binary and optionally the config/data directory (`~/.daemonclaw/`).
 
 ## Pre-built binaries
 
 For pre-built release binaries (no compilation required):
 
 ```bash
-gh release download --repo zeroclaw-labs/zeroclaw --pattern "zeroclaw-$(uname -m)*"
+gh release download --repo DeliveryBoyTech/daemonclaw --pattern "daemonclaw-$(uname -m)*"
 ```
 
-Or download from [GitHub Releases](https://github.com/zeroclaw-labs/zeroclaw/releases/latest).
+Or download from [GitHub Releases](https://github.com/DeliveryBoyTech/daemonclaw/releases/latest).
 
 ## Docker
 

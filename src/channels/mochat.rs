@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::mochat::*;
+pub use daemonclaw_channels::mochat::*;

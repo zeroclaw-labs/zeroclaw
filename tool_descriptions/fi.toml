@@ -43,7 +43,7 @@ model_routing_config = "Hallitse oletusmalliasetuksia, skenaariopohjaisia palvel
 notion = "Vuorovaikutus Notionin kanssa: kyselytietokannat, lue/luo/päivitä sivuja ja hae työtilasta."
 pdf_read = "Poimi teksti PDF-tiedostosta työtilassa. Palauttaa kaiken luettavan tekstin. Pelkkää kuvaa sisältävät tai salatut PDF-tiedostot palauttavat tyhjän tuloksen. Vaatii 'rag-pdf'-käännösominaisuuden."
 project_intel = "Projektin toimituksen tiedustelu: luo tilanneraportteja, tunnista riskejä, luonnostele asiakaspäivityksiä, tiivistä sprintit ja arvioi työmäärä. Vain luku -analyysityökalu."
-proxy_config = "Hallitse ZeroClaw-välityspalvelinasetuksia (laajuus: environment | zeroclaw | services), mukaan lukien suoritusaikainen ja prosessiympäristön soveltaminen"
+proxy_config = "Hallitse DaemonClaw-välityspalvelinasetuksia (laajuus: environment | daemonclaw | services), mukaan lukien suoritusaikainen ja prosessiympäristön soveltaminen"
 pushover = "Lähetä Pushover-ilmoitus laitteeseesi. Vaatii PUSHOVER_TOKEN- ja PUSHOVER_USER_KEY-arvot .env-tiedostossa."
 schedule = """Hallitse ajastettuja shell-tehtäviä. Toiminnot: create/add/once/list/get/cancel/remove/pause/resume. VAROITUS: Tämä työkalu luo shell-tehtäviä, joiden tuloste vain kirjataan lokiin, EIKÄ toimiteta mihinkään kanavaan. Ajastetun viestin lähettämiseen Discordiin/Telegramiin/Slackiin/Matrixiin käytä cron_add-työkalua parametreilla job_type='agent' ja delivery-asetuksella kuten {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Ota kuvakaappaus nykyisestä näytöstä. Palauttaa tiedostopolun ja base64-koodatun PNG-datan."

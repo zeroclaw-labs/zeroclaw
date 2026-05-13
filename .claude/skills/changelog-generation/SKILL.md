@@ -1,11 +1,11 @@
 ---
 name: changelog-generation
-description: "Changelog generation skill for ZeroClaw releases. Use this skill when the user wants to generate a changelog, prepare release notes, or summarize what changed between versions. Trigger on: 'generate changelog', 'changelog for v0.7.x', 'prepare release notes', 'what changed since <tag>', 'write the changelog', 'CHANGELOG-next', 'release notes for the next release'."
+description: "Changelog generation skill for DaemonClaw releases. Use this skill when the user wants to generate a changelog, prepare release notes, or summarize what changed between versions. Trigger on: 'generate changelog', 'changelog for v0.7.x', 'prepare release notes', 'what changed since <tag>', 'write the changelog', 'CHANGELOG-next', 'release notes for the next release'."
 ---
 
-# ZeroClaw Changelog Generation
+# DaemonClaw Changelog Generation
 
-You are generating a human-friendly `CHANGELOG-next.md` for a ZeroClaw release.
+You are generating a human-friendly `CHANGELOG-next.md` for a DaemonClaw release.
 The GitHub CLI (`gh`) is available and authenticated. The local repository is
 checked out and up to date.
 
@@ -123,7 +123,7 @@ git push upstream <branch>
 ```
 
 Replace `vX.Y.Z` with the next release version — ask the user if unsure.
-Push to the open release PR branch on `zeroclaw-labs/zeroclaw`. Do **not** push
+Push to the open release PR branch on `DeliveryBoyTech/daemonclaw`. Do **not** push
 to `master` directly.
 
 ---

@@ -12,7 +12,7 @@
 
 ## 1. 概述
 
-ZeroClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webhook/cron/外围设备事件。
+DaemonClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webhook/cron/外围设备事件。
 
 关键行为：
 
@@ -29,7 +29,7 @@ ZeroClaw 通过统一的 SOP 调度器（`dispatch_sop_event`）路由 MQTT/webh
 ```toml
 [channels_config.mqtt]
 broker_url = \"mqtts://broker.example.com:8883\"  # 明文使用 mqtt://
-client_id = \"zeroclaw-agent-1\"
+client_id = \"daemonclaw-agent-1\"
 topics = [\"sensors/alert\", \"ops/deploy/#\"]
 qos = 1
 username = \"mqtt-user\"      # 可选
@@ -140,4 +140,4 @@ Cron 表达式支持 5、6 或 7 个字段。
 | **Webhook** `401 Unauthorized` | 缺少 bearer 或无效密钥 | 重新配对令牌（`POST /pair`）并验证 `X-Webhook-Secret`（如果配置） |
 | **`/sop/*` 返回 404** | 触发器路径不匹配 | 确保 `SOP.toml` 使用精确路径（例如 `/sop/deploy`） |
 | **SOP 已启动但步骤未执行** | 无活动代理循环的无头触发器 | 运行代理循环执行 `ExecuteStep`，或设计运行在审批点暂停 |
-| **Cron 未触发** | 守护进程未运行或表达式无效 | 运行 `zeroclaw daemon`；检查日志中的 cron 解析警告 |
+| **Cron 未触发** | 守护进程未运行或表达式无效 | 运行 `daemonclaw daemon`；检查日志中的 cron 解析警告 |

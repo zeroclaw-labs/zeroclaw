@@ -177,11 +177,11 @@ async fn dockerignore_excludes_target_directory() {
 
     assert!(is_excluded(&patterns, "target"), "target must be excluded");
     assert!(
-        is_excluded(&patterns, "target/debug/zeroclaw"),
+        is_excluded(&patterns, "target/debug/daemonclaw"),
         "target/debug must be excluded"
     );
     assert!(
-        is_excluded(&patterns, "target/release/zeroclaw"),
+        is_excluded(&patterns, "target/release/daemonclaw"),
         "target/release must be excluded"
     );
 }
@@ -239,7 +239,7 @@ async fn dockerignore_excludes_image_files() {
     let patterns = parse_dockerignore(&content);
 
     assert!(
-        is_excluded(&patterns, "zeroclaw.png"),
+        is_excluded(&patterns, "daemonclaw.png"),
         "*.png files must be excluded"
     );
     assert!(

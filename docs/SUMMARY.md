@@ -1,4 +1,4 @@
-# ZeroClaw Docs Summary (Unified TOC)
+# DaemonClaw Docs Summary (Unified TOC)
 
 This file is the canonical table of contents for the documentation system.
 

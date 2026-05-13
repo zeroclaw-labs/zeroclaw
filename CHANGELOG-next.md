@@ -1,7 +1,7 @@
 # Changelog — v0.6.9 → v0.7.3
 
 > Changes since the **v0.6.9** stable release. This release represents the largest
-> structural overhaul in ZeroClaw's history: the entire codebase has been split into a
+> structural overhaul in DaemonClaw's history: the entire codebase has been split into a
 > proper Cargo workspace of focused crates, a new config schema has shipped with a live
 > migration path, and a wave of channel, provider, and security improvements have landed
 > on top of that foundation.
@@ -10,17 +10,17 @@
 
 ## Highlights
 
-- **Workspace split complete** — ZeroClaw is now a multi-crate Cargo workspace. The
+- **Workspace split complete** — DaemonClaw is now a multi-crate Cargo workspace. The
   monolithic source tree has been decomposed into 12+ focused crates
-  (`zeroclaw-api`, `zeroclaw-runtime`, `zeroclaw-gateway`, `zeroclaw-channels`,
-  `zeroclaw-tools`, `zeroclaw-memory`, `zeroclaw-providers`, `zeroclaw-infra`,
-  `zeroclaw-config`, `zeroclaw-tui`, `zeroclaw-plugins`, `zeroclaw-hardware`).
+  (`daemonclaw-api`, `daemonclaw-runtime`, `daemonclaw-gateway`, `daemonclaw-channels`,
+  `daemonclaw-tools`, `daemonclaw-memory`, `daemonclaw-providers`, `daemonclaw-infra`,
+  `daemonclaw-config`, `daemonclaw-tui`, `daemonclaw-plugins`, `daemonclaw-hardware`).
   The foundation binary now builds at **6.6 MB** with `--no-default-features`.
 
 - **Config V2 schema with automatic migration** — Provider config has moved to a cleaner
-  layout. Running `zeroclaw config migrate` upgrades your existing config in-place,
+  layout. Running `daemonclaw config migrate` upgrades your existing config in-place,
   preserving comments. The old `props` subcommand still works but is now deprecated in
-  favour of `zeroclaw config`.
+  favour of `daemonclaw config`.
 
 - **OpenRouter streaming** — OpenRouterProvider now streams responses token-by-token
   instead of waiting for the full response, matching the experience of native providers.
@@ -36,7 +36,7 @@
   onboarding wizard preservation.
 
 - **GitHub Copilot onboarding** — GitHub Copilot is now selectable as a provider
-  through the onboarding wizard and `zeroclaw config` flow (#5321).
+  through the onboarding wizard and `daemonclaw config` flow (#5321).
 
 - **Authenticated OTLP exporters** — New `otel_headers` config key lets you pass
   custom headers (e.g. `Authorization: Bearer …`) to protected OTLP endpoints (#5700).
@@ -70,7 +70,7 @@
 - **OpenRouterProvider** now supports streaming (#5717). Responses appear token-by-token
   instead of arriving all at once.
 - **GitHub Copilot** is now available as a selectable provider in the onboarding wizard
-  and `zeroclaw config` interactive flow (#5321).
+  and `daemonclaw config` interactive flow (#5321).
 - Fixed: native tool-call messages are now stripped before sending to providers that
   have `native_tool_calling = false`, preventing provider errors (#5762).
 - Fixed: `tool_stream` events are no longer forwarded to non-Z.AI providers in the
@@ -100,9 +100,9 @@
 
 - **Config V2 schema** with a new provider layout (`providers.models`,
   `providers.fallback`, `model_routes`, `embedding_routes`).
-- `zeroclaw config migrate` upgrades a V1 config to V2 in-place, preserving comments
+- `daemonclaw config migrate` upgrades a V1 config to V2 in-place, preserving comments
   and formatting.
-- `zeroclaw config` replaces `zeroclaw props`. The old `props` subcommand is deprecated
+- `daemonclaw config` replaces `daemonclaw props`. The old `props` subcommand is deprecated
   but still functional.
 - Onboarding wizard updated to write V2 provider format directly.
 - Fixed: false "Unknown config key" warnings for `Option<T>` fields and config aliases
@@ -134,7 +134,7 @@
 
 ### Agent & Runtime
 
-- CLI channel factory now registered for interactive mode — `zeroclaw` interactive
+- CLI channel factory now registered for interactive mode — `daemonclaw` interactive
   sessions work again after the workspace split (#5802).
 - Duplicate `ToolCall` events in `turn_streamed` deduplicated; clients no longer see the
   same tool call reported twice (#5746).
@@ -165,7 +165,7 @@
 
 - `install.sh` rewritten from scratch for the workspace split — correctly handles the
   new crate layout and binary paths (#5666).
-- AUR package migrated from `zeroclaw` to `zeroclawlabs` (#5544).
+- AUR package migrated from `daemonclaw` to `daemonclawlabs` (#5544).
 - Daemon supervisor and onboarding launch checks now include the webhook channel (#5799).
 
 ### Dependencies & Security Advisories
@@ -220,15 +220,15 @@ The provider section of `config.toml` has a new layout. V1 configs are still loa
 automatically understood, but the recommended path is to run the migration:
 
 ```sh
-zeroclaw config migrate
+daemonclaw config migrate
 ```
 
 This rewrites your config to V2 in-place. The old format will continue to work in this
 release but will not be supported indefinitely.
 
-### `zeroclaw props` deprecated
+### `daemonclaw props` deprecated
 
-Use `zeroclaw config` instead. The `props` subcommand still works and will not be
+Use `daemonclaw config` instead. The `props` subcommand still works and will not be
 removed in this release, but it will emit a deprecation notice.
 
 ### Slack `channel_id` deprecated
@@ -238,9 +238,9 @@ works but is deprecated in V2.
 
 ### Workspace crate boundaries
 
-If you have any code that depends directly on internal ZeroClaw crate paths (e.g. for
+If you have any code that depends directly on internal DaemonClaw crate paths (e.g. for
 embedding or testing), the crate structure has changed significantly. Refer to
-`AGENTS.md` for the current crate map and stability tiers. `zeroclaw-api` is the stable
+`AGENTS.md` for the current crate map and stability tiers. `daemonclaw-api` is the stable
 extension point — all other crates are Beta or Experimental.
 
 ---

@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::discord::*;
+pub use daemonclaw_channels::discord::*;

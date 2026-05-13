@@ -43,7 +43,7 @@ model_routing_config = "डिफ़ॉल्ट मॉडल सेटिंग
 notion = "Notion के साथ इंटरैक्ट करें: डेटाबेस क्वेरी करें, पेज पढ़ें/बनाएँ/अपडेट करें, और वर्कस्पेस खोजें।"
 pdf_read = "वर्कस्पेस में PDF फ़ाइल से सादा टेक्स्ट निकालें। सभी पठनीय टेक्स्ट लौटाता है। केवल-इमेज या एन्क्रिप्टेड PDF खाली परिणाम लौटाते हैं। 'rag-pdf' बिल्ड फ़ीचर आवश्यक है।"
 project_intel = "प्रोजेक्ट डिलीवरी इंटेलिजेंस: स्थिति रिपोर्ट बनाएँ, जोखिम पहचानें, क्लाइंट अपडेट ड्राफ़्ट करें, स्प्रिंट सारांशित करें, और प्रयास अनुमान लगाएँ। केवल रीड-ओनली विश्लेषण टूल।"
-proxy_config = "ZeroClaw proxy सेटिंग प्रबंधित करें (स्कोप: environment | zeroclaw | services), रनटाइम और प्रोसेस env एप्लिकेशन सहित"
+proxy_config = "DaemonClaw proxy सेटिंग प्रबंधित करें (स्कोप: environment | daemonclaw | services), रनटाइम और प्रोसेस env एप्लिकेशन सहित"
 pushover = "अपने डिवाइस पर Pushover नोटिफ़िकेशन भेजें। .env फ़ाइल में PUSHOVER_TOKEN और PUSHOVER_USER_KEY आवश्यक हैं।"
 schedule = """शेड्यूल्ड shell-ओनली कार्य प्रबंधित करें। एक्शन: create/add/once/list/get/cancel/remove/pause/resume। चेतावनी: यह टूल shell जॉब बनाता है जिनका आउटपुट केवल लॉग किया जाता है, किसी चैनल पर डिलीवर नहीं किया जाता। Discord/Telegram/Slack/Matrix पर शेड्यूल्ड संदेश भेजने के लिए, cron_add टूल का उपयोग करें job_type='agent' और delivery कॉन्फ़िग जैसे {"mode":"announce","channel":"discord","to":"<channel_id>"} के साथ।"""
 screenshot = "वर्तमान स्क्रीन का स्क्रीनशॉट कैप्चर करें। फ़ाइल पथ और base64-एनकोडेड PNG डेटा लौटाता है।"

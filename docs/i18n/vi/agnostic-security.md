@@ -224,7 +224,7 @@ impl SandboxingStrategy {
 
 | Tính năng | Kích thước code | RAM overhead | Trạng thái |
 |---------|-----------|--------------|--------|
-| **ZeroClaw cơ bản** | 3.4MB | <5MB | ✅ Hiện tại |
+| **DaemonClaw cơ bản** | 3.4MB | <5MB | ✅ Hiện tại |
 | **+ Landlock** | +50KB | +100KB | ✅ Linux 5.13+ |
 | **+ Firejail wrapper** | +20KB | +0KB (external) | ✅ Linux + firejail |
 | **+ Memory monitoring** | +30KB | +50KB | ✅ Tất cả nền tảng |
@@ -233,7 +233,7 @@ impl SandboxingStrategy {
 
 ### Tương thích phần cứng $10
 
-| Phần cứng | RAM | ZeroClaw (cơ bản) | ZeroClaw (full security) | Trạng thái |
+| Phần cứng | RAM | DaemonClaw (cơ bản) | DaemonClaw (full security) | Trạng thái |
 |----------|-----|-----------------|--------------------------|--------|
 | **Raspberry Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
 | **Orange Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
@@ -241,13 +241,13 @@ impl SandboxingStrategy {
 | **C.H.I.P.** | 512MB | ✅ 2% | ✅ 2.5% | Hoạt động |
 | **Rock64** | 1GB | ✅ 1% | ✅ 1.2% | Hoạt động |
 
-**Ngay cả với full security, ZeroClaw chỉ dùng <5% RAM trên board $10.**
+**Ngay cả với full security, DaemonClaw chỉ dùng <5% RAM trên board $10.**
 
 ---
 
 ## 5. Tính hoán đổi: mọi thứ vẫn pluggable
 
-### Cam kết chính của ZeroClaw: hoán đổi bất kỳ thứ gì
+### Cam kết chính của DaemonClaw: hoán đổi bất kỳ thứ gì
 
 ```rust
 // Providers (đã pluggable)

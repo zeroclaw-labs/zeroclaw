@@ -14,7 +14,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Agent",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/daemonclaw",
       "args": ["agent"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -23,17 +23,17 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Gateway",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/daemonclaw",
       "args": ["gateway"],
       "cwd": "${workspaceFolder}",
-      "env": { "ZEROCLAW_REQUIRE_PAIRING": "false" },
+      "env": { "DAEMONCLAW_REQUIRE_PAIRING": "false" },
       "preLaunchTask": "Build: Debug"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Daemon",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/daemonclaw",
       "args": ["daemon"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -42,7 +42,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Status",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/daemonclaw",
       "args": ["status"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -51,7 +51,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Onboard",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/daemonclaw",
       "args": ["onboard"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"

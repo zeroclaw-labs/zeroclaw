@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::nostr::*;
+pub use daemonclaw_channels::nostr::*;

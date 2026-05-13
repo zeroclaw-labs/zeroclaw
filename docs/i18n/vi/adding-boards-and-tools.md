@@ -1,17 +1,17 @@
-# Thêm Board và Tool — Hướng dẫn phần cứng ZeroClaw
+# Thêm Board và Tool — Hướng dẫn phần cứng DaemonClaw
 
-Hướng dẫn này giải thích cách thêm board phần cứng mới và tool tùy chỉnh vào ZeroClaw.
+Hướng dẫn này giải thích cách thêm board phần cứng mới và tool tùy chỉnh vào DaemonClaw.
 
 ## Bắt đầu nhanh: Thêm board qua CLI
 
 ```bash
-# Thêm board (cập nhật ~/.zeroclaw/config.toml)
-zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-zeroclaw peripheral add arduino-uno /dev/cu.usbmodem12345
-zeroclaw peripheral add rpi-gpio native   # cho Raspberry Pi GPIO (Linux)
+# Thêm board (cập nhật ~/.daemonclaw/config.toml)
+daemonclaw peripheral add nucleo-f401re /dev/ttyACM0
+daemonclaw peripheral add arduino-uno /dev/cu.usbmodem12345
+daemonclaw peripheral add rpi-gpio native   # cho Raspberry Pi GPIO (Linux)
 
 # Khởi động lại daemon để áp dụng
-zeroclaw daemon --host 127.0.0.1 --port 3000
+daemonclaw daemon --host 127.0.0.1 --port 3000
 ```
 
 ## Các board được hỗ trợ
@@ -26,7 +26,7 @@ zeroclaw daemon --host 127.0.0.1 --port 3000
 
 ## Cấu hình thủ công
 
-Chỉnh sửa `~/.zeroclaw/config.toml`:
+Chỉnh sửa `~/.daemonclaw/config.toml`:
 
 ```toml
 [peripherals]
@@ -76,7 +76,7 @@ builtin_led: 13
 
 ### PDF Datasheets
 
-Với feature `rag-pdf`, ZeroClaw có thể lập chỉ mục file PDF:
+Với feature `rag-pdf`, DaemonClaw có thể lập chỉ mục file PDF:
 
 ```bash
 cargo build --features hardware,rag-pdf
@@ -87,7 +87,7 @@ cargo build --features hardware,rag-pdf
 ## Thêm loại board mới
 
 1. **Tạo datasheet** — `docs/datasheets/my-board.md` với pin aliases và thông tin GPIO.
-2. **Thêm vào config** — `zeroclaw peripheral add my-board /dev/ttyUSB0`
+2. **Thêm vào config** — `daemonclaw peripheral add my-board /dev/ttyUSB0`
 3. **Triển khai peripheral** (tùy chọn) — Với giao thức tùy chỉnh, hãy implement trait `Peripheral` trong `src/peripherals/` và đăng ký trong `create_peripheral_tools`.
 
 Xem `docs/hardware-peripherals-design.md` để hiểu toàn bộ thiết kế.
@@ -102,12 +102,12 @@ Xem `docs/hardware-peripherals-design.md` để hiểu toàn bộ thiết kế.
 
 | Lệnh | Mô tả |
 |------|-------|
-| `zeroclaw peripheral list` | Liệt kê các board đã cấu hình |
-| `zeroclaw peripheral add <board> <path>` | Thêm board (ghi vào config) |
-| `zeroclaw peripheral flash` | Nạp firmware Arduino |
-| `zeroclaw peripheral flash-nucleo` | Nạp firmware Nucleo |
-| `zeroclaw hardware discover` | Liệt kê thiết bị USB |
-| `zeroclaw hardware info` | Thông tin chip qua probe-rs |
+| `daemonclaw peripheral list` | Liệt kê các board đã cấu hình |
+| `daemonclaw peripheral add <board> <path>` | Thêm board (ghi vào config) |
+| `daemonclaw peripheral flash` | Nạp firmware Arduino |
+| `daemonclaw peripheral flash-nucleo` | Nạp firmware Nucleo |
+| `daemonclaw hardware discover` | Liệt kê thiết bị USB |
+| `daemonclaw hardware info` | Thông tin chip qua probe-rs |
 
 ## Xử lý sự cố
 

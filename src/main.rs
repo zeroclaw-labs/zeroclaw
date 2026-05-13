@@ -51,7 +51,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 
 fn print_no_command_help() -> Result<()> {
     println!("No command provided.");
-    println!("Try `zeroclaw onboard` to initialize your workspace.");
+    println!("Try `daemonclaw onboard` to initialize your workspace.");
     println!();
 
     let mut cmd = Cli::command();
@@ -86,7 +86,7 @@ mod cli_input;
 mod commands;
 #[cfg(feature = "agent-runtime")]
 mod rag {
-    pub use zeroclaw::rag::*;
+    pub use daemonclaw::rag::*;
 }
 mod config;
 #[cfg(feature = "agent-runtime")]
@@ -155,7 +155,7 @@ mod verifiable_intent;
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
-pub use zeroclaw::{
+pub use daemonclaw::{
     ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
     MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
 };
@@ -186,9 +186,9 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
-/// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
+/// `DaemonClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
-#[command(name = "zeroclaw")]
+#[command(name = "daemonclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
@@ -247,10 +247,10 @@ Launches an interactive chat session with the configured AI provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  zeroclaw agent                              # interactive session
-  zeroclaw agent -m \"Summarize today's logs\"  # single message
-  zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  daemonclaw agent                              # interactive session
+  daemonclaw agent -m \"Summarize today's logs\"  # single message
+  daemonclaw agent -p anthropic --model claude-sonnet-4-20250514
+  daemonclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
@@ -285,12 +285,12 @@ Start, restart, or inspect the HTTP/WebSocket gateway that accepts \
 incoming webhook events and WebSocket connections.
 
 Examples:
-  zeroclaw gateway start              # start gateway
-  zeroclaw gateway restart            # restart gateway
-  zeroclaw gateway get-paircode       # show pairing code")]
+  daemonclaw gateway start              # start gateway
+  daemonclaw gateway restart            # restart gateway
+  daemonclaw gateway get-paircode       # show pairing code")]
     Gateway {
         #[command(subcommand)]
-        gateway_command: Option<zeroclaw::GatewayCommands>,
+        gateway_command: Option<daemonclaw::GatewayCommands>,
     },
 
     /// Start ACP (Agent Control Protocol) server over stdio
@@ -304,8 +304,8 @@ responses as notifications.
 Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
-  zeroclaw acp                        # start ACP server
-  zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
+  daemonclaw acp                        # start ACP server
+  daemonclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
@@ -320,18 +320,18 @@ Examples:
     #[command(long_about = "\
 Start the long-running autonomous daemon.
 
-Launches the full ZeroClaw runtime: gateway server, all configured \
+Launches the full DaemonClaw runtime: gateway server, all configured \
 channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
-the cron scheduler. This is the recommended way to run ZeroClaw in \
+the cron scheduler. This is the recommended way to run DaemonClaw in \
 production or as an always-on assistant.
 
-Use 'zeroclaw service install' to register the daemon as an OS \
+Use 'daemonclaw service install' to register the daemon as an OS \
 service (systemd/launchd) for auto-start on boot.
 
 Examples:
-  zeroclaw daemon                   # use config defaults
-  zeroclaw daemon -p 9090           # gateway on port 9090
-  zeroclaw daemon --host 127.0.0.1  # localhost only")]
+  daemonclaw daemon                   # use config defaults
+  daemonclaw daemon -p 9090           # gateway on port 9090
+  daemonclaw daemon --host 127.0.0.1  # localhost only")]
     Daemon {
         /// Port to listen on (use 0 for random available port); defaults to config gateway.port
         #[arg(short, long)]
@@ -368,19 +368,19 @@ Examples:
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
-    /// - `zeroclaw estop`
-    /// - `zeroclaw estop --level network-kill`
-    /// - `zeroclaw estop --level domain-block --domain "*.chase.com"`
-    /// - `zeroclaw estop --level tool-freeze --tool shell --tool browser`
-    /// - `zeroclaw estop status`
-    /// - `zeroclaw estop resume --network`
-    /// - `zeroclaw estop resume --domain "*.chase.com"`
-    /// - `zeroclaw estop resume --tool shell`
+    /// - `daemonclaw estop`
+    /// - `daemonclaw estop --level network-kill`
+    /// - `daemonclaw estop --level domain-block --domain "*.chase.com"`
+    /// - `daemonclaw estop --level tool-freeze --tool shell --tool browser`
+    /// - `daemonclaw estop status`
+    /// - `daemonclaw estop resume --network`
+    /// - `daemonclaw estop resume --domain "*.chase.com"`
+    /// - `daemonclaw estop resume --tool shell`
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
 
-        /// Level used when engaging estop from `zeroclaw estop`.
+        /// Level used when engaging estop from `daemonclaw estop`.
         #[arg(long, value_enum)]
         level: Option<EstopLevelArg>,
 
@@ -405,15 +405,15 @@ Cron expressions use the standard 5-field format: \
 override with --tz and an IANA timezone name.
 
 Examples:
-  zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  daemonclaw cron list
+  daemonclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  daemonclaw cron add '*/30 * * * *' 'Check system health' --agent
+  daemonclaw cron add '*/5 * * * *' 'echo ok'
+  daemonclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
+  daemonclaw cron add-every 60000 'Ping heartbeat'
+  daemonclaw cron once 30m 'Run backup in 30 minutes' --agent
+  daemonclaw cron pause <task-id>
+  daemonclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -432,17 +432,17 @@ Examples:
     #[command(long_about = "\
 Manage communication channels.
 
-Add, remove, list, send, and health-check channels that connect ZeroClaw \
+Add, remove, list, send, and health-check channels that connect DaemonClaw \
 to messaging platforms. Supported channel types: telegram, discord, \
 slack, whatsapp, matrix, imessage, email.
 
 Examples:
-  zeroclaw channel list
-  zeroclaw channel doctor
-  zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  zeroclaw channel remove my-bot
-  zeroclaw channel bind-telegram zeroclaw_user
-  zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
+  daemonclaw channel list
+  daemonclaw channel doctor
+  daemonclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  daemonclaw channel remove my-bot
+  daemonclaw channel bind-telegram daemonclaw_user
+  daemonclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
@@ -487,12 +487,12 @@ Enumerate connected USB devices, identify known development boards \
 probe-rs / ST-Link.
 
 Examples:
-  zeroclaw hardware discover
-  zeroclaw hardware introspect /dev/ttyACM0
-  zeroclaw hardware info --chip STM32F401RETx")]
+  daemonclaw hardware discover
+  daemonclaw hardware introspect /dev/ttyACM0
+  daemonclaw hardware info --chip STM32F401RETx")]
     Hardware {
         #[command(subcommand)]
-        hardware_command: zeroclaw::HardwareCommands,
+        hardware_command: daemonclaw::HardwareCommands,
     },
 
     /// Manage hardware peripherals (STM32, RPi GPIO, etc.)
@@ -504,14 +504,14 @@ to the agent (GPIO, sensors, actuators). Supported boards: \
 nucleo-f401re, rpi-gpio, esp32, arduino-uno.
 
 Examples:
-  zeroclaw peripheral list
-  zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
-  zeroclaw peripheral add rpi-gpio native
-  zeroclaw peripheral flash --port /dev/cu.usbmodem12345
-  zeroclaw peripheral flash-nucleo")]
+  daemonclaw peripheral list
+  daemonclaw peripheral add nucleo-f401re /dev/ttyACM0
+  daemonclaw peripheral add rpi-gpio native
+  daemonclaw peripheral flash --port /dev/cu.usbmodem12345
+  daemonclaw peripheral flash-nucleo")]
     Peripheral {
         #[command(subcommand)]
-        peripheral_command: zeroclaw::PeripheralCommands,
+        peripheral_command: daemonclaw::PeripheralCommands,
     },
 
     /// Manage agent memory (list, get, stats, clear)
@@ -523,11 +523,11 @@ Supports filtering by category and session, pagination, and \
 batch clearing with confirmation.
 
 Examples:
-  zeroclaw memory stats
-  zeroclaw memory list
-  zeroclaw memory list --category core --limit 10
-  zeroclaw memory get <key>
-  zeroclaw memory clear --category conversation --yes")]
+  daemonclaw memory stats
+  daemonclaw memory list
+  daemonclaw memory list --category core --limit 10
+  daemonclaw memory get <key>
+  daemonclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
@@ -535,7 +535,7 @@ Examples:
 
     /// Manage configuration
     #[command(long_about = "\
-Manage ZeroClaw configuration.
+Manage DaemonClaw configuration.
 
 View, set, or initialize config properties by dotted path. \
 Use 'schema' to dump the full JSON Schema for the config file.
@@ -545,18 +545,18 @@ Secret fields (API keys, tokens) automatically use masked input.
 Enum fields offer interactive selection when value is omitted.
 
 Examples:
-  zeroclaw config list                                  # list all properties
-  zeroclaw config list --secrets                        # list only secrets
-  zeroclaw config list --filter channels.matrix         # filter by prefix
-  zeroclaw config get channels.matrix.mention-only      # get a value
-  zeroclaw config set channels.matrix.mention-only true # set a value
-  zeroclaw config set channels.matrix.access-token      # secret: masked input
-  zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
-  zeroclaw config init channels.matrix                  # init section with defaults
-  zeroclaw config schema                                # print JSON Schema to stdout
-  zeroclaw config schema > schema.json
+  daemonclaw config list                                  # list all properties
+  daemonclaw config list --secrets                        # list only secrets
+  daemonclaw config list --filter channels.matrix         # filter by prefix
+  daemonclaw config get channels.matrix.mention-only      # get a value
+  daemonclaw config set channels.matrix.mention-only true # set a value
+  daemonclaw config set channels.matrix.access-token      # secret: masked input
+  daemonclaw config set channels.matrix.stream-mode       # enum: interactive select
+  daemonclaw config init channels.matrix                  # init section with defaults
+  daemonclaw config schema                                # print JSON Schema to stdout
+  daemonclaw config schema > schema.json
 
-Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
+Property path tab completion is included automatically in `daemonclaw completions <shell>`.")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -564,7 +564,7 @@ Property path tab completion is included automatically in `zeroclaw completions 
 
     /// Check for and apply updates
     #[command(long_about = "\
-Check for and apply ZeroClaw updates.
+Check for and apply DaemonClaw updates.
 
 By default, downloads and installs the latest release with a \
 6-phase pipeline: preflight, download, backup, validate, swap, \
@@ -575,10 +575,10 @@ Use --force to skip the confirmation prompt.
 Use --version to target a specific release instead of latest.
 
 Examples:
-  zeroclaw update                      # download and install latest
-  zeroclaw update --check              # check only, don't install
-  zeroclaw update --force              # install without confirmation
-  zeroclaw update --version 0.6.0      # install specific version")]
+  daemonclaw update                      # download and install latest
+  daemonclaw update --check              # check only, don't install
+  daemonclaw update --force              # install without confirmation
+  daemonclaw update --version 0.6.0      # install specific version")]
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
@@ -593,15 +593,15 @@ Examples:
 
     /// Run diagnostic self-tests
     #[command(long_about = "\
-Run diagnostic self-tests to verify the ZeroClaw installation.
+Run diagnostic self-tests to verify the DaemonClaw installation.
 
 By default, runs the full test suite including network checks \
 (gateway health, memory round-trip). Use --quick to skip network \
 checks for faster offline validation.
 
 Examples:
-  zeroclaw self-test             # full suite
-  zeroclaw self-test --quick     # quick checks only (no network)")]
+  daemonclaw self-test             # full suite
+  daemonclaw self-test --quick     # quick checks only (no network)")]
     SelfTest {
         /// Run quick checks only (no network)
         #[arg(long)]
@@ -610,14 +610,14 @@ Examples:
 
     /// Generate shell completion script to stdout
     #[command(long_about = "\
-Generate shell completion scripts for `zeroclaw`.
+Generate shell completion scripts for `daemonclaw`.
 
 The script is printed to stdout so it can be sourced directly:
 
 Examples:
-  source <(zeroclaw completions bash)
-  zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  source <(daemonclaw completions bash)
+  daemonclaw completions zsh > ~/.zfunc/_daemonclaw
+  daemonclaw completions fish > ~/.config/fish/completions/daemonclaw.fish")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -626,7 +626,7 @@ Examples:
 
     /// Launch or install the companion desktop app
     #[command(long_about = "\
-Launch the ZeroClaw companion desktop app.
+Launch the DaemonClaw companion desktop app.
 
 The companion app is a lightweight menu bar / system tray application \
 that connects to the same gateway as the CLI. It provides quick access \
@@ -635,15 +635,15 @@ to the dashboard, status monitoring, and device pairing.
 Use --install to download the pre-built companion app for your platform.
 
 Examples:
-  zeroclaw desktop              # launch the companion app
-  zeroclaw desktop --install    # download and install it")]
+  daemonclaw desktop              # launch the companion app
+  daemonclaw desktop --install    # download and install it")]
     Desktop {
         /// Download and install the companion app
         #[arg(long)]
         install: bool,
     },
 
-    /// Deprecated: use `zeroclaw config` instead
+    /// Deprecated: use `daemonclaw config` instead
     #[command(hide = true)]
     Props {
         #[command(subcommand)]
@@ -659,7 +659,7 @@ Examples:
 }
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
-/// `zeroclaw props <anything>` and print a deprecation message.
+/// `daemonclaw props <anything>` and print a deprecation message.
 #[derive(Subcommand, Debug)]
 enum DeprecatedPropsCommands {
     #[command(external_subcommand)]
@@ -951,7 +951,7 @@ async fn main() -> Result<()> {
             bail!("--config-dir cannot be empty");
         }
         // SAFETY: called early in main before any threads are spawned.
-        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
+        unsafe { std::env::set_var("DAEMONCLAW_CONFIG_DIR", config_dir) };
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
@@ -987,10 +987,10 @@ async fn main() -> Result<()> {
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
     // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
-    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
+    // or set DAEMONCLAW_INTERACTIVE=1 to force interactive mode when TTY
     // detection fails.  This means `curl … | bash` and
-    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
-    // `zeroclaw onboard` in a terminal launches the wizard.
+    // `daemonclaw onboard --api-key …` both take the fast path, while a bare
+    // `daemonclaw onboard` in a terminal launches the wizard.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         force,
@@ -1031,15 +1031,15 @@ async fn main() -> Result<()> {
 
         // Handle --reinit: backup and reset configuration
         if reinit {
-            let (zeroclaw_dir, _) =
+            let (daemonclaw_dir, _) =
                 crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
-            if zeroclaw_dir.exists() {
+            if daemonclaw_dir.exists() {
                 let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-                let backup_dir = format!("{}.backup.{}", zeroclaw_dir.display(), timestamp);
+                let backup_dir = format!("{}.backup.{}", daemonclaw_dir.display(), timestamp);
 
-                println!("⚠️  Reinitializing ZeroClaw configuration...");
-                println!("   Current config directory: {}", zeroclaw_dir.display());
+                println!("⚠️  Reinitializing DaemonClaw configuration...");
+                println!("   Current config directory: {}", daemonclaw_dir.display());
                 println!(
                     "   This will back up your existing config to: {}",
                     backup_dir
@@ -1059,7 +1059,7 @@ async fn main() -> Result<()> {
                 println!();
 
                 // Rename existing directory as backup
-                tokio::fs::rename(&zeroclaw_dir, &backup_dir)
+                tokio::fs::rename(&daemonclaw_dir, &backup_dir)
                     .await
                     .with_context(|| {
                         format!("Failed to backup existing config to {}", backup_dir)
@@ -1075,7 +1075,7 @@ async fn main() -> Result<()> {
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
+        let env_interactive = std::env::var("DAEMONCLAW_INTERACTIVE").as_deref() == Ok("1");
 
         // TUI onboarding mode (ratatui-based)
         if use_tui {
@@ -1118,7 +1118,7 @@ async fn main() -> Result<()> {
         }
 
         // Auto-start channels if user said yes during wizard
-        if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
+        if std::env::var("DAEMONCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             Box::pin(channels::start_channels(config)).await?;
         }
         return Ok(());
@@ -1139,7 +1139,7 @@ async fn main() -> Result<()> {
         let (_validator, enrollment_uri) =
             security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
         if let Some(uri) = enrollment_uri {
-            println!("Initialized OTP secret for ZeroClaw.");
+            println!("Initialized OTP secret for DaemonClaw.");
             println!("Enrollment URI: {uri}");
         }
     }
@@ -1167,7 +1167,7 @@ async fn main() -> Result<()> {
                 config.ensure_fallback_provider().temperature = Some(final_temperature);
 
                 let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
-                let provider = zeroclaw::providers::create_provider(
+                let provider = daemonclaw::providers::create_provider(
                     provider_name,
                     config
                         .providers
@@ -1235,8 +1235,8 @@ async fn main() -> Result<()> {
             });
 
             // Wire CLI channel for interactive mode
-            zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+            daemonclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
+                Box::new(daemonclaw_channels::cli::CliChannel::new())
             }));
 
             Box::pin(agent::run(
@@ -1271,10 +1271,10 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { gateway_command } => {
             match gateway_command {
-                Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
+                Some(daemonclaw::GatewayCommands::Restart { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
-                    info!("🔄 Restarting ZeroClaw Gateway on {addr}");
+                    info!("🔄 Restarting DaemonClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
                     match shutdown_gateway(&host, port).await {
@@ -1307,7 +1307,7 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
+                Some(daemonclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
 
@@ -1350,12 +1350,12 @@ async fn main() -> Result<()> {
                             println!("   Error: {e}");
                             println!();
                             println!("   Is the gateway running? Start it with:");
-                            println!("     zeroclaw gateway start");
+                            println!("     daemonclaw gateway start");
                         }
                     }
                     Ok(())
                 }
-                Some(zeroclaw::GatewayCommands::Start { port, host }) => {
+                Some(daemonclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
@@ -1383,30 +1383,30 @@ async fn main() -> Result<()> {
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                info!("🧠 Starting DaemonClaw Daemon on {host} (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                info!("🧠 Starting DaemonClaw Daemon on {host}:{port}");
             }
             // Wire CLI channel for interactive mode
             #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+            daemonclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
+                Box::new(daemonclaw_channels::cli::CliChannel::new())
             }));
 
-            // Wire peripheral tools from zeroclaw-hardware
+            // Wire peripheral tools from daemonclaw-hardware
             #[cfg(feature = "hardware")]
-            zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+            daemonclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
                 Box::pin(async move {
-                    zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                    daemonclaw_hardware::peripherals::create_peripheral_tools(&config).await
                 })
             }));
 
             // Wire cron delivery to the channels orchestrator
             #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+            daemonclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
                 |config, channel, target, output| {
                     Box::pin(async move {
-                        zeroclaw_channels::orchestrator::deliver_announcement(
+                        daemonclaw_channels::orchestrator::deliver_announcement(
                             &config, &channel, &target, &output,
                         )
                         .await
@@ -1418,26 +1418,26 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "gateway")]
                 gateway_start: Some(Box::new(|host, port, config, tx| {
                     Box::pin(async move {
-                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
+                        Box::pin(daemonclaw_gateway::run_gateway(&host, port, config, tx)).await
                     })
                 })),
                 #[cfg(not(feature = "gateway"))]
                 gateway_start: None,
                 channels_start: Some(Box::new(|config| {
                     Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
+                        Box::pin(daemonclaw_channels::orchestrator::start_channels(config)).await
                     })
                 })),
                 mqtt_start: Some(Box::new(|mqtt_config| {
                     Box::pin(async move {
                         use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                        use daemonclaw_config::schema::SopConfig;
+                        use daemonclaw_memory::NoneMemory;
+                        use daemonclaw_runtime::sop::{SopAuditLogger, SopEngine};
 
                         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
                         let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
-                        zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                        daemonclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                             &mqtt_config,
                             engine,
                             audit,
@@ -1473,7 +1473,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            println!("🦀 ZeroClaw Status");
+            println!("🦀 DaemonClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.workspace_dir.display());
@@ -1737,17 +1737,17 @@ async fn main() -> Result<()> {
         Commands::Desktop {
             install: do_install,
         } => {
-            let download_url = "https://www.zeroclawlabs.ai/download";
+            let download_url = "https://www.daemonclawlabs.ai/download";
 
             if do_install {
-                println!("Download the ZeroClaw companion app:");
+                println!("Download the DaemonClaw companion app:");
                 println!();
                 #[cfg(target_os = "macos")]
                 {
                     println!("  macOS:  {download_url}");
                     println!();
                     println!("Or install via Homebrew (coming soon):");
-                    println!("  brew install --cask zeroclaw");
+                    println!("  brew install --cask daemonclaw");
                 }
                 #[cfg(target_os = "linux")]
                 {
@@ -1779,13 +1779,13 @@ async fn main() -> Result<()> {
             let desktop_bin = {
                 let mut found = None;
 
-                // 1. macOS: check /Applications/ZeroClaw.app
+                // 1. macOS: check /Applications/DaemonClaw.app
                 #[cfg(target_os = "macos")]
                 {
                     let app_paths = [
-                        PathBuf::from("/Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                        PathBuf::from("/Applications/DaemonClaw.app/Contents/MacOS/DaemonClaw"),
                         PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                            .join("Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                            .join("Applications/DaemonClaw.app/Contents/MacOS/DaemonClaw"),
                     ];
                     for app in &app_paths {
                         if app.is_file() {
@@ -1798,19 +1798,19 @@ async fn main() -> Result<()> {
                 // 2. Same directory as the current executable
                 if found.is_none() {
                     if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
+                        let sibling = exe.with_file_name("daemonclaw-desktop");
                         if sibling.is_file() {
                             found = Some(sibling);
                         }
                     }
                 }
 
-                // 3. ~/.cargo/bin/zeroclaw-desktop or ~/.local/bin/zeroclaw-desktop
+                // 3. ~/.cargo/bin/daemonclaw-desktop or ~/.local/bin/daemonclaw-desktop
                 if found.is_none() {
                     if let Some(home) = std::env::var_os("HOME") {
                         let home = PathBuf::from(home);
                         for dir in &[".cargo/bin", ".local/bin"] {
-                            let candidate = home.join(dir).join("zeroclaw-desktop");
+                            let candidate = home.join(dir).join("daemonclaw-desktop");
                             if candidate.is_file() {
                                 found = Some(candidate);
                                 break;
@@ -1821,7 +1821,7 @@ async fn main() -> Result<()> {
 
                 // 4. Fallback to PATH lookup
                 if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
+                    if let Ok(path) = which::which("daemonclaw-desktop") {
                         found = Some(path);
                     }
                 }
@@ -1831,17 +1831,17 @@ async fn main() -> Result<()> {
 
             match desktop_bin {
                 Some(bin) => {
-                    println!("Launching ZeroClaw companion app...");
+                    println!("Launching DaemonClaw companion app...");
                     let _child = std::process::Command::new(&bin)
                         .spawn()
                         .with_context(|| format!("Failed to launch {}", bin.display()))?;
                     Ok(())
                 }
                 None => {
-                    println!("ZeroClaw companion app is not installed.");
+                    println!("DaemonClaw companion app is not installed.");
                     println!();
                     println!("  Download it at: {download_url}");
-                    println!("  Or run: zeroclaw desktop --install");
+                    println!("  Or run: daemonclaw desktop --install");
                     println!();
                     println!("The companion app is a lightweight menu bar app that");
                     println!("connects to the same gateway as the CLI.");
@@ -1950,7 +1950,7 @@ async fn main() -> Result<()> {
                 if no_interactive {
                     let val = value.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
+                            "Value required in --no-interactive mode. Usage: daemonclaw config set --no-interactive {path} <value>"
                         )
                     })?;
                     config.set_prop(&path, &val)?;
@@ -2025,7 +2025,7 @@ async fn main() -> Result<()> {
                             .join(", ");
                         config.set_prop(&path, &val)?;
                     } else {
-                        anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
+                        anyhow::bail!("Value required. Usage: daemonclaw config set {path} <value>");
                     }
                 }
                 config.save().await?;
@@ -2045,7 +2045,7 @@ async fn main() -> Result<()> {
                         println!("  {name}");
                     }
                     config.save().await?;
-                    println!("\nRun `zeroclaw config list` to review, then set required fields.");
+                    println!("\nRun `daemonclaw config list` to review, then set required fields.");
                 }
                 Ok(())
             }
@@ -2086,7 +2086,7 @@ async fn main() -> Result<()> {
 
         Commands::Props { .. } => {
             anyhow::bail!(
-                "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                "`daemonclaw props` has been renamed to `daemonclaw config`. \
                  Replace `props` with `config` in your command and try again."
             );
         }
@@ -2094,7 +2094,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let host = daemonclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("No plugins installed.");
@@ -2112,19 +2112,19 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let mut host = daemonclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
                 host.install(&source)?;
                 println!("Plugin installed from {source}");
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let mut host = daemonclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
                 host.remove(&name)?;
                 println!("Plugin '{name}' removed.");
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let host = daemonclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!("Plugin: {} v{}", info.name, info.version);
@@ -2155,7 +2155,7 @@ fn build_wizard_callbacks() -> onboard::WizardCallbacks {
             println!(
                 "  {} {}",
                 style("ℹ").dim(),
-                style("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).").dim()
+                style("DaemonClaw can talk to physical hardware (LEDs, sensors, motors).").dim()
             );
             println!(
                 "  {} {}",
@@ -2164,7 +2164,7 @@ fn build_wizard_callbacks() -> onboard::WizardCallbacks {
             );
             println!();
 
-            let devices = zeroclaw_hardware::discover_hardware();
+            let devices = daemonclaw_hardware::discover_hardware();
 
             if devices.is_empty() {
                 println!(
@@ -2213,21 +2213,21 @@ fn build_wizard_callbacks() -> onboard::WizardCallbacks {
                 "☁️  Software Only — no hardware access (default)",
             ];
 
-            let recommended = zeroclaw_hardware::recommended_wizard_default(&devices);
+            let recommended = daemonclaw_hardware::recommended_wizard_default(&devices);
 
             let choice = Select::new()
-                .with_prompt("  How should ZeroClaw interact with the physical world?")
+                .with_prompt("  How should DaemonClaw interact with the physical world?")
                 .items(&options)
                 .default(recommended)
                 .interact()?;
 
-            let mut hw_config = zeroclaw_hardware::config_from_wizard_choice(choice, &devices);
+            let mut hw_config = daemonclaw_hardware::config_from_wizard_choice(choice, &devices);
 
-            use zeroclaw_config::schema::HardwareTransport;
+            use daemonclaw_config::schema::HardwareTransport;
 
             // Serial: pick a port if multiple found
             if hw_config.transport_mode() == HardwareTransport::Serial {
-                let serial_devices: Vec<&zeroclaw_hardware::DiscoveredDevice> = devices
+                let serial_devices: Vec<&daemonclaw_hardware::DiscoveredDevice> = devices
                     .iter()
                     .filter(|d| d.transport == HardwareTransport::Serial)
                     .collect();
@@ -2409,7 +2409,7 @@ fn handle_estop_command(
                 let (validator, enrollment_uri) =
                     security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
                 if let Some(uri) = enrollment_uri {
-                    println!("Initialized OTP secret for ZeroClaw.");
+                    println!("Initialized OTP secret for DaemonClaw.");
                     println!("Enrollment URI: {uri}");
                 }
                 Some(validator)
@@ -2540,20 +2540,20 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     match shell {
         CompletionShell::Bash => {
             generate(shells::Bash, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic config path completion
+            // Wrap clap's _daemonclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw config get/set paths
-if type _zeroclaw &>/dev/null; then
-    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
-    _zeroclaw() {{
+# Dynamic completion for daemonclaw config get/set paths
+if type _daemonclaw &>/dev/null; then
+    _daemonclaw_clap_orig() {{ _daemonclaw "$@"; }}
+    _daemonclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
         if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
-            COMPREPLY=($(compgen -W "$(zeroclaw config complete "$cur" 2>/dev/null)" -- "$cur"))
+            COMPREPLY=($(compgen -W "$(daemonclaw config complete "$cur" 2>/dev/null)" -- "$cur"))
             return
         fi
-        _zeroclaw_clap_orig "$@"
+        _daemonclaw_clap_orig "$@"
     }}
 fi"#
             )?;
@@ -2563,28 +2563,28 @@ fi"#
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw config get/set paths
-complete -c zeroclaw -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from get set' \
-    -a '(zeroclaw config complete (commandline -ct) 2>/dev/null)' -f"#
+# Dynamic completion for daemonclaw config get/set paths
+complete -c daemonclaw -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from get set' \
+    -a '(daemonclaw config complete (commandline -ct) 2>/dev/null)' -f"#
             )?;
         }
         CompletionShell::Zsh => {
             generate(shells::Zsh, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic config path completion
+            // Wrap clap's _daemonclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw config get/set paths
-if (( $+functions[_zeroclaw] )); then
-    functions[_zeroclaw_clap_orig]=$functions[_zeroclaw]
-    _zeroclaw() {{
+# Dynamic completion for daemonclaw config get/set paths
+if (( $+functions[_daemonclaw] )); then
+    functions[_daemonclaw_clap_orig]=$functions[_daemonclaw]
+    _daemonclaw() {{
         if [[ "${{words[*]}}" == *"config "(get|set)* ]] && (( CURRENT > 3 )); then
             local -a props
-            props=(${{(f)"$(zeroclaw config complete "$words[CURRENT]" 2>/dev/null)"}})
+            props=(${{(f)"$(daemonclaw config complete "$words[CURRENT]" 2>/dev/null)"}})
             compadd -a props
             return
         fi
-        _zeroclaw_clap_orig "$@"
+        _daemonclaw_clap_orig "$@"
     }}
 fi"#
             )?;
@@ -2611,9 +2611,9 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 /// Log gateway startup message.
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
-        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+        info!("🚀 Starting DaemonClaw Gateway on {host} (random port)");
     } else {
-        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+        info!("🚀 Starting DaemonClaw Gateway on {host}:{port}");
     }
 }
 
@@ -2986,7 +2986,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider gemini --profile {profile}`"
+                                "Run `daemonclaw auth paste-redirect --provider gemini --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3079,7 +3079,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         Err(e) => {
                             println!("Callback capture failed: {e}");
                             println!(
-                                "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
+                                "Run `daemonclaw auth paste-redirect --provider openai-codex --profile {profile}`"
                             );
                             return Ok(());
                         }
@@ -3117,7 +3117,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "openai-codex" => {
                     let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
+                            "No pending OpenAI login found. Run `daemonclaw auth login --provider openai-codex` first."
                         )
                     })?;
 
@@ -3161,7 +3161,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 "gemini" => {
                     let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
+                            "No pending Gemini login found. Run `daemonclaw auth login --provider gemini` first."
                         )
                     })?;
 
@@ -3279,7 +3279,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
+                                "No OpenAI Codex auth profile found. Run `daemonclaw auth login --provider openai-codex`."
                             )
                         }
                     }
@@ -3297,7 +3297,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                         }
                         None => {
                             bail!(
-                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
+                                "No Gemini auth profile found. Run `daemonclaw auth login --provider gemini`."
                             )
                         }
                     }
@@ -3381,7 +3381,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 async fn run_gateway_if_enabled(
     host: &str,
     port: u16,
-    config: zeroclaw::config::Config,
+    config: daemonclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
     Box::pin(gateway::run_gateway(host, port, config, tx)).await
@@ -3392,7 +3392,7 @@ async fn run_gateway_if_enabled(
 async fn run_gateway_if_enabled(
     _host: &str,
     _port: u16,
-    _config: zeroclaw::config::Config,
+    _config: daemonclaw::config::Config,
     _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
@@ -3437,7 +3437,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
-            "zeroclaw",
+            "daemonclaw",
             "onboard",
             "--provider",
             "openrouter",
@@ -3471,7 +3471,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
-            let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
+            let cli = Cli::try_parse_from(["daemonclaw", "completions", shell])
                 .expect("completions invocation should parse");
             match cli.command {
                 Commands::Completions { .. } => {}
@@ -3488,7 +3488,7 @@ mod tests {
             .expect("completion generation should succeed");
         let script = String::from_utf8(output).expect("completion output should be valid utf-8");
         assert!(
-            script.contains("zeroclaw"),
+            script.contains("daemonclaw"),
             "completion script should reference binary name"
         );
     }
@@ -3496,7 +3496,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_force_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
+        let cli = Cli::try_parse_from(["daemonclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
 
         match cli.command {
@@ -3509,13 +3509,13 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+        assert!(Cli::try_parse_from(["daemonclaw", "onboard", "--interactive"]).is_err());
     }
 
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_parses_quick_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
+        let cli = Cli::try_parse_from(["daemonclaw", "onboard", "--quick"])
             .expect("onboard --quick should parse");
 
         match cli.command {
@@ -3529,7 +3529,7 @@ mod tests {
     fn onboard_cli_quick_and_channels_only_conflict() {
         // --quick and --channels-only should both parse at the CLI level
         // (the conflict is checked at runtime), but we verify both flags parse.
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--channels-only"]);
+        let cli = Cli::try_parse_from(["daemonclaw", "onboard", "--quick", "--channels-only"]);
         assert!(
             cli.is_ok(),
             "--quick --channels-only should parse at CLI level"
@@ -3539,7 +3539,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_bare_parses() {
-        let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
+        let cli = Cli::try_parse_from(["daemonclaw", "onboard"]).expect("bare onboard should parse");
 
         match cli.command {
             Commands::Onboard { .. } => {}
@@ -3550,7 +3550,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn cli_parses_estop_default_engage() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
+        let cli = Cli::try_parse_from(["daemonclaw", "estop"]).expect("estop command should parse");
 
         match cli.command {
             Commands::Estop {
@@ -3571,7 +3571,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn cli_parses_estop_resume_domain() {
-        let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
+        let cli = Cli::try_parse_from(["daemonclaw", "estop", "resume", "--domain", "*.chase.com"])
             .expect("estop resume command should parse");
 
         match cli.command {
@@ -3586,7 +3586,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
+        let cli = Cli::try_parse_from(["daemonclaw", "agent", "--temperature", "0.5"])
             .expect("agent command with temperature should parse");
 
         match cli.command {
@@ -3600,7 +3600,7 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_without_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
+        let cli = Cli::try_parse_from(["daemonclaw", "agent", "--message", "hello"])
             .expect("agent command without temperature should parse");
 
         match cli.command {
@@ -3615,7 +3615,7 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_session_state_file() {
         let cli =
-            Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
+            Cli::try_parse_from(["daemonclaw", "agent", "--session-state-file", "session.json"])
                 .expect("agent command with session state file should parse");
 
         match cli.command {

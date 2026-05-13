@@ -1,6 +1,6 @@
-# ZeroClaw ESP32 Firmware
+# DaemonClaw ESP32 Firmware
 
-Peripheral firmware for ESP32 — speaks the same JSON-over-serial protocol as the STM32 firmware. Flash this to your ESP32, then configure ZeroClaw on the host to connect via serial.
+Peripheral firmware for ESP32 — speaks the same JSON-over-serial protocol as the STM32 firmware. Flash this to your ESP32, then configure DaemonClaw on the host to connect via serial.
 
 **New to this?** See [SETUP.md](SETUP.md) for step-by-step commands and troubleshooting.
 
@@ -77,4 +77,4 @@ Default GPIO 2 and 13 are configured for output. Edit `src/main.rs` to add more 
 
 ## Edge-Native (Future)
 
-Phase 6 also envisions ZeroClaw running *on* the ESP32 (WiFi + LLM). This firmware is the host-mediated serial peripheral; edge-native will be a separate crate.
+Phase 6 also envisions DaemonClaw running *on* the ESP32 (WiFi + LLM). This firmware is the host-mediated serial peripheral; edge-native will be a separate crate.

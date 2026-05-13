@@ -1,33 +1,33 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daemonclaw-config", "crates/daemonclaw-providers", "crates/daemonclaw-memory", "crates/daemonclaw-channels", "crates/daemonclaw-tools", "crates/daemonclaw-runtime", "crates/daemonclaw-tui", "crates/daemonclaw-plugins", "crates/daemonclaw-gateway", "crates/daemonclaw-hardware", "crates/daemonclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/daemonclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
 version = "0.7.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository = "https://github.com/DeliveryBoyTech/daemonclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
+daemonclaw-api = { path = "crates/daemonclaw-api", version = "0.7.3" }
+daemonclaw-infra = { path = "crates/daemonclaw-infra", version = "0.7.3" }
+daemonclaw-config = { path = "crates/daemonclaw-config", version = "0.7.3", default-features = false }
+daemonclaw-providers = { path = "crates/daemonclaw-providers", version = "0.7.3" }
+daemonclaw-memory = { path = "crates/daemonclaw-memory", version = "0.7.3" }
+daemonclaw-channels = { path = "crates/daemonclaw-channels", version = "0.7.3", default-features = false }
+daemonclaw-tools = { path = "crates/daemonclaw-tools", version = "0.7.3" }
+daemonclaw-runtime = { path = "crates/daemonclaw-runtime", version = "0.7.3", default-features = false }
+daemonclaw-tui = { path = "crates/daemonclaw-tui", version = "0.7.3" }
+daemonclaw-plugins = { path = "crates/daemonclaw-plugins", version = "0.7.3" }
+daemonclaw-gateway = { path = "crates/daemonclaw-gateway", version = "0.7.3" }
+daemonclaw-hardware = { path = "crates/daemonclaw-hardware", version = "0.7.3" }
+daemonclaw-tool-call-parser = { path = "crates/daemonclaw-tool-call-parser", version = "0.7.3" }
+daemonclaw-macros = { path = "crates/daemonclaw-macros", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
-name = "zeroclawlabs"
+name = "daemonclawlabs"
 # Publishing blocked during microkernel workspace transition — see #5811.
 # All 14 workspace sub-crates are publish = false and therefore unresolvable
 # on crates.io. Flip or remove this once the multi-crate publish topology is
@@ -55,29 +55,29 @@ include = [
 ]
 
 [[bin]]
-name = "zeroclaw"
+name = "daemonclaw"
 path = "src/main.rs"
 
 [lib]
-name = "zeroclaw"
+name = "daemonclaw"
 path = "src/lib.rs"
 
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
-zeroclaw-api.workspace = true
-zeroclaw-infra.workspace = true
-zeroclaw-config.workspace = true
-zeroclaw-providers.workspace = true
-zeroclaw-memory.workspace = true
-zeroclaw-channels = { workspace = true, optional = true }
-zeroclaw-tools = { workspace = true, optional = true }
-zeroclaw-runtime = { workspace = true, optional = true }
-zeroclaw-tui = { workspace = true, optional = true }
-zeroclaw-plugins = { workspace = true, optional = true }
-zeroclaw-gateway = { workspace = true, optional = true }
-zeroclaw-hardware = { workspace = true, optional = true }
-zeroclaw-tool-call-parser.workspace = true
-zeroclaw-macros.workspace = true
+daemonclaw-api.workspace = true
+daemonclaw-infra.workspace = true
+daemonclaw-config.workspace = true
+daemonclaw-providers.workspace = true
+daemonclaw-memory.workspace = true
+daemonclaw-channels = { workspace = true, optional = true }
+daemonclaw-tools = { workspace = true, optional = true }
+daemonclaw-runtime = { workspace = true, optional = true }
+daemonclaw-tui = { workspace = true, optional = true }
+daemonclaw-plugins = { workspace = true, optional = true }
+daemonclaw-gateway = { workspace = true, optional = true }
+daemonclaw-hardware = { workspace = true, optional = true }
+daemonclaw-tool-call-parser.workspace = true
+daemonclaw-macros.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -240,7 +240,7 @@ default = [
 # The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:daemonclaw-runtime", "dep:daemonclaw-channels", "dep:daemonclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",
@@ -262,57 +262,57 @@ agent-runtime = [
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
-gateway = ["dep:zeroclaw-gateway"]
-tui-onboarding = ["dep:zeroclaw-tui"]
-schema-export = ["zeroclaw-config/schema-export"]
+gateway = ["dep:daemonclaw-gateway"]
+tui-onboarding = ["dep:daemonclaw-tui"]
+schema-export = ["daemonclaw-config/schema-export"]
 
-# Channels — each forwards directly to zeroclaw-channels (1 hop)
-channel-email = ["zeroclaw-channels/channel-email"]
-channel-telegram = ["zeroclaw-channels/channel-telegram"]
-channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
-channel-matrix = ["zeroclaw-channels/channel-matrix"]
-channel-discord = ["zeroclaw-channels/channel-discord"]
-channel-slack = ["zeroclaw-channels/channel-slack"]
-channel-signal = ["zeroclaw-channels/channel-signal"]
-channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
-channel-irc = ["zeroclaw-channels/channel-irc"]
-channel-imessage = ["zeroclaw-channels/channel-imessage"]
-channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
-channel-qq = ["zeroclaw-channels/channel-qq"]
-channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
-channel-twitter = ["zeroclaw-channels/channel-twitter"]
-channel-reddit = ["zeroclaw-channels/channel-reddit"]
-channel-notion = ["zeroclaw-channels/channel-notion"]
-channel-linq = ["zeroclaw-channels/channel-linq"]
-channel-wati = ["zeroclaw-channels/channel-wati"]
-channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
-channel-mochat = ["zeroclaw-channels/channel-mochat"]
-channel-wecom = ["zeroclaw-channels/channel-wecom"]
-channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
-channel-webhook = ["zeroclaw-channels/channel-webhook"]
-channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
-channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
-channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+# Channels — each forwards directly to daemonclaw-channels (1 hop)
+channel-email = ["daemonclaw-channels/channel-email"]
+channel-telegram = ["daemonclaw-channels/channel-telegram"]
+channel-lark = ["daemonclaw-channels/channel-lark"]
+channel-nostr = ["daemonclaw-channels/channel-nostr", "daemonclaw-runtime/channel-nostr", "dep:nostr-sdk"]
+channel-matrix = ["daemonclaw-channels/channel-matrix"]
+channel-discord = ["daemonclaw-channels/channel-discord"]
+channel-slack = ["daemonclaw-channels/channel-slack"]
+channel-signal = ["daemonclaw-channels/channel-signal"]
+channel-mattermost = ["daemonclaw-channels/channel-mattermost"]
+channel-irc = ["daemonclaw-channels/channel-irc"]
+channel-imessage = ["daemonclaw-channels/channel-imessage"]
+channel-dingtalk = ["daemonclaw-channels/channel-dingtalk"]
+channel-qq = ["daemonclaw-channels/channel-qq"]
+channel-bluesky = ["daemonclaw-channels/channel-bluesky"]
+channel-twitter = ["daemonclaw-channels/channel-twitter"]
+channel-reddit = ["daemonclaw-channels/channel-reddit"]
+channel-notion = ["daemonclaw-channels/channel-notion"]
+channel-linq = ["daemonclaw-channels/channel-linq"]
+channel-wati = ["daemonclaw-channels/channel-wati"]
+channel-nextcloud = ["daemonclaw-channels/channel-nextcloud"]
+channel-mochat = ["daemonclaw-channels/channel-mochat"]
+channel-wecom = ["daemonclaw-channels/channel-wecom"]
+channel-clawdtalk = ["daemonclaw-channels/channel-clawdtalk"]
+channel-webhook = ["daemonclaw-channels/channel-webhook"]
+channel-acp-server = ["daemonclaw-channels/channel-acp-server"]
+channel-whatsapp-cloud = ["daemonclaw-channels/channel-whatsapp-cloud"]
+channel-voice-call = ["daemonclaw-channels/channel-voice-call"]
 channel-feishu = ["channel-lark"]
-whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
-voice-wake = ["zeroclaw-channels/voice-wake"]
+whatsapp-web = ["daemonclaw-channels/whatsapp-web"]
+voice-wake = ["daemonclaw-channels/voice-wake"]
 
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
-    "zeroclaw-runtime/observability-prometheus",
-    "zeroclaw-gateway/observability-prometheus",
+    "daemonclaw-runtime/observability-prometheus",
+    "daemonclaw-gateway/observability-prometheus",
 ]
-observability-otel = ["zeroclaw-runtime/observability-otel"]
-hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
-peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
-sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
-sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
-browser-native = ["zeroclaw-tools/browser-native"]
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
-probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
-rag-pdf = ["zeroclaw-tools/rag-pdf"]
-webauthn = ["zeroclaw-runtime/webauthn"]
+observability-otel = ["daemonclaw-runtime/observability-otel"]
+hardware = ["dep:daemonclaw-hardware", "daemonclaw-hardware/hardware"]
+peripheral-rpi = ["dep:daemonclaw-hardware", "daemonclaw-hardware/peripheral-rpi"]
+sandbox-landlock = ["daemonclaw-runtime/sandbox-landlock"]
+sandbox-bubblewrap = ["daemonclaw-runtime/sandbox-bubblewrap"]
+browser-native = ["daemonclaw-tools/browser-native"]
+plugins-wasm = ["dep:daemonclaw-plugins", "daemonclaw-runtime/plugins-wasm"]
+probe = ["dep:daemonclaw-hardware", "daemonclaw-hardware/probe"]
+rag-pdf = ["daemonclaw-tools/rag-pdf"]
+webauthn = ["daemonclaw-runtime/webauthn"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]

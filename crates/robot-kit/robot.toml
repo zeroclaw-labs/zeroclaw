@@ -1,5 +1,5 @@
-# ZeroClaw Robot Kit Configuration
-# Copy to ~/.zeroclaw/robot.toml
+# DaemonClaw Robot Kit Configuration
+# Copy to ~/.daemonclaw/robot.toml
 
 # =============================================================================
 # DRIVE SYSTEM

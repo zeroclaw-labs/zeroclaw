@@ -64,7 +64,7 @@ The `zc-receipt-` prefix distinguishes real receipts from fabricated ones. The L
 ### In debug logs
 
 ```bash
-RUST_LOG=zeroclaw::agent=debug zeroclaw daemon
+RUST_LOG=daemonclaw::agent=debug daemonclaw daemon
 ```
 
 Look for:

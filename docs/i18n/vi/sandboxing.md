@@ -6,7 +6,7 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-ZeroClaw hiện có application-layer security (allowlists, path blocking, command injection protection) nhưng thiếu cơ chế cách ly cấp hệ điều hành. Nếu kẻ tấn công nằm trong allowlist, họ có thể chạy bất kỳ lệnh nào được cho phép với quyền của user zeroclaw.
+DaemonClaw hiện có application-layer security (allowlists, path blocking, command injection protection) nhưng thiếu cơ chế cách ly cấp hệ điều hành. Nếu kẻ tấn công nằm trong allowlist, họ có thể chạy bất kỳ lệnh nào được cho phép với quyền của user daemonclaw.
 
 ## Các giải pháp đề xuất
 
@@ -164,7 +164,7 @@ extra_args = ["--seccomp", "--caps.drop=all"]
 # Dành riêng cho Landlock
 [security.sandbox.landlock]
 readonly_paths = ["/usr", "/bin", "/lib"]
-readwrite_paths = ["$HOME/workspace", "/tmp/zeroclaw"]
+readwrite_paths = ["$HOME/workspace", "/tmp/daemonclaw"]
 ```
 
 ## Chiến lược kiểm thử

@@ -4,12 +4,12 @@ status: accepted
 last-reviewed: 2026-04-19
 relates-to:
   - ADR-003
-  - crates/zeroclaw-plugins
+  - crates/daemonclaw-plugins
 ---
 
 # WASM Plugin Protocol Reference
 
-This document defines the protocol between ZeroClaw's plugin host and WASM
+This document defines the protocol between DaemonClaw's plugin host and WASM
 plugin modules. See [ADR-003](../../architecture/decisions/adr-003-wasm-extism-plugin-model.md)
 for the architectural rationale.
 
@@ -23,7 +23,7 @@ my-plugin/
   plugin.wasm      # Compiled WASM module
 ```
 
-Plugins are discovered from `~/.zeroclaw/plugins/` (configurable via
+Plugins are discovered from `~/.daemonclaw/plugins/` (configurable via
 `plugins.plugins_dir` in config).
 
 ## Manifest format
@@ -116,7 +116,7 @@ On failure:
 
 ## Host functions
 
-Host functions are provided by the ZeroClaw runtime and callable from within
+Host functions are provided by the DaemonClaw runtime and callable from within
 the WASM plugin. Each is gated on a manifest permission — calling without the
 required permission returns an error.
 
@@ -249,10 +249,10 @@ The output `.wasm` file is at
 
 ```bash
 # Copy to plugin directory
-zeroclaw plugin install /path/to/my-plugin/
+daemonclaw plugin install /path/to/my-plugin/
 
 # Or manually
-cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
+cp -r my-plugin/ ~/.daemonclaw/plugins/my-plugin/
 ```
 
 ## Reference implementation
@@ -262,12 +262,12 @@ generates images via the fal.ai API using `zc_http_request` and `zc_env_read`.
 
 ## Configuration
 
-Enable the plugin system in your ZeroClaw config:
+Enable the plugin system in your DaemonClaw config:
 
 ```toml
 [plugins]
 enabled = true
-plugins_dir = "~/.zeroclaw/plugins"
+plugins_dir = "~/.daemonclaw/plugins"
 auto_discover = true
 
 [plugins.security]

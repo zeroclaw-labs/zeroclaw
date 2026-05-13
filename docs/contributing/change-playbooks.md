@@ -1,6 +1,6 @@
 # Change Playbooks
 
-Step-by-step guides for common extension and modification patterns in ZeroClaw.
+Step-by-step guides for common extension and modification patterns in DaemonClaw.
 
 For complete code examples of each extension trait, see [extension-examples.md](./extension-examples.md).
 

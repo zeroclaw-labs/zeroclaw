@@ -5,7 +5,7 @@
 //! pub(crate). These tests cover the public config surface: TOML parsing,
 //! schema defaults, and round-trips that would catch serde regressions.
 
-use zeroclaw_config::schema::{PodmanSandboxConfig, SandboxBackend, SandboxConfig};
+use daemonclaw_config::schema::{PodmanSandboxConfig, SandboxBackend, SandboxConfig};
 
 // ─── SandboxBackend::Podman deserialization ─────────────────────────────────
 

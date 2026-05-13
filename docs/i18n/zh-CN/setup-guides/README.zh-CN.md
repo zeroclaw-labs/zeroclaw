@@ -13,19 +13,19 @@
 
 | 场景 | 命令 |
 |----------|---------|
-| 我有 API 密钥，想要最快安装 | `zeroclaw onboard --api-key sk-... --provider openrouter` |
-| 我想要引导式提示 | `zeroclaw onboard` |
-| 配置已存在，仅修复渠道配置 | `zeroclaw onboard --channels-only` |
-| 配置已存在，我需要完全覆盖 | `zeroclaw onboard --force` |
+| 我有 API 密钥，想要最快安装 | `daemonclaw onboard --api-key sk-... --provider openrouter` |
+| 我想要引导式提示 | `daemonclaw onboard` |
+| 配置已存在，仅修复渠道配置 | `daemonclaw onboard --channels-only` |
+| 配置已存在，我需要完全覆盖 | `daemonclaw onboard --force` |
 | 使用订阅认证 | 查看 [订阅认证](../../../../README.zh-CN.md#subscription-auth-openai-codex--claude-code) |
 
 ## 引导和验证
 
-- 快速引导：`zeroclaw onboard --api-key \"sk-...\" --provider openrouter`
-- 引导式设置：`zeroclaw onboard`
+- 快速引导：`daemonclaw onboard --api-key \"sk-...\" --provider openrouter`
+- 引导式设置：`daemonclaw onboard`
 - 现有配置保护：重新运行需要显式确认（非交互式流程中使用 `--force`）
 - Ollama 云模型（`:cloud`）需要远程 `api_url` 和 API 密钥（例如 `api_url = \"https://ollama.com\"`）。
-- 验证环境：`zeroclaw status` + `zeroclaw doctor`
+- 验证环境：`daemonclaw status` + `daemonclaw doctor`
 
 ## 下一步
 

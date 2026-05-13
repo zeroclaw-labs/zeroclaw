@@ -13,7 +13,7 @@ pub fn create_tray_menu<R: Runtime>(app: &App<R>) -> Result<Menu<R>, tauri::Erro
         .enabled(false)
         .build(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit ZeroClaw").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit DaemonClaw").build(app)?;
 
     Menu::with_items(app, &[&show, &chat, &sep1, &status, &sep2, &quit])
 }

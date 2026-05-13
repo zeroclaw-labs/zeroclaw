@@ -50,8 +50,8 @@
 使用以下命令导出当前有效政策：
 
 ```bash
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
-gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+gh api repos/DeliveryBoyTech/daemonclaw/actions/permissions
+gh api repos/DeliveryBoyTech/daemonclaw/actions/permissions/selected-actions
 ```
 
 ## 护栏

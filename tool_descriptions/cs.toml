@@ -44,7 +44,7 @@ model_routing_config = "Správa výchozích nastavení modelu, směrování posk
 notion = "Interakce s Notion: dotazování databází, čtení/vytváření/aktualizace stránek a vyhledávání v pracovním prostoru."
 pdf_read = "Extrakce prostého textu ze souboru PDF v pracovním prostoru. Vrací veškerý čitelný text. PDF obsahující pouze obrázky nebo šifrované PDF vrací prázdný výsledek. Vyžaduje build feature 'rag-pdf'."
 project_intel = "Inteligence dodávky projektů: generování stavových reportů, detekce rizik, příprava aktualizací pro klienty, shrnutí sprintů a odhad náročnosti. Analytický nástroj pouze pro čtení."
-proxy_config = "Správa nastavení proxy ZeroClaw (rozsah: environment | zeroclaw | services), včetně aplikace na runtime a procesní prostředí"
+proxy_config = "Správa nastavení proxy DaemonClaw (rozsah: environment | daemonclaw | services), včetně aplikace na runtime a procesní prostředí"
 pushover = "Odeslání Pushover notifikace na vaše zařízení. Vyžaduje PUSHOVER_TOKEN a PUSHOVER_USER_KEY v souboru .env."
 schedule = """Správa naplánovaných úloh pouze pro shell. Akce: create/add/once/list/get/cancel/remove/pause/resume. UPOZORNĚNÍ: Tento nástroj vytváří shell úlohy, jejichž výstup je pouze zaznamenáván do logu a NENÍ doručován do žádného kanálu. Pro odesílání naplánovaných zpráv na Discord/Telegram/Slack/Matrix použijte nástroj cron_add s job_type='agent' a konfigurací delivery jako {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
 screenshot = "Pořízení snímku obrazovky aktuální obrazovky. Vrací cestu k souboru a data PNG zakódovaná v base64."

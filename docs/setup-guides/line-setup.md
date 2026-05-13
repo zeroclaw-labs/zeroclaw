@@ -1,12 +1,12 @@
 # LINE Messaging API Integration Guide
 
-ZeroClaw supports LINE via the Messaging API — receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
+DaemonClaw supports LINE via the Messaging API — receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
 
 ## Prerequisites
 
 1. A [LINE Developers Console](https://developers.line.biz) account.
 2. A public HTTPS endpoint reachable from LINE's servers (or ngrok for local development).
-3. ZeroClaw built with the `channel-line` feature:
+3. DaemonClaw built with the `channel-line` feature:
 
 ```bash
 cargo build --release --features channel-line
@@ -25,9 +25,9 @@ cargo build --release --features channel-line
 
 ---
 
-## 2. Configure ZeroClaw
+## 2. Configure DaemonClaw
 
-Add the following to your `zeroclaw.toml`:
+Add the following to your `daemonclaw.toml`:
 
 ```toml
 [channels_config.line]
@@ -91,20 +91,20 @@ Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 1. Go to your channel → **Messaging API** tab → **Webhook settings**.
 2. Set **Webhook URL** to `https://your-domain.com/webhook`.
 3. Toggle **Use webhook** to on.
-4. Click **Verify** — LINE will send a test request. ZeroClaw must be running for verification to succeed.
+4. Click **Verify** — LINE will send a test request. DaemonClaw must be running for verification to succeed.
 
 ---
 
-## 5. Start ZeroClaw
+## 5. Start DaemonClaw
 
 ```bash
-./target/release/zeroclaw --config zeroclaw.toml
+./target/release/daemonclaw --config daemonclaw.toml
 ```
 
 Or via daemon mode:
 
 ```bash
-zeroclaw daemon
+daemonclaw daemon
 ```
 
 **Startup log signal:**
@@ -121,15 +121,15 @@ LINE webhook server listening on 0.0.0.0:8443
 
 | Value | Behaviour |
 |---|---|
-| `pairing` (default) | The bot ignores all DMs until the user sends `/bind <code>`. A pairing code is displayed in the ZeroClaw log at startup. |
+| `pairing` (default) | The bot ignores all DMs until the user sends `/bind <code>`. A pairing code is displayed in the DaemonClaw log at startup. |
 | `open` | The bot responds to every DM immediately. |
 | `allowlist` | The bot responds only to LINE user IDs listed in `allowed_users`. |
 
 **Pairing workflow:**
 
-1. ZeroClaw prints a pairing code in the log at startup.
+1. DaemonClaw prints a pairing code in the log at startup.
 2. The user opens a LINE DM with the bot and sends `/bind <code>`.
-3. ZeroClaw confirms the pairing; subsequent DMs are accepted.
+3. DaemonClaw confirms the pairing; subsequent DMs are accepted.
 
 ### Group / multi-person chat — `group_policy`
 
@@ -174,7 +174,7 @@ The maximum accepted audio size is 25 MB. Larger files are silently skipped with
 
 | Symptom | Likely cause | Action |
 |---|---|---|
-| LINE Verify fails | ZeroClaw not running, or port not reachable | Confirm the process is up and the port is accessible from the internet |
+| LINE Verify fails | DaemonClaw not running, or port not reachable | Confirm the process is up and the port is accessible from the internet |
 | Bot does not reply to DMs | `dm_policy = pairing` and user has not run `/bind` | User must send `/bind <code>` first, or switch to `dm_policy = open` |
 | Bot does not reply in groups | `group_policy = mention` and message has no @mention | @mention the bot, or switch to `group_policy = open` |
 | Reply arrives as a push message | Reply token expired (~30 s window) | Expected fallback behaviour — no action required |

@@ -1,4 +1,4 @@
-# ZeroClaw Documentation Hub
+# DaemonClaw Documentation Hub
 
 This page is the primary entry point for the documentation system.
 
@@ -11,7 +11,7 @@ Localized hubs:
 
 | I want to… | Read this |
 |---|---|
-| Install and run ZeroClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
+| Install and run DaemonClaw quickly | [README.md (Quick Start)](../README.md#quick-start) |
 | Bootstrap in one command | [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md) |
 | Update or uninstall on macOS | [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md) |
 | Find commands by task | [commands-reference.md](reference/cli/commands-reference.md) |

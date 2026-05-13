@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::wecom::*;
+pub use daemonclaw_channels::wecom::*;

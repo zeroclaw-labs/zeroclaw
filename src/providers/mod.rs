@@ -1,6 +1,6 @@
-//! Provider subsystem — re-exported from `zeroclaw-providers`.
+//! Provider subsystem — re-exported from `daemonclaw-providers`.
 
-pub use zeroclaw_providers::*;
+pub use daemonclaw_providers::*;
 
 // Keep traits.rs as a file module so its #[cfg(test)] block compiles.
 #[path = "traits.rs"]

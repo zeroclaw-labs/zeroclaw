@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentationssammanfattning (Enhetlig Innehållsförteckning)
+# DaemonClaw Dokumentationssammanfattning (Enhetlig Innehållsförteckning)
 
 Denna fil utgör den kanoniska innehållsförteckningen för dokumentationssystemet.
 

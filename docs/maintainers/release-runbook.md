@@ -83,7 +83,7 @@ git show origin/master:Cargo.toml | grep '^version'
 Go to:
 
 ```
-https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/release-stable-manual.yml
+https://github.com/DeliveryBoyTech/daemonclaw/actions/workflows/release-stable-manual.yml
 ```
 
 Click **Run workflow**. Fill in:

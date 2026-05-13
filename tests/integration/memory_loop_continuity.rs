@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use zeroclaw::memory::sqlite::SqliteMemory;
-use zeroclaw::memory::traits::{Memory, MemoryCategory};
-use zeroclaw::providers::ToolCall;
+use daemonclaw::memory::sqlite::SqliteMemory;
+use daemonclaw::memory::traits::{Memory, MemoryCategory};
+use daemonclaw::providers::ToolCall;
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, MockProvider};
@@ -208,8 +208,8 @@ async fn agent_auto_saves_and_recalls_memory() {
 /// Verify ContextCompressor.with_memory saves summary to memory before splice.
 #[tokio::test]
 async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
-    use zeroclaw::providers::traits::ChatMessage;
+    use daemonclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
+    use daemonclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
@@ -308,7 +308,7 @@ async fn agent_handles_interleaved_tools_and_text() {
 /// Agent survives large tool output (truncation should kick in).
 #[tokio::test]
 async fn agent_survives_large_tool_output() {
-    use zeroclaw::tools::{Tool, ToolResult};
+    use daemonclaw::tools::{Tool, ToolResult};
 
     /// Tool that returns a very large output.
     struct LargeOutputTool;
@@ -452,7 +452,7 @@ async fn consolidation_extracts_facts_to_memory() {
         r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
     )]);
 
-    let result = zeroclaw::memory::consolidation::consolidate_turn(
+    let result = daemonclaw::memory::consolidation::consolidate_turn(
         &provider,
         "test-model",
         mem.as_ref(),
@@ -483,7 +483,7 @@ async fn memory_survives_rapid_consolidation() {
             r#"{{"history_entry": "Turn {i} conversation", "memory_update": null}}"#,
         ))]);
 
-        let _ = zeroclaw::memory::consolidation::consolidate_turn(
+        let _ = daemonclaw::memory::consolidation::consolidate_turn(
             &provider,
             "test-model",
             mem.as_ref(),
@@ -512,9 +512,9 @@ async fn memory_survives_rapid_consolidation() {
 /// SQLite session backend stores and loads messages correctly.
 #[tokio::test]
 async fn session_backend_persists_messages() {
-    use zeroclaw::channels::session_backend::SessionBackend;
-    use zeroclaw::channels::session_sqlite::SqliteSessionBackend;
-    use zeroclaw::providers::traits::ChatMessage;
+    use daemonclaw::channels::session_backend::SessionBackend;
+    use daemonclaw::channels::session_sqlite::SqliteSessionBackend;
+    use daemonclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -534,8 +534,8 @@ async fn session_backend_persists_messages() {
 /// Session state transitions work correctly.
 #[tokio::test]
 async fn session_state_transitions() {
-    use zeroclaw::channels::session_backend::SessionBackend;
-    use zeroclaw::channels::session_sqlite::SqliteSessionBackend;
+    use daemonclaw::channels::session_backend::SessionBackend;
+    use daemonclaw::channels::session_sqlite::SqliteSessionBackend;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -545,7 +545,7 @@ async fn session_state_transitions() {
     assert!(state.is_none(), "Initial state should be absent");
 
     // Create the session row by appending a message (set_session_state only UPDATEs)
-    use zeroclaw::providers::traits::ChatMessage;
+    use daemonclaw::providers::traits::ChatMessage;
     let msg = ChatMessage::user("hello".to_string());
     backend.append("test_session", &msg).unwrap();
 

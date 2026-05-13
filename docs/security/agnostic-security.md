@@ -224,7 +224,7 @@ impl SandboxingStrategy {
 
 | Feature | Code Size | RAM Overhead | Status |
 |---------|-----------|--------------|--------|
-| **Base ZeroClaw** | 3.4MB | <5MB | ✅ Current |
+| **Base DaemonClaw** | 3.4MB | <5MB | ✅ Current |
 | **+ Landlock** | +50KB | +100KB | ✅ Linux 5.13+ |
 | **+ Firejail wrapper** | +20KB | +0KB (external) | ✅ Linux + firejail |
 | **+ Memory monitoring** | +30KB | +50KB | ✅ All platforms |
@@ -233,7 +233,7 @@ impl SandboxingStrategy {
 
 ### $10 Hardware Compatibility
 
-| Hardware | RAM | ZeroClaw (base) | ZeroClaw (full security) | Status |
+| Hardware | RAM | DaemonClaw (base) | DaemonClaw (full security) | Status |
 |----------|-----|-----------------|--------------------------|--------|
 | **Raspberry Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Works |
 | **Orange Pi Zero** | 512MB | ✅ 2% | ✅ 2.5% | Works |
@@ -241,13 +241,13 @@ impl SandboxingStrategy {
 | **C.H.I.P.** | 512MB | ✅ 2% | ✅ 2.5% | Works |
 | **Rock64** | 1GB | ✅ 1% | ✅ 1.2% | Works |
 
-**Even with full security, ZeroClaw uses <5% of RAM on $10 boards.**
+**Even with full security, DaemonClaw uses <5% of RAM on $10 boards.**
 
 ---
 
 ## 5. Agnostic Swaps: Everything Remains Pluggable
 
-### ZeroClaw's Core Promise: Swap Anything
+### DaemonClaw's Core Promise: Swap Anything
 
 ```rust
 // Providers (already pluggable)

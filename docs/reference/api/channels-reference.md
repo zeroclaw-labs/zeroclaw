@@ -1,6 +1,6 @@
 # Channels Reference
 
-This document is the canonical reference for channel configuration in ZeroClaw.
+This document is the canonical reference for channel configuration in DaemonClaw.
 
 For encrypted Matrix rooms, also read the dedicated runbook:
 - [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md)
@@ -23,13 +23,13 @@ This is the most common symptom (same class as issue #499). Check these in order
 3. **Token/account mismatch**: token is valid but belongs to another Matrix account.
 4. **E2EE device identity gap**: `whoami` does not return `device_id` and config does not provide one.
 5. **Key sharing/trust gap**: room keys were not shared to the bot device, so encrypted events cannot be decrypted.
-6. **Stale runtime state**: config changed but `zeroclaw daemon` was not restarted.
+6. **Stale runtime state**: config changed but `daemonclaw daemon` was not restarted.
 
 ---
 
 ## 1. Configuration Namespace
 
-All channel settings live under `channels_config` in `~/.zeroclaw/config.toml`.
+All channel settings live under `channels_config` in `~/.daemonclaw/config.toml`.
 
 ```toml
 [channels_config]
@@ -40,7 +40,7 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching (Telegram / Discord)
 
-When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+When running `daemonclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
@@ -52,12 +52,12 @@ Notes:
 
 - Switching provider or model clears only that sender's in-memory conversation history to avoid cross-model context contamination.
 - `/new` clears the sender's conversation history without changing provider or model selection.
-- Model cache previews come from `zeroclaw models refresh --provider <ID>`.
+- Model cache previews come from `daemonclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
 
 ## Inbound Image Marker Protocol
 
-ZeroClaw supports multimodal input through inline message markers:
+DaemonClaw supports multimodal input through inline message markers:
 
 - Syntax: ``[IMAGE:<source>]``
 - `<source>` can be:
@@ -96,7 +96,7 @@ cargo check --features hardware,channel-matrix
 cargo check --features hardware,channel-lark
 ```
 
-If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
+If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `daemonclaw channel list`, `daemonclaw channel doctor`, and `daemonclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---
 
@@ -220,7 +220,7 @@ allowed_users = ["*"]
 [channels_config.matrix]
 homeserver = "https://matrix.example.com"
 access_token = "syt_..."
-user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
+user_id = "@daemonclaw:matrix.example.com"   # optional, recommended for E2EE
 device_id = "DEVICEID123"                  # optional, recommended for E2EE
 room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
@@ -254,7 +254,7 @@ ignore_stories = true
 
 ### 4.7 WhatsApp
 
-ZeroClaw supports two WhatsApp backends:
+DaemonClaw supports two WhatsApp backends:
 
 - **Cloud API mode** (`phone_number_id` + `access_token` + `verify_token`)
 - **WhatsApp Web mode** (`session_path`, requires build flag `--features whatsapp-web`)
@@ -276,7 +276,7 @@ WhatsApp Web mode:
 
 ```toml
 [channels_config.whatsapp]
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+session_path = "~/.daemonclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
@@ -292,7 +292,7 @@ Notes:
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
 - `mention_only = true` makes the bot ignore group messages unless the bot is @-mentioned. Direct messages are always processed. Bot identity is seeded from `pair_phone` and updated from the device store on connect.
-- `dm_mention_patterns` and `group_mention_patterns` (both modes) provide regex-based mention gating for DMs and group chats respectively. When non-empty, only messages matching at least one pattern are processed; matched fragments are stripped from the forwarded content. Patterns are case-insensitive. Example: `["@?ZeroClaw", "\\+?15555550123"]`. Invalid or oversized patterns are logged and skipped.
+- `dm_mention_patterns` and `group_mention_patterns` (both modes) provide regex-based mention gating for DMs and group chats respectively. When non-empty, only messages matching at least one pattern are processed; matched fragments are stripped from the forwarded content. Patterns are case-insensitive. Example: `["@?DaemonClaw", "\\+?15555550123"]`. Invalid or oversized patterns are logged and skipped.
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 
 ### 4.8 Webhook Channel Config (Gateway)
@@ -330,9 +330,9 @@ allowed_senders = ["*"]
 [channels_config.irc]
 server = "irc.libera.chat"
 port = 6697
-nickname = "zeroclaw-bot"
-username = "zeroclaw"              # optional
-channels = ["#zeroclaw"]
+nickname = "daemonclaw-bot"
+username = "daemonclaw"              # optional
+channels = ["#daemonclaw"]
 allowed_users = ["*"]
 server_password = ""                # optional
 nickserv_password = ""              # optional
@@ -390,7 +390,7 @@ via the `SecretStore` when `secrets.encrypt = true` (the default).
 Guided onboarding support:
 
 ```bash
-zeroclaw onboard
+daemonclaw onboard
 ```
 
 The wizard now includes dedicated **Lark** and **Feishu** steps with:
@@ -456,7 +456,7 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"  # optional but recommended
 allowed_users = ["*"]
-# bot_name = "zeroclaw"  # display name of the bot; filters own messages to prevent feedback loops
+# bot_name = "daemonclaw"  # display name of the bot; filters own messages to prevent feedback loops
 ```
 
 Notes:
@@ -464,7 +464,7 @@ Notes:
 - Inbound webhook endpoint: `POST /nextcloud-talk`.
 - Signature verification uses `X-Nextcloud-Talk-Random` and `X-Nextcloud-Talk-Signature`.
 - If `webhook_secret` is set, invalid signatures are rejected with `401`.
-- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
+- `DAEMONCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.md) for a full runbook.
 
 ### 4.18 Linq
@@ -483,7 +483,7 @@ Notes:
 - Inbound webhook endpoint: `POST /linq`.
 - Signature verification uses `X-Webhook-Signature` (HMAC-SHA256) and `X-Webhook-Timestamp`.
 - If `signing_secret` is set, invalid or stale (>300s) signatures are rejected.
-- `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
+- `DAEMONCLAW_LINQ_SIGNING_SECRET` overrides config secret.
 - `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
 
 ### 4.19 iMessage
@@ -501,8 +501,8 @@ allowed_contacts = ["*"]
 2. Run:
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+daemonclaw onboard --channels-only
+daemonclaw daemon
 ```
 
 1. Send a message from an expected sender.
@@ -521,7 +521,7 @@ If a channel appears connected but does not respond:
 4. Confirm transport mode assumptions:
    - polling/websocket channels do not need public inbound HTTP
    - webhook channels do need reachable HTTPS callback
-5. Restart `zeroclaw daemon` after config changes.
+5. Restart `daemonclaw daemon` after config changes.
 
 For Matrix encrypted rooms specifically, use:
 - [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md)
@@ -535,13 +535,13 @@ Use this appendix for fast triage. Match log keywords first, then follow the tro
 ### 7.1 Recommended capture command
 
 ```bash
-RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
+RUST_LOG=info daemonclaw daemon 2>&1 | tee /tmp/daemonclaw.log
 ```
 
 Then filter channel/gateway events:
 
 ```bash
-rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/zeroclaw.log
+rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel" /tmp/daemonclaw.log
 ```
 
 ### 7.2 Keyword table
