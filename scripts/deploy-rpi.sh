@@ -12,11 +12,11 @@
 #     cargo install cross
 #
 # Usage:
-#   RPI_HOST=raspberrypi.local RPI_USER=pi ./scripts/deploy-rpi.sh
+#   RPI_HOST=raspberrypi.local RPI_USER=quant ./scripts/deploy-rpi.sh
 #
 # Optional env vars:
 #   RPI_HOST        — hostname or IP of the Pi        (default: raspberrypi.local)
-#   RPI_USER        — SSH user on the Pi              (default: pi)
+#   RPI_USER        — SSH user on the Pi              (default: quant)
 #   RPI_PORT        — SSH port                        (default: 22)
 #   RPI_DIR         — remote deployment dir           (default: /home/$RPI_USER/quantclaw_rust_app)
 #   SERVICE_NAME    — systemd unit name               (default: quantclaw-rust)
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 RPI_HOST="${RPI_HOST:-raspberrypi.local}"
-RPI_USER="${RPI_USER:-pi}"
+RPI_USER="${RPI_USER:-quant}"
 RPI_PORT="${RPI_PORT:-22}"
 RPI_DIR="${RPI_DIR:-/home/${RPI_USER}/quantclaw_rust_app}"
 SERVICE_NAME="${SERVICE_NAME:-quantclaw-rust}"

@@ -89,3 +89,8 @@ journalctl -u quantclaw-rust -f
 完整过程和结果沉淀在：
 
 - `BUILD_AARCH64_GUIDE.md`
+
+补充提醒（2026-05-11）：
+
+- 树莓派上 `~/quantclaw` 为配网服务目录（`quantclaw-net`），不要用于 Rust 服务部署。
+- 若 `quantclaw-rust` 启动失败，先前台运行 `quantclaw gateway --config-dir /home/<user>/quantclaw_rust_app/.quantclaw` 检查配置字段兼容（如 `challenge_delivery`、`challenge_timeout_secs` 已弃用）。

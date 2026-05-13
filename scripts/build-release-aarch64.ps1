@@ -133,7 +133,7 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 SERVICE_DIR="/etc/systemd/system"
-QUANTCLAW_USER="${QUANTCLAW_USER:-pi}"
+QUANTCLAW_USER="${QUANTCLAW_USER:-quant}"
 QUANTCLAW_HOME="$(getent passwd "$QUANTCLAW_USER" | cut -d: -f6 2>/dev/null || printf '/home/%s' "$QUANTCLAW_USER")"
 INSTALL_SOURCE_DIR="$(pwd)"
 APP_ROOT="${QUANTCLAW_APP_ROOT:-${QUANTCLAW_HOME}/quantclaw_rust_app}"
@@ -186,8 +186,9 @@ fi
 
 if [[ -d "web/dist" ]]; then
     echo "[*] Installing web assets..."
-    mkdir -p "/usr/local/share/quantclaw"
-    cp -r web/dist "/usr/local/share/quantclaw/"
+    mkdir -p "/usr/local/share/quantclaw/web"
+    rm -rf "/usr/local/share/quantclaw/web/dist"
+    cp -r web/dist "/usr/local/share/quantclaw/web/"
 fi
 
 chmod 600 "$CONFIG_DIR/config.toml" 2>/dev/null || true
@@ -256,7 +257,7 @@ Install steps:
    tar xzf $packageName.tar.gz
    cd $packageName
 3. Install:
-   QUANTCLAW_USER=pi sudo ./install.sh
+   QUANTCLAW_USER=quant sudo ./install.sh
 
 Default gateway:
 - http://<树莓派IP>:42617
