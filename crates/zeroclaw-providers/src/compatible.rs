@@ -648,7 +648,11 @@ struct ResponseMessage {
     content: Option<String>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
-    #[serde(default)]
+    ///
+    /// OpenRouter and vLLM (>= v0.16.0) emit reasoning under `reasoning`
+    /// rather than `reasoning_content`; serde's `alias` accepts both names
+    /// on deserialization. See #6584.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
@@ -829,7 +833,9 @@ struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
-    #[serde(default)]
+    /// OpenRouter and vLLM (>= v0.16.0) emit reasoning deltas under
+    /// `reasoning`; serde's `alias` accepts both names. See #6584.
+    #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     #[serde(default)]
@@ -1498,8 +1504,11 @@ impl OpenAiCompatibleProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
+                    // Accept both `reasoning_content` (canonical) and
+                    // `reasoning` (OpenRouter / vLLM >= v0.16.0). See #6584.
                     let reasoning_content = value
                         .get("reasoning_content")
+                        .or_else(|| value.get("reasoning"))
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
 
@@ -3988,6 +3997,77 @@ mod tests {
         let result = parse_sse_line(line).unwrap().unwrap();
         assert!(result.delta.is_empty());
         assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
+    }
+
+    // Regression for #6584. OpenRouter and vLLM (>= v0.16.0) emit reasoning
+    // under `reasoning` rather than `reasoning_content`. Both fields must
+    // be accepted on deserialization.
+    #[test]
+    fn parse_sse_line_accepts_reasoning_alias() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning":"thinking via vllm..."}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking via vllm..."));
+    }
+
+    #[test]
+    fn parse_sse_line_with_empty_content_and_reasoning_alias() {
+        let line = r#"data: {"choices":[{"delta":{"content":"","reasoning":"vllm thought"}}]}"#;
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("vllm thought"));
+    }
+
+    #[test]
+    fn response_message_accepts_reasoning_alias_on_non_stream_path() {
+        // Non-stream OpenAI Chat Completions response, vLLM/OpenRouter shape.
+        let json = r#"{"content":null,"reasoning":"chain-of-thought via vllm","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_none());
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("chain-of-thought via vllm"),
+            "the `reasoning` alias must populate the canonical reasoning_content field",
+        );
+        // effective_content should also surface the reasoning when content is missing.
+        assert_eq!(msg.effective_content(), "chain-of-thought via vllm");
+    }
+
+    #[test]
+    fn response_message_canonical_reasoning_content_still_works() {
+        // Existing providers continue to populate reasoning_content directly.
+        let json = r#"{"content":null,"reasoning_content":"canonical thought","tool_calls":null}"#;
+        let msg: ResponseMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("canonical thought"));
+    }
+
+    // The round-trip path at to_native_messages reconstructs reasoning_content
+    // from session-stored assistant-with-tool-calls JSON. Both names must work.
+    #[test]
+    fn round_trip_reasoning_extraction_accepts_alias() {
+        fn extract_reasoning(value: &serde_json::Value) -> Option<String> {
+            value
+                .get("reasoning_content")
+                .or_else(|| value.get("reasoning"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        }
+        let canonical: serde_json::Value =
+            serde_json::from_str(r#"{"reasoning_content":"canonical","tool_calls":[]}"#).unwrap();
+        let alias: serde_json::Value =
+            serde_json::from_str(r#"{"reasoning":"vllm","tool_calls":[]}"#).unwrap();
+        let neither: serde_json::Value = serde_json::from_str(r#"{"tool_calls":[]}"#).unwrap();
+        let both: serde_json::Value = serde_json::from_str(
+            r#"{"reasoning_content":"canonical","reasoning":"alias","tool_calls":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_reasoning(&canonical).as_deref(), Some("canonical"));
+        assert_eq!(extract_reasoning(&alias).as_deref(), Some("vllm"));
+        assert_eq!(extract_reasoning(&neither), None);
+        // When both are present, the canonical name wins — preserves existing
+        // behavior for providers that emit `reasoning_content` plus a stray
+        // `reasoning` field.
+        assert_eq!(extract_reasoning(&both).as_deref(), Some("canonical"));
     }
 
     #[test]
