@@ -129,7 +129,7 @@ WkMessageType::MARKDOWN => {
     │       ├─ 成功 → [IMAGE:data:mime;base64,...]
     │       └─ 失败 → [图片下载失败]{url}
     └─ [text](url) → 普通链接
-        ├─ 检查扩展名是否在黑名单 → 是 → 跳过
+        ├─ 检查扩展名是否在黑名单 → 是 → [text](url) [下载失败: 不允许的文件类型]
         └─ 下载文件
             ├─ 成功 → [text](/workspace/downloads/filename)
             └─ 失败 → [text](url) [下载失败: reason]
