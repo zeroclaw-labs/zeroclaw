@@ -7,6 +7,7 @@ import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { getAdminPairCode, getOnboardStatus } from './lib/api';
 import { basePath } from './lib/basePath';
+import { ConfigDraftProvider } from './lib/draftStore';
 import { setLocale, type Locale } from './lib/i18n';
 import { Router } from './router/router';
 
@@ -211,10 +212,12 @@ function AppContent() {
 
   return (
     <DraftContext.Provider value={draftStore}>
-      <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <FreshInstallRedirect />
-        <Router />
-      </LocaleContext.Provider>
+      <ConfigDraftProvider>
+        <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <FreshInstallRedirect />
+          <Router />
+        </LocaleContext.Provider>
+      </ConfigDraftProvider>
     </DraftContext.Provider>
   );
 }

@@ -23,7 +23,6 @@ import { Link } from 'react-router-dom';
 import { ExternalLink, List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
 import {
   ApiError,
-  deleteProp,
   descriptionForPath,
   fetchConfigSchema,
   getAgentOptions,
@@ -39,6 +38,7 @@ import {
   type PatchOp,
   type ValidationWarning,
 } from '../../lib/api';
+import { useConfigDraft } from '../../lib/draftStore';
 import { fuzzyFilter } from '../../lib/fuzzy';
 
 interface FieldFormProps {
@@ -296,6 +296,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   { prefix, onSaved, showDelete = true, title, drift },
   ref,
 ) {
+  const configDraft = useConfigDraft();
   const [entries, setEntries] = useState<ListResponseEntry[]>([]);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
@@ -330,8 +331,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
       const resp = await listProps(prefix);
       setEntries(resp.entries);
       const seed: Record<string, string> = {};
-      for (const e of resp.entries) seed[e.path] = defaultInputValue(e);
+      const commentSeed: Record<string, string> = {};
+      for (const e of resp.entries) {
+        const staged = configDraft.drafts[e.path];
+        seed[e.path] = staged?.input ?? defaultInputValue(e);
+        const stagedComment = configDraft.comments[e.path];
+        if (stagedComment) commentSeed[e.path] = stagedComment;
+      }
       setDraft(seed);
+      setComments(commentSeed);
     } catch (e) {
       if (e instanceof ApiError) {
         setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
@@ -360,6 +368,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
     const ops: PatchOp[] = [];
     for (const e of entries) {
+      if (configDraft.tombstones.has(e.path)) {
+        ops.push({ op: 'remove', path: e.path });
+        continue;
+      }
       const raw = draft[e.path] ?? '';
       const original = defaultInputValue(e);
       // Secrets with empty input mean "don't change".
@@ -392,6 +404,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
       const resp = await patchConfig(ops);
       setSavedAt(`Saved ${resp.results.length} field(s).`);
       setWarnings(resp.warnings ?? []);
+      configDraft.discardSection(prefix);
       await reload();
       onSaved?.();
       return true;
@@ -417,17 +430,13 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     flushSave: handleSave,
   }));
 
-  const handleDelete = async (path: string) => {
-    try {
-      await deleteProp(path);
-      await reload();
-    } catch (e) {
-      if (e instanceof ApiError) {
-        setTopError(`Delete failed: [${e.envelope.code}] ${e.envelope.message}`);
-      } else {
-        setTopError(`Delete failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
+  // Stage a tombstone in the cross-section draft store rather than
+  // POSTing DELETE immediately. The save bar (or the top banner's
+  // Save-all) commits the removal as a JSON Patch `remove` op alongside
+  // any other pending edits. Tombstoned rows render with a strikethrough
+  // + Undo affordance via `tombstones` from the store.
+  const handleDelete = (path: string) => {
+    configDraft.stageTombstone(path);
   };
 
   const sortedEntries = useMemo(() => {
@@ -461,13 +470,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   const unsavedCount = useMemo(() => {
     let n = 0;
     for (const e of entries) {
+      if (configDraft.tombstones.has(e.path)) {
+        n += 1;
+        continue;
+      }
       const raw = draft[e.path] ?? '';
       const original = defaultInputValue(e);
       if (e.is_secret && raw.length === 0) continue;
       if (raw !== original) n += 1;
     }
     return n;
-  }, [entries, draft]);
+  }, [entries, draft, configDraft.tombstones]);
 
   // Warn user before navigating away with unsaved changes.
   useEffect(() => {
@@ -544,9 +557,40 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               key={f.path}
               entry={f}
               value={draft[f.path] ?? ''}
-              onChange={(v) => setDraft((d) => ({ ...d, [f.path]: v }))}
+              onChange={(v) => {
+                setDraft((d) => ({ ...d, [f.path]: v }));
+                const baseline = defaultInputValue(f);
+                if (v === baseline || (f.is_secret && v.length === 0)) {
+                  configDraft.clearDraft(f.path);
+                } else {
+                  let parsed: unknown;
+                  try {
+                    parsed = parseInput(f, v);
+                  } catch {
+                    parsed = v;
+                  }
+                  if (
+                    f.kind === 'string-array'
+                    && Array.isArray(parsed)
+                    && parsed.length === 0
+                    && isOptionalArray(f.type_hint)
+                  ) {
+                    parsed = null;
+                  }
+                  configDraft.setDraft(f.path, v, parsed);
+                }
+              }}
               comment={comments[f.path] ?? ''}
-              onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
+              onCommentChange={(v) => {
+                setComments((c) => ({ ...c, [f.path]: v }));
+                if (v.length > 0) {
+                  configDraft.setComment(f.path, v);
+                } else {
+                  configDraft.clearComment(f.path);
+                }
+              }}
+              tombstoned={configDraft.tombstones.has(f.path)}
+              onUndoTombstone={() => configDraft.unstageTombstone(f.path)}
               error={fieldErrors[f.path]}
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
               description={descriptionForPath(schema, f.path)}
@@ -649,9 +693,15 @@ interface FieldRowProps {
   elementProps?: ObjectArrayPropMeta[] | null;
   /** Drift entry for this path (in-memory ≠ on-disk). `null` when no drift. */
   drift: DriftEntry | null;
+  /** `true` when the operator clicked the trash icon and the removal is
+   *  staged (not yet committed). The row renders strikethrough with an
+   *  Undo button replacing the input. */
+  tombstoned?: boolean;
+  /** Pulls the row out of tombstoned state. */
+  onUndoTombstone?: () => void;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift, tombstoned, onUndoTombstone }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
@@ -709,6 +759,33 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
         // Fail-open: leave options null so the field falls back to text.
       });
   }, [agentNeedsOptions, agentOptions]);
+
+  if (tombstoned) {
+    return (
+      <div className="px-4 py-3 flex items-center justify-between gap-3 opacity-70">
+        <div className="min-w-0 flex-1">
+          <code
+            className="text-xs font-mono line-through break-all"
+            style={{ color: 'var(--pc-text-muted)' }}
+          >
+            {entry.path}
+          </code>
+          <p className="text-xs mt-0.5" style={{ color: 'var(--pc-text-muted)' }}>
+            Staged for removal. Commits on Save.
+          </p>
+        </div>
+        {onUndoTombstone && (
+          <button
+            type="button"
+            onClick={onUndoTombstone}
+            className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
+          >
+            Undo
+          </button>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="px-4 py-3">

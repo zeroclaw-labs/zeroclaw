@@ -3,6 +3,7 @@ import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
+import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import { ErrorBoundary } from '@/App';
 
 const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
@@ -51,6 +52,7 @@ export default function Layout() {
           collapsed={collapsed}
         />
         <ReloadBanner />
+        <UnsavedChangesBanner />
 
         {/* Page content — ErrorBoundary keyed by the first path segment
             so the boundary resets when the user navigates between pages
