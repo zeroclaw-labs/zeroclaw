@@ -398,20 +398,45 @@ impl NextcloudTalkChannel {
         messages
     }
 
+    /// Build the JSON body, random nonce, and HMAC signature for an outbound
+    /// bot message. Returns `(random_hex, body_string, signature_hex)`.
+    ///
+    /// The Nextcloud Talk bot API signs `random + raw_body` with HMAC-SHA256
+    /// using the shared bot secret. The body string and signature must travel
+    /// together — callers must send the exact `body_string` bytes that were
+    /// signed, not a re-serialized JSON value.
+    fn build_bot_message_request(&self, content: &str) -> (String, String, String) {
+        use rand::RngExt;
+
+        const HEX: &[u8] = b"0123456789abcdef";
+        let mut rng = rand::rng();
+        let random: String = (0..64)
+            .map(|_| HEX[rng.random_range(0..HEX.len())] as char)
+            .collect();
+
+        let body = serde_json::json!({ "message": content }).to_string();
+        let signature = sign_nextcloud_bot_message(&self.app_token, &random, &body);
+        (random, body, signature)
+    }
+
     async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
         let encoded_room = urlencoding::encode(room_token);
         let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/message",
             self.base_url, encoded_room
         );
+
+        let (random, body, signature) = self.build_bot_message_request(content);
 
         let response = self
             .client
             .post(&url)
-            .bearer_auth(&self.app_token)
             .header("OCS-APIRequest", "true")
             .header("Accept", "application/json")
-            .json(&serde_json::json!({ "message": content }))
+            .header("Content-Type", "application/json")
+            .header("X-Nextcloud-Talk-Bot-Random", random)
+            .header("X-Nextcloud-Talk-Bot-Signature", signature)
+            .body(body)
             .send()
             .await?;
 
@@ -425,7 +450,10 @@ impl NextcloudTalkChannel {
         anyhow::bail!("Nextcloud Talk API error: {status}");
     }
 
-    /// Send a message and return the numeric message ID assigned by Nextcloud Talk.
+    /// Send a message and return the numeric message ID assigned by Nextcloud Talk,
+    /// when the bot endpoint returns one. Some Nextcloud Talk versions return an
+    /// empty `data` object for bot messages, in which case the returned ID is a
+    /// synthetic UUID so that callers do not panic on missing IDs.
     async fn send_to_room_with_id(
         &self,
         room_token: &str,
@@ -433,17 +461,21 @@ impl NextcloudTalkChannel {
     ) -> anyhow::Result<String> {
         let encoded_room = urlencoding::encode(room_token);
         let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
+            "{}/ocs/v2.php/apps/spreed/api/v1/bot/{}/message",
             self.base_url, encoded_room
         );
+
+        let (random, body, signature) = self.build_bot_message_request(content);
 
         let response = self
             .client
             .post(&url)
-            .bearer_auth(&self.app_token)
             .header("OCS-APIRequest", "true")
             .header("Accept", "application/json")
-            .json(&serde_json::json!({ "message": content }))
+            .header("Content-Type", "application/json")
+            .header("X-Nextcloud-Talk-Bot-Random", random)
+            .header("X-Nextcloud-Talk-Bot-Signature", signature)
+            .body(body)
             .send()
             .await?;
 
@@ -454,81 +486,30 @@ impl NextcloudTalkChannel {
             anyhow::bail!("Nextcloud Talk API error: {status}");
         }
 
-        // Response: { "ocs": { "data": { "id": 42, ... } } }
-        let body: serde_json::Value = response.json().await?;
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
         let message_id = body
             .pointer("/ocs/data/id")
             .and_then(|v| v.as_u64())
             .map(|id| id.to_string())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Nextcloud Talk: missing message ID in send response")
-            })?;
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         Ok(message_id)
     }
 
-    /// Edit an existing message via the Nextcloud Talk OCS API.
-    ///
-    /// `PUT /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
+    /// Edit is not supported by the Nextcloud Talk bot API. Returns `Err` so that
+    /// `finalize_draft` falls back to a fresh send via the bot endpoint.
     async fn edit_message(
         &self,
-        room_token: &str,
-        message_id: &str,
-        content: &str,
+        _room_token: &str,
+        _message_id: &str,
+        _content: &str,
     ) -> anyhow::Result<()> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
-            self.base_url, encoded_room, message_id
-        );
-
-        let response = self
-            .client
-            .put(&url)
-            .bearer_auth(&self.app_token)
-            .header("OCS-APIRequest", "true")
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({ "message": content }))
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::warn!("Nextcloud Talk edit_message failed ({status}): {body}");
-        anyhow::bail!("Nextcloud Talk edit API error: {status}");
+        anyhow::bail!("Nextcloud Talk bot API does not support editing messages")
     }
 
-    /// Delete a message via the Nextcloud Talk OCS API.
-    ///
-    /// `DELETE /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
-    async fn delete_message(&self, room_token: &str, message_id: &str) -> anyhow::Result<()> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
-            self.base_url, encoded_room, message_id
-        );
-
-        let response = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.app_token)
-            .header("OCS-APIRequest", "true")
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::warn!("Nextcloud Talk delete_message failed ({status}): {body}");
-        anyhow::bail!("Nextcloud Talk delete API error: {status}");
+    /// Delete is not supported by the Nextcloud Talk bot API.
+    async fn delete_message(&self, _room_token: &str, _message_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("Nextcloud Talk bot API does not support deleting messages")
     }
 
     /// Truncate text to the Nextcloud Talk character limit (UTF-8 char boundary safe).
@@ -558,7 +539,17 @@ impl Channel for NextcloudTalkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != StreamMode::Off
+        // The Nextcloud Talk *bot* API exposes only a send endpoint — there is no
+        // bot-authenticated edit or delete. Mid-stream draft updates rely on edit,
+        // so they cannot be honored here even when `stream_mode != Off`. We warn
+        // once if the operator opted in, so the silent downgrade is visible.
+        if self.stream_mode != StreamMode::Off {
+            tracing::warn!(
+                "Nextcloud Talk: stream_mode is set but the bot API does not support \
+                 message edits; draft updates will be skipped"
+            );
+        }
+        false
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -689,6 +680,18 @@ impl Channel for NextcloudTalkChannel {
     }
 }
 
+/// Sign an outbound Nextcloud Talk bot message.
+///
+/// `hex(hmac_sha256(secret, random + raw_body))` — same construction the server
+/// applies for verification, kept in lockstep with `verify_nextcloud_talk_signature`.
+pub fn sign_nextcloud_bot_message(secret: &str, random: &str, body: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(random.as_bytes());
+    mac.update(body.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Verify Nextcloud Talk webhook signature.
 ///
 /// Signature calculation (official Talk bot docs):
@@ -752,10 +755,14 @@ mod tests {
     }
 
     #[test]
-    fn supports_draft_updates_true_when_partial() {
+    fn supports_draft_updates_stays_false_even_when_partial() {
+        // The Nextcloud Talk bot API has no edit endpoint, so opting into Partial
+        // streaming must still report `false` (mid-stream edits are silently dropped).
+        // See #6157 — the previous behavior advertised draft support that the
+        // transport could not actually deliver.
         use zeroclaw_config::schema::StreamMode;
         let channel = make_channel().with_streaming(StreamMode::Partial, 800);
-        assert!(channel.supports_draft_updates());
+        assert!(!channel.supports_draft_updates());
     }
 
     #[test]
@@ -1165,5 +1172,129 @@ mod tests {
         assert!(verify_nextcloud_talk_signature(
             secret, random, body, &signature
         ));
+    }
+
+    #[test]
+    fn sign_bot_message_matches_verify_construction() {
+        // The outbound signer and the inbound verifier must use the same
+        // `random + body` HMAC construction, otherwise self-loop tests would
+        // pass while real Nextcloud servers reject our requests (#6157).
+        let secret = "shared-bot-secret";
+        let random = "abc123";
+        let body = r#"{"message":"hello"}"#;
+
+        let signature = sign_nextcloud_bot_message(secret, random, body);
+        assert!(verify_nextcloud_talk_signature(
+            secret, random, body, &signature
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_to_room_uses_bot_endpoint_with_hmac_headers() {
+        use wiremock::matchers::{header_exists, method, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let secret = "bot-shared-secret".to_string();
+
+        let captured_secret = secret.clone();
+        // Verify on the server side: extract the two bot headers and the raw body,
+        // recompute the HMAC with the *same* secret, and reject anything that does
+        // not match. Wiremock returns 401 from the matcher if signature is wrong.
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/ocs/v2\.php/apps/spreed/api/v1/bot/[^/]+/message$",
+            ))
+            .and(header_exists("X-Nextcloud-Talk-Bot-Random"))
+            .and(header_exists("X-Nextcloud-Talk-Bot-Signature"))
+            .and(header_exists("OCS-APIRequest"))
+            .and(move |req: &Request| {
+                let random = req
+                    .headers
+                    .get("X-Nextcloud-Talk-Bot-Random")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let provided = req
+                    .headers
+                    .get("X-Nextcloud-Talk-Bot-Signature")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = std::str::from_utf8(&req.body).unwrap_or_default();
+                let expected = sign_nextcloud_bot_message(&captured_secret, &random, body);
+                expected == provided
+            })
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({ "ocs": { "meta": { "status": "ok" }, "data": [] } }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            mock_server.uri(),
+            secret,
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+
+        channel
+            .send_to_room("room-abc", "hello from bot")
+            .await
+            .expect("send_to_room must succeed against the bot endpoint");
+        // MockServer drops here and asserts the `.expect(1)` count.
+    }
+
+    #[tokio::test]
+    async fn send_to_room_does_not_use_chat_endpoint_or_bearer_auth() {
+        use wiremock::matchers::{any, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Negative assertion: any request to the legacy `chat/{token}` endpoint
+        // would indicate a regression to the pre-#6157 behavior.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/ocs/v2\.php/apps/spreed/api/v1/chat/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        // Catch-all for the bot endpoint so the call still succeeds.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({ "ocs": { "meta": { "status": "ok" }, "data": [] } }),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            mock_server.uri(),
+            "secret".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        channel.send_to_room("room", "hello").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_and_delete_message_return_unsupported_error() {
+        // Bot API offers send-only; edit/delete must surface as Err so that the
+        // streaming finalize_draft path falls back to a fresh send instead of
+        // pretending to have edited.
+        let channel = make_channel();
+        let edit_err = channel
+            .edit_message("room", "42", "updated")
+            .await
+            .expect_err("edit must report unsupported");
+        assert!(edit_err.to_string().contains("does not support editing"));
+
+        let delete_err = channel
+            .delete_message("room", "42")
+            .await
+            .expect_err("delete must report unsupported");
+        assert!(delete_err.to_string().contains("does not support deleting"));
     }
 }
