@@ -32,6 +32,11 @@ impl PluginHost {
         Self::with_security(workspace_dir, SignatureMode::Disabled, Vec::new())
     }
 
+    /// Create a new plugin host using an already-resolved plugin directory.
+    pub fn from_plugins_dir(plugins_dir: &Path) -> Result<Self, PluginError> {
+        Self::from_plugins_dir_with_security(plugins_dir, SignatureMode::Disabled, Vec::new())
+    }
+
     /// Create a new plugin host with signature verification settings.
     pub fn with_security(
         workspace_dir: &Path,
@@ -39,6 +44,17 @@ impl PluginHost {
         trusted_publisher_keys: Vec<String>,
     ) -> Result<Self, PluginError> {
         let plugins_dir = workspace_dir.join("plugins");
+        Self::from_plugins_dir_with_security(&plugins_dir, signature_mode, trusted_publisher_keys)
+    }
+
+    /// Create a new plugin host from an already-resolved plugin directory with
+    /// signature verification settings.
+    pub fn from_plugins_dir_with_security(
+        plugins_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+    ) -> Result<Self, PluginError> {
+        let plugins_dir = plugins_dir.to_path_buf();
         if !plugins_dir.exists() {
             std::fs::create_dir_all(&plugins_dir)?;
         }
@@ -474,6 +490,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let host = PluginHost::new(dir.path()).unwrap();
         assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn test_from_plugins_dir_uses_exact_directory() {
+        let dir = tempdir().unwrap();
+        let plugins_dir = dir.path().join("custom-plugins");
+        let plugin_dir = plugins_dir.join("exact-dir");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "exact-dir"
+version = "0.1.0"
+description = "Loaded from an exact plugin directory"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::from_plugins_dir(&plugins_dir).unwrap();
+        assert_eq!(host.plugins_dir(), plugins_dir);
+        let plugins = host.list_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "exact-dir");
     }
 
     #[test]

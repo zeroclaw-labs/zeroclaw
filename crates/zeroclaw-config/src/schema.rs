@@ -7035,6 +7035,16 @@ impl Default for PluginsConfig {
     }
 }
 
+impl PluginsConfig {
+    /// Resolve the configured plugin installation/discovery directory.
+    ///
+    /// CLI plugin management and runtime plugin discovery both use this helper
+    /// so `plugins.plugins_dir` remains the single source of truth.
+    pub fn resolved_plugins_dir(&self) -> PathBuf {
+        expand_tilde_path(&self.plugins_dir)
+    }
+}
+
 /// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
 ///
 /// The agent reads this via the `linkedin get_content_strategy` action to know
@@ -17209,6 +17219,19 @@ mod tests {
                 "Tilde should be expanded when HOME is set"
             );
         }
+    }
+
+    #[test]
+    async fn plugins_config_resolves_plugins_dir_with_shared_tilde_expansion() {
+        let config = PluginsConfig {
+            plugins_dir: "~/.zeroclaw/plugins".to_string(),
+            ..PluginsConfig::default()
+        };
+
+        assert_eq!(
+            config.resolved_plugins_dir(),
+            expand_tilde_path("~/.zeroclaw/plugins")
+        );
     }
 
     // ── Defaults ─────────────────────────────────────────────

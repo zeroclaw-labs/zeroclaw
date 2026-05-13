@@ -1258,20 +1258,10 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_dir = config.plugins.plugins_dir.clone();
-        let plugin_path = if plugin_dir.starts_with("~/") {
-            let home = directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(plugin_dir.strip_prefix("~/").unwrap())
-        } else {
-            std::path::PathBuf::from(&plugin_dir)
-        };
+        let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::new(
-                plugin_path.parent().unwrap_or(&plugin_path),
-            ) {
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
