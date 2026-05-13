@@ -279,6 +279,44 @@ fn find_default<'a>(defaults: &'a [FieldDefault], path: &str) -> Option<&'a str>
 /// True when `input` parses as the same `Vec<String>` form `config.toml`
 /// emits. Lets the StringArray prompt accept the bracketed display form
 /// bidirectionally.
+/// Live alias list to render as a picker when the field's `type_hint`
+/// references a typed alias-ref newtype (ChannelRef, AgentAlias, …).
+/// `None` for plain `String` fields so the caller falls through to the
+/// free-text input.
+fn alias_options_for_type_hint(cfg: &Config, type_hint: &str) -> Option<Vec<String>> {
+    let dotted = |prefix: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for f in cfg.prop_fields() {
+            if let Some(rest) = f.name.strip_prefix(&format!("{prefix}.")) {
+                let mut parts = rest.splitn(3, '.');
+                if let (Some(ty), Some(alias), Some(_)) = (parts.next(), parts.next(), parts.next())
+                {
+                    let dotted = format!("{ty}.{alias}");
+                    if !out.contains(&dotted) {
+                        out.push(dotted);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    let bare = |section: &str| -> Vec<String> { cfg.get_map_keys(section).unwrap_or_default() };
+    if type_hint.contains("ChannelRef") {
+        Some(dotted("channels"))
+    } else if type_hint.contains("ModelProviderRef") {
+        Some(dotted("providers.models"))
+    } else if type_hint.contains("TtsProviderRef") {
+        Some(dotted("providers.tts"))
+    } else if type_hint.contains("TranscriptionProviderRef") {
+        Some(dotted("providers.transcription"))
+    } else if type_hint.contains("AgentAlias") {
+        Some(bare("agents"))
+    } else {
+        None
+    }
+}
+
 fn parses_as_string_array(input: &str) -> bool {
     toml::from_str::<std::collections::HashMap<String, Vec<String>>>(&format!("v = {input}"))
         .is_ok()
@@ -377,10 +415,32 @@ async fn prompt_field(
             }
         }
         PropKind::String | PropKind::Integer | PropKind::Float => {
+            // Typed alias-ref (ChannelRef, AgentAlias, ModelProviderRef,
+            // TtsProviderRef, TranscriptionProviderRef) — render the
+            // live alias list as a select instead of a free-text input.
+            // Matches what the dashboard does and keeps the CLI surface
+            // from accepting silently-broken refs.
+            if let Some(options) = alias_options_for_type_hint(cfg, field.type_hint) {
+                let items: Vec<SelectItem> = options.iter().map(SelectItem::new).collect();
+                let current_idx = if is_set {
+                    options.iter().position(|v| v == &current)
+                } else {
+                    default.and_then(|d| options.iter().position(|v| v == d))
+                };
+                match ui.select(prompt, &items, current_idx).await? {
+                    Answer::Back => return Ok(Nav::Back),
+                    Answer::Value(idx) => {
+                        let new = options[idx].clone();
+                        if (is_set || !new.is_empty()) && new != current {
+                            persist(cfg, name, &new).await?;
+                        }
+                    }
+                }
+                return Ok(Nav::Done);
+            }
             // `current` pre-fills the buffer (edit mode); `placeholder`
-            // renders the section default as ghost text. The Enter-on-
-            // empty path commits the placeholder so the resolved value
-            // is still recorded in config.toml.
+            // renders the section default as ghost text. Enter on empty
+            // commits the placeholder.
             let (prefill, placeholder) = if is_set {
                 (Some(current.as_str()), None)
             } else {
