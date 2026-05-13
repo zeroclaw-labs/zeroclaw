@@ -22,9 +22,7 @@ use crate::connection::{
     WkChannelType, WkMessageType, WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
-use crate::messaging::{
-    download_image_as_base64, encode_text_payload, process_markdown_resources,
-};
+use crate::messaging::{download_image_as_base64, encode_text_payload, process_markdown_resources};
 
 #[derive(Clone)]
 pub struct WuKongIMChannel {
@@ -410,7 +408,8 @@ mod tests {
     #[test]
     fn from_config_maps_fields() {
         let workspace = std::path::PathBuf::from("/tmp/test");
-        let ch = WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true), &workspace);
+        let ch =
+            WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true), &workspace);
         assert_eq!(ch.ws_url, "ws://localhost:5200");
         assert_eq!(ch.uid, "bot001");
         assert_eq!(ch.device_id, "web-001");

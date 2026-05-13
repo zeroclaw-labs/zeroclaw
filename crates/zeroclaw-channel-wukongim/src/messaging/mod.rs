@@ -2,12 +2,8 @@
 pub mod media;
 
 pub use media::{
-    download_image_as_base64,
-    extract_markdown_images,
-    process_markdown_resources,
-    extract_markdown_links,
-    download_file_to_workspace,
-    is_blocked_extension,
+    download_file_to_workspace, download_image_as_base64, extract_markdown_images,
+    extract_markdown_links, is_blocked_extension, process_markdown_resources,
 };
 
 use base64::Engine;

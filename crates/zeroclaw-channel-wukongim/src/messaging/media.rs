@@ -7,8 +7,7 @@ const IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const FILE_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 const BLOCKED_EXTENSIONS: &[&str] = &[
-    "exe", "dll", "bat", "sh", "app", "dmg",
-    "js", "py", "rb", "php", "pl",
+    "exe", "dll", "bat", "sh", "app", "dmg", "js", "py", "rb", "php", "pl",
 ];
 
 const SUPPORTED_IMAGE_MIMES: &[&str] = &[
@@ -114,7 +113,9 @@ pub async fn download_file_to_workspace(
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    if let Some(cl) = resp.content_length() && cl > FILE_MAX_BYTES as u64 {
+    if let Some(cl) = resp.content_length()
+        && cl > FILE_MAX_BYTES as u64
+    {
         return Err("文件超过 100MB 限制".to_string());
     }
 
@@ -129,7 +130,9 @@ pub async fn download_file_to_workspace(
         return Err("文件为空或超过大小限制".to_string());
     }
 
-    let filename = url.rsplit('/').next()
+    let filename = url
+        .rsplit('/')
+        .next()
         .unwrap_or("download")
         .split('?')
         .next()
@@ -147,7 +150,7 @@ pub async fn download_file_to_workspace(
     let mut target_path = downloads_dir.join(filename);
     let mut counter = 1;
     while target_path.exists() {
-        let stem = filename.rsplit('.').next().unwrap_or(&filename);
+        let stem = filename.rsplit('.').next().unwrap_or(filename);
         let ext = if filename.contains('.') {
             format!(".{}", filename.rsplit('.').next().unwrap_or(""))
         } else {
@@ -162,7 +165,10 @@ pub async fn download_file_to_workspace(
         return Err(format!("写入文件失败: {}", e));
     }
 
-    Ok(format!("/workspace/downloads/{}", target_path.file_name().unwrap().to_str().unwrap()))
+    Ok(format!(
+        "/workspace/downloads/{}",
+        target_path.file_name().unwrap().to_str().unwrap()
+    ))
 }
 
 pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
@@ -432,7 +438,10 @@ mod tests {
                 counter += 1;
             }
 
-            assert_eq!(target_path.file_name().unwrap().to_str().unwrap(), "test (1).pdf");
+            assert_eq!(
+                target_path.file_name().unwrap().to_str().unwrap(),
+                "test (1).pdf"
+            );
         }
     }
 }
