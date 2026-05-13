@@ -98,7 +98,12 @@ pub async fn download_file_to_workspace(
     downloads_dir: &std::path::Path,
     filename_hint: Option<&str>,
 ) -> Result<String, String> {
-    tracing::debug!("download_file_to_workspace: url={}, downloads_dir={}, filename_hint={:?}", url, downloads_dir.display(), filename_hint);
+    tracing::debug!(
+        "download_file_to_workspace: url={}, downloads_dir={}, filename_hint={:?}",
+        url,
+        downloads_dir.display(),
+        filename_hint
+    );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -118,7 +123,11 @@ pub async fn download_file_to_workspace(
     if let Some(cl) = resp.content_length()
         && cl > FILE_MAX_BYTES as u64
     {
-        tracing::warn!("download_file_to_workspace: file too large {} > {} bytes", cl, FILE_MAX_BYTES);
+        tracing::warn!(
+            "download_file_to_workspace: file too large {} > {} bytes",
+            cl,
+            FILE_MAX_BYTES
+        );
         return Err("文件超过 100MB 限制".to_string());
     }
 
@@ -138,9 +147,11 @@ pub async fn download_file_to_workspace(
             && hint.chars().filter(|&c| c == '-').count() <= 4
             && hint.chars().all(|c| c == '-' || c.is_alphanumeric());
         if is_high_entropy {
-            tracing::debug!("download_file_to_workspace: hint {:?} looks like high-entropy, using URL filename", hint);
-            url
-                .rsplit('/')
+            tracing::debug!(
+                "download_file_to_workspace: hint {:?} looks like high-entropy, using URL filename",
+                hint
+            );
+            url.rsplit('/')
                 .next()
                 .unwrap_or("download")
                 .split('?')
@@ -151,8 +162,7 @@ pub async fn download_file_to_workspace(
             hint.to_string()
         }
     } else {
-        url
-            .rsplit('/')
+        url.rsplit('/')
             .next()
             .unwrap_or("download")
             .split('?')
@@ -162,11 +172,17 @@ pub async fn download_file_to_workspace(
     };
 
     if is_blocked_extension(&filename) {
-        tracing::warn!("download_file_to_workspace: blocked extension for filename={}", filename);
+        tracing::warn!(
+            "download_file_to_workspace: blocked extension for filename={}",
+            filename
+        );
         return Err("不允许的文件类型".to_string());
     }
 
-    tracing::debug!("download_file_to_workspace: creating dir {:?}", downloads_dir);
+    tracing::debug!(
+        "download_file_to_workspace: creating dir {:?}",
+        downloads_dir
+    );
     if let Err(e) = tokio::fs::create_dir_all(&downloads_dir).await {
         return Err(format!("无法创建下载目录: {}", e));
     }
@@ -191,7 +207,11 @@ pub async fn download_file_to_workspace(
     }
 
     let result_path = target_path.to_str().unwrap().to_string();
-    tracing::info!("download_file_to_workspace: success, saved to {:?}, result_path={}", target_path, result_path);
+    tracing::info!(
+        "download_file_to_workspace: success, saved to {:?}, result_path={}",
+        target_path,
+        result_path
+    );
     Ok(result_path)
 }
 
@@ -207,7 +227,10 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
             if let Some(inner) = tail.strip_prefix('(')
                 && let Some(pe) = inner.find(')')
             {
-                let url = inner[..pe].split_whitespace().next().unwrap_or(&inner[..pe]);
+                let url = inner[..pe]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&inner[..pe]);
                 links.push((alt, url.to_string(), true));
                 rest = &tail[pe + 1..];
                 continue;
@@ -230,7 +253,10 @@ pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
             if let Some(inner) = tail.strip_prefix('(')
                 && let Some(pe) = inner.find(')')
             {
-                let url = inner[..pe].split_whitespace().next().unwrap_or(&inner[..pe]);
+                let url = inner[..pe]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&inner[..pe]);
                 links.push((text_content, url.to_string(), false));
                 rest = &tail[pe + 1..];
                 continue;

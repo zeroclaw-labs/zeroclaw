@@ -441,7 +441,11 @@ fn validate_target_url(
     }
 
     let host = extract_host(url)?;
-    tracing::info!("web_fetch: extracted host={}, is_private={}", host, is_private_or_local_host(&host));
+    tracing::info!(
+        "web_fetch: extracted host={}, is_private={}",
+        host,
+        is_private_or_local_host(&host)
+    );
 
     // blocked_domains always takes precedence
     if host_matches_allowlist(&host, blocked_domains) {

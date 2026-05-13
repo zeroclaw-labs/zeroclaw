@@ -22,7 +22,10 @@ use crate::connection::{
     WkChannelType, WkMessageType, WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
-use crate::messaging::{download_image_as_base64, download_file_to_workspace, encode_text_payload, process_markdown_resources};
+use crate::messaging::{
+    download_file_to_workspace, download_image_as_base64, encode_text_payload,
+    process_markdown_resources,
+};
 
 #[derive(Clone)]
 pub struct WuKongIMChannel {

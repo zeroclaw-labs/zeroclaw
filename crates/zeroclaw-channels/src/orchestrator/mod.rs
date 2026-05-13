@@ -4517,7 +4517,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .wukongim
                 .as_ref()
                 .context("WuKongIM channel is not configured")?;
-             Ok(Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir)))
+            Ok(Arc::new(WuKongIMChannel::from_config(
+                wk,
+                &config.workspace_dir,
+            )))
         }
         "wecom" => {
             let wc = config
