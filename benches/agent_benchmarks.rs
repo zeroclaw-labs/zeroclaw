@@ -41,6 +41,7 @@ impl BenchModelProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             }]),
         }
     }
@@ -58,12 +59,14 @@ impl BenchModelProvider {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
                 ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
             ]),
         }
@@ -108,6 +111,7 @@ impl ModelProvider for BenchModelProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             });
         }
         Ok(guard.remove(0))
@@ -177,6 +181,7 @@ Let me know if you need more."#
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        reasoning_field: None,
     };
 
     let multi_tool = ChatResponse {
@@ -195,6 +200,7 @@ Let me know if you need more."#
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        reasoning_field: None,
     };
 
     c.bench_function("xml_parse_single_tool_call", |b| {
@@ -231,6 +237,7 @@ fn bench_native_parsing(c: &mut Criterion) {
         ],
         usage: None,
         reasoning_content: None,
+        reasoning_field: None,
     };
 
     c.bench_function("native_parse_tool_calls", |b| {

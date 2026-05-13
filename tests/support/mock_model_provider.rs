@@ -51,6 +51,7 @@ impl ModelProvider for MockModelProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             });
         }
         Ok(guard.remove(0))
@@ -116,6 +117,7 @@ impl ModelProvider for RecordingModelProvider {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             });
         }
         Ok(guard.remove(0))
@@ -198,6 +200,7 @@ impl ModelProvider for TraceLlmModelProvider {
                     cached_input_tokens: None,
                 }),
                 reasoning_content: None,
+                reasoning_field: None,
             }),
             TraceResponse::ToolCalls {
                 tool_calls,
@@ -222,6 +225,7 @@ impl ModelProvider for TraceLlmModelProvider {
                         cached_input_tokens: None,
                     }),
                     reasoning_content: None,
+                    reasoning_field: None,
                 })
             }
         }

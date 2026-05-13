@@ -787,7 +787,7 @@ impl ResponseMessage {
         }
 
         self.reasoning_text()
-            .map(|c| strip_think_tags(c))
+            .map(strip_think_tags)
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
     }
@@ -801,7 +801,7 @@ impl ResponseMessage {
         }
 
         self.reasoning_text()
-            .map(|c| strip_think_tags(c))
+            .map(strip_think_tags)
             .filter(|c| !c.is_empty())
     }
 

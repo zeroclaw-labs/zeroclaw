@@ -75,6 +75,7 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -89,6 +90,7 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
+            reasoning_field: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -112,6 +114,7 @@ mod tests {
                 cached_input_tokens: None,
             }),
             reasoning_content: None,
+            reasoning_field: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));
