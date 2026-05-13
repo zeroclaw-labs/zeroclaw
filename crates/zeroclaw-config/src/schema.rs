@@ -8516,6 +8516,55 @@ fn default_otp_gated_actions() -> Vec<String> {
     ]
 }
 
+/// Curated list of action / tool identifiers `security.otp.gated_actions` may
+/// reference. Used at config-validation time to warn operators when an entry
+/// does not match any known action — so a typo or stale name cannot silently
+/// promise a TOTP gate that the runtime can never enforce. See issue #5810.
+///
+/// Names mirror the `Tool::name()` strings registered by the runtime tool
+/// catalog. The list is intentionally a static superset of the
+/// `default_otp_gated_actions()` baseline so operators can author entries for
+/// destructive tools that aren't on by default. Add new entries whenever a
+/// destructive tool ships.
+pub fn known_otp_gated_actions() -> &'static [&'static str] {
+    &[
+        // baseline (mirrored from default_otp_gated_actions)
+        "shell",
+        "file_write",
+        "browser_open",
+        "browser",
+        "memory_forget",
+        // additional destructive / state-mutating tools registered by the
+        // runtime catalog that an operator may reasonably want to gate
+        "file_edit",
+        "backup_tool",
+        "cloud_ops",
+        "git_operations",
+        "google_workspace",
+        "microsoft365",
+        "notion_tool",
+        "jira_tool",
+        "claude_code_runner",
+        "codex_cli",
+        "gemini_cli",
+        "composio",
+        "linkedin",
+        "discord_search",
+        "web_search_tool",
+        "content_search",
+        "calculator",
+        "mcp_tool",
+        "proxy_config",
+    ]
+}
+
+/// `true` when `action` (after the same trim/normalize that
+/// `validate()` applies) matches one of the known gated-action identifiers.
+pub fn is_known_otp_gated_action(action: &str) -> bool {
+    let normalized = action.trim();
+    known_otp_gated_actions().contains(&normalized)
+}
+
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
@@ -10707,6 +10756,14 @@ impl Config {
             {
                 anyhow::bail!(
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !is_known_otp_gated_action(normalized) {
+                tracing::warn!(
+                    "security.otp.gated_actions[{i}] = {normalized:?} does not match any known \
+                     action — the entry is a no-op and will not gate any tool execution. \
+                     Known actions: {known}. See issue #5810.",
+                    known = known_otp_gated_actions().join(", "),
                 );
             }
         }
@@ -16913,6 +16970,47 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn known_otp_gated_actions_includes_all_defaults() {
+        // Regression for #5810: every entry in `default_otp_gated_actions`
+        // must also pass `is_known_otp_gated_action`, otherwise the warning
+        // path would fire spuriously on a stock config.
+        for action in default_otp_gated_actions() {
+            assert!(
+                is_known_otp_gated_action(&action),
+                "{action:?} is a default gated action but not on the known-actions allowlist",
+            );
+        }
+    }
+
+    #[test]
+    async fn is_known_otp_gated_action_rejects_unknown_names() {
+        assert!(!is_known_otp_gated_action("kubectl_write"));
+        assert!(!is_known_otp_gated_action("this_is_not_a_real_action"));
+        assert!(!is_known_otp_gated_action(""));
+        // trim is applied so whitespace-padded variants of known actions hit.
+        assert!(is_known_otp_gated_action("  shell  "));
+    }
+
+    #[test]
+    async fn security_validation_warns_but_accepts_unknown_gated_actions() {
+        // Regression for #5810: an unknown action like `kubectl_write` must
+        // not fail validation (operators may have stale entries we don't
+        // want to break on upgrade), but the warning path is exercised by
+        // the validate() call so operators get a `tracing::warn!` at
+        // daemon start. Backward-compat: stock defaults still validate.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec![
+            "shell".into(),
+            "kubectl_write".into(),
+            "this_is_not_a_real_action".into(),
+        ];
+
+        config
+            .validate()
+            .expect("unknown gated_actions must warn, not fail");
     }
 
     #[test]
