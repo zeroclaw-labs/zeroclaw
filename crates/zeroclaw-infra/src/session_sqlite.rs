@@ -727,7 +727,16 @@ fn row_to_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Slot> {
     let dirty_int: i64 = row.get(8)?;
     let workspace: Option<String> = row.get(9)?;
 
-    let agent_config = serde_json::from_str(&agent_config_json).unwrap_or_default();
+    let agent_config = serde_json::from_str(&agent_config_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to deserialize agent_config for slot {id}: {err}"),
+            )),
+        )
+    })?;
 
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     Ok(Slot {
