@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
-import type { WsMessage } from '@/types/api';
+import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
@@ -40,6 +40,13 @@ interface AgentContextValue {
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
   abortSession: () => Promise<void>;
+  /**
+   * Pending supervised-mode tool-approval prompt, or null. Populated when the
+   * gateway emits an `approval_request` frame; cleared once the user responds
+   * or a fresh `approval_request` arrives. See #6522.
+   */
+  pendingApproval: PendingApproval | null;
+  respondToApproval: (decision: ApprovalDecision) => void;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -68,6 +75,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const pendingContentRef = useRef('');
@@ -120,6 +128,26 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     if (!historyReady) return;
     saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
   }, [messages, historyReady]);
+
+  // Auto-clear a pending approval when its timeout elapses on the backend.
+  // The gateway auto-denies after `timeout_secs`; without this effect the
+  // banner would linger indefinitely if the user just walked away. Add a
+  // small grace buffer so the user is not penalised for last-second clicks.
+  useEffect(() => {
+    if (!pendingApproval) return;
+    const elapsed = Date.now() - pendingApproval.receivedAt;
+    const remainingMs = pendingApproval.timeoutSecs * 1000 - elapsed + 500;
+    if (remainingMs <= 0) {
+      setPendingApproval(null);
+      return;
+    }
+    const id = setTimeout(() => {
+      setPendingApproval((current) =>
+        current && current.requestId === pendingApproval.requestId ? null : current,
+      );
+    }, remainingMs);
+    return () => clearTimeout(id);
+  }, [pendingApproval]);
 
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
@@ -248,6 +276,21 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         break;
       }
 
+      case 'approval_request': {
+        // Supervised-mode tool consent prompt. Backend parks on a oneshot
+        // until we send `approval_response`; if the socket closes or the
+        // timeout elapses, the backend auto-denies on its side.
+        if (!msg.request_id) break;
+        setPendingApproval({
+          requestId: msg.request_id,
+          toolName: msg.tool ?? 'unknown',
+          argumentsSummary: msg.arguments_summary ?? '',
+          timeoutSecs: msg.timeout_secs ?? 120,
+          receivedAt: Date.now(),
+        });
+        break;
+      }
+
       case 'error':
         setMessages((prev) => [
           ...prev,
@@ -268,6 +311,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         pendingThinkingRef.current = '';
         setStreamingContent('');
         setStreamingThinking('');
+        setPendingApproval(null);
         break;
     }
   }, []);
@@ -297,6 +341,9 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     ws.onClose = (ev: CloseEvent) => {
       if (version !== wsVersionRef.current) return;
       setConnected(false);
+      // Backend auto-denies pending approvals when the socket closes; clear
+      // local UI so the user is not staring at a stale banner.
+      setPendingApproval(null);
 
       if (pendingModelSwitchRef.current) {
         // We intentionally closed the old socket; non-normal codes mean the reconnect failed.
@@ -499,6 +546,18 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     setMessages([]);
   }, []);
 
+  const respondToApproval = useCallback((decision: ApprovalDecision) => {
+    setPendingApproval((current) => {
+      if (!current) return null;
+      try {
+        wsRef.current?.sendApprovalResponse(current.requestId, decision);
+      } catch {
+        // Socket closed mid-prompt; backend will auto-deny on its side.
+      }
+      return null;
+    });
+  }, []);
+
   const value: AgentContextValue = {
     messages,
     sendMessage,
@@ -521,6 +580,8 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         // Best-effort abort
       }
     },
+    pendingApproval,
+    respondToApproval,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;
