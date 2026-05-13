@@ -85,7 +85,7 @@ fn resolve_title(requested: Option<String>) -> String {
 }
 
 fn mint_session_id() -> String {
-    format!("gw_{}", uuid::Uuid::new_v4())
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Outcome of a pre-create slot-limit check. Callers proceed for `Below`
