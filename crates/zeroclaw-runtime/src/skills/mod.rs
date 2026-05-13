@@ -1809,19 +1809,15 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         return Vec::new();
     }
 
-    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
-    let parent = match plugins_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return Vec::new(),
-    };
+    let plugins_dir = config.plugins.resolved_plugins_dir();
 
     let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
 
-    let host = match zeroclaw_plugins::host::PluginHost::with_security(
-        &parent,
+    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+        &plugins_dir,
         signature_mode,
         trusted_keys,
     ) {
@@ -1840,16 +1836,6 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         }
     }
     skills
-}
-
-#[cfg(feature = "plugins-wasm")]
-fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
-    if let Some(rest) = plugins_dir.strip_prefix("~/")
-        && let Some(dirs) = UserDirs::new()
-    {
-        return dirs.home_dir().join(rest);
-    }
-    PathBuf::from(plugins_dir)
 }
 
 #[cfg(feature = "plugins-wasm")]

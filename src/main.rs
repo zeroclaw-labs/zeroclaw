@@ -3026,7 +3026,8 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("No plugins installed.");
@@ -3044,19 +3045,22 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 host.install(&source)?;
                 println!("Plugin installed from {source}");
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 host.remove(&name)?;
                 println!("Plugin '{name}' removed.");
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!("Plugin: {} v{}", info.name, info.version);
