@@ -30,7 +30,6 @@ use std::sync::Arc;
 use axum::{Router, extract::State, routing::post};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
-use zeroclaw_config::providers::ModelProviders;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 

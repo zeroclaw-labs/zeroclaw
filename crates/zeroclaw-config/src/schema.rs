@@ -12589,6 +12589,60 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
+/// Top-level keys that must always appear in the saved config even
+/// when their value equals the default. `schema_version` is the
+/// migration detector's anchor — dropping it from a freshly-saved
+/// config would make the next load mis-detect the file as V1 (no
+/// version key = V1).
+const SAVE_PRESERVE_KEYS: &[&str] = &["schema_version"];
+
+/// Walk `actual` and drop every key whose value matches the same
+/// key's value in `defaults`. Tables recurse; the recursion drops a
+/// sub-table when every one of its keys was itself dropped (i.e. the
+/// sub-table contained only defaults). Keys that don't appear in
+/// `defaults` are operator-added and always survive.
+///
+/// HashMap-keyed sub-trees (e.g. `agents`, `providers.models.<family>`)
+/// are not in the typed default tree, so their operator-added aliases
+/// pass through this filter unchanged.
+fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
+    let keys: Vec<String> = actual.keys().cloned().collect();
+    for key in keys {
+        if SAVE_PRESERVE_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let Some(default_value) = defaults.get(&key) else {
+            // Operator added this key; not in the typed default tree.
+            // Always keep — recursing in would either be a no-op or
+            // strip operator content.
+            continue;
+        };
+        let Some(child) = actual.remove(&key) else {
+            continue;
+        };
+        let pruned = match (child, default_value) {
+            (toml::Value::Table(mut child_table), toml::Value::Table(default_subtable)) => {
+                prune_default_values(&mut child_table, default_subtable);
+                if child_table.is_empty() {
+                    None
+                } else {
+                    Some(toml::Value::Table(child_table))
+                }
+            }
+            (child, default_value) => {
+                if &child == default_value {
+                    None
+                } else {
+                    Some(child)
+                }
+            }
+        };
+        if let Some(value) = pruned {
+            actual.insert(key, value);
+        }
+    }
+}
+
 fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
     let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
@@ -14089,8 +14143,23 @@ impl Config {
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
 
+        // Serialize, then prune fields whose values match
+        // `Config::default()` so the on-disk config carries only the
+        // operator's actual choices (no hundreds of lines of struct
+        // defaults the operator never touched). The schema's
+        // `#[serde(default = "...")]` annotations re-supply the
+        // defaults on load, so the pruned file round-trips identically.
+        let mut new_table: toml::Table = toml::Value::try_from(&config_to_save)
+            .context("Failed to serialize config to TOML value")?
+            .try_into()
+            .context("Serialized config is not a TOML table")?;
+        let default_table: toml::Table = toml::Value::try_from(Config::default())
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_default();
+        prune_default_values(&mut new_table, &default_table);
         let new_toml =
-            toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
+            toml::to_string_pretty(&new_table).context("Failed to serialize pruned config")?;
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
@@ -14099,8 +14168,6 @@ impl Config {
             if existing.is_empty() {
                 new_toml
             } else {
-                let new_table: toml::Table =
-                    toml::from_str(&new_toml).context("Failed to round-trip serialized config")?;
                 let mut doc: toml_edit::DocumentMut = existing
                     .parse()
                     .context("Failed to parse existing config for comment preservation")?;
@@ -15500,6 +15567,92 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_save_prunes_unchanged_default_blocks() {
+        // Fresh-init config without any operator edits should write a
+        // tiny config.toml — only `schema_version` and any operator-
+        // touched fields. The hundreds of all-default blocks
+        // (LinkedIn, memory, observability, etc.) must not appear.
+        let dir =
+            std::env::temp_dir().join(format!("zeroclaw_save_prune_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config = Config {
+            config_path: dir.join("config.toml"),
+            data_dir: dir.join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let raw = fs::read_to_string(&config.config_path).await.unwrap();
+
+        // schema_version must always survive (migration detector
+        // anchor); without it a re-load would mis-detect as V1.
+        assert!(
+            raw.contains("schema_version"),
+            "schema_version must survive pruning"
+        );
+
+        // Defaulted nested struct blocks must NOT appear in a fresh
+        // save. Pick representative samples from across the schema:
+        for block in [
+            "[memory]",
+            "[linkedin",
+            "[observability]",
+            "[gateway]",
+            "[cost]",
+        ] {
+            assert!(
+                !raw.contains(block),
+                "pruned config.toml must not emit defaulted block {block}; got:\n{raw}",
+            );
+        }
+
+        // Round-trip: load the pruned config and verify it still
+        // deserializes to a `Config` (schema defaults fill the gaps).
+        let _reloaded: Config = toml::from_str(&raw).expect("pruned config round-trips");
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn config_save_keeps_operator_set_non_default_fields() {
+        let dir =
+            std::env::temp_dir().join(format!("zeroclaw_save_keep_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut config = Config {
+            config_path: dir.join("config.toml"),
+            data_dir: dir.join("data"),
+            ..Default::default()
+        };
+        // Operator picked a non-default locale + provider entry.
+        config.locale = Some("ja-JP".into());
+        config.providers.models.anthropic.insert(
+            "claude_default".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.save().await.unwrap();
+        let raw = fs::read_to_string(&config.config_path).await.unwrap();
+
+        assert!(
+            raw.contains("ja-JP"),
+            "operator-set locale must survive pruning; got:\n{raw}",
+        );
+        assert!(
+            raw.contains("claude_default"),
+            "operator-added provider alias must survive pruning; got:\n{raw}",
+        );
+        assert!(
+            raw.contains("claude-sonnet-4"),
+            "operator-set model must survive pruning; got:\n{raw}",
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
