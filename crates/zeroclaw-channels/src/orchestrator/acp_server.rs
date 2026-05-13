@@ -1321,9 +1321,32 @@ fn to_acp_raw_input(name: &str, args: &Value) -> Value {
         "file_write" => {
             let path = args.get("path").cloned().unwrap_or(Value::Null);
             let new_text = args.get("content").cloned().unwrap_or(Value::Null);
-            serde_json::json!({ "path": path, "oldText": Value::Null, "newText": new_text })
+            serde_json::json!({ "path": path, "newText": new_text })
         }
         _ => args.clone(),
+    }
+}
+
+/// Build the ACP `content` array for a tool call notification.
+///
+/// Zed and Toad render tool call content from the `content` array. For
+/// file-editing tools, emit an ACP Diff content item (`{ "type": "diff", ... }`)
+/// so clients show a side-by-side diff editor. Non-edit tools return an empty
+/// array — their `rawInput` is displayed via the standard `raw_input` fallback.
+fn to_acp_content(name: &str, args: &Value) -> Value {
+    match name {
+        "file_edit" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let old_text = args.get("old_string").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
+            serde_json::json!([{ "type": "diff", "path": path, "oldText": old_text, "newText": new_text }])
+        }
+        "file_write" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
+            serde_json::json!([{ "type": "diff", "path": path, "newText": new_text }])
+        }
+        _ => serde_json::json!([]),
     }
 }
 
@@ -1395,22 +1418,31 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: serde_json::json!({
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": id,
-                    "name": name,
-                    "title": name,
-                    "kind": map_tool_kind(name),
-                    "rawInput": to_acp_raw_input(name, args),
-                    "status": "pending"
+        TurnEvent::ToolCall { id, name, args } => {
+            let acp_content = to_acp_content(name, args);
+            let mut update = serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "name": name,
+                "title": name,
+                "kind": map_tool_kind(name),
+                "rawInput": to_acp_raw_input(name, args),
+                "status": "pending"
+            });
+            if let serde_json::Value::Array(ref items) = acp_content {
+                if !items.is_empty() {
+                    update["content"] = acp_content;
                 }
-            }),
-        },
+            }
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": update
+                }),
+            }
+        }
         TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -1493,20 +1525,27 @@ fn history_notifications_for_message(
             .map(|tc| {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                let acp_content = to_acp_content(&tc.name, &args);
+                let mut update = serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": &tc.id,
+                    "name": &tc.name,
+                    "title": &tc.name,
+                    "kind": map_tool_kind(&tc.name),
+                    "rawInput": to_acp_raw_input(&tc.name, &args),
+                    "status": "completed"
+                });
+                if let serde_json::Value::Array(ref items) = acp_content {
+                    if !items.is_empty() {
+                        update["content"] = acp_content;
+                    }
+                }
                 JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": &tc.id,
-                            "name": &tc.name,
-                            "title": &tc.name,
-                            "kind": map_tool_kind(&tc.name),
-                            "rawInput": to_acp_raw_input(&tc.name, &args),
-                            "status": "completed"
-                        }
+                        "update": update
                     }),
                 }
             })
@@ -1967,6 +2006,14 @@ mod tests {
         assert_eq!(raw["newText"], "let x = 2;");
         assert!(raw.get("old_string").is_none(), "old_string must not appear in rawInput");
         assert!(raw.get("new_string").is_none(), "new_string must not appear in rawInput");
+
+        let content = &v["params"]["update"]["content"];
+        assert!(content.is_array(), "file_edit must emit a content array");
+        let diff = &content[0];
+        assert_eq!(diff["type"], "diff");
+        assert_eq!(diff["path"], "src/foo.rs");
+        assert_eq!(diff["oldText"], "let x = 1;");
+        assert_eq!(diff["newText"], "let x = 2;");
     }
 
     #[test]
@@ -1986,8 +2033,16 @@ mod tests {
         let raw = &v["params"]["update"]["rawInput"];
         assert_eq!(raw["path"], "src/new.rs");
         assert_eq!(raw["newText"], "fn main() {}");
-        assert!(raw["oldText"].is_null());
+        assert!(raw.get("oldText").is_none(), "oldText must not appear in file_write rawInput");
         assert!(raw.get("content").is_none(), "content must not appear in rawInput");
+
+        let content = &v["params"]["update"]["content"];
+        assert!(content.is_array(), "file_write must emit a content array");
+        let diff = &content[0];
+        assert_eq!(diff["type"], "diff");
+        assert_eq!(diff["path"], "src/new.rs");
+        assert_eq!(diff["newText"], "fn main() {}");
+        assert!(diff.get("oldText").is_none(), "oldText must be absent for file_write diff");
     }
 
     #[test]

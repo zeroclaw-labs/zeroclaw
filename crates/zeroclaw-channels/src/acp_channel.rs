@@ -75,10 +75,9 @@ fn map_approval_kind(tool_name: &str) -> &'static str {
 
 /// Build the `rawInput` object for a `session/request_permission` approval.
 ///
-/// For `file_edit` and `file_write`, emit the ACP Diff shape (`oldText` /
-/// `newText`) so that IDE clients (Toad, Zed) render a side-by-side diff
-/// instead of raw JSON fields. All other tools fall back to a generic shape
-/// that shows the tool name and the pre-computed summary string.
+/// This carries the raw tool arguments so clients that inspect `rawInput`
+/// directly can read the original field names. Structured diff rendering is
+/// driven by the `content` array (see `build_approval_content`).
 fn build_approval_raw_input(
     tool_name: &str,
     raw_arguments: &Option<serde_json::Value>,
@@ -103,12 +102,68 @@ fn build_approval_raw_input(
                     .get("content")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                return json!({ "path": path, "oldText": serde_json::Value::Null, "newText": new_text });
+                return json!({ "path": path, "newText": new_text });
             }
             _ => {}
         }
     }
     json!({ "tool": tool_name })
+}
+
+/// Build the `content` array for a `session/request_permission` approval.
+///
+/// Zed and Toad render tool call content items from the `content` array, not
+/// from `rawInput`. For file-editing tools, emit an ACP `Diff` content item
+/// (`{ "type": "diff", "path": ..., "oldText": ..., "newText": ... }`) so the
+/// client renders a side-by-side diff editor instead of raw JSON field names.
+/// Other tools fall back to a plain-text content block containing the
+/// pre-computed `arguments_summary`.
+fn build_approval_content(
+    tool_name: &str,
+    raw_arguments: &Option<serde_json::Value>,
+    fallback_summary: &str,
+) -> serde_json::Value {
+    if let Some(args) = raw_arguments {
+        match tool_name {
+            "file_edit" => {
+                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+                let old_text = args
+                    .get("old_string")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let new_text = args
+                    .get("new_string")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return json!([{
+                    "type": "diff",
+                    "path": path,
+                    "oldText": old_text,
+                    "newText": new_text,
+                }]);
+            }
+            "file_write" => {
+                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+                let new_text = args
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return json!([{
+                    "type": "diff",
+                    "path": path,
+                    "newText": new_text,
+                }]);
+            }
+            _ => {}
+        }
+    }
+    json!([{
+        "type": "content",
+        "content": {
+            "type": "text",
+            "text": fallback_summary,
+        }
+    }])
 }
 
 #[async_trait]
@@ -282,6 +337,8 @@ impl Channel for AcpChannel {
         let title = format!("Approve {}?", request.tool_name);
         let kind = map_approval_kind(&request.tool_name);
         let raw_input = build_approval_raw_input(&request.tool_name, &request.raw_arguments);
+        let content =
+            build_approval_content(&request.tool_name, &request.raw_arguments, &request.arguments_summary);
         let params = json!({
             "sessionId": self.session_id,
             "options": options,
@@ -291,13 +348,7 @@ impl Channel for AcpChannel {
                 "kind": kind,
                 "status": "pending",
                 "rawInput": raw_input,
-                "content": [{
-                    "type": "content",
-                    "content": {
-                        "type": "text",
-                        "text": request.arguments_summary,
-                    }
-                }]
+                "content": content,
             }
         });
 
@@ -583,5 +634,71 @@ mod tests {
             task.await.unwrap().unwrap(),
             Some(ChannelApprovalResponse::Deny)
         );
+    }
+
+    #[tokio::test]
+    async fn file_edit_approval_emits_diff_content_item() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
+        let request = ChannelApprovalRequest {
+            tool_name: "file_edit".to_string(),
+            arguments_summary: "old_string: let x = 1;, new_string: let x = 2;".to_string(),
+            raw_arguments: Some(serde_json::json!({
+                "path": "src/foo.rs",
+                "old_string": "let x = 1;",
+                "new_string": "let x = 2;"
+            })),
+        };
+
+        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        // kind must be "edit" for diff rendering
+        assert_eq!(req["params"]["toolCall"]["kind"], "edit");
+
+        // content must carry a Diff item, not a plain text fallback
+        let content = &req["params"]["toolCall"]["content"];
+        assert_eq!(content[0]["type"], "diff", "file_edit approval must emit a diff content item");
+        assert_eq!(content[0]["path"], "src/foo.rs");
+        assert_eq!(content[0]["oldText"], "let x = 1;");
+        assert_eq!(content[0]["newText"], "let x = 2;");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response_for_test(
+            &id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})),
+            None,
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            Some(ChannelApprovalResponse::Approve)
+        );
+    }
+
+    #[test]
+    fn build_approval_content_returns_diff_for_file_edit() {
+        let args = serde_json::json!({
+            "path": "README.md",
+            "old_string": "# Old Title",
+            "new_string": "# New Title"
+        });
+        let content = build_approval_content("file_edit", &Some(args), "fallback");
+        let arr = content.as_array().expect("content must be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "diff");
+        assert_eq!(arr[0]["path"], "README.md");
+        assert_eq!(arr[0]["oldText"], "# Old Title");
+        assert_eq!(arr[0]["newText"], "# New Title");
+    }
+
+    #[test]
+    fn build_approval_content_falls_back_to_text_for_other_tools() {
+        let content = build_approval_content("shell", &None, "ls -la");
+        let arr = content.as_array().expect("content must be an array");
+        assert_eq!(arr[0]["type"], "content");
+        assert_eq!(arr[0]["content"]["type"], "text");
+        assert_eq!(arr[0]["content"]["text"], "ls -la");
     }
 }
