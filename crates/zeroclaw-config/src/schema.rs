@@ -3940,7 +3940,8 @@ pub enum ImageGenProviderType {
     #[default]
     FalAi,
     /// RunPod ComfyUI Serverless.
-    Runpod,
+    #[serde(rename = "comfyui-runpod")]
+    ComfyuiRunpod,
 }
 
 /// Standalone image generation tool configuration (`[image_gen]`).
@@ -3973,8 +3974,13 @@ pub struct ImageGenConfig {
 
     /// RunPod specific: path to the workflow.json template.
     /// Resolved relative to the workspace directory.
+    /// This template file is read dynamically but will not be modified by the service during runtime.
     #[serde(default = "default_runpod_workflow_template")]
     pub runpod_workflow_template: String,
+
+    /// RunPod specific: the base minimum dimension used to compute aspect ratios. Default: 512.
+    #[serde(default = "default_runpod_base_dimension")]
+    pub runpod_base_dimension: u32,
 
     /// RunPod specific: the node ID in the workflow to inject the prompt. Default: "6".
     #[serde(default = "default_runpod_prompt_node")]
@@ -4009,6 +4015,10 @@ fn default_runpod_prompt_field() -> String {
     "text".into()
 }
 
+fn default_runpod_base_dimension() -> u32 {
+    512
+}
+
 fn default_runpod_api_key_env() -> String {
     "RUNPOD_API_KEY".into()
 }
@@ -4022,6 +4032,7 @@ impl Default for ImageGenConfig {
             api_key_env: default_image_gen_api_key_env(),
             runpod_endpoint_id: None,
             runpod_workflow_template: default_runpod_workflow_template(),
+            runpod_base_dimension: default_runpod_base_dimension(),
             runpod_prompt_node_id: default_runpod_prompt_node(),
             runpod_prompt_node_field: default_runpod_prompt_field(),
             runpod_api_key_env: default_runpod_api_key_env(),
