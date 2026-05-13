@@ -13226,6 +13226,29 @@ impl Config {
             }
         }
 
+        // Skill bundles — directories must stay inside `<install>/shared/`
+        // and no two bundles may resolve to the same directory. Default
+        // directory and the rules themselves live in
+        // [`crate::skill_bundles`] so the runtime SkillsService and this
+        // validator share one implementation.
+        if !self.skill_bundles.is_empty() {
+            let install_root = self.install_root_dir();
+            for alias in self.skill_bundles.keys() {
+                let dir = crate::skill_bundles::resolve_directory(self, &install_root, alias)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if let Err(e) = crate::skill_bundles::validate_directory(&dir, &install_root) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("skill-bundles.{alias}.directory"),
+                        "{e}"
+                    );
+                }
+            }
+            if let Err(e) = crate::skill_bundles::validate_uniqueness(self, &install_root) {
+                validation_bail!(InvalidFormat, "skill-bundles", "{e}");
+            }
+        }
+
         // Validate every configured risk profile. Each profile stands on
         // its own — there is no "active" or "default" risk profile concept;
         // an agent's `risk_profile` field names exactly which one applies.
