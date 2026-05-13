@@ -855,6 +855,7 @@ export function getOnboardStatus(): Promise<OnboardStatusResponse> {
 
 export interface AgentOptionsResponse {
   channels: string[];
+  channel_types: string[];
   model_providers: string[];
   risk_profiles: string[];
   runtime_profiles: string[];

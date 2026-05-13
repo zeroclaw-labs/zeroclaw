@@ -1476,7 +1476,7 @@ allowed_users = ["user1"]
             .peer_groups
             .get("qq_default")
             .expect("qq allow-list synthesizes [peer_groups.qq_default]");
-        assert_eq!(group.channel.as_str(), "qq.default");
+        assert_eq!(group.channel, "qq");
         let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(peers, vec!["user1"]);
     }

@@ -123,7 +123,6 @@ async fn dispatch_section(
     section: Section,
 ) -> Result<Nav> {
     match section {
-        Section::Workspace => no_wizard_acknowledge(ui, section, "Workspace setup is automatic — the install directory was bootstrapped at first run. Override via the `ZEROCLAW_CONFIG_DIR` / `ZEROCLAW_DATA_DIR` env vars, or by passing `--config <path>` on the CLI.").await,
         Section::ModelProviders => model_providers(cfg, ui, flags).await,
         // TTS and transcription typed-family sections share the same
         // shape as model_providers but don't have an interactive wizard
@@ -204,17 +203,7 @@ async fn no_wizard_acknowledge(
 /// rewinds to the previous section. Back at the first section exits
 /// onboarding cleanly (user bails out).
 async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
-    // Walk the canonical wizard order from
-    // `zeroclaw_config::sections::ONBOARDING_WIZARD` — the
-    // single source of truth shared with the gateway and the dashboard.
-    // Skipping `workspace` here matches the previous behavior (the CLI
-    // wizard never had a workspace step; Config::load_or_init handles
-    // the install-dir bootstrap before onboarding runs).
-    let order: Vec<Section> = zeroclaw_config::sections::ONBOARDING_WIZARD
-        .iter()
-        .copied()
-        .filter(|w| *w != Section::Workspace)
-        .collect();
+    let order: Vec<Section> = zeroclaw_config::sections::ONBOARDING_WIZARD.to_vec();
     let mut i: usize = 0;
     loop {
         let Some(section) = order.get(i).copied() else {
@@ -673,8 +662,7 @@ fn section_has_signal(cfg: &Config, section: Section) -> bool {
         // defaults. TTS / transcription providers and agents start
         // empty; their existence in the typed family map IS the signal,
         // not a derivable default-divergence. Marker-only for these.
-        Section::Workspace
-        | Section::TtsProviders
+        Section::TtsProviders
         | Section::TranscriptionProviders
         | Section::Memory
         | Section::Tunnel

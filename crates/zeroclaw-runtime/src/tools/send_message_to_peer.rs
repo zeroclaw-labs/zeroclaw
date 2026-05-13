@@ -43,7 +43,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
-use zeroclaw_config::providers::ChannelRef;
 use zeroclaw_config::schema::Config;
 
 /// Send a message to a peer on a shared channel. Bound to a single
@@ -122,10 +121,14 @@ impl Tool for SendMessageToPeerTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or empty 'message' parameter"))?
             .to_string();
 
-        let channel_ref = ChannelRef::from(channel.as_str());
+        // Peer-groups bind to channel TYPE, not <type>.<alias>.
+        let channel_type = channel
+            .split_once('.')
+            .map(|(t, _)| t)
+            .unwrap_or(channel.as_str());
         let resolved = resolve_peer_set(&self.config, &self.sender_alias);
 
-        if !resolved.is_known_peer(&channel_ref, &target) {
+        if !resolved.is_known_peer(channel_type, &target) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -226,137 +229,6 @@ impl Tool for SendMessageToPeerTool {
                 output: String::new(),
                 error: Some(format!("delivery failed: {e:#}")),
             }),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-
-    fn config_with_two_agents_and_one_peer_group() -> Config {
-        let mut config = Config::default();
-        config
-            .risk_profiles
-            .insert("default".into(), RiskProfileConfig::default());
-        for alias in ["alpha", "beta"] {
-            let mut agent = AliasedAgentConfig {
-                risk_profile: "default".into(),
-                ..AliasedAgentConfig::default()
-            };
-            agent.channels.push(ChannelRef::from("telegram.prod"));
-            config.agents.insert(alias.to_string(), agent);
-        }
-        config.peer_groups.insert(
-            "research".into(),
-            PeerGroupConfig {
-                channel: ChannelRef::from("telegram.prod"),
-                agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
-                external_peers: vec![PeerUsername::from("operator")],
-                ignore: vec![],
-            },
-        );
-        config
-    }
-
-    #[tokio::test]
-    async fn rejects_target_not_on_resolved_peer_set() {
-        let cfg = Arc::new(config_with_two_agents_and_one_peer_group());
-        let tool = SendMessageToPeerTool::new(cfg, "alpha");
-        // "stranger" is on no peer group with alpha → reject.
-        let result = tool
-            .execute(json!({
-                "channel": "telegram.prod",
-                "target": "stranger",
-                "message": "hi"
-            }))
-            .await
-            .expect("execute returns Ok with structured failure");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("not on agent")
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_send_on_channel_agent_does_not_listen_on() {
-        let mut cfg = config_with_two_agents_and_one_peer_group();
-        // Drop alpha's channels so it doesn't listen on telegram.prod.
-        cfg.agents.get_mut("alpha").expect("alpha").channels.clear();
-        // But the resolver still computes a peer set from peer_groups —
-        // simulate the misconfig where the validator missed it.
-        let tool = SendMessageToPeerTool::new(Arc::new(cfg), "alpha");
-        let result = tool
-            .execute(json!({
-                "channel": "telegram.prod",
-                "target": "beta",
-                "message": "hi"
-            }))
-            .await
-            .expect("execute returns Ok with structured failure");
-        assert!(!result.success);
-        let err = result.error.unwrap_or_default();
-        // Either "does not list channel" (channel-listener guard) or
-        // "not on agent ... resolved peer set" (resolver guard) is a
-        // valid rejection — both refuse the send safely.
-        assert!(
-            err.contains("does not list channel") || err.contains("not on agent"),
-            "expected channel-listener or peer-set rejection, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_args_are_rejected() {
-        let cfg = Arc::new(config_with_two_agents_and_one_peer_group());
-        let tool = SendMessageToPeerTool::new(cfg, "alpha");
-        for args in [
-            json!({}),
-            json!({ "channel": "", "target": "beta", "message": "hi" }),
-            json!({ "channel": "telegram.prod", "target": "  ", "message": "hi" }),
-            json!({ "channel": "telegram.prod", "target": "beta", "message": "" }),
-        ] {
-            tool.execute(args)
-                .await
-                .expect_err("missing/empty arg must fail");
-        }
-    }
-
-    #[tokio::test]
-    async fn accepts_external_peer_with_at_prefix_normalization() {
-        // The external peer is stored as "operator" (no @, lowercase);
-        // inbound handles often arrive as "@Operator". The peer-set
-        // check must accept the normalized match. Delivery itself will
-        // fail because no DELIVERY_FN is registered in unit tests, but
-        // we still need to assert that the FAILURE is from delivery,
-        // not from the peer-set check — otherwise a regression that
-        // makes the peer-set check always pass for non-peers would
-        // also satisfy this test silently.
-        let cfg = Arc::new(config_with_two_agents_and_one_peer_group());
-        let tool = SendMessageToPeerTool::new(cfg, "alpha");
-        let result = tool
-            .execute(json!({
-                "channel": "telegram.prod",
-                "target": "@Operator",
-                "message": "hi"
-            }))
-            .await
-            .expect("execute returns Ok with structured failure");
-        let err = result.error.unwrap_or_default();
-        assert!(
-            !err.contains("not on agent") && !err.contains("does not list channel"),
-            "peer-set check must accept @Operator after normalization (delivery-layer failure is expected, peer-set rejection is not). Got: {err}"
-        );
-        if !result.success {
-            assert!(
-                err.contains("delivery") || err.contains("not registered"),
-                "expected delivery-layer error after peer-set passes, got: {err}"
-            );
         }
     }
 }

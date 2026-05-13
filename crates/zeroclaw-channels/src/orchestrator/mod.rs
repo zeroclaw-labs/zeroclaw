@@ -4129,7 +4129,6 @@ fn normalize_telegram_identity(value: &str) -> String {
 
 pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
 
     let normalized = normalize_telegram_identity(identity);
     if normalized.is_empty() {
@@ -4150,12 +4149,11 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     // so a hand-bound identity lands in the same group an operator
     // would inspect after an upgrade.
     let group_name = "telegram_default".to_string();
-    let channel_ref = ChannelRef::new("telegram.default");
     let group = updated
         .peer_groups
         .entry(group_name.clone())
         .or_insert_with(|| PeerGroupConfig {
-            channel: channel_ref.clone(),
+            channel: "telegram".to_string(),
             ..PeerGroupConfig::default()
         });
 

@@ -12761,23 +12761,14 @@ pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
-    /// Resolve the inbound external-peer usernames authorized to talk
-    /// to the `{channel_type}.{alias}` channel ref, drawn live from
-    /// `peer_groups` (the V3 single source of truth for inbound peer
-    /// authorization).
-    ///
-    /// Walks every `[peer_groups.<name>]` whose `channel` matches and
-    /// flattens each group's `external_peers[].username` into a
-    /// deduplicated Vec preserving first-seen order. Returns an empty
-    /// Vec when no group references the channel — that means "no
-    /// external peers authorized" (callers may apply their own
-    /// wildcard semantics).
-    pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        let target = format!("{channel_type}.{alias}");
+    /// External-peer usernames authorized on a channel of `channel_type`,
+    /// from every `[peer_groups.<name>]` whose `channel == channel_type`.
+    /// `_alias` is ignored — peer-groups bind to the type, not an instance.
+    pub fn channel_external_peers(&self, channel_type: &str, _alias: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
-            if group.channel.as_str() != target {
+            if group.channel != channel_type {
                 continue;
             }
             for peer in &group.external_peers {
@@ -13004,6 +12995,14 @@ impl Config {
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
             let mut config: Config = crate::migration::migrate_to_current(&contents)
                 .context("Failed to migrate config")?;
+            // V3 healer: peer_groups.<name>.channel is type-only. Strip
+            // any legacy "<type>.<alias>" suffix in place so existing
+            // V3 configs from before the change keep working.
+            for group in config.peer_groups.values_mut() {
+                if let Some((ty, _)) = group.channel.split_once('.') {
+                    group.channel = ty.to_string();
+                }
+            }
             if let Some(from_version) = stale_version {
                 tracing::warn!(
                     "Config at {} is schema_version {from_version}; auto-migrated to {} in memory. \
@@ -14138,12 +14137,22 @@ impl Config {
         peer_group_names.sort();
         for group_name in peer_group_names {
             let group = &self.peer_groups[group_name];
-            let group_channel = group.channel.as_str();
-            if group_channel.trim().is_empty() {
+            let group_channel = group.channel.trim();
+            if group_channel.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel must reference a configured [channels.<type>.<alias>] entry",
+                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\")",
+                );
+            }
+            if self
+                .get_map_keys(&format!("channels.{group_channel}"))
+                .is_none()
+            {
+                validation_bail!(
+                    DanglingReference,
+                    format!("peer_groups.{group_name}.channel"),
+                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel}.*] block is configured",
                 );
             }
             for (i, member) in group.agents.iter().enumerate() {
@@ -14155,15 +14164,15 @@ impl Config {
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
                     );
                 };
-                let channel_in_list = member_agent
+                let has_channel_of_type = member_agent
                     .channels
                     .iter()
-                    .any(|ch| ch.as_str() == group_channel);
-                if !channel_in_list {
+                    .any(|ch| ch.as_str().starts_with(&format!("{group_channel}.")));
+                if !has_channel_of_type {
                     validation_bail!(
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
-                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels does not include {group_channel:?}; an agent can only join a peer group whose channel it has access to",
+                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no entry of type {group_channel:?}",
                     );
                 }
             }
@@ -16396,7 +16405,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             .peer_groups
             .get("imessage_default")
             .expect("V2 imessage.allowed_contacts must fold into peer_groups.imessage_default");
-        assert_eq!(group.channel.as_str(), "imessage.default");
+        assert_eq!(group.channel, "imessage");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["+1234567890", "user@icloud.com"]);
     }
@@ -16659,7 +16668,7 @@ allowed_users = ["111", "222"]
             .peer_groups
             .get("discord_default")
             .expect("V2 discord.allowed_users must fold into peer_groups.discord_default");
-        assert_eq!(group.channel.as_str(), "discord.default");
+        assert_eq!(group.channel, "discord");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["111", "222"]);
     }
@@ -16679,7 +16688,7 @@ allowed_users = ["U111"]
             .peer_groups
             .get("slack_default")
             .expect("V2 slack.allowed_users must fold into peer_groups.slack_default");
-        assert_eq!(group.channel.as_str(), "slack.default");
+        assert_eq!(group.channel, "slack");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["U111"]);
     }
@@ -16877,7 +16886,7 @@ allowed_numbers = ["+1", "+2"]
             .peer_groups
             .get("whatsapp_default")
             .expect("V2 whatsapp.allowed_numbers must fold into peer_groups.whatsapp_default");
-        assert_eq!(group.channel.as_str(), "whatsapp.default");
+        assert_eq!(group.channel, "whatsapp");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["+1", "+2"]);
     }
@@ -18418,7 +18427,7 @@ allowed_users = ["user_alpha", "user_beta"]
             .peer_groups
             .get("lark_default")
             .expect("V2 lark.allowed_users must fold into peer_groups.lark_default");
-        assert_eq!(group.channel.as_str(), "lark.default");
+        assert_eq!(group.channel, "lark");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["user_alpha", "user_beta"]);
     }
@@ -21064,7 +21073,7 @@ allowed_users = []
     async fn validate_rejects_peer_group_dangling_member() {
         let mut config = multi_agent_test_config();
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            channel: "telegram".to_string(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("ghost"),
@@ -21100,7 +21109,7 @@ allowed_users = []
 
         // Group on telegram.draft includes beta (who only has discord).
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            channel: "telegram".to_string(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("beta"),
@@ -21134,7 +21143,7 @@ allowed_users = []
 
         // Group on telegram.draft includes both members.
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: crate::providers::ChannelRef::new("telegram.draft"),
+            channel: "telegram".to_string(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("beta"),

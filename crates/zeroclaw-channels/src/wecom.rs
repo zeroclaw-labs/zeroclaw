@@ -207,7 +207,7 @@ allowed_users = ["user1", "*"]
             .peer_groups
             .get("wecom_default")
             .expect("wecom allow-list synthesizes [peer_groups.wecom_default]");
-        assert_eq!(group.channel.as_str(), "wecom.default");
+        assert_eq!(group.channel, "wecom");
         let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(peers, vec!["user1"]);
     }

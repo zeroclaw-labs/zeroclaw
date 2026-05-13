@@ -236,7 +236,7 @@ const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
 // list (subset of configured agents). Mirror agent's picker UX so a
 // peer-groups form doesn't fall back to free-text inputs.
 const PEER_GROUP_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
-  channel: 'channels',
+  channel: 'channel_types',
 };
 const PEER_GROUP_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   agents: 'agents',
@@ -257,6 +257,7 @@ function peerGroupFieldKey(path: string): string | null {
 // Used both by the empty-state hint and the per-item edit-jump links.
 const AGENT_ALIAS_SOURCE_PATH: Record<keyof AgentOptionsResponse, string> = {
   channels: '/config/channels',
+  channel_types: '/config/channels',
   model_providers: '/config/providers',
   risk_profiles: '/config/risk-profiles',
   runtime_profiles: '/config/runtime-profiles',

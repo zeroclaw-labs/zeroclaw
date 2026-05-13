@@ -376,7 +376,7 @@ allowed_users = ["user1"]
             .peer_groups
             .get("mochat_default")
             .expect("mochat allow-list synthesizes [peer_groups.mochat_default]");
-        assert_eq!(group.channel.as_str(), "mochat.default");
+        assert_eq!(group.channel, "mochat");
         let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(peers, vec!["user1"]);
     }

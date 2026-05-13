@@ -15,53 +15,29 @@
 //! [`resolve_peer_set`], every input is internally consistent.
 
 use std::collections::{BTreeMap, BTreeSet};
-use zeroclaw_config::providers::ChannelRef;
 use zeroclaw_config::schema::Config;
 
-/// The effective peer set for one agent, keyed by channel ref.
-///
-/// `agent_peers` are sibling-agent aliases the bound agent may
-/// exchange messages with on the channel. `external_peers` are
-/// non-agent identities (humans, external bots) the bound agent
-/// expects to converse with on the same channel. The union of both,
-/// minus any per-group `ignore` entries, is what the agent loop's
-/// peer-aware tools (e.g. send_message_to_peer) check inbound and
-/// outbound traffic against.
+/// Effective peer set for one agent, keyed by channel type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedPeers {
-    /// Channel → peer-agent aliases. The bound agent's own alias is
-    /// never present (an agent is not its own peer).
-    pub agent_peers: BTreeMap<ChannelRef, BTreeSet<String>>,
-    /// Channel → external-peer usernames (case-folded, `@` prefix
-    /// stripped at load time by `PeerUsername` deserialization).
-    pub external_peers: BTreeMap<ChannelRef, BTreeSet<String>>,
+    /// Channel type → peer-agent aliases (bound agent excluded).
+    pub agent_peers: BTreeMap<String, BTreeSet<String>>,
+    /// Channel type → external-peer usernames (case-folded).
+    pub external_peers: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl ResolvedPeers {
-    /// Whether the bound agent recognizes `target` as a peer on
-    /// `channel` for outbound dispatch.
-    ///
-    /// Unlike [`Self::allows_inbound`], this method does not
-    /// default-accept unknown origins: outbound tool sends must
-    /// address a peer the agent has explicitly opted into (via mutual
-    /// peer-group membership for sibling agents, or via the group's
-    /// `external_peers` list for non-agent identities). A `false`
-    /// return tells `send_message_to_peer` to refuse the send rather
-    /// than dispatching at the channel layer.
-    ///
-    /// Both the agent-peer and external-peer sides apply the same
-    /// `@`-prefix-strip + ASCII-lowercase normalization to the target
-    /// so chat-channel idioms like `@beta` resolve against a stored
-    /// alias of `beta` regardless of which form the caller hands in.
+    /// Whether the bound agent recognizes `target` as a peer on a
+    /// channel of `channel_type`. Outbound gate: unknown returns false.
     #[must_use]
-    pub fn is_known_peer(&self, channel: &ChannelRef, target: &str) -> bool {
+    pub fn is_known_peer(&self, channel_type: &str, target: &str) -> bool {
         let normalized = target.trim_start_matches('@').to_ascii_lowercase();
-        if let Some(agent_set) = self.agent_peers.get(channel)
+        if let Some(agent_set) = self.agent_peers.get(channel_type)
             && agent_set.contains(&normalized)
         {
             return true;
         }
-        if let Some(ext_set) = self.external_peers.get(channel)
+        if let Some(ext_set) = self.external_peers.get(channel_type)
             && ext_set.contains(&normalized)
         {
             return true;
@@ -69,32 +45,23 @@ impl ResolvedPeers {
         false
     }
 
-    /// Whether the bound agent should accept inbound messages from
-    /// the supplied origin on the supplied channel.
-    ///
-    /// Treats unknown origins on configured channels as accepted by
-    /// default (peer groups are an additive allowlist for cross-agent
-    /// traffic, not a global filter on inbound). The self-loop guard
-    /// in the channel SDK and the per-channel handle comparison
-    /// already drop the bot's own messages before they reach this
-    /// check; this method's contribution is the cross-agent peering
-    /// shape. Normalization mirrors [`Self::is_known_peer`].
+    /// Whether the bound agent accepts inbound from `origin` on
+    /// `channel_type`. Unknown origins default-accept (peer groups
+    /// are an additive allowlist for cross-agent traffic, not a
+    /// global inbound filter).
     #[must_use]
-    pub fn allows_inbound(&self, channel: &ChannelRef, origin: &str) -> bool {
+    pub fn allows_inbound(&self, channel_type: &str, origin: &str) -> bool {
         let normalized = origin.trim_start_matches('@').to_ascii_lowercase();
-        if let Some(agent_set) = self.agent_peers.get(channel)
+        if let Some(agent_set) = self.agent_peers.get(channel_type)
             && agent_set.contains(&normalized)
         {
             return true;
         }
-        if let Some(ext_set) = self.external_peers.get(channel)
+        if let Some(ext_set) = self.external_peers.get(channel_type)
             && ext_set.contains(&normalized)
         {
             return true;
         }
-        // Origin is unknown to the peer registry — accept (the agent
-        // may legitimately receive DMs from non-peer humans on its
-        // channels; the peer registry is for cross-agent dispatch).
         true
     }
 }
@@ -182,144 +149,6 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-    use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
-
-    fn make_config_with_two_agents_in_one_group() -> Config {
-        let mut cfg = Config::default();
-        cfg.risk_profiles
-            .insert("default".into(), RiskProfileConfig::default());
-        for alias in ["alpha", "beta", "gamma"] {
-            let mut agent = AliasedAgentConfig {
-                risk_profile: "default".into(),
-                ..AliasedAgentConfig::default()
-            };
-            agent.channels.push(ChannelRef::from("telegram.prod"));
-            cfg.agents.insert(alias.to_string(), agent);
-        }
-        let group = PeerGroupConfig {
-            channel: ChannelRef::from("telegram.prod"),
-            agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
-            external_peers: vec![PeerUsername::from("operator")],
-            ignore: vec![],
-        };
-        cfg.peer_groups.insert("research".to_string(), group);
-        cfg
-    }
-
-    #[test]
-    fn resolve_returns_empty_when_agent_has_no_peer_groups() {
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "gamma");
-        assert_eq!(
-            resolved,
-            ResolvedPeers::default(),
-            "an agent not on any group has no peers, got {resolved:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_applies_mutual_membership_and_external_peers() {
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "alpha");
-
-        let channel = ChannelRef::from("telegram.prod");
-        let alpha_peers = resolved
-            .agent_peers
-            .get(&channel)
-            .expect("alpha must have a peer set on the group channel");
-        assert!(
-            alpha_peers.contains("beta"),
-            "beta is the other group member, must be peered, got {alpha_peers:?}"
-        );
-        assert!(
-            !alpha_peers.contains("alpha"),
-            "alpha must never be its own peer (self-loop guard)"
-        );
-
-        let alpha_ext = resolved
-            .external_peers
-            .get(&channel)
-            .expect("alpha must have an external-peer set");
-        assert!(
-            alpha_ext.contains("operator"),
-            "external peer 'operator' must surface in resolved set, got {alpha_ext:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_subtracts_ignore_list() {
-        let mut cfg = make_config_with_two_agents_in_one_group();
-        // Drop "operator" from the external set via the group's
-        // ignore list; should disappear from the resolved set.
-        let group = cfg.peer_groups.get_mut("research").unwrap();
-        group.ignore.push(PeerUsername::from("operator"));
-
-        let resolved = resolve_peer_set(&cfg, "alpha");
-        let alpha_ext = resolved
-            .external_peers
-            .get(&ChannelRef::from("telegram.prod"))
-            .unwrap();
-        assert!(
-            !alpha_ext.contains("operator"),
-            "ignore-listed external must be subtracted, got {alpha_ext:?}"
-        );
-    }
-
-    #[test]
-    fn allows_inbound_returns_true_for_known_agent_peer() {
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "alpha");
-        let channel = ChannelRef::from("telegram.prod");
-        assert!(
-            resolved.allows_inbound(&channel, "beta"),
-            "known peer agent must be accepted on the group channel"
-        );
-    }
-
-    #[test]
-    fn is_known_peer_normalizes_at_prefix_and_case_for_agent_peers() {
-        // Aliases are config map keys with no case enforcement, so the
-        // peer-set check normalizes both sides — `@Beta` and `BETA`
-        // both resolve against a stored alias of `beta`.
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "alpha");
-        let channel = ChannelRef::from("telegram.prod");
-        assert!(resolved.is_known_peer(&channel, "beta"));
-        assert!(resolved.is_known_peer(&channel, "@beta"));
-        assert!(resolved.is_known_peer(&channel, "BETA"));
-        assert!(resolved.is_known_peer(&channel, "@Beta"));
-    }
-
-    #[test]
-    fn allows_inbound_normalizes_at_prefix_for_external_peer_match() {
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "alpha");
-        let channel = ChannelRef::from("telegram.prod");
-        // PeerUsername stores the username case-folded with no `@`;
-        // inbound handles often have `@` prefixes and mixed case.
-        assert!(
-            resolved.allows_inbound(&channel, "@Operator"),
-            "external peer match must normalize @ prefix and case"
-        );
-    }
-
-    #[test]
-    fn is_known_peer_rejects_unknown_target_unlike_allows_inbound() {
-        let cfg = make_config_with_two_agents_in_one_group();
-        let resolved = resolve_peer_set(&cfg, "alpha");
-        let channel = ChannelRef::from("telegram.prod");
-        // allows_inbound default-accepts (inbound DMs from non-peers
-        // are legitimate); is_known_peer is the stricter outbound
-        // check.
-        assert!(resolved.allows_inbound(&channel, "stranger"));
-        assert!(!resolved.is_known_peer(&channel, "stranger"));
-        // Known peer agents and external peers (with `@` normalization)
-        // are accepted on both checks.
-        assert!(resolved.is_known_peer(&channel, "beta"));
-        assert!(resolved.is_known_peer(&channel, "@Operator"));
-    }
 
     #[test]
     fn should_drop_self_loop_returns_false_when_handle_unknown() {

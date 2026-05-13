@@ -199,12 +199,6 @@ macro_rules! sections {
 
 sections! {
     wizard_steps: {
-        Workspace => {
-            key:   "workspace",
-            shape: DirectForm,
-            help:  "Where ZeroClaw stores config, memory, and per-agent state. \
-                    The default install dir is fine for most setups.",
-        },
         ModelProviders => {
             key:   "providers.models",
             shape: TypedFamilyMap,

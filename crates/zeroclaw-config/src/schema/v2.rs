@@ -973,9 +973,10 @@ fn synthesize_peer_group_from_allowlist(
         return;
     }
     let mut group_entry = toml::Table::new();
+    // Channel type only (peer-groups bind to the type, not an alias).
     group_entry.insert(
         "channel".to_string(),
-        toml::Value::String(format!("{channel_type}.{channel_alias}")),
+        toml::Value::String(channel_type.to_string()),
     );
     // V1/V2 single-agent semantics — bridge alias `default`.
     group_entry.insert(

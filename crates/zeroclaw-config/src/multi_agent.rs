@@ -122,33 +122,20 @@ pub struct AgentMemoryConfig {
     pub backend: MemoryBackendKind,
 }
 
-/// Top-level peer-group block: `[peer_groups.<name>]`.
-///
-/// Mutual opt-in: two agents become peers only when both appear in the
-/// same group's `agents` list. The `channel` field declares which
-/// `[channels.<type>.<alias>]` entry the group operates on; the
-/// validator at config load enforces that every member's `channels`
-/// list includes the group's channel. `external_peers` adds non-agent
-/// members (humans, external bots) by username. `ignore` is a per-group
-/// blocklist that subtracts from the resolved peer set.
+/// `[peer_groups.<name>]` — mutual-opt-in peer group on a channel type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "peer-group"]
 #[serde(default)]
 pub struct PeerGroupConfig {
-    /// The channel ref this group operates on (e.g. `"telegram.prod"`).
-    /// Must resolve to a configured `[channels.<type>.<alias>]` entry.
-    pub channel: crate::providers::ChannelRef,
-    /// Member agents by alias. Mutual membership with another agent in
-    /// the same group makes them peers.
+    /// Channel type (`"discord"`, `"telegram"`, …). Type, not alias —
+    /// each agent has its own alias and peers cannot share one.
+    pub channel: String,
+    /// Member agents by alias.
     pub agents: Vec<AgentAlias>,
-    /// Non-agent members on the group's channel. Each entry is a
-    /// channel-native username (e.g. `@beta_bot` for Telegram,
-    /// `Audacity#0001` for Discord); validation lives in
-    /// `Config::validate()` once the channel kind is known.
+    /// Non-agent members by channel-native username.
     pub external_peers: Vec<PeerUsername>,
-    /// Group-wide blocklist. Matching usernames are subtracted from the
-    /// resolved peer set every member sees.
+    /// Per-group blocklist; subtracts from the resolved peer set.
     pub ignore: Vec<PeerUsername>,
 }
 

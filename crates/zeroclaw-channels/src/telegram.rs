@@ -626,7 +626,6 @@ impl TelegramChannel {
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-        use zeroclaw_config::providers::ChannelRef;
 
         let Some(config) = &self.persist else {
             tracing::warn!(
@@ -639,7 +638,8 @@ impl TelegramChannel {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
         let group_name = format!("telegram_{}", self.alias);
-        let channel_ref = ChannelRef::new(format!("telegram.{}", self.alias));
+        // Peer-groups bind to channel TYPE, not <type>.<alias>.
+        let channel_ref = "telegram".to_string();
         let snapshot = {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {

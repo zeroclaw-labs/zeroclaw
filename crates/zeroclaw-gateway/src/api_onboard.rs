@@ -229,6 +229,9 @@ pub async fn handle_onboard_status(State(state): State<AppState>, headers: Heade
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct AgentOptionsResponse {
     pub channels: Vec<String>,
+    /// Distinct channel types with at least one configured alias —
+    /// `["discord", "telegram"]`. Source for peer-group channel picker.
+    pub channel_types: Vec<String>,
     pub model_providers: Vec<String>,
     pub risk_profiles: Vec<String>,
     pub runtime_profiles: Vec<String>,
@@ -266,8 +269,17 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
         out
     }
 
+    let channels = dotted_aliases(cfg, "channels");
+    let mut channel_types: Vec<String> = channels
+        .iter()
+        .filter_map(|d| d.split_once('.').map(|(t, _)| t.to_string()))
+        .collect();
+    channel_types.sort();
+    channel_types.dedup();
+
     AgentOptionsResponse {
-        channels: dotted_aliases(cfg, "channels"),
+        channels,
+        channel_types,
         model_providers: dotted_aliases(cfg, "providers.models"),
         risk_profiles: cfg.get_map_keys("risk-profiles").unwrap_or_default(),
         runtime_profiles: cfg.get_map_keys("runtime-profiles").unwrap_or_default(),
@@ -383,8 +395,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
             let has_picker = match wizard {
                 Some(w) => !matches!(
                     w,
-                    zeroclaw_config::sections::Section::Workspace
-                        | zeroclaw_config::sections::Section::Hardware
+                    zeroclaw_config::sections::Section::Hardware
                         | zeroclaw_config::sections::Section::Mcp
                         | zeroclaw_config::sections::Section::Skills
                 ),
@@ -635,9 +646,7 @@ fn picker_items_for(
         | Section::RuntimeProfiles => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
-        Section::Workspace | Section::Hardware | Section::Mcp | Section::Skills => {
-            PickerDispatch::DirectForm
-        }
+        Section::Hardware | Section::Mcp | Section::Skills => PickerDispatch::DirectForm,
     }
 }
 
@@ -1042,7 +1051,7 @@ pub async fn handle_section_select(
             };
             (prefix, true)
         }
-        Section::Workspace | Section::Hardware | Section::Mcp | Section::Skills => {
+        Section::Hardware | Section::Mcp | Section::Skills => {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
@@ -1388,7 +1397,6 @@ mod tests {
         // Spelling them out here pins both groups, so adding a row to
         // the `sections!` macro forces an update here too.
         let all: &[Section] = &[
-            Section::Workspace,
             Section::ModelProviders,
             Section::TtsProviders,
             Section::TranscriptionProviders,
@@ -1407,7 +1415,7 @@ mod tests {
             Section::RiskProfiles,
             Section::RuntimeProfiles,
         ];
-        let direct_form = [Section::Workspace, Section::Hardware, Section::Mcp];
+        let direct_form = [Section::Hardware, Section::Mcp];
         for section in all {
             match picker_items_for(*section, &cfg) {
                 PickerDispatch::Items(_items) => {
