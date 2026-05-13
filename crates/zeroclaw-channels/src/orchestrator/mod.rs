@@ -3039,15 +3039,13 @@ async fn process_channel_message(
     // untouched: only the outgoing LLM `history` carries the preamble.
     let turn_preamble =
         build_channel_turn_context_preamble(&msg.channel, &msg.reply_target, &msg.sender);
-    if !turn_preamble.is_empty() {
-        if let Some(last) = history
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == "user")
-            .filter(|m| !m.content.starts_with("[turn-context]"))
-        {
-            last.content = format!("{turn_preamble}\n\n{}", last.content);
-        }
+    if let Some(last) = history
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "user")
+        .filter(|m| !turn_preamble.is_empty() && !m.content.starts_with("[turn-context]"))
+    {
+        last.content = format!("{turn_preamble}\n\n{}", last.content);
     }
 
     // ── Proactive context compression ────────────────────────────
