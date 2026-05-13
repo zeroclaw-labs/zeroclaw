@@ -1027,12 +1027,18 @@ pub async fn run_gateway(
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         slot_queue: Arc::new(session_queue::SlotActorQueue::new(8, 30, 600)),
-        slot_store: match zeroclaw_infra::make_slot_store(&config.workspace_dir) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!("slot_store initialization failed; /api/slots will return 503: {e}");
-                None
+        slot_store: if config.gateway.session_persistence {
+            match zeroclaw_infra::make_slot_store(&config.workspace_dir) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(
+                        "slot_store initialization failed; /api/slots will return 503: {e}"
+                    );
+                    None
+                }
             }
+        } else {
+            None
         },
         slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         device_registry,
