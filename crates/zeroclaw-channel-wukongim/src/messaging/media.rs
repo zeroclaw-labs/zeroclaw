@@ -94,6 +94,77 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
 }
 
+pub async fn download_file_to_workspace(
+    url: &str,
+    workspace_dir: &std::path::Path,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!("网络错误: {}", e));
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    if let Some(cl) = resp.content_length() && cl > FILE_MAX_BYTES as u64 {
+        return Err("文件超过 100MB 限制".to_string());
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(format!("读取响应失败: {}", e));
+        }
+    };
+
+    if bytes.is_empty() || bytes.len() > FILE_MAX_BYTES {
+        return Err("文件为空或超过大小限制".to_string());
+    }
+
+    let filename = url.rsplit('/').next()
+        .unwrap_or("download")
+        .split('?')
+        .next()
+        .unwrap_or("download");
+
+    if is_blocked_extension(filename) {
+        return Err("不允许的文件类型".to_string());
+    }
+
+    let downloads_dir = workspace_dir.join("downloads");
+    if let Err(e) = tokio::fs::create_dir_all(&downloads_dir).await {
+        return Err(format!("无法创建下载目录: {}", e));
+    }
+
+    let mut target_path = downloads_dir.join(filename);
+    let mut counter = 1;
+    while target_path.exists() {
+        let stem = filename.rsplit('.').next().unwrap_or(&filename);
+        let ext = if filename.contains('.') {
+            format!(".{}", filename.rsplit('.').next().unwrap_or(""))
+        } else {
+            String::new()
+        };
+        let new_filename = format!("{} ({}){}", stem, counter, ext);
+        target_path = downloads_dir.join(&new_filename);
+        counter += 1;
+    }
+
+    if let Err(e) = tokio::fs::write(&target_path, &bytes).await {
+        return Err(format!("写入文件失败: {}", e));
+    }
+
+    Ok(format!("/workspace/downloads/{}", target_path.file_name().unwrap().to_str().unwrap()))
+}
+
 pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
     let mut links = Vec::new();
     let mut rest = text;
@@ -273,5 +344,45 @@ mod tests {
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].2, true);
         assert_eq!(links[1].2, false);
+    }
+
+    #[cfg(test)]
+    mod file_download_tests {
+        use super::*;
+
+        fn create_test_workspace() -> tempfile::TempDir {
+            tempfile::TempDir::new().unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_download_file_to_workspace_success() {
+            let workspace = create_test_workspace();
+            let url = "https://example.com/test.pdf";
+
+            let result = download_file_to_workspace(url, workspace.path()).await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_download_filename_conflict_handling() {
+            let workspace = create_test_workspace();
+            let downloads_dir = workspace.path().join("downloads");
+            tokio::fs::create_dir_all(&downloads_dir).await.unwrap();
+
+            let initial_path = downloads_dir.join("test.pdf");
+            tokio::fs::write(&initial_path, b"content").await.unwrap();
+
+            let mut counter = 1;
+            let mut target_path = downloads_dir.join("test.pdf");
+            while target_path.exists() {
+                let stem = "test";
+                let ext = ".pdf";
+                let new_filename = format!("{} ({}){}", stem, counter, ext);
+                target_path = downloads_dir.join(&new_filename);
+                counter += 1;
+            }
+
+            assert_eq!(target_path.file_name().unwrap().to_str().unwrap(), "test (1).pdf");
+        }
     }
 }
