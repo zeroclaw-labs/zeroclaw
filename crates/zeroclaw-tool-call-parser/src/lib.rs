@@ -1513,6 +1513,16 @@ pub fn build_native_assistant_history_from_parsed_calls(
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
 ) -> Option<String> {
+    // No tool calls → no native tool history. Returning Some(...) with
+    // an empty `tool_calls` array makes strict providers (DeepSeek V4
+    // thinking mode, NVIDIA NIM, etc.) reject the message with
+    //   "Invalid 'messages[*].tool_calls': empty array. Expected an
+    //    array with minimum length 1"
+    // (#6298). None lets the caller fall back to plain assistant text.
+    if tool_calls.is_empty() {
+        return None;
+    }
+
     let calls_json = tool_calls
         .iter()
         .map(|tc| {
@@ -2751,6 +2761,42 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // #6298: returning Some({..., "tool_calls": []}) for an empty `tool_calls`
+    // slice serialized into the chat history as `"tool_calls": []`, which
+    // strict OpenAI-compatible validators reject with:
+    //   "Invalid 'messages[*].tool_calls': empty array. Expected an array
+    //    with minimum length 1"
+    // The function must return None when there are no calls, so the call
+    // site falls back to plain assistant text and the `tool_calls` field is
+    // omitted entirely from the next provider request.
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_returns_none_for_empty_tool_calls() {
+        let calls: Vec<ParsedToolCall> = Vec::new();
+        let result = build_native_assistant_history_from_parsed_calls("answer text", &calls, None);
+        assert!(
+            result.is_none(),
+            "empty tool_calls slice must return None so the caller omits the empty array (#6298); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_returns_none_for_empty_tool_calls_with_reasoning()
+     {
+        // Even with reasoning_content present, the gate must hold: no tool
+        // calls means no native tool history; reasoning text is preserved
+        // by the caller's fallback path on the plain assistant message.
+        let calls: Vec<ParsedToolCall> = Vec::new();
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer text",
+            &calls,
+            Some("inner monologue"),
+        );
+        assert!(
+            result.is_none(),
+            "empty tool_calls must return None even when reasoning_content is provided (#6298); got {result:?}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -7229,6 +7229,31 @@ Let me check the result."#;
         assert!(parsed.get("reasoning_content").is_none());
     }
 
+    /// Regression: when the model returns a plain text reply with no tool
+    /// calls (neither native nor parsed) under `use_native_tools = true`,
+    /// the assistant history that we replay on the next turn must NOT
+    /// contain `"tool_calls": []`. Strict OpenAI-compatible validators
+    /// (DeepSeek V4 thinking mode, NVIDIA NIM) reject empty arrays as
+    ///   "Invalid 'messages[*].tool_calls': empty array. Expected an
+    ///    array with minimum length 1"
+    /// (#6298). The parser-crate fix returns `None` for empty `calls`,
+    /// and the call site at loop_.rs:1366 falls back to plain text via
+    /// `unwrap_or_else(|| response_text.clone())`. This test pins the
+    /// parser-side contract that drives that fallback.
+    #[test]
+    fn no_native_history_when_calls_empty_for_strict_validator_compat() {
+        let calls: Vec<ParsedToolCall> = Vec::new();
+        // With reasoning, without reasoning — both must elect the fallback.
+        assert!(
+            build_native_assistant_history_from_parsed_calls("hi", &calls, None).is_none(),
+            "empty calls must yield None so the call site replays plain text (#6298)"
+        );
+        assert!(
+            build_native_assistant_history_from_parsed_calls("hi", &calls, Some("think")).is_none(),
+            "empty calls must yield None even with reasoning_content (#6298)"
+        );
+    }
+
     /// Regression test for issue #6059 — DeepSeek V4 thinking-mode tool-call
     /// replay rejected with `400` because the assistant's prior
     /// `reasoning_content` was missing from the next request.
