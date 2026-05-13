@@ -94,6 +94,54 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
 }
 
+pub fn extract_markdown_links(text: &str) -> Vec<(String, String, bool)> {
+    let mut links = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("![") {
+        // Image link: ![alt](url)
+        let after = &rest[start + 2..];
+        if let Some(cb) = after.find(']') {
+            let alt = after[..cb].to_string();
+            let tail = &after[cb + 1..];
+            if let Some(inner) = tail.strip_prefix('(')
+                && let Some(pe) = inner.find(')')
+            {
+                links.push((alt, inner[..pe].to_string(), true));
+                rest = &tail[pe + 1..];
+                continue;
+            }
+        }
+        break;
+    }
+
+    rest = text;
+    while let Some(start) = rest.find('[') {
+        if start > 0 && &rest[start - 1..start] == "!" {
+            // Skip image links
+            rest = &rest[start + 1..];
+            continue;
+        }
+
+        // Regular link: [text](url)
+        let after = &rest[start + 1..];
+        if let Some(cb) = after.find(']') {
+            let text_content = after[..cb].to_string();
+            let tail = &after[cb + 1..];
+            if let Some(inner) = tail.strip_prefix('(')
+                && let Some(pe) = inner.find(')')
+            {
+                links.push((text_content, inner[..pe].to_string(), false));
+                rest = &tail[pe + 1..];
+                continue;
+            }
+        }
+        rest = &rest[start + 1..];
+    }
+
+    links
+}
+
 pub fn extract_markdown_images(text: &str) -> Vec<(String, String)> {
     let mut images = Vec::new();
     let mut rest = text;
@@ -194,5 +242,36 @@ mod tests {
         assert!(!is_blocked_extension("document.pdf"));
         assert!(!is_blocked_extension("data.txt"));
         assert!(!is_blocked_extension("no_extension"));
+    }
+
+    #[test]
+    fn test_extract_markdown_links_images_only() {
+        let text = "Check ![logo](https://example.com/logo.png) and ![photo](https://example.com/photo.jpg)";
+        let links = extract_markdown_links(text);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].0, "logo");
+        assert_eq!(links[0].1, "https://example.com/logo.png");
+        assert_eq!(links[0].2, true);
+        assert_eq!(links[1].2, true);
+    }
+
+    #[test]
+    fn test_extract_markdown_links_files_only() {
+        let text = "Download [document](https://example.com/file.pdf) and [data](https://example.com/data.csv)";
+        let links = extract_markdown_links(text);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].0, "document");
+        assert_eq!(links[0].1, "https://example.com/file.pdf");
+        assert_eq!(links[0].2, false);
+        assert_eq!(links[1].2, false);
+    }
+
+    #[test]
+    fn test_extract_markdown_links_mixed() {
+        let text = "See ![img](img.png) and [file](doc.pdf)";
+        let links = extract_markdown_links(text);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].2, true);
+        assert_eq!(links[1].2, false);
     }
 }
