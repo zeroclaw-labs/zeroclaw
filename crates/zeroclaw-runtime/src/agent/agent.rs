@@ -1272,10 +1272,22 @@ impl Agent {
                     let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
                 }
 
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
+                // Preserve reasoning_content even when there are no tool calls.
+                // DeepSeek and other reasoning models require assistant messages
+                // that were generated with reasoning_content to include it when
+                // sent back in subsequent requests.
+                if response.reasoning_content.is_some() {
+                    self.history.push(ConversationMessage::AssistantToolCalls {
+                        text: Some(final_text.clone()),
+                        tool_calls: Vec::new(),
+                        reasoning_content: response.reasoning_content.clone(),
+                    });
+                } else {
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            final_text.clone(),
+                        )));
+                }
                 self.trim_history();
 
                 return Ok(final_text);
@@ -1437,6 +1449,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut streamed_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
+            let mut streamed_reasoning = String::new();
             let mut got_stream = false;
             let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut was_cancelled = false;
@@ -1468,6 +1481,7 @@ impl Agent {
                             if let Some(reasoning) = chunk.reasoning
                                 && !reasoning.is_empty()
                             {
+                                streamed_reasoning.push_str(&reasoning);
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
@@ -1550,11 +1564,16 @@ impl Agent {
             // check for tool calls via the dispatcher.
             let response = if got_stream {
                 // Build a synthetic ChatResponse from streamed text
+                let reasoning_content = if streamed_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(streamed_reasoning)
+                };
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: streamed_usage.clone(),
-                    reasoning_content: None,
+                    reasoning_content,
                 }
             } else {
                 // Fall back to non-streaming chat, with cancellation guard
@@ -1629,10 +1648,22 @@ impl Agent {
                         .await;
                 }
 
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
+                // Preserve reasoning_content even when there are no tool calls.
+                // DeepSeek and other reasoning models require assistant messages
+                // that were generated with reasoning_content to include it when
+                // sent back in subsequent requests.
+                if response.reasoning_content.is_some() {
+                    self.history.push(ConversationMessage::AssistantToolCalls {
+                        text: Some(final_text.clone()),
+                        tool_calls: Vec::new(),
+                        reasoning_content: response.reasoning_content.clone(),
+                    });
+                } else {
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            final_text.clone(),
+                        )));
+                }
                 self.trim_history();
 
                 return Ok(final_text);
