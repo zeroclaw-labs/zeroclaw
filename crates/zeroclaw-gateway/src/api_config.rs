@@ -278,6 +278,44 @@ fn lookup_prop_field(
 ///
 /// On save failure: best-effort restore the pre-write disk content (when
 /// readable), keep in-memory state untouched, return `reload_failed`.
+/// Run `validate()` and partition errors: if the failure path overlaps
+/// a dirty path on the working config, the save is rejected
+/// (`Err(Response)`); otherwise the error is downgraded to a
+/// non-fatal warning attached to the response. Saving a single field
+/// shouldn't be blocked by an unrelated pre-existing validation
+/// problem elsewhere in the config.
+fn scoped_validate(
+    working: &zeroclaw_config::schema::Config,
+) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
+    if let Err(e) = working.validate() {
+        let api_err = ConfigApiError::from_validation(e);
+        let err_path = api_err.path.as_deref().unwrap_or("");
+        let touches_dirty = !err_path.is_empty()
+            && working.dirty_paths.iter().any(|d| {
+                err_path == d.as_str()
+                    || err_path.starts_with(&format!("{d}."))
+                    || d.starts_with(&format!("{err_path}."))
+            });
+        if touches_dirty || err_path.is_empty() {
+            return Err(api_err);
+        }
+        tracing::warn!(
+            path = %err_path,
+            "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
+             surfacing as a warning: {}",
+            api_err.message,
+        );
+        return Ok(vec![
+            zeroclaw_config::validation_warnings::ValidationWarning::new(
+                "pre_existing_validation_error",
+                api_err.message,
+                err_path.to_string(),
+            ),
+        ]);
+    }
+    Ok(Vec::new())
+}
+
 async fn persist_and_swap(
     state: &AppState,
     mut new_config: zeroclaw_config::schema::Config,
@@ -483,16 +521,14 @@ pub async fn handle_prop_put(
         return error_response(map_prop_error(e, &body.path));
     }
 
-    if let Err(e) = new_config.validate() {
-        return error_response(ConfigApiError::from_validation(e).with_path(&body.path));
-    }
+    let scoped_validation_warnings = match scoped_validate(&new_config) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
     let config_path = new_config.config_path.clone();
-    // Collect non-fatal validation warnings against the post-save state
-    // before the config is moved into persist_and_swap. Warnings here are
-    // the same signal `validate()` emits via `tracing::warn!` — surfaced
-    // structured so dashboard callers see what CLI users see on stderr.
-    let warnings = new_config.collect_warnings();
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -548,11 +584,13 @@ pub async fn handle_prop_delete(
         return error_response(map_prop_error(e, &q.path));
     }
 
-    if let Err(e) = new_config.validate() {
-        return error_response(ConfigApiError::from_validation(e).with_path(&q.path));
-    }
+    let scoped_validation_warnings = match scoped_validate(&new_config) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
-    let warnings = new_config.collect_warnings();
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -1169,9 +1207,12 @@ pub async fn handle_patch(
         }
     }
 
-    if let Err(e) = working.validate() {
-        return error_response(ConfigApiError::from_validation(e));
-    }
+    // Per-PATCH validation is scoped to the dirty paths. See
+    // `scoped_validate` for the contract.
+    let scoped_validation_warnings = match scoped_validate(&working) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
     // Collect (path, comment) pairs from any op that supplied a non-None
     // comment. Applied after save() so the comment-preserving sync_table
@@ -1187,7 +1228,8 @@ pub async fn handle_patch(
     // before working is moved into persist_and_swap. Same signal as
     // `tracing::warn!` from `validate()`, surfaced structured so dashboard
     // callers see it.
-    let warnings = working.collect_warnings();
+    let mut warnings = working.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
     }
@@ -1263,8 +1305,8 @@ pub async fn handle_init(
         working.mark_dirty(section);
     }
 
-    if let Err(e) = working.validate() {
-        return error_response(ConfigApiError::from_validation(e));
+    if let Err(err) = scoped_validate(&working) {
+        return error_response(err);
     }
     if let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
