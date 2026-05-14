@@ -1257,8 +1257,19 @@ mod inbound {
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+        // Bind handler lifetime to this function's scope. matrix-sdk 0.16's
+        // `add_event_handler` registers handlers on the cached `Client` and
+        // never deduplicates — so without explicit removal, every supervisor
+        // restart of `run_sync_loop` (after sleep/wake, WLAN drop, transient
+        // sync errors) would stack a fresh handler on top of the existing
+        // one, multiplying every inbound event by the restart count.
+        //
+        // Wrapping the returned `EventHandlerHandle` in
+        // `EventHandlerDropGuard` makes the SDK call `remove_event_handler`
+        // when this function returns, keeping exactly one active handler
+        // per event type at all times.
         let handler_ctx = ctx.clone();
-        client.add_event_handler(
+        let message_handler = client.add_event_handler(
             move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
                 let ctx = handler_ctx.clone();
                 async move {
@@ -1268,18 +1279,21 @@ mod inbound {
                 }
             },
         );
+        let _message_handler_guard = client.event_handler_drop_guard(message_handler);
 
         // Surface inbound events the SDK couldn't decrypt by reacting ❓ on
         // the encrypted event so the operator notices a key gap in chat
         // instead of silent dropping. Best-effort: prophylactic in normally-
         // healthy rooms where decryption succeeds.
         let encrypted_ctx = ctx.clone();
-        client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
-            let ctx = encrypted_ctx.clone();
-            async move {
-                handle_undecryptable(ctx, ev, room).await;
-            }
-        });
+        let encrypted_handler =
+            client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
+                let ctx = encrypted_ctx.clone();
+                async move {
+                    handle_undecryptable(ctx, ev, room).await;
+                }
+            });
+        let _encrypted_handler_guard = client.event_handler_drop_guard(encrypted_handler);
 
         info!("matrix: starting sync loop");
         // Run an initial sync once so the sync token + state are populated,
@@ -1846,7 +1860,7 @@ mod outbound {
                 reaction::ReactionEventContent,
                 relation::Annotation,
                 room::message::{
-                    MessageType, ReplyWithinThread, RoomMessageEventContent,
+                    AddMentions, MessageType, ReplyWithinThread, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
             },
@@ -2300,7 +2314,7 @@ mod outbound {
         ) {
             send_threaded_reply(&room, content, anchor, outbox.threads_seen).await?
         } else {
-            room.send(content).await?.event_id
+            room.send(content).await?.response.event_id
         };
 
         let kinds = delivery.failure_kinds();
@@ -2343,13 +2357,14 @@ mod outbound {
                 Reply {
                     event_id: anchor.clone(),
                     enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                    add_mentions: AddMentions::No,
                 },
             )
             .await
             .map_err(|e| anyhow!("make_reply_event failed: {e}"))?;
         ctx_mod::mark_seen(threads_seen, anchor).await;
         let resp = room.send(reply_event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     pub(super) async fn edit(
@@ -2401,7 +2416,7 @@ mod outbound {
                 event_id.clone(),
                 emoji.to_string(),
             ),
-            resp.event_id,
+            resp.response.event_id,
         );
         Ok(())
     }
@@ -2471,6 +2486,7 @@ mod outbound {
             config = config.reply(Some(Reply {
                 event_id: anchor.clone(),
                 enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                add_mentions: AddMentions::No,
             }));
         }
         let resp = room
@@ -2524,7 +2540,7 @@ mod outbound {
             );
         }
         let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     fn derive_file_name(target: &str) -> String {

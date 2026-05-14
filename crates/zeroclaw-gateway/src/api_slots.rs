@@ -1438,8 +1438,7 @@ mod tests {
         );
 
         // Round-trip through GET to confirm persistence.
-        let get_resp =
-            handle_api_slots_get(State(state), HeaderMap::new(), Path(slot_id)).await;
+        let get_resp = handle_api_slots_get(State(state), HeaderMap::new(), Path(slot_id)).await;
         let got = body_to_json(get_resp).await;
         assert!(got["workspace"].is_null());
     }

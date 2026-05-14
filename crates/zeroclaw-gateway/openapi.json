@@ -6295,6 +6295,9 @@
               "null"
             ]
           },
+          "chat_template_kwargs": {
+            "description": "Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`\nin the request body (llama.cpp-specific). Use this to pass model-family\ntemplate variables that control behaviour not exposed by other fields.\nExample (Qwen3 thinking suppression):\n  `chat_template_kwargs = { enable_thinking = false }`"
+          },
           "extra_headers": {
             "additionalProperties": {
               "type": "string"
@@ -6336,6 +6339,31 @@
               "null"
             ]
           },
+          "ollama_num_ctx": {
+            "description": "Override the Ollama `num_ctx` (context window, in tokens) sent on\nevery `/api/chat` request. Only consulted when this profile resolves\nto the `ollama` provider. Defaults to the framework constant\n(`OLLAMA_DEFAULT_NUM_CTX`) when unset.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ollama_num_predict": {
+            "description": "Override the Ollama `num_predict` (max output tokens) sent on every\n`/api/chat` request. Only consulted when this profile resolves to\nthe `ollama` provider. Defaults to the framework constant\n(`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ollama_temperature_override": {
+            "description": "Force every Ollama `/api/chat` request to use this temperature,\noverriding the per-call value passed through\n`Provider::chat_with_system(.., temperature)`. When unset\n(`None`, the default), the per-call temperature wins — full\nbackward compatibility. Only consulted when this profile\nresolves to the `ollama` provider.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "pricing": {
             "anyOf": [
               {
@@ -6359,6 +6387,13 @@
             "format": "double",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "think": {
+            "description": "Enable or disable chain-of-thought thinking for models that support it\n(e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.\n`None` (default) lets the model decide. Forwarded as `enable_thinking`\nin the request body; mirrors the Ollama provider's `think` field.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -6479,7 +6514,7 @@
         "type": "object"
       },
       "MultimodalConfig": {
-        "description": "Multimodal (image) handling configuration (`[multimodal]` section).",
+        "description": "Multimodal (image) handling configuration (`[multimodal]` section).\n\n# Privacy and cost note\n\nTool results that print real local image paths (e.g. shell tools doing\n`ls /pictures` or `find . -name '*.png'`) are canonicalized into\n`[IMAGE:...]` markers and base64-inlined into the next provider request.\nThis means image bytes that previously stayed local will be uploaded to\nthe configured provider when surfaced by a tool.\n\n`max_images` (and the `trim_old_images` LRU policy) bounds the per-request\nimage budget, but operators running shell-style tools over directories of\npersonal or sensitive images should be aware of the upload semantics. See\n`docs/book/src/contributing/privacy.md` for the project's privacy stance.",
         "properties": {
           "allow_remote_fetch": {
             "default": false,
@@ -6495,7 +6530,7 @@
           },
           "max_images": {
             "default": 4,
-            "description": "Maximum number of image attachments accepted per request.",
+            "description": "Maximum number of image attachments accepted per request.\n\nCaps the total number of `[IMAGE:...]` markers that survive into the\nprovider request after multimodal preprocessing. Older images are\ndropped first when the cumulative count exceeds this limit. Acts as\nthe upper bound on per-turn upload cost when tool outputs surface\nlocal image paths.",
             "format": "uint",
             "minimum": 0,
             "type": "integer"
@@ -6646,6 +6681,13 @@
               "null"
             ]
           },
+          "draft_update_interval_ms": {
+            "default": 1000,
+            "description": "Minimum interval in milliseconds between consecutive OCS edit calls per\nroom when `stream_mode = \"partial\"`. Default: 1000 ms.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "enabled": {
             "default": false,
             "description": "Whether this channel is active (must be explicitly enabled). Default: false.",
@@ -6658,6 +6700,11 @@
               "string",
               "null"
             ]
+          },
+          "stream_mode": {
+            "$ref": "#/components/schemas/StreamMode",
+            "default": "off",
+            "description": "Controls whether and how streaming draft updates are delivered.\n\n- `\"off\"` (default) — responses are sent as a single final message.\n- `\"partial\"` — a placeholder is posted first and edited incrementally\n  as tokens arrive, making long responses visible in real time."
           },
           "webhook_secret": {
             "default": null,
@@ -9061,7 +9108,7 @@
           },
           "sops_dir": {
             "default": null,
-            "description": "Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).\nFalls back to `<workspace>/sops` when omitted.",
+            "description": "Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).\nRequired to enable runtime SOP loading. When omitted, no SOPs are loaded\nat runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still\nresolve the default `<workspace>/sops` for offline inspection.",
             "type": [
               "string",
               "null"

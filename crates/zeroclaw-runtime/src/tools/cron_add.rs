@@ -18,6 +18,21 @@ impl CronAddTool {
         Self { config, security }
     }
 
+    fn plain_string_schedule_error(raw: &str) -> Option<String> {
+        let schedule = raw.trim();
+        if schedule.starts_with('{') {
+            return None;
+        }
+
+        let got = serde_json::to_string(schedule).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+        Some(format!(
+            "Invalid schedule: expected a JSON object with a \"kind\" field, got plain string {got}. \
+             Use one of: {{\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}}, \
+             {{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}}, or \
+             {{\"kind\":\"every\",\"every_ms\":3600000}}"
+        ))
+    }
+
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
         if !self.security.can_act() {
             return Some(ToolResult {
@@ -183,6 +198,26 @@ impl Tool for CronAddTool {
         }
 
         let schedule = match args.get("schedule") {
+            Some(v @ serde_json::Value::String(raw)) => {
+                if let Some(error) = Self::plain_string_schedule_error(raw) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
+                    });
+                }
+
+                match deserialize_maybe_stringified::<Schedule>(v) {
+                    Ok(schedule) => schedule,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Invalid schedule: {e}")),
+                        });
+                    }
+                }
+            }
             Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
                 Ok(schedule) => schedule,
                 Err(e) => {
@@ -598,6 +633,32 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn rejects_plain_string_schedule_with_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": "0 9 * * 1-5",
+                "job_type": "shell",
+                "command": "echo bad-schedule"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("expected a JSON object"));
+        assert!(error.contains("\"kind\""));
+        assert!(error.contains("plain string \"0 9 * * 1-5\""));
+        assert!(error.contains("{\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}"));
+        assert!(error.contains("{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}"));
+        assert!(error.contains("{\"kind\":\"every\",\"every_ms\":3600000}"));
+        assert!(!error.contains("internally tagged enum"));
     }
 
     #[tokio::test]
