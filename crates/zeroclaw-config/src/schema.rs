@@ -380,6 +380,11 @@ pub struct Config {
     #[nested]
     pub notion: NotionConfig,
 
+    /// Dawn S3 compatible storage tool configuration (`[dawn_s3]`).
+    #[serde(default)]
+    #[nested]
+    pub dawn_s3: DawnS3Config,
+
     /// Jira integration configuration (`[jira]`).
     #[serde(default)]
     #[nested]
@@ -9459,7 +9464,23 @@ impl Default for JiraConfig {
     }
 }
 
-///
+/// Dawn S3 compatible storage tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn-s3"]
+pub struct DawnS3Config {
+    /// Enable the `dawn_s3` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dawn API base URL.
+    #[serde(default)]
+    pub url: String,
+    /// Assistant token for authentication.
+    #[serde(default)]
+    #[secret]
+    pub token: String,
+}
+
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -9776,6 +9797,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
@@ -12768,7 +12790,7 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
-            hooks: HooksConfig::default(),
+hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
@@ -12777,6 +12799,7 @@ auto_save = true
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
@@ -12794,11 +12817,6 @@ auto_save = true
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
         };
-        // Provider fields are now resolved directly — no cache needed.
-
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed = parse_test_config(&toml_str);
-
         assert_eq!(parsed.providers.fallback, config.providers.fallback);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");

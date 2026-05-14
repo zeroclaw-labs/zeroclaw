@@ -19,6 +19,7 @@ pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod data_management;
+pub mod dawn_s3;
 pub mod discord_search;
 pub mod escalate;
 pub mod file_edit;

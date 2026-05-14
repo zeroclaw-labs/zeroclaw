@@ -8,9 +8,15 @@ pub use media::{
 
 use base64::Engine;
 
-/// Encode a text content string as a WuKongIM type-1 Base64 payload.
+/// Encode a text content string as a WuKongIM type-14 Markdown Base64 payload.
 pub fn encode_text_payload(content: &str) -> anyhow::Result<String> {
-    let obj = serde_json::json!({ "type": 1, "content": content });
+    let obj = serde_json::json!({
+        "type": 14,
+        "content": {
+            "type": "markdown",
+            "text": content
+        }
+    });
     let json = serde_json::to_string(&obj)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
@@ -27,7 +33,8 @@ mod tests {
             .decode(&b64)
             .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(val["type"], 1);
-        assert_eq!(val["content"], "hello");
+        assert_eq!(val["type"], 14);
+        assert_eq!(val["content"]["type"], "markdown");
+        assert_eq!(val["content"]["text"], "hello");
     }
 }
