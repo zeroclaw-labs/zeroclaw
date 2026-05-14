@@ -149,3 +149,49 @@ fn serve_embedded_file(path: &str) -> Option<Response> {
             .into_response(),
     )
 }
+
+// ── Multi-session dashboard (M3) ─────────────────────────────────────
+//
+// The M3 dashboard ships as a separate Vite+React app at
+// `web-dashboard/`. We serve it from `/dashboard/*` during development
+// and initial rollout; the M5.5 parity-gate flips it to root-mount
+// once the dashboard covers every page the existing `web/` exposes
+// (plan §12).
+
+/// `GET /dashboard/*path` — serve a file from `web_dashboard_dist_dir`.
+/// Mirrors `handle_static` but strips the `/dashboard/` prefix and
+/// reads from the dashboard dist directory, not `web/dist/`.
+pub async fn handle_dashboard_static(State(state): State<AppState>, uri: Uri) -> Response {
+    let path = uri
+        .path()
+        .strip_prefix("/dashboard/")
+        .unwrap_or(uri.path())
+        .trim_start_matches('/');
+
+    serve_fs_file(state.web_dashboard_dist_dir.as_ref(), path).await
+}
+
+/// `GET /dashboard/` and any `/dashboard/<react-route>` that doesn't
+/// match a static file — serve the dashboard SPA's `index.html`.
+pub async fn handle_dashboard_spa_fallback(State(state): State<AppState>) -> Response {
+    let Some(bytes) = load_index_html_bytes(state.web_dashboard_dist_dir.as_ref()).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Web dashboard not available. Set gateway.web_dashboard_dist_dir in your config \
+             and build the frontend with: cd web-dashboard && npm run build",
+        )
+            .into_response();
+    };
+
+    let html = String::from_utf8_lossy(&bytes).into_owned();
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        html,
+    )
+        .into_response()
+}

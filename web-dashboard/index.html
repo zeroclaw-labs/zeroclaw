@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>ZeroClaw Dashboard</title>
+    <!--
+      FOUC-avoidance script — ports OpenClaw's approach at ui/index.html:15-55
+      into our three-theme × two-mode system. Applies the stored theme/mode
+      before React hydrates so the first paint already reflects user choice.
+
+      LocalStorage key: zeroclaw.control.settings.v1
+      Theme values: "default" | "monochrome" | "contrast"
+      Mode values:  "light"   | "dark"
+    -->
+    <script>
+      (function () {
+        try {
+          const raw = localStorage.getItem("zeroclaw.control.settings.v1");
+          const parsed = raw ? JSON.parse(raw) : null;
+          const theme = parsed?.theme ?? "default";
+          const mode = parsed?.mode ?? (
+            window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
+          );
+          const html = document.documentElement;
+          if (["default", "monochrome", "contrast"].includes(theme)) {
+            html.setAttribute("data-theme", theme);
+          }
+          if (["light", "dark"].includes(mode)) {
+            html.setAttribute("data-mode", mode);
+          }
+        } catch (_e) {
+          // LocalStorage unavailable or malformed — leave defaults.
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

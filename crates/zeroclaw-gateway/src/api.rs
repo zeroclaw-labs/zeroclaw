@@ -849,6 +849,50 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/control-ui/config — one-shot bootstrap snapshot for the
+/// dashboard (M3).
+///
+/// Ports OpenClaw's `CONTROL_UI_BOOTSTRAP_CONFIG_PATH` pattern into
+/// ZeroClaw's naming. Returns server version, assistant identity,
+/// default theme/mode, and layout hints. The dashboard fetches this
+/// once on mount and caches for 1h — fields here change on daemon
+/// reload, not on runtime data churn.
+///
+/// Anything that changes frequently (slot list, cost, health,
+/// sessions) has its own dedicated endpoint and its own React Query
+/// hook. Adding "one more field" here should trigger a
+/// design-by-consensus question about whether it actually belongs
+/// in the bootstrap snapshot.
+pub async fn handle_api_control_ui_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Borrow-and-release the config lock rather than holding it while
+    // serializing JSON. M3 only needs the server version here;
+    // assistant identity is a static "ZeroClaw" string today and
+    // becomes per-persona in M4a once persona presets land. Letting
+    // the dashboard show a generic identity until then is strictly
+    // better than invented-config sketches.
+    let _config = state.config.lock();
+    let body = serde_json::json!({
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "assistant_identity": {
+            "name": "ZeroClaw",
+        },
+        "themes": {
+            "default_theme": "default",
+            "default_mode": "dark",
+        },
+        "max_chat_width_ch": 80,
+    });
+
+    Json(body).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 // ── Session API handlers ─────────────────────────────────────────
@@ -1299,6 +1343,7 @@ mod tests {
             pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reload_tx: None,

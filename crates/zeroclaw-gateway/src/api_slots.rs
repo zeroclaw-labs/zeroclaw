@@ -1034,6 +1034,7 @@ mod tests {
             node_registry: Arc::new(crate::nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: Arc::new(SessionActorQueue::new(8, 30, 600)),
             slot_queue: Arc::new(SlotActorQueue::new(8, 30, 600)),
