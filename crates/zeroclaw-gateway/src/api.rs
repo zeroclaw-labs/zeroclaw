@@ -116,6 +116,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "provider": config.providers.fallback,
         "model": state.model,
         "temperature": state.temperature,

@@ -456,7 +456,11 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+    if is_matrix_channel_name(&msg.channel) {
+        msg.thread_ts.clone()
+    } else {
+        msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+    }
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -785,6 +789,10 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+}
+
+fn is_matrix_channel_name(channel_name: &str) -> bool {
+    channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -10630,7 +10638,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "hello".into(),
-            channel: "cli".into(),
+            channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
@@ -10638,6 +10646,68 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
+    }
+
+    #[test]
+    fn followup_thread_id_does_not_open_matrix_thread_for_root_message() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "$event:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "hello".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(followup_thread_id(&msg), None);
+    }
+
+    #[test]
+    fn matrix_root_conversation_history_key_omits_event_id() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "$first:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "send a.txt".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "$second:server".into(),
+            content: "send it again".into(),
+            timestamp: 2,
+            ..first.clone()
+        };
+
+        let key = conversation_history_key(&first);
+        assert_eq!(key, conversation_history_key(&second));
+        assert!(!key.contains("$first:server"));
+        assert!(!key.contains("$second:server"));
+    }
+
+    #[test]
+    fn matrix_thread_conversation_history_key_uses_thread_root() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "thread reply".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            attachments: vec![],
+        };
+
+        let key = conversation_history_key(&msg);
+        assert!(key.contains("$root:server"));
+        assert!(!key.contains("$reply:server"));
     }
 
     #[test]

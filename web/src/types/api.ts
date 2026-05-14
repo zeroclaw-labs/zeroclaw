@@ -1,4 +1,5 @@
 export interface StatusResponse {
+  version?: string;
   provider: string | null;
   model: string;
   temperature: number;

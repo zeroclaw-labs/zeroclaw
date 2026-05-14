@@ -11,9 +11,12 @@
 //!
 //! Gemini CLI is invoked as:
 //! ```text
-//! gemini --print -
+//! gemini --prompt ""
 //! ```
-//! with prompt content written to stdin.
+//! with prompt content written to stdin. The empty `--prompt ""` is the
+//! headless-mode trigger; the CLI appends stdin to it, so the actual prompt
+//! is never visible in `ps` / `/proc/<pid>/cmdline`. Older CLI builds used
+//! `--print -` for this; that flag was removed in Gemini CLI v0.40.x.
 //!
 //! # Limitations
 //!
@@ -119,18 +122,26 @@ impl GeminiCliProvider {
         format!("{clipped}...")
     }
 
+    /// Build the argv tail (excluding the binary itself) for a CLI invocation.
+    ///
+    /// `--prompt ""` is the headless-mode trigger; the CLI appends stdin to
+    /// it, so the actual prompt stays out of `ps` / `/proc/<pid>/cmdline`.
+    /// The pre-v0.40 syntax `--print -` was removed upstream in #6520.
+    fn build_cli_args(model: &str) -> Vec<String> {
+        let mut args = vec!["--prompt".to_string(), String::new()];
+        if Self::should_forward_model(model) {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+        args
+    }
+
     /// Invoke the gemini binary with the given prompt and optional model.
     /// Returns the trimmed stdout output as the assistant response.
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.binary_path);
-        cmd.arg("--print");
+        cmd.args(Self::build_cli_args(model));
 
-        if Self::should_forward_model(model) {
-            cmd.arg("--model").arg(model);
-        }
-
-        // Read prompt from stdin to avoid exposing sensitive content in process args.
-        cmd.arg("-");
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -311,6 +322,33 @@ mod tests {
             err.to_string()
                 .contains("temperature unsupported by Gemini CLI")
         );
+    }
+
+    // Regression for #6520. Gemini CLI v0.40.x removed `--print`; the
+    // headless-mode flag is now `--prompt`. The argv must (a) carry
+    // `--prompt ""` so stdin still feeds the prompt content (keeping the
+    // user message out of `ps`) and (b) NEVER carry `--print` or `-`.
+    #[test]
+    fn build_cli_args_uses_prompt_flag_with_empty_token_default_model() {
+        let args = GeminiCliProvider::build_cli_args(DEFAULT_MODEL_MARKER);
+        assert_eq!(args, vec!["--prompt".to_string(), String::new()]);
+        assert!(!args.iter().any(|a| a == "--print"));
+        assert!(!args.iter().any(|a| a == "-"));
+    }
+
+    #[test]
+    fn build_cli_args_forwards_explicit_model_after_prompt() {
+        let args = GeminiCliProvider::build_cli_args("gemini-2.5-pro");
+        assert_eq!(
+            args,
+            vec![
+                "--prompt".to_string(),
+                String::new(),
+                "--model".to_string(),
+                "gemini-2.5-pro".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--print"));
     }
 
     #[tokio::test]
