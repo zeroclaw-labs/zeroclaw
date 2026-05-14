@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+/*
+ * Theme tokens — three themes × two modes (M3).
+ *
+ * Rationale for renaming from OpenClaw's `claw`/`knot`/`dash`: port
+ * the mechanism (three themes × light/dark, FOUC-avoidance, legacy
+ * alias map) but not the branded values that would leak into
+ * localStorage keys, HTML attributes, and settings UI labels.
+ *
+ * Consumers read CSS custom properties via Tailwind utilities like
+ * `bg-[color:var(--color-surface)]`. New surfaces should prefer
+ * semantic names (surface, surface-muted, text, border, accent) over
+ * palette primitives (gray-100, blue-500) so theme switching works
+ * with zero component churn.
+ */
+
+@theme {
+  --color-surface: #ffffff;
+  --color-surface-muted: #f5f5f5;
+  --color-text: #111111;
+  --color-text-muted: #555555;
+  --color-border: #dddddd;
+  --color-accent: #2563eb;
+}
+
+/* default · dark */
+html[data-theme="default"][data-mode="dark"] {
+  --color-surface: #0f0f10;
+  --color-surface-muted: #17171a;
+  --color-text: #f0f0f0;
+  --color-text-muted: #a0a0a0;
+  --color-border: #2c2c30;
+  --color-accent: #60a5fa;
+}
+
+/* monochrome · light */
+html[data-theme="monochrome"][data-mode="light"] {
+  --color-surface: #fafafa;
+  --color-surface-muted: #efefef;
+  --color-text: #0a0a0a;
+  --color-text-muted: #444444;
+  --color-border: #cccccc;
+  --color-accent: #333333;
+}
+
+/* monochrome · dark */
+html[data-theme="monochrome"][data-mode="dark"] {
+  --color-surface: #0a0a0a;
+  --color-surface-muted: #161616;
+  --color-text: #eaeaea;
+  --color-text-muted: #8a8a8a;
+  --color-border: #2a2a2a;
+  --color-accent: #e5e5e5;
+}
+
+/* contrast · light */
+html[data-theme="contrast"][data-mode="light"] {
+  --color-surface: #ffffff;
+  --color-surface-muted: #f0f0f0;
+  --color-text: #000000;
+  --color-text-muted: #222222;
+  --color-border: #000000;
+  --color-accent: #0000ee;
+}
+
+/* contrast · dark */
+html[data-theme="contrast"][data-mode="dark"] {
+  --color-surface: #000000;
+  --color-surface-muted: #0a0a0a;
+  --color-text: #ffffff;
+  --color-text-muted: #e0e0e0;
+  --color-border: #ffffff;
+  --color-accent: #ffff00;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+}

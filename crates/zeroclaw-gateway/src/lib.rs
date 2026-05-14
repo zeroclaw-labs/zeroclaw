@@ -417,6 +417,11 @@ pub struct AppState {
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
     pub web_dist_dir: Option<std::path::PathBuf>,
+    /// Filesystem path to `web-dashboard/dist/` (M3). Separate from
+    /// `web_dist_dir` so the legacy `web/` app and the new
+    /// `web-dashboard/` app can coexist during the parity-gate
+    /// window before M5.5's root-mount flip.
+    pub web_dashboard_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
@@ -934,6 +939,41 @@ pub async fn run_gateway(
         );
     }
 
+    // Resolve web_dashboard_dist_dir (M3): auto-detect `web-dashboard/dist/`
+    // as a sibling of the legacy `web/dist/` location. No explicit config
+    // key yet — the env var fallback stays consistent with the legacy
+    // `web_dist_dir` override pattern.
+    let web_dashboard_dist_dir: Option<std::path::PathBuf> =
+        std::env::var("ZEROCLAW_WEB_DASHBOARD_DIST_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let mut candidates = vec![
+                    std::path::PathBuf::from("web-dashboard/dist"),
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("web-dashboard/dist")))
+                        .unwrap_or_default(),
+                    std::path::PathBuf::from("/zeroclaw-data/web-dashboard/dist"),
+                    std::path::PathBuf::from("/usr/share/zeroclawlabs/web-dashboard/dist"),
+                ];
+                if let Some(data_dir) = dirs_data_local() {
+                    candidates.push(data_dir.join("zeroclaw/web-dashboard/dist"));
+                }
+                candidates
+                    .into_iter()
+                    .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+            });
+
+    if let Some(ref dir) = web_dashboard_dist_dir {
+        tracing::info!("Multi-session dashboard: serving from {}", dir.display());
+    } else {
+        tracing::debug!(
+            "Multi-session dashboard: not available (set ZEROCLAW_WEB_DASHBOARD_DIST_DIR or \
+             build with: cd web-dashboard && npm run build)"
+        );
+    }
+
     let pfx = path_prefix.unwrap_or("");
     println!("🦀 ZeroClaw Gateway listening on http://{display_addr}{pfx}");
     if let Some(ref url) = tunnel_url {
@@ -1068,6 +1108,7 @@ pub async fn run_gateway(
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
+        web_dashboard_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         #[cfg(feature = "webauthn")]
@@ -1226,6 +1267,11 @@ pub async fn run_gateway(
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
+        // ── Multi-session dashboard bootstrap (M3) ──
+        .route(
+            "/api/control-ui/config",
+            get(api::handle_api_control_ui_config),
+        )
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -1337,6 +1383,27 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
+        // ── Multi-session dashboard (M3) ──
+        //
+        // Served at `/dashboard/*` during the parity-gate window
+        // (plan §12). Three routes are needed:
+        //   * `/dashboard` (no slash) — 308-redirect to `/dashboard/`
+        //     so a typed URL without the trailing slash reaches the
+        //     SPA instead of being interpreted as a filename lookup
+        //     by the wildcard route.
+        //   * `/dashboard/` — SPA entry.
+        //   * `/dashboard/{*path}` — static assets + SPA fallback for
+        //     deep-linked client routes (the static handler itself
+        //     falls back to `index.html` for non-asset misses).
+        .route("/dashboard", get(redirect_dashboard_trailing_slash))
+        .route(
+            "/dashboard/",
+            get(static_files::handle_dashboard_spa_fallback),
+        )
+        .route(
+            "/dashboard/{*path}",
+            get(static_files::handle_dashboard_static),
+        )
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())
@@ -1456,6 +1523,24 @@ pub async fn run_gateway(
 // ══════════════════════════════════════════════════════════════════════════════
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// `GET /dashboard` → 308 redirect to `/dashboard/` (M3).
+///
+/// Without this, a user who types `/dashboard` without the trailing
+/// slash matches the `/dashboard/{*path}` wildcard with the whole URL
+/// stripped — `handle_dashboard_static` then looks for a file
+/// literally named `dashboard` in the dist directory and 404s. A
+/// 308 is used instead of 307 because the redirect is permanent and
+/// applies to every method (including future `POST /dashboard` if the
+/// SPA ever gains form submissions).
+async fn redirect_dashboard_trailing_slash(State(state): State<AppState>) -> impl IntoResponse {
+    let target = if state.path_prefix.is_empty() {
+        "/dashboard/".to_string()
+    } else {
+        format!("{}/dashboard/", state.path_prefix)
+    };
+    (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, target)]).into_response()
+}
 
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -2889,6 +2974,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -2968,6 +3054,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3432,6 +3519,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3519,6 +3607,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3618,6 +3707,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3689,6 +3779,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3765,6 +3856,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3846,6 +3938,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3924,6 +4017,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
+            web_dashboard_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
