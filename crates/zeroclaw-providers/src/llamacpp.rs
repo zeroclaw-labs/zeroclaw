@@ -429,6 +429,7 @@ impl Provider for LlamaCppProvider {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 

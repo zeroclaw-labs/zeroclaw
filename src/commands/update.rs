@@ -4,10 +4,13 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use tracing::{info, warn};
 
+// Point to Stealinglight fork for self-updates on the `stealinglight` branch.
+// Upstream uses zeroclaw-labs/zeroclaw — this override ensures the Pi pulls
+// builds from the fork's releases instead.
 const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
+    "https://api.github.com/repos/Stealinglight/zeroclaw/releases/latest";
 const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+    "https://api.github.com/repos/Stealinglight/zeroclaw/releases/tags";
 
 #[derive(Debug)]
 pub struct UpdateInfo {

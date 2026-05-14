@@ -13,10 +13,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 portable-atomic = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 tracing = { version = "0.1", default-features = false }
+
+[features]
+default = []
+# Gate `JsonSchema` derives on the slot data model. The gateway's
+# `schema-export` feature forwards to this so OpenAPI generation picks
+# up the slot types.
+schema-export = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = "3.26"

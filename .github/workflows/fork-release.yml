@@ -1,0 +1,94 @@
+name: Fork Release
+
+# Triggers on any `v*` tag pushed to this fork. Tags are global refs,
+# not branch-scoped — this workflow fires regardless of which branch the
+# tagged commit sits on.
+# Usage: git tag v0.6.9-sl.1 && git push origin v0.6.9-sl.1
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux-only to preserve free-tier Actions minutes. macOS binaries
+          # are built locally on the Mac via `cargo build --release`.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y "$CROSS_COMPILER"
+        env:
+          CROSS_COMPILER: ${{ matrix.cross_compiler }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
+            export "$LINKER_ENV=$LINKER"
+          fi
+          cargo build --release --locked --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER_ENV: ${{ matrix.linker_env }}
+          LINKER: ${{ matrix.linker }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          BIN="target/$TARGET/release/zeroclaw"
+          ARCHIVE="zeroclaw-${TARGET}.tar.gz"
+          tar czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

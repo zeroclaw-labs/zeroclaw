@@ -15,6 +15,7 @@ pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+pub mod api_slots;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 pub mod auth_rate_limit;
@@ -24,6 +25,9 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod session_queue;
+pub mod slot;
+pub mod slot_agent;
+pub mod slot_events;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
@@ -416,6 +420,22 @@ pub struct AppState {
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
+    /// Per-slot actor queue for serializing dashboard slot turns.
+    /// Independent of `session_queue` so two slots on the same memory
+    /// session don't serialize; M1 ships the queue, M2 wires it into
+    /// slot turn handling.
+    pub slot_queue: Arc<session_queue::SlotActorQueue>,
+    /// Slot persistence store (multi-session dashboard). `None` when the
+    /// session backend is disabled — `/api/slots/*` returns 503 in that
+    /// case.
+    pub slot_store: Option<Arc<dyn slot::SlotStore>>,
+    /// Per-slot cancellation tokens for aborting in-flight slot turns.
+    /// Keyed on `slot_id`. Parallel to `cancel_tokens` which keys on the
+    /// session-key form `gw_<session_id>`. M1 ships the registry; M2
+    /// uses it from the messaging handler.
+    pub slot_cancel_tokens: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -1006,6 +1026,21 @@ pub async fn run_gateway(
         node_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        slot_queue: Arc::new(session_queue::SlotActorQueue::new(8, 30, 600)),
+        slot_store: if config.gateway.session_persistence {
+            match zeroclaw_infra::make_slot_store(&config.workspace_dir) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(
+                        "slot_store initialization failed; /api/slots will return 503: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
@@ -1145,6 +1180,33 @@ pub async fn run_gateway(
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        // ── Dashboard slots API (M1 — multi-session dashboard) ──
+        .route(
+            "/api/slots",
+            get(api_slots::handle_api_slots_list).post(api_slots::handle_api_slots_create),
+        )
+        .route(
+            "/api/slots/{id}",
+            get(api_slots::handle_api_slots_get)
+                .patch(api_slots::handle_api_slots_patch)
+                .delete(api_slots::handle_api_slots_delete),
+        )
+        .route(
+            "/api/slots/{id}/duplicate",
+            post(api_slots::handle_api_slots_duplicate),
+        )
+        .route(
+            "/api/slots/{id}/messages",
+            post(api_slots::handle_api_slots_messages),
+        )
+        .route(
+            "/api/slots/{id}/stop",
+            post(api_slots::handle_api_slots_stop),
+        )
+        .route(
+            "/api/slots/{id}/approve",
+            post(api_slots::handle_api_slots_approve),
+        )
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -2776,6 +2838,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2850,6 +2915,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3309,6 +3377,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3391,6 +3462,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3485,6 +3559,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3551,6 +3628,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3622,6 +3702,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3698,6 +3781,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3771,6 +3857,9 @@ mod tests {
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),
+            slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
+            slot_store: None,
+            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),

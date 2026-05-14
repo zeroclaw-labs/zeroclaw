@@ -1282,6 +1282,7 @@ impl Provider for GeminiProvider {
             vision: true,
             native_tool_calling: false,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
