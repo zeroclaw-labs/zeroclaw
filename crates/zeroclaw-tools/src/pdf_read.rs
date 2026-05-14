@@ -36,8 +36,7 @@ impl Tool for PdfReadTool {
 
     fn description(&self) -> &str {
         "Extract plain text from a PDF file in the workspace. \
-         Returns all readable text. Image-only or encrypted PDFs return an empty result. \
-         Requires the 'rag-pdf' build feature."
+         Returns all readable text. Image-only or encrypted PDFs return an empty result."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

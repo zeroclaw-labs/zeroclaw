@@ -4526,7 +4526,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .wukongim
                 .as_ref()
                 .context("WuKongIM channel is not configured")?;
-            Ok(Arc::new(WuKongIMChannel::from_config(wk)))
+            Ok(Arc::new(WuKongIMChannel::from_config(
+                wk,
+                &config.workspace_dir,
+            )))
         }
         "wecom" => {
             let wc = config
@@ -5474,7 +5477,7 @@ fn collect_configured_channels(
         if wk.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
-                channel: Arc::new(WuKongIMChannel::from_config(wk)),
+                channel: Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir)),
             });
         } else {
             tracing::info!("WuKongIM channel configured but disabled (enabled = false)");
@@ -6346,7 +6349,7 @@ pub async fn deliver_announcement(
                 .wukongim
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("wukongim channel not configured"))?;
-            let ch = WuKongIMChannel::from_config(wk);
+            let ch = WuKongIMChannel::from_config(wk, &config.workspace_dir);
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }

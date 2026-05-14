@@ -310,8 +310,12 @@ impl Tool for WebFetchTool {
         }
 
         let url = match self.validate_url(url) {
-            Ok(v) => v,
+            Ok(v) => {
+                tracing::info!("web_fetch: URL validated successfully: {}", v);
+                v
+            }
             Err(e) => {
+                tracing::warn!("web_fetch: URL validation failed: {}", e);
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -408,6 +412,13 @@ fn validate_target_url(
     allowed_private_hosts: &[String],
     tool_name: &str,
 ) -> anyhow::Result<String> {
+    tracing::info!(
+        "web_fetch validate_target_url: url={}, allowed_domains={:?}, allowed_private_hosts={:?}",
+        raw_url,
+        allowed_domains,
+        allowed_private_hosts
+    );
+
     let url = raw_url.trim();
 
     if url.is_empty() {
@@ -430,6 +441,11 @@ fn validate_target_url(
     }
 
     let host = extract_host(url)?;
+    tracing::info!(
+        "web_fetch: extracted host={}, is_private={}",
+        host,
+        is_private_or_local_host(&host)
+    );
 
     // blocked_domains always takes precedence
     if host_matches_allowlist(&host, blocked_domains) {
@@ -438,6 +454,8 @@ fn validate_target_url(
 
     let private_host_allowed =
         is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+
+    tracing::info!("web_fetch: private_host_allowed={}", private_host_allowed);
 
     if is_private_or_local_host(&host) && !private_host_allowed {
         anyhow::bail!(
