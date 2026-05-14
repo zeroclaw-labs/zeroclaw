@@ -5,7 +5,7 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 
@@ -46,7 +46,7 @@ pub fn add_shell_job(
 
     let delete_after_run = matches!(schedule, Schedule::At { .. });
 
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
@@ -92,7 +92,7 @@ pub fn add_agent_job(
     let schedule_json = serde_json::to_string(&schedule)?;
     let delivery = delivery.unwrap_or_default();
 
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
@@ -121,7 +121,7 @@ pub fn add_agent_job(
 }
 
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
-    with_connection(config, |conn| {
+    let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -136,11 +136,16 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
             jobs.push(row?);
         }
         Ok(jobs)
-    })
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(jobs)
 }
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
-    with_connection(config, |conn| {
+    let Some(job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -154,11 +159,16 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         } else {
             anyhow::bail!("Cron job '{job_id}' not found")
         }
-    })
+    })?
+    else {
+        anyhow::bail!("Cron job '{job_id}' not found")
+    };
+
+    Ok(job)
 }
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
-    let changed = with_connection(config, |conn| {
+    let changed = with_initialized_connection(config, |conn| {
         conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
             .context("Failed to delete cron job")
     })?;
@@ -174,7 +184,7 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
-    with_connection(config, |conn| {
+    let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -195,7 +205,12 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
             }
         }
         Ok(jobs)
-    })
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(jobs)
 }
 
 /// Return **all** enabled overdue jobs without the `max_tasks` limit.
@@ -204,7 +219,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 /// executed at least once after a period of downtime (late boot, daemon
 /// restart, etc.).
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
-    with_connection(config, |conn| {
+    let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -224,7 +239,12 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
             }
         }
         Ok(jobs)
-    })
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(jobs)
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
@@ -278,7 +298,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
     }
 
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
@@ -329,7 +349,7 @@ pub fn record_last_run_with_status(
     output: &str,
 ) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
              SET last_run = ?1, last_status = ?2, last_output = ?3
@@ -363,7 +383,7 @@ pub fn reschedule_after_run_with_status(
     // One-shot `At` schedules have no future occurrence — record the run
     // result and disable the job so it won't be picked up again.
     if matches!(job.schedule, Schedule::At { .. }) {
-        with_connection(config, |conn| {
+        with_initialized_connection(config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs
                  SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
@@ -375,7 +395,7 @@ pub fn reschedule_after_run_with_status(
         })
     } else {
         let next_run = next_run_for_schedule(&job.schedule, now)?;
-        with_connection(config, |conn| {
+        with_initialized_connection(config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs
                  SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
@@ -404,7 +424,7 @@ pub fn record_run(
     duration_ms: i64,
 ) -> Result<()> {
     let bounded_output = output.map(truncate_cron_output);
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
         // cannot grow unboundedly.
@@ -464,7 +484,7 @@ fn truncate_cron_output(output: &str) -> String {
 }
 
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
-    with_connection(config, |conn| {
+    let Some(runs) = with_read_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
             "SELECT id, job_id, started_at, finished_at, status, output, duration_ms
@@ -493,7 +513,12 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
             runs.push(row?);
         }
         Ok(runs)
-    })
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
 }
 
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
@@ -614,9 +639,10 @@ pub fn sync_declarative_jobs(
     use zeroclaw_config::schema::CronScheduleDecl;
 
     if decls.is_empty() {
-        // If no declarative jobs are defined, clean up any previously
-        // synced declarative jobs that are no longer in config.
-        with_connection(config, |conn| {
+        // If no declarative jobs are defined, clean up previously synced
+        // declarative jobs only when cron storage already exists. A fresh
+        // workspace with nothing to sync should stay DB-free on daemon start.
+        let _ = with_existing_initialized_connection(config, |conn| {
             let deleted = conn
                 .execute("DELETE FROM cron_jobs WHERE source = 'declarative'", [])
                 .context("Failed to remove stale declarative cron jobs")?;
@@ -638,7 +664,7 @@ pub fn sync_declarative_jobs(
 
     let now = Utc::now();
 
-    with_connection(config, |conn| {
+    with_initialized_connection(config, |conn| {
         // Collect IDs of all declarative jobs currently defined in config.
         let config_ids: std::collections::HashSet<&str> =
             decls.iter().map(|d| d.id.as_str()).collect();
@@ -901,8 +927,45 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     }
 }
 
-fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = config.workspace_dir.join("cron").join("jobs.db");
+fn cron_db_path(config: &Config) -> std::path::PathBuf {
+    config.workspace_dir.join("cron").join("jobs.db")
+}
+
+// Read paths must not create the cron directory or jobs.db. If the DB already
+// exists, however, reads still need the lightweight schema/migration ensure
+// step before selecting columns added by newer releases.
+fn with_read_connection<T>(
+    config: &Config,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<Option<T>> {
+    with_existing_initialized_connection(config, f)
+}
+
+fn with_existing_initialized_connection<T>(
+    config: &Config,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<Option<T>> {
+    let db_path = cron_db_path(config);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display()))?;
+
+    initialize_schema(&conn)?;
+
+    f(&conn).map(Some)
+}
+
+fn with_initialized_connection<T>(
+    config: &Config,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let db_path = cron_db_path(config);
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
@@ -911,6 +974,12 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
+    initialize_schema(&conn)?;
+
+    f(&conn)
+}
+
+fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -951,20 +1020,20 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(&conn, "schedule", "TEXT")?;
-    add_column_if_missing(&conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(&conn, "prompt", "TEXT")?;
-    add_column_if_missing(&conn, "name", "TEXT")?;
-    add_column_if_missing(&conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(&conn, "model", "TEXT")?;
-    add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "delivery", "TEXT")?;
-    add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
-    add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
-    add_column_if_missing(&conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "schedule", "TEXT")?;
+    add_column_if_missing(conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
+    add_column_if_missing(conn, "prompt", "TEXT")?;
+    add_column_if_missing(conn, "name", "TEXT")?;
+    add_column_if_missing(conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
+    add_column_if_missing(conn, "model", "TEXT")?;
+    add_column_if_missing(conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "delivery", "TEXT")?;
+    add_column_if_missing(conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "allowed_tools", "TEXT")?;
+    add_column_if_missing(conn, "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
 
-    f(&conn)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -982,6 +1051,133 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    fn cron_dir(config: &Config) -> std::path::PathBuf {
+        config.workspace_dir.join("cron")
+    }
+
+    fn cron_db(config: &Config) -> std::path::PathBuf {
+        cron_dir(config).join("jobs.db")
+    }
+
+    #[test]
+    fn read_only_queries_on_empty_workspace_do_not_initialize_cron_db() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        assert!(list_jobs(&config).unwrap().is_empty());
+        assert!(due_jobs(&config, Utc::now()).unwrap().is_empty());
+        assert!(all_overdue_jobs(&config, Utc::now()).unwrap().is_empty());
+        assert!(list_runs(&config, "missing", 10).unwrap().is_empty());
+
+        let err = get_job(&config, "missing").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+
+        assert!(
+            !cron_dir(&config).exists(),
+            "read-only queries should not create the cron directory"
+        );
+        assert!(
+            !cron_db(&config).exists(),
+            "read-only queries should not create jobs.db"
+        );
+    }
+
+    #[test]
+    fn first_write_initializes_schema_and_follow_up_reads_work() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+
+        assert!(cron_db(&config).exists());
+        assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
+        assert_eq!(list_jobs(&config).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_declarative_sync_on_empty_workspace_does_not_initialize_cron_db() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        sync_declarative_jobs(&config, &[]).unwrap();
+
+        assert!(
+            !cron_dir(&config).exists(),
+            "empty declarative sync should not create the cron directory"
+        );
+        assert!(
+            !cron_db(&config).exists(),
+            "empty declarative sync should not create jobs.db"
+        );
+    }
+
+    #[test]
+    fn read_existing_old_schema_db_migrates_before_querying_new_columns() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let cron_dir = cron_dir(&config);
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        let db_path = cron_db(&config);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                schedule         TEXT,
+                job_type         TEXT NOT NULL DEFAULT 'shell',
+                prompt           TEXT,
+                name             TEXT,
+                session_target   TEXT NOT NULL DEFAULT 'isolated',
+                model            TEXT,
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                delivery         TEXT,
+                delete_after_run INTEGER NOT NULL DEFAULT 0,
+                allowed_tools    TEXT,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL,
+                last_run         TEXT,
+                last_status      TEXT,
+                last_output      TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cron_jobs (
+                id, expression, command, schedule, job_type, session_target,
+                enabled, delete_after_run, created_at, next_run
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', 'isolated', 1, 0, ?5, ?6)",
+            params![
+                "legacy-schema",
+                "*/5 * * * *",
+                "echo legacy",
+                Option::<String>::None,
+                Utc::now().to_rfc3339(),
+                (Utc::now() + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let jobs = list_jobs(&config).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "legacy-schema");
+        assert_eq!(jobs[0].source, "imperative");
+        assert!(jobs[0].uses_memory);
+
+        let conn = Connection::open(&db_path).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(cron_jobs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "source"));
+        assert!(columns.iter().any(|name| name == "uses_memory"));
     }
 
     #[test]
@@ -1288,7 +1484,7 @@ mod tests {
         let config = test_config(&tmp);
         let now = Utc::now();
 
-        with_connection(&config, |conn| {
+        with_initialized_connection(&config, |conn| {
             conn.execute(
                 "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1316,7 +1512,7 @@ mod tests {
         let config = test_config(&tmp);
         let now = Utc::now();
 
-        with_connection(&config, |conn| {
+        with_initialized_connection(&config, |conn| {
             conn.execute(
                 "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at, next_run)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1342,7 +1538,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        with_connection(&config, |conn| {
+        with_initialized_connection(&config, |conn| {
             conn.execute(
                 "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
