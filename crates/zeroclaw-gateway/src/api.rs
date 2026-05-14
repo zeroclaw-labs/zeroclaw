@@ -871,13 +871,14 @@ pub async fn handle_api_control_ui_config(
         return e.into_response();
     }
 
-    // Borrow-and-release the config lock rather than holding it while
-    // serializing JSON. M3 only needs the server version here;
-    // assistant identity is a static "ZeroClaw" string today and
-    // becomes per-persona in M4a once persona presets land. Letting
-    // the dashboard show a generic identity until then is strictly
-    // better than invented-config sketches.
-    let _config = state.config.lock();
+    // M3 only needs a static identity here — the assistant identity
+    // becomes per-persona in M4a once persona presets land. No reason
+    // to grab the config lock today; add it back when the handler
+    // actually reads from `state.config`. Keeping the lock around
+    // unused held a `Mutex` guard across the entire response body
+    // construction for no reason, which is worse than both
+    // alternatives.
+    let _ = state;
     let body = serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "assistant_identity": {
@@ -1611,5 +1612,68 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /api/control-ui/config (M3 dashboard bootstrap) ─────────────
+
+    #[tokio::test]
+    async fn control_ui_config_returns_expected_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_control_ui_config(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        // Dashboard bootstrap contract: these top-level fields must
+        // exist for the frontend's `ControlUiBootstrapProvider` to
+        // render at all. Breaking this shape breaks the dashboard
+        // SPA's first paint — treat this test as a contract gate.
+        assert!(
+            json["server_version"].is_string(),
+            "server_version must be a string"
+        );
+        assert!(
+            json["assistant_identity"]["name"].is_string(),
+            "assistant_identity.name must be a string"
+        );
+        assert_eq!(json["themes"]["default_theme"], "default");
+        assert_eq!(json["themes"]["default_mode"], "dark");
+    }
+
+    #[tokio::test]
+    async fn control_ui_config_returns_401_when_pairing_required_without_token() {
+        // When pairing is enforced, the handler must reject requests
+        // that arrive without a bearer token. The dashboard's shared
+        // `apiFetch` helper wires the header; a skipped call or a
+        // misconfigured gateway must not silently serve the bootstrap
+        // snapshot to an unpaired caller.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let mut state = test_state(config);
+        // Swap in a pairing guard that requires pairing and has no
+        // trusted tokens. With no `Authorization` header on the
+        // request, `require_auth` should return 401.
+        state.pairing = std::sync::Arc::new(
+            zeroclaw_runtime::security::pairing::PairingGuard::new(true, &[]),
+        );
+
+        let response = handle_api_control_ui_config(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

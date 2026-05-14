@@ -1,5 +1,6 @@
 import { createContext, useContext, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { apiFetch } from "@/lib/apiFetch";
 
 /**
  * Shape of `GET /api/control-ui/config` (M3).
@@ -26,13 +27,7 @@ export interface ControlUiBootstrapConfig {
 const BootstrapContext = createContext<ControlUiBootstrapConfig | null>(null);
 
 async function fetchBootstrap(): Promise<ControlUiBootstrapConfig> {
-  const res = await fetch("/api/control-ui/config", {
-    headers: { Accept: "application/json" },
-  });
-  if (!res.ok) {
-    throw new Error(`GET /api/control-ui/config → ${res.status}`);
-  }
-  return res.json();
+  return apiFetch<ControlUiBootstrapConfig>("/api/control-ui/config");
 }
 
 export function ControlUiBootstrapProvider({ children }: { children: ReactNode }) {

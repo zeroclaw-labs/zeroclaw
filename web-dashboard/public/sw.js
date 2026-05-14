@@ -54,8 +54,13 @@ self.addEventListener("fetch", (event) => {
       (async () => {
         try {
           const res = await fetch(req);
-          const cache = await caches.open(CACHE_NAME);
-          cache.put(req, res.clone());
+          // Only cache successful, non-opaque responses so a transient
+          // 401/503/404 can't pin a broken reply until cache eviction.
+          // `type === "basic"` excludes opaque cross-origin responses.
+          if (res.ok && res.type === "basic") {
+            const cache = await caches.open(CACHE_NAME);
+            cache.put(req, res.clone());
+          }
           return res;
         } catch (_err) {
           const cached = await caches.match(req);
@@ -74,8 +79,13 @@ self.addEventListener("fetch", (event) => {
         const cached = await caches.match(req);
         if (cached) return cached;
         const res = await fetch(req);
-        const cache = await caches.open(CACHE_NAME);
-        cache.put(req, res.clone());
+        // Same guard as above: don't cache errors or opaque replies.
+        // Redirects are also skipped — an `assets/` URL that 302s is a
+        // deployment mistake we don't want to memoise.
+        if (res.ok && res.type === "basic" && !res.redirected) {
+          const cache = await caches.open(CACHE_NAME);
+          cache.put(req, res.clone());
+        }
         return res;
       })(),
     );

@@ -1386,20 +1386,23 @@ pub async fn run_gateway(
         // ── Multi-session dashboard (M3) ──
         //
         // Served at `/dashboard/*` during the parity-gate window
-        // (plan §12). The explicit `/dashboard/` route is load-bearing:
-        // without it, a request to `/dashboard/` without a trailing
-        // asset path would match `/dashboard/{*path}` with an empty
-        // `path` capture (axum treats that as `None`) and 404, because
-        // `serve_fs_file` doesn't know to fall back to `index.html` on
-        // its own. The route order (static → spa fallback) mirrors
-        // the legacy `web/` pattern above.
-        .route(
-            "/dashboard/{*path}",
-            get(static_files::handle_dashboard_static),
-        )
+        // (plan §12). Three routes are needed:
+        //   * `/dashboard` (no slash) — 308-redirect to `/dashboard/`
+        //     so a typed URL without the trailing slash reaches the
+        //     SPA instead of being interpreted as a filename lookup
+        //     by the wildcard route.
+        //   * `/dashboard/` — SPA entry.
+        //   * `/dashboard/{*path}` — static assets + SPA fallback for
+        //     deep-linked client routes (the static handler itself
+        //     falls back to `index.html` for non-asset misses).
+        .route("/dashboard", get(redirect_dashboard_trailing_slash))
         .route(
             "/dashboard/",
             get(static_files::handle_dashboard_spa_fallback),
+        )
+        .route(
+            "/dashboard/{*path}",
+            get(static_files::handle_dashboard_static),
         )
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
@@ -1520,6 +1523,24 @@ pub async fn run_gateway(
 // ══════════════════════════════════════════════════════════════════════════════
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// `GET /dashboard` → 308 redirect to `/dashboard/` (M3).
+///
+/// Without this, a user who types `/dashboard` without the trailing
+/// slash matches the `/dashboard/{*path}` wildcard with the whole URL
+/// stripped — `handle_dashboard_static` then looks for a file
+/// literally named `dashboard` in the dist directory and 404s. A
+/// 308 is used instead of 307 because the redirect is permanent and
+/// applies to every method (including future `POST /dashboard` if the
+/// SPA ever gains form submissions).
+async fn redirect_dashboard_trailing_slash(State(state): State<AppState>) -> impl IntoResponse {
+    let target = if state.path_prefix.is_empty() {
+        "/dashboard/".to_string()
+    } else {
+        format!("{}/dashboard/", state.path_prefix)
+    };
+    (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, target)]).into_response()
+}
 
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {

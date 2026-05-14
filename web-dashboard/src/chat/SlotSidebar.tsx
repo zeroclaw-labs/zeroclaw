@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { apiFetch } from "@/lib/apiFetch";
 
 /**
  * Slot sidebar (M3 scaffold).
@@ -24,13 +25,7 @@ interface SlotListResponse {
 }
 
 async function fetchSlots(): Promise<SlotListResponse> {
-  const res = await fetch("/api/slots", {
-    headers: { Accept: "application/json" },
-  });
-  if (!res.ok) {
-    throw new Error(`GET /api/slots → ${res.status}`);
-  }
-  return res.json();
+  return apiFetch<SlotListResponse>("/api/slots");
 }
 
 export function SlotSidebar() {

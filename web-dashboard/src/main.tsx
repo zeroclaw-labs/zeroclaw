@@ -38,9 +38,23 @@ createRoot(document.getElementById("root")!).render(
 // Production service worker registration (M3). Mirrors OpenClaw's
 // pattern at ui/src/main.ts:3-18 — dev builds skip SW entirely to
 // avoid caching the Vite dev bundle.
+//
+// Path joining: `routerBasename` is `/` when Vite BASE_URL is empty
+// (dev) and `/dashboard` (no trailing slash) in production. Naively
+// concatenating `${routerBasename}/sw.js` yields `//sw.js` in the
+// former case, which browsers may read as protocol-relative. Normalise
+// both the script URL and the SW scope so they have exactly one
+// leading slash and the scope always ends with `/` (Service Worker
+// spec requires scope to be a directory).
 if (import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    void navigator.serviceWorker.register(`${routerBasename}/sw.js`, { scope: routerBasename })
+    const scriptUrl =
+      routerBasename === "/" ? "/sw.js" : `${routerBasename}/sw.js`;
+    const scope = routerBasename.endsWith("/")
+      ? routerBasename
+      : `${routerBasename}/`;
+    void navigator.serviceWorker
+      .register(scriptUrl, { scope })
       .catch((err) => {
         // Non-fatal — the app works without a SW; log for diagnosis.
         console.warn("[zeroclaw-dashboard] SW registration failed:", err);
