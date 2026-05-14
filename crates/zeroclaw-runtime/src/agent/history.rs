@@ -271,6 +271,49 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
         .sum()
 }
 
+pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
+    let mut saw_system = false;
+    let mut system_content = String::new();
+    let mut non_system = Vec::with_capacity(history.len());
+
+    for message in history.drain(..) {
+        if message.role == "system" {
+            saw_system = true;
+            if !message.content.is_empty() {
+                if !system_content.is_empty() {
+                    system_content.push_str("\n\n");
+                }
+                system_content.push_str(&message.content);
+            }
+        } else {
+            non_system.push(message);
+        }
+    }
+
+    if saw_system && !system_content.is_empty() {
+        history.push(ChatMessage::system(system_content));
+    }
+    history.extend(non_system);
+}
+
+pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: impl Into<String>) {
+    let content = content.into();
+    if content.is_empty() {
+        normalize_system_messages(history);
+        return;
+    }
+
+    if let Some(system_message) = history.iter_mut().find(|message| message.role == "system") {
+        if !system_message.content.is_empty() {
+            system_message.content.push_str("\n\n");
+        }
+        system_message.content.push_str(&content);
+    } else {
+        history.insert(0, ChatMessage::system(content));
+    }
+    normalize_system_messages(history);
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
@@ -290,6 +333,7 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
     remove_orphaned_tool_messages(history);
+    normalize_system_messages(history);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +364,10 @@ pub fn load_interactive_session_history(
     if state.history.is_empty() {
         state.history.push(ChatMessage::system(system_prompt));
     } else if state.history.first().map(|msg| msg.role.as_str()) != Some("system") {
+        state.history.insert(0, ChatMessage::system(system_prompt));
+    }
+    normalize_system_messages(&mut state.history);
+    if state.history.first().map(|msg| msg.role.as_str()) != Some("system") {
         state.history.insert(0, ChatMessage::system(system_prompt));
     }
 

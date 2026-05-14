@@ -2729,6 +2729,19 @@ mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
 
+    // Compile-time proof that both reqwest TLS-root features are enabled.
+    // `tls_built_in_webpki_certs` is gated on `rustls-tls-webpki-roots-no-provider`;
+    // `tls_built_in_native_certs` is gated on `rustls-tls-native-roots-no-provider`.
+    // If either feature were dropped, this test would fail to compile.
+    #[test]
+    fn provider_http_client_trusts_both_webpki_and_native_roots() {
+        let _client = reqwest::Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
+            .build()
+            .expect("client builder should succeed with both root sets enabled");
+    }
+
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));

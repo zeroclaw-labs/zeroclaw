@@ -27,21 +27,8 @@ impl CronUpdateTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         None
     }
@@ -478,38 +465,6 @@ mod tests {
         for ch in &["telegram", "discord", "slack", "mattermost", "matrix"] {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }
-    }
-
-    #[tokio::test]
-    async fn blocks_update_when_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool
-            .execute(json!({
-                "job_id": job.id,
-                "patch": { "enabled": false }
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Rate limit exceeded")
-        );
-        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
     }
 
     #[tokio::test]
