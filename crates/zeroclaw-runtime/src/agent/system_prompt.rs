@@ -465,13 +465,30 @@ mod tests {
     use zeroclaw_config::schema::{ChannelsConfig, SlackConfig, TelegramConfig};
 
     fn channels_with_telegram(target: &str) -> ChannelsConfig {
-        let mut c = ChannelsConfig::default();
-        c.telegram = Some(TelegramConfig {
-            enabled: true,
-            default_target: Some(target.to_string()),
-            ..TelegramConfig::default()
-        });
-        c
+        ChannelsConfig {
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                default_target: Some(target.to_string()),
+                ..TelegramConfig::default()
+            }),
+            ..ChannelsConfig::default()
+        }
+    }
+
+    fn channels_with_telegram_and_slack(tg_target: &str, slack_enabled: bool) -> ChannelsConfig {
+        ChannelsConfig {
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                default_target: Some(tg_target.to_string()),
+                ..TelegramConfig::default()
+            }),
+            slack: Some(SlackConfig {
+                enabled: slack_enabled,
+                default_target: Some("#alerts".to_string()),
+                ..SlackConfig::default()
+            }),
+            ..ChannelsConfig::default()
+        }
     }
 
     #[test]
@@ -481,23 +498,27 @@ mod tests {
 
     #[test]
     fn returns_none_when_channel_disabled() {
-        let mut c = ChannelsConfig::default();
-        c.telegram = Some(TelegramConfig {
-            enabled: false,
-            default_target: Some("123".to_string()),
-            ..TelegramConfig::default()
-        });
+        let c = ChannelsConfig {
+            telegram: Some(TelegramConfig {
+                enabled: false,
+                default_target: Some("123".to_string()),
+                ..TelegramConfig::default()
+            }),
+            ..ChannelsConfig::default()
+        };
         assert!(build_channel_targets_section(&c).is_none());
     }
 
     #[test]
     fn returns_none_when_default_target_unset() {
-        let mut c = ChannelsConfig::default();
-        c.telegram = Some(TelegramConfig {
-            enabled: true,
-            default_target: None,
-            ..TelegramConfig::default()
-        });
+        let c = ChannelsConfig {
+            telegram: Some(TelegramConfig {
+                enabled: true,
+                default_target: None,
+                ..TelegramConfig::default()
+            }),
+            ..ChannelsConfig::default()
+        };
         assert!(build_channel_targets_section(&c).is_none());
     }
 
@@ -515,12 +536,7 @@ mod tests {
 
     #[test]
     fn lists_multiple_channels() {
-        let mut c = channels_with_telegram("111");
-        c.slack = Some(SlackConfig {
-            enabled: true,
-            default_target: Some("#alerts".to_string()),
-            ..SlackConfig::default()
-        });
+        let c = channels_with_telegram_and_slack("111", true);
         let section = build_channel_targets_section(&c).unwrap();
         assert!(section.contains("telegram"));
         assert!(section.contains("111"));
@@ -530,12 +546,7 @@ mod tests {
 
     #[test]
     fn excludes_disabled_channel_from_multiple() {
-        let mut c = channels_with_telegram("111");
-        c.slack = Some(SlackConfig {
-            enabled: false,
-            default_target: Some("#alerts".to_string()),
-            ..SlackConfig::default()
-        });
+        let c = channels_with_telegram_and_slack("111", false);
         let section = build_channel_targets_section(&c).unwrap();
         assert!(!section.contains("slack"));
     }
