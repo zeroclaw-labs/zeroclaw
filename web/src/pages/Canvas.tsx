@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
@@ -26,7 +26,6 @@ export default function Canvas() {
   const [showHistory, setShowHistory] = useState(false);
   const [canvasList, setCanvasList] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   // Build WebSocket URL for canvas
   const getWsUrl = useCallback((id: string) => {
@@ -92,16 +91,13 @@ export default function Canvas() {
     return () => clearInterval(interval);
   }, []);
 
-  // Render content into the iframe
-  useEffect(() => {
-    if (!iframeRef.current || !currentFrame) return;
-    if (currentFrame.content_type === 'eval') return; // eval frames are special
+  // Build srcdoc HTML for the iframe — avoids needing allow-same-origin to
+  // access contentDocument.  Content types that don't need scripts get a
+  // restrictive CSP meta tag; HTML frames keep allow-scripts only.
+  const srcdoc = useMemo(() => {
+    if (!currentFrame) return undefined;
+    if (currentFrame.content_type === 'eval') return undefined;
 
-    const iframe = iframeRef.current;
-    const doc = iframe.contentDocument;
-    if (!doc) return;
-
-    let html = currentFrame.content;
     const cs = getComputedStyle(document.documentElement);
     const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
     const textPrimary = cs.getPropertyValue('--pc-text-primary').trim() || '#d4d4d8';
@@ -109,25 +105,36 @@ export default function Canvas() {
     const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
     const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
 
+    // CSP that blocks all scripts — used for svg/markdown/text content types
+    const noScriptCsp =
+      '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">';
+
     if (currentFrame.content_type === 'svg') {
-      html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${currentFrame.content}</body></html>`;
-    } else if (currentFrame.content_type === 'markdown') {
-      const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
-    } else if (currentFrame.content_type === 'text') {
-      const escaped = currentFrame.content
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+      // Strip <script> tags and event-handler attributes from SVG to prevent XSS
+      const sanitized = currentFrame.content
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${sanitized}</body></html>`;
     }
 
-    doc.open();
-    doc.write(html);
-    doc.close();
+    if (currentFrame.content_type === 'markdown') {
+      const escaped = currentFrame.content
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
+    }
+
+    if (currentFrame.content_type === 'text') {
+      const escaped = currentFrame.content
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+    }
+
+    // HTML content type — scripts allowed but still sandboxed (no same-origin)
+    return currentFrame.content;
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
@@ -258,8 +265,8 @@ export default function Canvas() {
         >
           {currentFrame ? (
             <iframe
-              ref={iframeRef}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts"
+              srcDoc={srcdoc}
               className="w-full h-full border-0"
               title={`Canvas: ${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
