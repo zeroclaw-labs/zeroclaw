@@ -21,6 +21,8 @@ import {
   getDrift,
   getMapKeys,
   getSections,
+  listProps,
+  patchConfig,
   selectSectionItem,
   type DriftEntry,
   type PickerItem,
@@ -278,7 +280,23 @@ export default function Config() {
       const body = isAgent ? (
         <SectionTabs
           tabs={[
-            { key: 'settings', label: 'Settings', render: () => settingsTab },
+            ...agentSettingsTabs(fieldsPrefix, {
+              reloadKey,
+              title: typeParam,
+              onSaved: fetchDrift,
+              drifted,
+            }),
+            {
+              key: 'peer-groups',
+              label: 'Peer Groups',
+              render: () => (
+                <AgentPeerGroupsTab
+                  key={`${reloadKey}-${typeParam}-peer-groups`}
+                  agentAlias={typeParam}
+                  onSaved={fetchDrift}
+                />
+              ),
+            },
             {
               key: 'personality',
               label: 'Personality',
@@ -868,6 +886,312 @@ function sectionTabsForAliasForm(
     ];
   }
   return null;
+}
+
+/**
+ * Split the ~50 `agents.<alias>.*` fields into navigable buckets so the
+ * edit page reads as a structured form instead of a fuzzy-filter
+ * scroll. Each tab is a FieldForm with an `includePath` predicate; the
+ * predicate gets the full dotted path of the entry.
+ */
+function agentSettingsTabs(
+  fieldsPrefix: string,
+  ctx: {
+    reloadKey: number;
+    title: string;
+    onSaved: () => void;
+    drifted: DriftEntry[];
+  },
+): SectionTabSpec[] {
+  const leaf = (path: string): string => {
+    const rest = path.startsWith(`${fieldsPrefix}.`)
+      ? path.slice(fieldsPrefix.length + 1)
+      : path;
+    return rest.split('.', 1)[0] ?? '';
+  };
+  const branch = (path: string, name: string): boolean =>
+    path.startsWith(`${fieldsPrefix}.${name}.`) || leaf(path) === name;
+
+  const makeForm = (filter: (path: string) => boolean, key: string) => (
+    <FieldForm
+      key={`${ctx.reloadKey}-${fieldsPrefix}-${key}`}
+      prefix={fieldsPrefix}
+      title={ctx.title}
+      onSaved={ctx.onSaved}
+      drift={ctx.drifted}
+      includePath={filter}
+    />
+  );
+
+  const generalKeys = new Set([
+    'model-provider',
+    'risk-profile',
+    'runtime-profile',
+    'tts-provider',
+    'transcription-provider',
+  ]);
+  const inGeneral = (p: string) => generalKeys.has(leaf(p));
+  const inChannels = (p: string) => leaf(p) === 'channels';
+  const inBundles = (p: string) => {
+    const k = leaf(p);
+    return k === 'skill-bundles' || k === 'knowledge-bundles' || k === 'mcp-bundles';
+  };
+  const inCron = (p: string) => leaf(p) === 'cron-jobs';
+  const inMemory = (p: string) => branch(p, 'memory');
+  const inWorkspace = (p: string) => branch(p, 'workspace');
+  const explicit = (p: string) =>
+    inGeneral(p) ||
+    inChannels(p) ||
+    inBundles(p) ||
+    inCron(p) ||
+    inMemory(p) ||
+    inWorkspace(p);
+
+  return [
+    { key: 'general', label: 'General', render: () => makeForm(inGeneral, 'general') },
+    { key: 'channels', label: 'Channels', render: () => makeForm(inChannels, 'channels') },
+    { key: 'bundles', label: 'Bundles', render: () => makeForm(inBundles, 'bundles') },
+    { key: 'cron', label: 'Cron', render: () => makeForm(inCron, 'cron') },
+    { key: 'memory', label: 'Memory', render: () => makeForm(inMemory, 'memory') },
+    { key: 'workspace', label: 'Workspace', render: () => makeForm(inWorkspace, 'workspace') },
+    {
+      key: 'tuning',
+      label: 'Tuning',
+      render: () => makeForm((p) => !explicit(p), 'tuning'),
+    },
+  ];
+}
+
+/**
+ * Peer Groups tab on the agent edit page. Walks `peer-groups.*` for
+ * groups containing the bound agent, then embeds the SAME FieldForm
+ * used at `/config/peer-groups/<alias>` — no duplicated authoring
+ * surface. Plus an "Add to group" picker that appends this agent to a
+ * group's `agents` array via patchConfig.
+ */
+function AgentPeerGroupsTab({
+  agentAlias,
+  onSaved,
+}: {
+  agentAlias: string;
+  onSaved: () => void;
+}) {
+  const [memberOf, setMemberOf] = useState<string[]>([]);
+  const [nonMembers, setNonMembers] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [pickerValue, setPickerValue] = useState('');
+
+  const reload = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { keys } = await getMapKeys('peer-groups');
+      const memberships: string[] = [];
+      const others: string[] = [];
+      for (const pg of keys) {
+        const { entries } = await listProps(`peer-groups.${pg}`);
+        const agentsEntry = entries.find(
+          (e) => e.path === `peer-groups.${pg}.agents`,
+        );
+        const list = parseAgentsList(agentsEntry?.value);
+        if (list.includes(agentAlias)) memberships.push(pg);
+        else others.push(pg);
+      }
+      setMemberOf(memberships);
+      setNonMembers(others);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentAlias]);
+
+  const addToGroup = async () => {
+    if (!pickerValue) return;
+    setAdding(true);
+    setError(null);
+    try {
+      const { entries } = await listProps(`peer-groups.${pickerValue}`);
+      const agentsEntry = entries.find(
+        (e) => e.path === `peer-groups.${pickerValue}.agents`,
+      );
+      const list = parseAgentsList(agentsEntry?.value);
+      if (!list.includes(agentAlias)) {
+        const next = [...list, agentAlias];
+        await patchConfig([
+          {
+            op: 'replace',
+            path: `peer-groups.${pickerValue}.agents`,
+            value: next,
+          },
+        ]);
+      }
+      setPickerValue('');
+      await reload();
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const removeFromGroup = async (pg: string) => {
+    setError(null);
+    try {
+      const { entries } = await listProps(`peer-groups.${pg}`);
+      const agentsEntry = entries.find(
+        (e) => e.path === `peer-groups.${pg}.agents`,
+      );
+      const list = parseAgentsList(agentsEntry?.value).filter(
+        (a) => a !== agentAlias,
+      );
+      await patchConfig([
+        { op: 'replace', path: `peer-groups.${pg}.agents`, value: list },
+      ]);
+      await reload();
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (loading) {
+    return (
+      <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+        Loading peer groups…
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {error && (
+        <div
+          className="rounded-xl border p-3 text-sm"
+          style={{
+            background: 'var(--color-status-error-alpha-08)',
+            borderColor: 'var(--color-status-error-alpha-20)',
+            color: 'var(--color-status-error)',
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      <div
+        className="flex items-center gap-2 rounded-xl p-3"
+        style={{ background: 'var(--pc-bg-elevated)' }}
+      >
+        <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          Add this agent to:
+        </span>
+        <select
+          value={pickerValue}
+          onChange={(e) => setPickerValue(e.target.value)}
+          disabled={adding || nonMembers.length === 0}
+          className="input-electric text-xs px-2 py-1 appearance-none cursor-pointer"
+        >
+          <option value="">
+            {nonMembers.length === 0 ? 'no other groups' : 'select a group…'}
+          </option>
+          {nonMembers.map((g) => (
+            <option key={g} value={g}>
+              {g}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={addToGroup}
+          disabled={!pickerValue || adding}
+          className="btn-electric text-xs px-3 py-1 rounded-lg disabled:opacity-50"
+        >
+          {adding ? 'Adding…' : 'Add'}
+        </button>
+        <Link
+          to="/config/peer-groups"
+          className="text-xs ml-auto hover:underline"
+          style={{ color: 'var(--pc-text-muted)' }}
+        >
+          Create new →
+        </Link>
+      </div>
+
+      {memberOf.length === 0 ? (
+        <p
+          className="text-sm rounded-xl p-4 text-center"
+          style={{
+            color: 'var(--pc-text-muted)',
+            background: 'var(--pc-bg-elevated)',
+          }}
+        >
+          {agentAlias} is not a member of any peer group.
+        </p>
+      ) : (
+        memberOf.map((pg) => (
+          <div
+            key={pg}
+            className="rounded-xl border"
+            style={{ borderColor: 'var(--pc-border)' }}
+          >
+            <div
+              className="flex items-center justify-between px-4 py-2 border-b"
+              style={{ borderColor: 'var(--pc-border)' }}
+            >
+              <Link
+                to={`/config/peer-groups/${encodeURIComponent(pg)}`}
+                className="text-sm font-mono hover:underline"
+                style={{ color: 'var(--pc-text-primary)' }}
+              >
+                peer-groups.{pg}
+              </Link>
+              <button
+                type="button"
+                onClick={() => removeFromGroup(pg)}
+                className="text-xs hover:underline"
+                style={{ color: 'var(--color-status-error)' }}
+                title={`Remove ${agentAlias} from peer-groups.${pg}`}
+              >
+                Remove from group
+              </button>
+            </div>
+            <div className="p-4">
+              <FieldForm
+                key={`peer-groups-embed-${pg}`}
+                prefix={`peer-groups.${pg}`}
+                onSaved={onSaved}
+                showDelete={false}
+              />
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function parseAgentsList(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
+  if (typeof raw !== 'string' || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.map(String);
+  } catch {
+    // fall through
+  }
+  return raw
+    .replace(/^\[|\]$/g, '')
+    .split(/[,\n]/)
+    .map((s) => s.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
 }
 
 function AliasRow({
