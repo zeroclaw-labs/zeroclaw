@@ -91,14 +91,14 @@ impl WebhookChannel {
     }
 
     /// Compute the backoff delay for a given attempt, bounded by `retry_max_delay_ms`
-    /// and with ±25% jitter applied. The cap is approximate: jitter is applied after
-    /// capping, so the returned delay may exceed `retry_max_delay_ms` by up to 25%.
+    /// and with ±25% jitter applied. Jitter is applied before the final cap, so the
+    /// returned delay is strictly `<= retry_max_delay_ms`.
     fn compute_backoff(&self, attempt: u32) -> Duration {
         let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
         let base = self.retry_base_delay_ms.saturating_mul(multiplier);
-        let capped = base.min(self.retry_max_delay_ms);
-        let jittered = apply_jitter(capped);
-        Duration::from_millis(jittered)
+        let jittered = apply_jitter(base);
+        let capped = jittered.min(self.retry_max_delay_ms);
+        Duration::from_millis(capped)
     }
 
     /// Verify an incoming request's signature if a secret is configured.
@@ -597,9 +597,37 @@ mod tests {
             Some(1_000),
             Some(2_000),
         );
-        let d = ch.compute_backoff(10); // 1_000 * 2^10 = 1_024_000, capped at 2_000
-        // With ±25% jitter: [1500, 2500]
-        assert!(d.as_millis() >= 1_500 && d.as_millis() <= 2_500);
+        // Base for attempt=10 is 1_000 * 2^10 = 1_024_000ms. Jitter scales it by
+        // [0.75, 1.25] → still well above the 2_000ms cap. The strict cap clamps
+        // the jittered value, so the returned delay must equal `retry_max_delay_ms`.
+        let d = ch.compute_backoff(10);
+        assert_eq!(d.as_millis(), 2_000);
+    }
+
+    #[test]
+    fn backoff_never_exceeds_max_delay_near_cap() {
+        // When the un-capped base is close to `retry_max_delay_ms`, jitter could
+        // historically push the result above the cap. With strict capping the
+        // returned delay must stay `<= retry_max_delay_ms` on every draw.
+        let ch = WebhookChannel::new(
+            8080,
+            None,
+            Some("https://example.com".into()),
+            None,
+            None,
+            None,
+            Some(5),
+            Some(1_000),
+            Some(2_000),
+        );
+        for _ in 0..256 {
+            let d = ch.compute_backoff(1); // base = 2_000ms, jitter ∈ [1_500, 2_500]
+            assert!(
+                d.as_millis() <= 2_000,
+                "compute_backoff exceeded retry_max_delay_ms: {}ms",
+                d.as_millis()
+            );
+        }
     }
 
     #[test]
