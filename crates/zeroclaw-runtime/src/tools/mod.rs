@@ -56,6 +56,7 @@ pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
+pub use zeroclaw_tools::dawn_s3::DawnS3Tool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
@@ -563,6 +564,22 @@ pub fn all_tools_with_runtime(
             );
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
+    }
+
+    // Dawn S3 compatible storage tool (conditionally registered)
+    if root_config.dawn_s3.enabled {
+        if root_config.dawn_s3.url.trim().is_empty() {
+            tracing::warn!("dawn_s3 tool enabled but dawn_s3.url is empty — skipping registration");
+        } else if root_config.dawn_s3.token.trim().is_empty() {
+            tracing::warn!("dawn_s3 tool enabled but dawn_s3.token is empty — skipping registration");
+        } else {
+            tool_arcs.push(Arc::new(DawnS3Tool::new(
+                security.clone(),
+                root_config.dawn_s3.url.trim().to_string(),
+                root_config.dawn_s3.token.trim().to_string(),
+            )));
+            tracing::info!("dawn_s3 tool registered with endpoint: {}", root_config.dawn_s3.url);
         }
     }
 
