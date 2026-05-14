@@ -10709,8 +10709,8 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         let key = conversation_history_key(&msg);
-        assert!(key.contains("$root:server"));
-        assert!(!key.contains("$reply:server"));
+        assert!(key.contains("_root_server"));
+        assert!(!key.contains("_reply_server"));
     }
 
     #[test]
