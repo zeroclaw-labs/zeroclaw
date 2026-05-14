@@ -147,7 +147,8 @@ export interface WsMessage {
     | 'session_start'
     | 'connected'
     | 'cron_result'
-    | 'approval_request';
+    | 'approval_request'
+    | 'aborted';
   content?: string;
   full_response?: string;
   name?: string;

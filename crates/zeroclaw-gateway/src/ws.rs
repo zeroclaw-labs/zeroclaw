@@ -727,9 +727,28 @@ async fn process_chat_message(
     // tool approval could neither be sent to the client nor answered before
     // the timeout fired.
     let forward_fut = async {
+        let mut cancel_drained = false;
         loop {
             tokio::select! {
                 biased;
+                // ── Cancellation arm ─────────────────────────────
+                // When `/abort` cancels the token, immediately drop every
+                // parked oneshot sender so any in-flight `request_approval`
+                // unblocks via the "sender dropped → deny" path in
+                // `WsApprovalChannel`. Without this, the approval future
+                // races only its own `timeout_secs` (default 120s) and
+                // ignores the cancel token, so the abort sits idle for up
+                // to two minutes before the tool loop even gets a chance
+                // to observe the cancellation.
+                _ = cancel_token.cancelled(), if !cancel_drained => {
+                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                    drop(drained);
+                    cancel_drained = true;
+                    // Fall through; the agent loop will now wake from the
+                    // approval await, see the cancel token, and propagate
+                    // a ToolLoopCancelled error which closes event_rx and
+                    // breaks this loop on the `event_rx.recv()` arm below.
+                }
                 client_msg = receiver.next() => {
                     let Some(Ok(Message::Text(text))) = client_msg else { continue };
                     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {

@@ -21,7 +21,8 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
 
   return (
     <div
-      role="alertdialog"
+      role="alert"
+      aria-live="assertive"
       aria-labelledby="approval-banner-title"
       className="border-b px-4 py-3 animate-fade-in"
       style={{
@@ -47,7 +48,7 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
               <span
                 className="text-xs font-mono"
                 style={{ color: 'var(--pc-text-muted)' }}
-                aria-live="polite"
+                aria-hidden="true"
               >
                 {t('agent.approval_timeout_in')}: {remainingSec}s
               </span>

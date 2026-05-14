@@ -291,6 +291,20 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         break;
       }
 
+      case 'aborted': {
+        // Gateway sends this after a cancelled turn; the parked approval (if
+        // any) is no longer valid because its request_id belongs to the old
+        // turn. Clear so the banner does not linger across the abort.
+        pendingContentRef.current = '';
+        pendingThinkingRef.current = '';
+        capturedThinkingRef.current = '';
+        setStreamingContent('');
+        setStreamingThinking('');
+        setTyping(false);
+        setPendingApproval(null);
+        break;
+      }
+
       case 'error':
         setMessages((prev) => [
           ...prev,
@@ -339,11 +353,13 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     };
 
     ws.onClose = (ev: CloseEvent) => {
+      // Clear pending approval ahead of the version guard: even if this is a
+      // stale socket whose other state we don't want to write, the parked
+      // request_id is gone on the server side regardless and the banner must
+      // not survive the close.
+      setPendingApproval(null);
       if (version !== wsVersionRef.current) return;
       setConnected(false);
-      // Backend auto-denies pending approvals when the socket closes; clear
-      // local UI so the user is not staring at a stale banner.
-      setPendingApproval(null);
 
       if (pendingModelSwitchRef.current) {
         // We intentionally closed the old socket; non-normal codes mean the reconnect failed.
@@ -510,6 +526,10 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       setStreamingContent('');
       setStreamingThinking('');
       setTyping(false);
+      // The old socket's request_id no longer maps to anything on the server
+      // after we tear it down. Clear here explicitly because we null out the
+      // old socket's callbacks below, so its onClose will not fire to do it.
+      setPendingApproval(null);
 
       // Tear down the old socket and create a fresh one.
       // The backend will read the updated config when the new socket opens
@@ -574,6 +594,11 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     deleteMessage,
     clearAllMessages,
     abortSession: async () => {
+      // Clear local approval state immediately — the in-flight request_id
+      // belongs to the turn we're cancelling and will be rejected by the
+      // backend on a late click anyway. Don't wait for the `aborted` frame
+      // to round-trip; the user clicked Stop and expects the UI to follow.
+      setPendingApproval(null);
       try {
         await abortSession(sessionIdRef.current);
       } catch {
