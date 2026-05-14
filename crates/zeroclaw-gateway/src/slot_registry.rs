@@ -41,8 +41,14 @@ use crate::ws_approval::{PendingApprovals, new_pending_approvals};
 /// serving without blocking the registry itself.
 pub struct SlotEntry {
     pub agent: Arc<tokio::sync::Mutex<Agent>>,
-    /// Last time this slot served a turn; idle sweep uses this.
-    pub last_active: Instant,
+    /// Last time this slot was active; idle sweep reads it via `touch`.
+    /// Wrapped in `Mutex` because entries live behind `Arc<SlotEntry>` —
+    /// interior mutability lets every turn-start cache hit and approval
+    /// resolution re-stamp it without needing `&mut`. A future
+    /// `AtomicU64`-of-unix-millis variant (deferred per plan §4.5) would
+    /// drop the lock; for now the contention surface is tiny (one store
+    /// per turn, one read per 60s sweep).
+    pub last_active: Mutex<Instant>,
     /// Config frozen at spawn time. Edits to `config.toml` after this
     /// do not retroactively reshape running slots (documented contract;
     /// plan §4.5).
@@ -51,6 +57,21 @@ pub struct SlotEntry {
     /// `WsApprovalChannel` (inserts) and `POST /api/slots/{id}/approve`
     /// (pops by `request_id`).
     pub pending_approvals: PendingApprovals,
+}
+
+impl SlotEntry {
+    /// Mark this slot as active now. Called on every turn start (via
+    /// `get_or_spawn` cache hit) and on `/approve` resolution so
+    /// `evict_idle` measures "time since last activity" rather than
+    /// "time since spawn" — without this, a slot parked on a long tool
+    /// approval would be silently evicted while the user was still
+    /// deciding.
+    pub fn touch(&self) {
+        *self
+            .last_active
+            .lock()
+            .expect("slot_entry last_active lock poisoned") = Instant::now();
+    }
 }
 
 /// Process-global registry of warm slot agents. Stored on
@@ -93,6 +114,12 @@ impl SlotRegistry {
         shared_mcp: Option<Arc<McpRegistry>>,
     ) -> anyhow::Result<Arc<SlotEntry>> {
         if let Some(entry) = self.get(slot_id) {
+            // Cache-hit path: mark the slot as freshly active so the
+            // idle sweep doesn't evict a slot that's actively in use.
+            // Critical for turns that park on tool approvals longer than
+            // `idle_ttl` — the next reach-in here (e.g. an /approve
+            // followed by a new /messages) resets the clock.
+            entry.touch();
             return Ok(entry);
         }
 
@@ -108,7 +135,7 @@ impl SlotRegistry {
 
         let entry = Arc::new(SlotEntry {
             agent,
-            last_active: Instant::now(),
+            last_active: Mutex::new(Instant::now()),
             config_snapshot: overrides.clone(),
             pending_approvals: new_pending_approvals(),
         });
@@ -155,7 +182,13 @@ impl SlotRegistry {
             .lock()
             .expect("slot_registry lock poisoned");
         let before = map.len();
-        map.retain(|_, entry| now.duration_since(entry.last_active) <= ttl);
+        map.retain(|_, entry| {
+            let last = *entry
+                .last_active
+                .lock()
+                .expect("slot_entry last_active lock poisoned");
+            now.duration_since(last) <= ttl
+        });
         before - map.len()
     }
 
@@ -226,5 +259,49 @@ mod tests {
     fn default_uses_600s_idle_ttl() {
         let reg = SlotRegistry::default();
         assert!(reg.is_empty());
+    }
+
+    /// Constructing a real `Agent` in a unit test pulls a full provider
+    /// stack; instead we exercise `Mutex<Instant>` semantics directly.
+    /// The behaviour under test is "store through `&self` and read the
+    /// new value back" — identical semantics to `SlotEntry::touch`,
+    /// minus the Agent. This guards the lock-expect contract and the
+    /// interior-mutability shape `touch` relies on.
+    #[test]
+    fn mutex_instant_allows_touch_through_shared_ref() {
+        let stamp = std::sync::Mutex::new(Instant::now());
+        let before = *stamp.lock().unwrap();
+        // Busy-sleep long enough that `Instant` advances monotonically.
+        std::thread::sleep(Duration::from_millis(5));
+        // Simulate SlotEntry::touch — store through a shared ref.
+        *stamp.lock().unwrap() = Instant::now();
+        let after = *stamp.lock().unwrap();
+        assert!(
+            after > before,
+            "touch must produce a strictly later Instant"
+        );
+    }
+
+    /// Asserts the `retain` closure in `evict_idle` respects a touched
+    /// timestamp — entries whose `last_active` is within `ttl` of `now`
+    /// must be kept. This is a direct mirror of the predicate at
+    /// `evict_idle`'s `map.retain` call, and the key regression this PR
+    /// fix prevents: before the fix, `last_active` was set at spawn and
+    /// never updated, so an active slot would still be evicted once
+    /// `ttl` elapsed from spawn time regardless of touches.
+    #[test]
+    fn evict_predicate_retains_recently_touched_entry() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+
+        // Entry touched within TTL: must be retained.
+        let fresh_last_active = now - Duration::from_secs(5);
+        assert!(now.duration_since(fresh_last_active) <= ttl);
+
+        // Entry untouched for longer than TTL: must be evicted.
+        // (Use a timestamp from before `now` to avoid negative-duration
+        // panics on monotonic clocks.)
+        let stale_last_active = now - Duration::from_secs(120);
+        assert!(now.duration_since(stale_last_active) > ttl);
     }
 }

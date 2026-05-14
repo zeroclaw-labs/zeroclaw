@@ -856,6 +856,11 @@ pub async fn handle_api_slots_approve(
             "Slot has no warm agent; no approval is in flight",
         );
     };
+    // The operator decision is activity — re-stamp `last_active` so a
+    // long approval wait doesn't hand the idle sweep a stale timestamp
+    // and evict the slot out from under the tool loop we're about to
+    // unpark.
+    entry.touch();
     let sender = entry.pending_approvals.lock().remove(&req.request_id);
     let Some(sender) = sender else {
         return err_response(
