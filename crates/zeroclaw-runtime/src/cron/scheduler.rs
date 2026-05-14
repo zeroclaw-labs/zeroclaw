@@ -357,7 +357,10 @@ async fn run_agent_job(
         Err(e) => {
             // Purge memories written during this failed run so they don't
             // pollute future recall and cause context snowball.
-            let mem_session_key = format!("cli:{}", session_path.display());
+            let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                "cli:{}",
+                session_path.display()
+            ));
             if let Ok(mem) = zeroclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,

@@ -2558,7 +2558,10 @@ pub async fn run(
         if raw.is_empty() {
             None
         } else {
-            Some(format!("cli:{raw}"))
+            // Match the sanitized form persisted by memory backend migrations.
+            Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                "cli:{raw}"
+            )))
         }
     });
 
