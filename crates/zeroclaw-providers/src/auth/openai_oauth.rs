@@ -21,6 +21,41 @@ pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const OPENAI_OAUTH_DEVICE_CODE_URL: &str = "https://auth.openai.com/oauth/device/code";
 pub const OPENAI_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
+fn oauth_success_page_html() -> &'static str {
+    r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authentication complete</title>
+  <style>
+    body {
+      align-items: center;
+      color: #111827;
+      display: flex;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    main { max-width: 28rem; padding: 1.5rem; text-align: center; }
+    h1 { font-size: 1rem; margin: 0 0 .5rem; }
+    p { color: #6b7280; font-size: .875rem; margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Authentication complete</h1>
+    <p>You can return to the desktop app.</p>
+  </main>
+  <script>
+    window.open('', '_self');
+    window.close();
+  </script>
+</body>
+</html>"#
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceCodeStart {
     pub device_code: String,
@@ -255,8 +290,7 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
     let code = parse_code_from_redirect(path, Some(expected_state))?;
 
-    let body =
-        "<html><body><h2>ZeroClaw login complete</h2><p>You can close this tab.</p></body></html>";
+    let body = oauth_success_page_html();
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -423,6 +457,14 @@ mod tests {
             err.to_string()
                 .contains("OpenAI OAuth error: access_denied")
         );
+    }
+
+    #[test]
+    fn success_page_attempts_to_close_browser_tab() {
+        let html = oauth_success_page_html();
+        assert!(html.contains("window.close()"));
+        assert!(html.contains("Authentication complete"));
+        assert!(!html.contains("ZeroClaw login complete"));
     }
 
     #[test]
