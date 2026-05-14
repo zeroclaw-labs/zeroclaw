@@ -60,14 +60,8 @@ impl Tool for OpenCodeCliTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -135,15 +129,6 @@ impl Tool for OpenCodeCliTool {
         } else {
             self.security.workspace_dir.clone()
         };
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Build CLI command
         let mut cmd = Command::new("opencode");

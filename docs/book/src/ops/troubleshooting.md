@@ -245,7 +245,7 @@ See [Security → Autonomy levels](../security/autonomy.md).
 
 ### Tool invocations fail inside Docker sandbox
 
-- Container image isn't pulled — `docker pull zeroclawlabs/tool-runner`
+- Container image isn't pulled — run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
 - Docker daemon not reachable from the ZeroClaw user — check `docker info`
 - Tool needs a device that's not passed through — extend `allow_devices`
 

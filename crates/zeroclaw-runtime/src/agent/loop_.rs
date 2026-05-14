@@ -74,9 +74,10 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    canonicalize_tool_result_media_markers, emergency_history_trim, estimate_history_tokens,
-    fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
-    trim_history, truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
+    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+    normalize_system_messages, save_interactive_session_history, trim_history,
+    truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -496,7 +497,6 @@ fn build_native_assistant_history(
     obj.to_string()
 }
 
-#[cfg(test)]
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -971,6 +971,7 @@ pub async fn run_tool_call_loop(
         // or session history reloading.  Without this, providers like MiniMax
         // reject the request with "tool result's tool id not found" (bug #5743).
         crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1443,11 +1444,12 @@ pub async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1906,16 +1908,16 @@ pub async fn run_tool_call_loop(
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                     crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
-                        // Inject a system nudge so the LLM adjusts strategy.
-                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                        append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
                         // Replace the tool output with the block message.
                         // We still continue the loop so the LLM sees the block feedback.
-                        history.push(ChatMessage::system(format!(
-                            "[Loop Detection — BLOCKED] {msg}"
-                        )));
+                        append_or_merge_system_message(
+                            history,
+                            format!("[Loop Detection — BLOCKED] {msg}"),
+                        );
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
                         runtime_trace::record_event(
@@ -3899,6 +3901,75 @@ mod tests {
         assert_eq!(restored[1].content, "orphan");
     }
 
+    #[test]
+    fn load_interactive_session_merges_non_leading_system_messages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("base system"),
+                ChatMessage::user("first question"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::system("late loop-detection guidance"),
+                ChatMessage::user("follow-up"),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1,
+            "loaded session must not contain non-leading system messages: {:?}",
+            restored
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(restored[0].role, "system");
+        assert!(restored[0].content.contains("base system"));
+        assert!(restored[0].content.contains("late loop-detection guidance"));
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
+    }
+
+    #[test]
+    fn load_interactive_session_replaces_empty_system_messages_with_fallback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system(""),
+                ChatMessage::user("follow-up"),
+                ChatMessage::system(""),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback system").unwrap();
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("system", "fallback system"), ("user", "follow-up")]
+        );
+    }
+
     /// Regression test for issue #5813: a persisted session whose assistant
     /// (tool_use) was lost to compaction must self-heal on load so the next
     /// API call doesn't fail with "unexpected tool_use_id found in tool_result
@@ -4170,6 +4241,49 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct RecordingProvider {
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in recording provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .push(request.messages.to_vec());
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
 
@@ -7721,6 +7835,70 @@ Let me check the result."#;
         assert_eq!(summary.request_count, 1);
         assert_eq!(summary.total_tokens, 1_200);
         assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn tool_loop_normalizes_non_leading_system_messages_before_provider_request() {
+        let provider = RecordingProvider::new();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("base system"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::system("late loop-detection guidance"),
+            ChatMessage::user("follow-up"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "recording-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        assert_eq!(result, "done");
+        let requests = requests.lock().expect("requests lock should be valid");
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent[0].role, "system");
+        assert_eq!(
+            sent.iter().filter(|msg| msg.role == "system").count(),
+            1,
+            "provider request must not contain non-leading system messages: {:?}",
+            sent.iter().map(|msg| msg.role.as_str()).collect::<Vec<_>>()
+        );
+        assert!(sent[0].content.contains("base system"));
+        assert!(sent[0].content.contains("late loop-detection guidance"));
+        assert_eq!(
+            sent.iter().map(|msg| msg.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
     }
 
     #[tokio::test]

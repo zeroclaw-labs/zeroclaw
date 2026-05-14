@@ -908,7 +908,14 @@ pub async fn run_gateway(
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
+        println!(
+            "     To pair a new device: {}",
+            format_paircode_recovery_command(host, actual_port)
+        );
+        println!(
+            "     Fallback: {}",
+            format_paircode_recovery_curl(host, actual_port, pfx)
+        );
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
@@ -946,13 +953,23 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Wrap observer with broadcast capability for SSE
-    let broadcast_observer: Arc<dyn zeroclaw_runtime::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(
-            zeroclaw_runtime::observability::create_observer(&config.observability),
-            event_tx.clone(),
-            event_buffer.clone(),
-        ));
+    // Install the SSE broadcast hook before building any observer so that
+    // events emitted by the agent's per-call observer (built inside
+    // `process_message`) also reach `/api/events`. The state-level observer
+    // is just the configured backend — `TeeObserver` (created by
+    // `create_observer`) tees its events into the hook automatically.
+    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
+        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
+    );
+    zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
+
+    // Bound into AppState. Not a broadcaster — the broadcaster is the
+    // `broadcast_layer` installed above as the global hook. This is the
+    // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
+    // which tees events into the hook on every record.
+    let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+        zeroclaw_runtime::observability::create_observer(&config.observability),
+    );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -996,7 +1013,7 @@ pub async fn run_gateway(
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
         gmail_push: gmail_push_channel,
-        observer: broadcast_observer,
+        observer: state_observer,
         tools_registry,
         cost_tracker,
         event_tx,
@@ -1336,6 +1353,26 @@ pub async fn run_gateway(
     Ok(())
 }
 
+fn format_paircode_recovery_command(host: &str, port: u16) -> String {
+    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
+    if let Some(host_arg) = paircode_recovery_host_arg(host) {
+        cmd.push_str(" --host ");
+        cmd.push_str(host_arg);
+    }
+    cmd
+}
+
+fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
+    match host {
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
+        _ => Some(host),
+    }
+}
+
+fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1364,20 +1401,12 @@ fn prometheus_disabled_hint() -> String {
 fn prometheus_observer_from_state(
     observer: &dyn zeroclaw_runtime::observability::Observer,
 ) -> Option<&zeroclaw_runtime::observability::PrometheusObserver> {
+    // `TeeObserver::as_any` returns the primary observer, so a single direct
+    // downcast finds the PrometheusObserver whether the state observer is the
+    // raw backend or wrapped by the factory tee.
     observer
         .as_any()
         .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-        .or_else(|| {
-            observer
-                .as_any()
-                .downcast_ref::<sse::BroadcastObserver>()
-                .and_then(|broadcast| {
-                    broadcast
-                        .inner()
-                        .as_any()
-                        .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-                })
-        })
 }
 
 /// GET /metrics — Prometheus text exposition format
@@ -2343,58 +2372,66 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-        let session_id = sender_session_id("nextcloud_talk", msg);
+    // Spawn per-message processing so the webhook returns 200 quickly.
+    // Nextcloud Talk cancels webhook requests that don't complete within ~5s
+    // (see #6156); slow local models routinely exceed that. Each message gets
+    // its own task — the LLM call and reply are independent of the ack.
+    for msg in messages {
+        let state = state.clone();
+        let nextcloud_talk = Arc::clone(nextcloud_talk);
+        tokio::spawn(async move {
+            tracing::info!(
+                "Nextcloud Talk message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+            let session_id = sender_session_id("nextcloud_talk", &msg);
 
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        match Box::pin(run_gateway_chat_with_tools(
-            &state,
-            &msg.content,
-            Some(&session_id),
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                let reply = if is_needs_onboarding_err(&e) {
-                    tracing::warn!(
-                        "Nextcloud Talk chat refused: gateway has no model configured; \
-                         visit /onboard"
-                    );
-                    needs_onboarding_channel_reply()
-                } else {
-                    tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(reply, &msg.reply_target))
+            if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+                let key = nextcloud_talk_memory_key(&msg);
+                let _ = state
+                    .mem
+                    .store(
+                        &key,
+                        &msg.content,
+                        MemoryCategory::Conversation,
+                        Some(&session_id),
+                    )
                     .await;
             }
-        }
+
+            match Box::pin(run_gateway_chat_with_tools(
+                &state,
+                &msg.content,
+                Some(&session_id),
+            ))
+            .await
+            {
+                Ok(GatewayChatOutcome { response, .. }) => {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    let reply = if is_needs_onboarding_err(&e) {
+                        tracing::warn!(
+                            "Nextcloud Talk chat refused: gateway has no model configured; \
+                             visit /onboard"
+                        );
+                        needs_onboarding_channel_reply()
+                    } else {
+                        tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                        "Sorry, I couldn't process your message right now.".to_string()
+                    };
+                    let _ = nextcloud_talk
+                        .send(&SendMessage::new(reply, &msg.reply_target))
+                        .await;
+                }
+            }
+        });
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2692,6 +2729,38 @@ mod tests {
     }
 
     #[test]
+    fn paircode_recovery_command_includes_alternate_port() {
+        assert_eq!(
+            format_paircode_recovery_command("127.0.0.1", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_specific_host_when_needed() {
+        assert_eq!(
+            format_paircode_recovery_command("192.168.1.20", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_targets_running_instance() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_path_prefix() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[test]
     fn gateway_timeout_falls_back_to_default() {
         // When env var is not set, should return the default constant
         // SAFETY: test-only, single-threaded test runner.
@@ -2803,18 +2872,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let event_tx = tokio::sync::broadcast::channel(16).0;
-        let event_buffer = Arc::new(sse::EventBuffer::new(16));
-        let wrapped = sse::BroadcastObserver::new(
-            Box::new(zeroclaw_runtime::observability::PrometheusObserver::new()),
-            event_tx.clone(),
-            event_buffer,
-        );
+        let prom = zeroclaw_runtime::observability::PrometheusObserver::new();
         zeroclaw_runtime::observability::Observer::record_event(
-            &wrapped,
+            &prom,
             &zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick,
         );
 
-        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(wrapped);
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
@@ -3798,6 +3862,124 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Regression for #6156: handler must return 200 OK before the (potentially
+    // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
+    // request at its ~5s timeout.
+    #[derive(Default)]
+    struct SlowProvider {
+        calls: AtomicUsize,
+        started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Provider for SlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.started_tx.lock().take() {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("slow ok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider_impl = Arc::new(SlowProvider {
+            calls: AtomicUsize::new(0),
+            started_tx: Mutex::new(Some(started_tx)),
+        });
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            String::new(),
+            vec!["*".into()],
+        ));
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let start = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_nextcloud_talk_webhook(
+                State(state),
+                HeaderMap::new(),
+                Bytes::from(body),
+            )),
+        )
+        .await
+        .expect("webhook must return before 2s deadline (regression #6156)")
+        .into_response();
+
+        let elapsed = start.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler returned after {elapsed:?}; expected fast return for #6156"
+        );
+
+        // Confirm the spawned task actually started the LLM call (i.e., the
+        // ack didn't just skip processing). The 30s sleep is still in flight.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("spawned LLM call did not start within 2s")
+            .expect("started_tx sender was dropped");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
     // ══════════════════════════════════════════════════════════
