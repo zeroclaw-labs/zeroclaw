@@ -29,6 +29,12 @@ use crate::messaging::{
     process_markdown_resources,
 };
 
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
+struct SyncState {
+    max_version: i64,
+    channel_seqs: HashMap<String, u32>,
+}
+
 #[derive(Clone)]
 pub struct WuKongIMChannel {
     pub(crate) ws_url: String,
@@ -47,6 +53,7 @@ pub struct WuKongIMChannel {
     pub(crate) pending_approvals: Arc<PendingApprovals>,
     pub(crate) ws_sink: Arc<RwLock<Option<WsSink>>>,
     pub(crate) downloads_dir: PathBuf,
+    pub(crate) workspace_dir: PathBuf,
 }
 
 impl WuKongIMChannel {
@@ -72,6 +79,7 @@ impl WuKongIMChannel {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
             downloads_dir,
+            workspace_dir: workspace_dir.to_path_buf(),
         }
     }
 
@@ -144,28 +152,58 @@ impl WuKongIMChannel {
         Ok(())
     }
 
-    async fn update_sync_state(&self, channel_id: &str, channel_type: u8, seq: u32, timestamp_ns: i64) -> anyhow::Result<()> {
-        use zeroclaw_api::memory_traits::MemoryCategory;
+    fn get_sync_state_path(&self) -> PathBuf {
+        self.workspace_dir.join("wukongim_sync.json")
+    }
 
-        // Update channel sequence
-        let seq_key = format!("wukongim:channel_seq:{}:{}", channel_id, channel_type);
-        let current_seq = self.memory.get(&seq_key).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+    async fn load_sync_state(&self) -> SyncState {
+        let path = self.get_sync_state_path();
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            SyncState::default()
+        }
+    }
+
+    async fn save_sync_state(&self, state: &SyncState) -> anyhow::Result<()> {
+        let path = self.get_sync_state_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let content = serde_json::to_string_pretty(state)?;
+        tokio::fs::write(&path, content).await?;
+        Ok(())
+    }
+
+    async fn update_sync_state(&self, channel_id: &str, channel_type: u8, seq: u32, timestamp_ns: i64) -> anyhow::Result<()> {
+        let mut state = self.load_sync_state().await;
+        let mut changed = false;
+
+        // 1. Update channel sequence
+        let seq_key = format!("{}:{}", channel_id, channel_type);
+        let current_seq = *state.channel_seqs.get(&seq_key).unwrap_or(&0);
         if seq > current_seq {
-            self.memory.store(&seq_key, &seq.to_string(), MemoryCategory::Custom("wukongim_seq".to_string()), None).await?;
+            tracing::info!("WuKongIM: updating sequence for {} from {} to {}", seq_key, current_seq, seq);
+            state.channel_seqs.insert(seq_key, seq);
+            changed = true;
         }
 
-        // Update global version
-        let ver_key = "wukongim:sync:max_version";
-        let current_ver = self.memory.get(ver_key).await?.and_then(|e| e.content.parse::<i64>().ok()).unwrap_or(0);
-        if timestamp_ns > current_ver {
-            self.memory.store(ver_key, &timestamp_ns.to_string(), MemoryCategory::Core, None).await?;
+        // 2. Update max version
+        if timestamp_ns > state.max_version {
+            tracing::info!("WuKongIM: updating max_version from {} to {}", state.max_version, timestamp_ns);
+            state.max_version = timestamp_ns;
+            changed = true;
+        }
+
+        if changed {
+            self.save_sync_state(&state).await?;
         }
 
         Ok(())
     }
 
     async fn clear_unread(&self, channel_id: &str, channel_type: u8, message_seq: u32) -> anyhow::Result<()> {
-        let url = format!("{}/v1/conversations/clearUnread", self.dawn_url.trim_end_matches('/'));
+        let url = format!("{}/v1/conversations/clear_unread", self.dawn_url.trim_end_matches('/'));
         let client = reqwest::Client::new();
         let req = ClearUnreadRequest {
             uid: self.uid.clone(),
@@ -174,32 +212,24 @@ impl WuKongIMChannel {
             message_seq,
         };
 
-        let resp = client.post(&url)
+        let resp = client.put(&url)
             .header("X-Assistant-Token", &self.dawn_token)
             .json(&req)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            tracing::warn!("WuKongIM: failed to clear unread for {}:{}: status={}", channel_id, channel_type, resp.status());
+            tracing::warn!("WuKongIM: failed to clear unread for {}:{}: status={} url={}", channel_id, channel_type, resp.status(), url);
         }
         Ok(())
     }
 
     async fn sync_history(&self) -> anyhow::Result<Vec<RecvNotificationParams>> {
-        use zeroclaw_api::memory_traits::MemoryCategory;
-
-        // 1. Get current version
-        let ver_key = "wukongim:sync:max_version";
-        let version = self.memory.get(ver_key).await?.and_then(|e| e.content.parse::<i64>().ok()).unwrap_or(0);
-
-        // 2. Collect all channel sequences
-        let entries = self.memory.list(Some(&MemoryCategory::Custom("wukongim_seq".to_string())), None).await?;
-        let last_msg_seqs = entries.into_iter()
-            .filter_map(|e| {
-                let key = e.key.strip_prefix("wukongim:channel_seq:")?;
-                Some(format!("{}:{}", key, e.content))
-            })
+        // 1. Load sync state from file
+        let state = self.load_sync_state().await;
+        let version = state.max_version;
+        let last_msg_seqs = state.channel_seqs.iter()
+            .map(|(k, v)| format!("{}:{}", k, v))
             .collect::<Vec<_>>()
             .join("|");
 
@@ -225,10 +255,21 @@ impl WuKongIMChannel {
             anyhow::bail!("WuKongIM sync failed: status={}", resp.status());
         }
 
-        let sync_resp: SyncResponse = resp.json().await?;
+        let body_text = resp.text().await?;
+        let sync_resp: SyncResponse = match serde_json::from_str(&body_text) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("WuKongIM: failed to decode sync response: {}. Raw body: {}", e, body_text);
+                anyhow::bail!("WuKongIM: sync decode error: {}", e);
+            }
+        };
         let mut all_history = Vec::new();
+        let mut total_messages = 0;
+        let num_conversations = sync_resp.conversations.len();
         for conv in sync_resp.conversations {
+            tracing::info!("WuKongIM: syncing conversation {}:{} last_seq={} version={}", conv.channel_id, conv.channel_type, conv.last_msg_seq, conv.version);
             if let Some(messages) = conv.recents {
+                total_messages += messages.len();
                 for m in messages {
                     let msg_id = if m.message_id.is_string() {
                         m.message_id.as_str().unwrap_or_default().to_string()
@@ -237,14 +278,34 @@ impl WuKongIMChannel {
                     };
                     
                     all_history.push(RecvNotificationParams {
-                        message_id: msg_id,
+                        message_id: msg_id.clone(),
                         message_seq: m.message_seq,
-                        from_uid: m.from_uid,
+                        from_uid: m.from_uid.clone(),
                         channel_id: conv.channel_id.clone(),
                         channel_type: conv.channel_type,
-                        payload: m.payload,
+                        payload: m.payload.clone(),
                         timestamp: m.timestamp,
                     });
+                    
+                    // Log the message content summary by decoding Base64 payload if string
+                    let payload_json: Option<serde_json::Value> = if m.payload.is_string() {
+                        base64::engine::general_purpose::STANDARD.decode(m.payload.as_str().unwrap_or_default())
+                            .ok()
+                            .and_then(|d| serde_json::from_slice(&d).ok())
+                    } else {
+                        Some(m.payload.clone())
+                    };
+
+                    let summary = if let Some(pj) = payload_json {
+                        if let Some(text) = pj.get("content").and_then(|v| v.as_str()) {
+                            text.chars().take(50).collect::<String>()
+                        } else {
+                            format!("type={}", pj.get("type").and_then(|v| v.as_i64()).unwrap_or(0))
+                        }
+                    } else {
+                        "unparseable_payload".to_string()
+                    };
+                    tracing::info!("  - [History] from {}: {}", m.from_uid, summary);
                 }
             }
             // Clear unread after fetch
@@ -255,6 +316,11 @@ impl WuKongIMChannel {
 
         // Sort globally by timestamp
         all_history.sort_by_key(|m| m.timestamp);
+        if num_conversations == 0 {
+            tracing::info!("WuKongIM: history sync completed, no new updates from server");
+        } else {
+            tracing::info!("WuKongIM: history sync completed, {} messages found across {} conversations", total_messages, num_conversations);
+        }
         Ok(all_history)
     }
 
@@ -277,8 +343,14 @@ impl WuKongIMChannel {
             return Ok(());
         }
 
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
-        let payload_json: serde_json::Value = serde_json::from_slice(&decoded)?;
+        // Decode payload if it's a string (Base64), otherwise use as is if it's an object
+        let payload_json: serde_json::Value = if params.payload.is_string() {
+            let decoded = base64::engine::general_purpose::STANDARD.decode(params.payload.as_str().unwrap_or_default())?;
+            serde_json::from_slice(&decoded)?
+        } else {
+            params.payload.clone()
+        };
+
         let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
 
         // System command — handle la_init_helloworld CMD
@@ -378,6 +450,7 @@ impl WuKongIMChannel {
         };
 
         if tx.send(ch_msg).await.is_ok() {
+            tracing::info!("WuKongIM: message sent to orchestrator, updating sync state: seq={}, ts={}", params.message_seq, params.timestamp);
             self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
         }
         Ok(())
@@ -402,7 +475,7 @@ impl Channel for WuKongIMChannel {
             client_msg_no: Uuid::new_v4().to_string(),
             channel_id,
             channel_type,
-            payload: payload_b64,
+            payload: serde_json::Value::String(payload_b64),
             header: None,
             setting: None,
             msg_key: None,
@@ -540,7 +613,7 @@ impl Channel for WuKongIMChannel {
             client_msg_no: Uuid::new_v4().to_string(),
             channel_id,
             channel_type,
-            payload: payload_b64,
+            payload: serde_json::Value::String(payload_b64),
             header: None,
             setting: None,
             msg_key: None,
