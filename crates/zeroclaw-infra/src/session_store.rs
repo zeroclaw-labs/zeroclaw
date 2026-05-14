@@ -9,6 +9,7 @@ use crate::session_backend::SessionBackend;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::provider::ChatMessage;
+pub use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Append-only JSONL session store for channel conversations.
 pub struct SessionStore {
@@ -143,21 +144,6 @@ impl SessionStore {
             })
             .collect()
     }
-}
-
-/// Replace every character outside `[A-Za-z0-9_-]` with `_`. Idempotent.
-/// Callers building session keys must pre-apply this so the runtime HashMap
-/// key and the filename returned by `list_sessions` agree across restarts.
-pub fn sanitize_session_key(key: &str) -> String {
-    key.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 impl SessionBackend for SessionStore {
