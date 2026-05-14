@@ -58,7 +58,6 @@ export function useTheme(): UseThemeResult {
   // respect it and ignore OS changes.
   useEffect(() => {
     if (readStored().mode) return;
-    if (typeof window.matchMedia !== "function") return;
     const mql = window.matchMedia("(prefers-color-scheme: dark)");
     const onChange = () => {
       // Re-check stored just in case the user set a preference between

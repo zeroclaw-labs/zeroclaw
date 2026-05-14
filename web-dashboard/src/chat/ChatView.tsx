@@ -174,7 +174,6 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       </div>
     );
   }
-  // assistant
   return (
     <div className="max-w-[80%]">
       <div

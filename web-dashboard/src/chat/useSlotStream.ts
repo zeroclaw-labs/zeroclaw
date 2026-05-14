@@ -132,7 +132,12 @@ export function useSlotStream(slotId: string | undefined): UseSlotStream {
         );
 
         if (!res.ok) {
-          const errMsg = await safeText(res);
+          let errMsg = "";
+          try {
+            errMsg = await res.text();
+          } catch {
+            // Body unreadable — fall back to status text alone.
+          }
           throw new Error(
             `${res.status} ${res.statusText}${errMsg ? `: ${errMsg}` : ""}`,
           );
@@ -268,10 +273,3 @@ function appendSystemMessage(
   ]);
 }
 
-async function safeText(res: Response): Promise<string> {
-  try {
-    return await res.text();
-  } catch {
-    return "";
-  }
-}

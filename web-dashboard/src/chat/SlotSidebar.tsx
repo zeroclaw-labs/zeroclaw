@@ -75,7 +75,8 @@ export function SlotSidebar({
 
   const commitRename = (id: string) => {
     const next = renameDraft.trim();
-    if (next.length === 0 || next === slotById(data, id)?.title) {
+    const current = data?.slots.find((s) => s.id === id);
+    if (next.length === 0 || next === current?.title) {
       setRenamingId(null);
       return;
     }
@@ -332,9 +333,3 @@ function SlotStateBadge({ state }: { state: SlotResponse["state"] }) {
   );
 }
 
-function slotById(
-  data: SlotListResponse | undefined,
-  id: string,
-): SlotResponse | undefined {
-  return data?.slots.find((s) => s.id === id);
-}
