@@ -109,54 +109,35 @@ fn set_ownership(path: &Path, user: &str, group: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn set_ownership_recursive(path: &Path, user: &str, group: &str) -> Result<(), String> {
-    run("chown", &["-R", &format!("{user}:{group}"), &path.to_string_lossy()])?;
-    Ok(())
-}
-
 // ── Groups ───────────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Groups: two groups, one ACL.
 
-struct GroupDef {
-    name: String,
-    description: &'static str,
+const AGENTS_GROUP: &str = "agents";
+
+fn admin_group(user: &str) -> String {
+    format!("{user}-admin")
 }
 
-fn group_defs(user: &str) -> Vec<GroupDef> {
-    vec![
-        GroupDef {
-            name: user.to_string(),
-            description: "service account primary group",
-        },
-        GroupDef {
-            name: format!("{user}-admin-read"),
-            description: "read-only access to agent state and logs",
-        },
-        GroupDef {
-            name: format!("{user}-admin-write"),
-            description: "read-write access to agent config and state",
-        },
-        GroupDef {
-            name: format!("{user}-sandbox"),
-            description: "dev-tool sandbox group for agent subprocesses",
-        },
-    ]
-}
-
-fn create_groups(groups: &[GroupDef], log: &mut ChangeLog) -> Result<(), String> {
-    for g in groups {
-        if group_exists(&g.name) {
-            log.record("group", format!("{} already exists ({})", g.name, g.description));
+fn create_groups(user: &str, log: &mut ChangeLog) -> Result<(), String> {
+    let groups = [
+        (AGENTS_GROUP.to_string(), "system-wide read tier for agent service accounts"),
+        (admin_group(user), "config write escalation (one ACL on config.toml)"),
+    ];
+    for (name, desc) in &groups {
+        if group_exists(name) {
+            log.record("group", format!("{name} already exists ({desc})"));
         } else if !log.dry_run {
-            run("groupadd", &["--system", &g.name])?;
-            log.record("group", format!("created {} ({})", g.name, g.description));
+            run("groupadd", &["--system", name])?;
+            log.record("group", format!("created {name} ({desc})"));
         } else {
-            log.record("group", format!("would create {} ({})", g.name, g.description));
+            log.record("group", format!("would create {name} ({desc})"));
         }
     }
     Ok(())
 }
 
 // ── User ─────────────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Group membership: primary group = agents
 
 fn create_user(user: &str, home: &Path, log: &mut ChangeLog) -> Result<(), String> {
     if user_exists(user) {
@@ -164,60 +145,50 @@ fn create_user(user: &str, home: &Path, log: &mut ChangeLog) -> Result<(), Strin
         return Ok(());
     }
     if log.dry_run {
-        log.record("user", format!("would create system user {user} with home {}", home.display()));
+        log.record("user", format!("would create system user {user} (gid={AGENTS_GROUP}) with home {}", home.display()));
         return Ok(());
     }
     run(
         "useradd",
         &[
             "--system",
-            "--gid", user,
+            "--gid", AGENTS_GROUP,
             "--home-dir", &home.to_string_lossy(),
             "--create-home",
             "--shell", "/usr/sbin/nologin",
             user,
         ],
     )?;
-    log.record("user", format!("created system user {user} with home {}", home.display()));
+    log.record("user", format!("created system user {user} (gid={AGENTS_GROUP}) with home {}", home.display()));
     Ok(())
 }
 
 // ── Directories ──────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Workspace directories, State and logs, Scratch space
+// All dirs owned daemonclaw:agents. Mode is the access gate.
 
 struct DirDef {
     relative: &'static str,
     mode: u32,
-    owner_group: &'static str, // "service" | "admin-read" | "admin-write" | "sandbox"
     description: &'static str,
 }
 
 const DIRS: &[DirDef] = &[
-    DirDef { relative: ".daemonclaw",                    mode: 0o750, owner_group: "service",     description: "main state directory" },
-    DirDef { relative: ".daemonclaw/workspace",          mode: 0o750, owner_group: "service",     description: "agent workspace root" },
-    DirDef { relative: ".daemonclaw/workspace/github",   mode: 0o750, owner_group: "service",     description: "github project clones" },
-    DirDef { relative: ".daemonclaw/workspace/memory",   mode: 0o700, owner_group: "service",     description: "memory store (private)" },
-    DirDef { relative: ".daemonclaw/workspace/sessions", mode: 0o700, owner_group: "service",     description: "session persistence" },
-    DirDef { relative: ".daemonclaw/workspace/skills",   mode: 0o750, owner_group: "service",     description: "installed skills" },
-    DirDef { relative: ".daemonclaw/state",              mode: 0o750, owner_group: "admin-read",  description: "runtime state and traces" },
-    DirDef { relative: ".daemonclaw/state/backups",      mode: 0o750, owner_group: "admin-read",  description: "automated backups" },
-    DirDef { relative: ".daemonclaw/logs",               mode: 0o750, owner_group: "admin-read",  description: "log directory" },
-    DirDef { relative: "tmp",                            mode: 0o700, owner_group: "service",     description: "private tmp (not /tmp)" },
+    DirDef { relative: ".daemonclaw",                    mode: 0o750, description: "main state directory" },
+    DirDef { relative: ".daemonclaw/workspace",          mode: 0o750, description: "agent workspace root" },
+    DirDef { relative: ".daemonclaw/workspace/github",   mode: 0o750, description: "github project clones" },
+    DirDef { relative: ".daemonclaw/workspace/memory",   mode: 0o700, description: "memory store (private)" },
+    DirDef { relative: ".daemonclaw/workspace/sessions", mode: 0o700, description: "session persistence" },
+    DirDef { relative: ".daemonclaw/workspace/skills",   mode: 0o750, description: "installed skills" },
+    DirDef { relative: ".daemonclaw/state",              mode: 0o750, description: "runtime state and traces" },
+    DirDef { relative: ".daemonclaw/state/backups",      mode: 0o750, description: "agent-side backups" },
+    DirDef { relative: ".daemonclaw/logs",               mode: 0o750, description: "log directory" },
+    DirDef { relative: "tmp",                            mode: 0o700, description: "private scratch (not /tmp)" },
 ];
-
-fn resolve_group(user: &str, tag: &str) -> String {
-    match tag {
-        "service" => user.to_string(),
-        "admin-read" => format!("{user}-admin-read"),
-        "admin-write" => format!("{user}-admin-write"),
-        "sandbox" => format!("{user}-sandbox"),
-        _ => user.to_string(),
-    }
-}
 
 fn create_directories(user: &str, home: &Path, log: &mut ChangeLog) -> Result<(), String> {
     for d in DIRS {
         let full = home.join(d.relative);
-        let group = resolve_group(user, d.owner_group);
         if full.exists() {
             log.record("dir", format!("{} already exists ({})", full.display(), d.description));
         } else if !log.dry_run {
@@ -225,22 +196,147 @@ fn create_directories(user: &str, home: &Path, log: &mut ChangeLog) -> Result<()
                 .map_err(|e| format!("mkdir {}: {e}", full.display()))?;
             fs::set_permissions(&full, fs::Permissions::from_mode(d.mode))
                 .map_err(|e| format!("chmod {}: {e}", full.display()))?;
-            set_ownership(&full, user, &group)?;
+            set_ownership(&full, user, AGENTS_GROUP)?;
             log.record(
                 "dir",
-                format!("{} (mode {:04o}, owner {user}:{group}, {})", full.display(), d.mode, d.description),
+                format!("{} (mode {:04o}, owner {user}:{AGENTS_GROUP}, {})", full.display(), d.mode, d.description),
             );
         } else {
             log.record(
                 "dir",
-                format!("would create {} (mode {:04o}, owner {user}:{group}, {})", full.display(), d.mode, d.description),
+                format!("would create {} (mode {:04o}, owner {user}:{AGENTS_GROUP}, {})", full.display(), d.mode, d.description),
             );
         }
     }
     Ok(())
 }
 
+// ── Default ACLs ─────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Default ACLs: guarantee agents can read runtime-created files
+
+fn set_default_acls(home: &Path, log: &mut ChangeLog) -> Result<(), String> {
+    let acl_dirs = [
+        (".daemonclaw/logs", "new log files readable by agents"),
+        (".daemonclaw/state", "new state files readable by agents"),
+    ];
+    for (rel, desc) in &acl_dirs {
+        let full = home.join(rel);
+        let acl = format!("default:group:{AGENTS_GROUP}:r--");
+        if log.dry_run {
+            log.record("acl", format!("would set {acl} on {} ({desc})", full.display()));
+        } else {
+            run("setfacl", &["-m", &acl, &full.to_string_lossy()])?;
+            log.record("acl", format!("set {acl} on {} ({desc})", full.display()));
+        }
+    }
+    Ok(())
+}
+
 // ── Config ───────────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Config:
+//   /etc/daemonclaw/           root:agents  0750
+//   /etc/daemonclaw/config.toml  root:agents  0640  ACL group:daemonclaw-admin:rw-
+//   $HOME/.daemonclaw/config.toml  → symlink to /etc/daemonclaw/config.toml
+
+fn install_config(cli: &Cli, log: &mut ChangeLog) -> Result<(), String> {
+    let etc_dir = PathBuf::from("/etc/daemonclaw");
+    let etc_config = etc_dir.join("config.toml");
+    let home_symlink = cli.home.join(".daemonclaw/config.toml");
+    let admin_grp = admin_group(&cli.user);
+
+    // /etc/daemonclaw/ directory
+    if etc_dir.exists() {
+        log.record("config", format!("{} already exists", etc_dir.display()));
+    } else if log.dry_run {
+        log.record("config", format!("would create {} (root:{AGENTS_GROUP} 0750)", etc_dir.display()));
+    } else {
+        fs::create_dir_all(&etc_dir)
+            .map_err(|e| format!("mkdir {}: {e}", etc_dir.display()))?;
+        fs::set_permissions(&etc_dir, fs::Permissions::from_mode(0o750))
+            .map_err(|e| format!("chmod {}: {e}", etc_dir.display()))?;
+        set_ownership(&etc_dir, "root", AGENTS_GROUP)?;
+        log.record("config", format!("created {} (root:{AGENTS_GROUP} 0750)", etc_dir.display()));
+    }
+
+    // /etc/daemonclaw/config.toml
+    if etc_config.exists() {
+        log.record("config", format!("{} already exists — not overwriting", etc_config.display()));
+    } else if log.dry_run {
+        log.record("config", format!(
+            "would write {} (root:{AGENTS_GROUP} 0640, ACL group:{admin_grp}:rw-)",
+            etc_config.display()
+        ));
+    } else {
+        let content = generate_config(cli);
+        fs::write(&etc_config, &content)
+            .map_err(|e| format!("write {}: {e}", etc_config.display()))?;
+        fs::set_permissions(&etc_config, fs::Permissions::from_mode(0o640))
+            .map_err(|e| format!("chmod {}: {e}", etc_config.display()))?;
+        set_ownership(&etc_config, "root", AGENTS_GROUP)?;
+        run("setfacl", &["-m", &format!("group:{admin_grp}:rw-"), &etc_config.to_string_lossy()])?;
+        log.record("config", format!(
+            "wrote {} (root:{AGENTS_GROUP} 0640, ACL group:{admin_grp}:rw-)",
+            etc_config.display()
+        ));
+    }
+
+    // Symlink $HOME/.daemonclaw/config.toml → /etc/daemonclaw/config.toml
+    if home_symlink.exists() || home_symlink.is_symlink() {
+        log.record("config", format!("{} already exists", home_symlink.display()));
+    } else if log.dry_run {
+        log.record("config", format!(
+            "would symlink {} → {}",
+            home_symlink.display(), etc_config.display()
+        ));
+    } else {
+        std::os::unix::fs::symlink(&etc_config, &home_symlink)
+            .map_err(|e| format!("symlink {}: {e}", home_symlink.display()))?;
+        set_ownership(&home_symlink, &cli.user, AGENTS_GROUP)?;
+        log.record("config", format!(
+            "symlinked {} → {}",
+            home_symlink.display(), etc_config.display()
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Secret key ───────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § Secret key: daemonclaw:agents 0600, chattr +i after creation
+
+fn install_secret_key(cli: &Cli, log: &mut ChangeLog) -> Result<(), String> {
+    let key_path = cli.home.join(".daemonclaw/.secret_key");
+
+    if key_path.exists() {
+        log.record("secret", format!("{} already exists", key_path.display()));
+        return Ok(());
+    }
+
+    if log.dry_run {
+        log.record("secret", format!(
+            "would generate {} ({}:{AGENTS_GROUP} 0600, chattr +i)",
+            key_path.display(), cli.user
+        ));
+        return Ok(());
+    }
+
+    // Generate 64 bytes of random key material
+    let key_hex = run("openssl", &["rand", "-hex", "32"])?;
+    fs::write(&key_path, key_hex.trim())
+        .map_err(|e| format!("write {}: {e}", key_path.display()))?;
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", key_path.display()))?;
+    set_ownership(&key_path, &cli.user, AGENTS_GROUP)?;
+    run("chattr", &["+i", &key_path.to_string_lossy()])?;
+    log.record("secret", format!(
+        "generated {} ({}:{AGENTS_GROUP} 0600, chattr +i)",
+        key_path.display(), cli.user
+    ));
+
+    Ok(())
+}
+
+// ── Config content ───────────────────────────────────────────────────
 
 fn generate_config(cli: &Cli) -> String {
     format!(
@@ -405,6 +501,7 @@ enabled = true
 }
 
 // ── Systemd unit ─────────────────────────────────────────────────────
+// ACCESS_MATRIX.md § systemd hardening
 
 fn generate_service_unit(cli: &Cli) -> String {
     format!(
@@ -417,7 +514,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User={user}
-Group={user}
+Group={agents}
 WorkingDirectory={home}
 
 ExecStart={bin} gateway --host {host} --port {port}
@@ -441,14 +538,18 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 
-# Allow agent access to its own state
+# Network: outbound only (Telegram polling)
+SocketBindDeny=any
+
+# Allow agent access to its own state + read config
 ReadWritePaths={home}
-ReadOnlyPaths=/proc /sys /etc/os-release /etc/hostname /etc/resolv.conf
+ReadOnlyPaths=/proc /sys /etc/os-release /etc/hostname /etc/resolv.conf /etc/daemonclaw
 
 # Resource limits
-MemoryMax=8G
-TasksMax=256
-CPUQuota=400%
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=64
+LimitFSIZE=1073741824
 
 # Environment
 Environment=RUST_LOG=info
@@ -463,6 +564,7 @@ SyslogIdentifier=daemonclaw
 WantedBy=multi-user.target
 "#,
         user = cli.user,
+        agents = AGENTS_GROUP,
         home = cli.home.display(),
         bin = cli.bin_path.display(),
         host = cli.listen_host,
@@ -472,47 +574,99 @@ WantedBy=multi-user.target
 
 // ── Systemd slice ────────────────────────────────────────────────────
 
-fn generate_slice(_user: &str) -> String {
-    format!(
-        r#"[Unit]
+fn generate_slice() -> String {
+    r#"[Unit]
 Description=DaemonClaw agent group resource slice
 
 [Slice]
 MemoryMax=12G
 TasksMax=512
 CPUQuota=600%
+"#.to_string()
+}
 
-# Future: per-agent scopes will be children of this slice,
-# inheriting these limits as a group ceiling.
-# e.g. daemonclaw-agent@primary.service → Slice=daemonclaw.slice
+// ── Backup infrastructure ────────────────────────────────────────────
+// ACCESS_MATRIX.md § Data durability → State → external backups
+
+fn generate_backup_timer() -> &'static str {
+    r#"[Unit]
+Description=DaemonClaw state backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 "#
+}
+
+fn generate_backup_service(home: &Path) -> String {
+    format!(
+        r#"[Unit]
+Description=DaemonClaw state backup
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+    ts=$(date +%%Y%%m%%d-%%H%%M%%S) && \
+    tar czf /var/backups/daemonclaw/state-${{ts}}.tar.gz \
+        -C {home}/.daemonclaw state/ \
+    '
+User=root
+Group={agents}
+"#,
+        home = home.display(),
+        agents = AGENTS_GROUP,
     )
+}
+
+fn generate_tmpfiles_conf() -> &'static str {
+    "d /var/backups/daemonclaw 0750 root agents - -\n\
+     e /var/backups/daemonclaw - - - 30d -\n"
 }
 
 // ── Systemd installation ─────────────────────────────────────────────
 
 fn install_systemd(cli: &Cli, log: &mut ChangeLog) -> Result<(), String> {
-    let unit_path = PathBuf::from("/etc/systemd/system/daemonclaw.service");
-    let slice_path = PathBuf::from("/etc/systemd/system/daemonclaw.slice");
-
-    let unit_content = generate_service_unit(cli);
-    let slice_content = generate_slice(&cli.user);
+    let units: Vec<(PathBuf, String, &str)> = vec![
+        (
+            PathBuf::from("/etc/systemd/system/daemonclaw.service"),
+            generate_service_unit(cli),
+            "service unit",
+        ),
+        (
+            PathBuf::from("/etc/systemd/system/daemonclaw.slice"),
+            generate_slice(),
+            "resource slice",
+        ),
+        (
+            PathBuf::from("/etc/systemd/system/daemonclaw-backup.timer"),
+            generate_backup_timer().to_string(),
+            "backup timer",
+        ),
+        (
+            PathBuf::from("/etc/systemd/system/daemonclaw-backup.service"),
+            generate_backup_service(&cli.home),
+            "backup service",
+        ),
+    ];
 
     if log.dry_run {
-        log.record("systemd", format!("would write {}", unit_path.display()));
-        log.record("systemd", format!("would write {}", slice_path.display()));
+        for (path, _, desc) in &units {
+            log.record("systemd", format!("would write {} ({desc})", path.display()));
+        }
         log.record("systemd", "would run systemctl daemon-reload".to_string());
-        log.record("systemd", "would run systemctl enable daemonclaw.service".to_string());
+        log.record("systemd", "would enable daemonclaw.service".to_string());
+        log.record("systemd", "would enable daemonclaw-backup.timer".to_string());
         return Ok(());
     }
 
-    fs::write(&unit_path, &unit_content)
-        .map_err(|e| format!("write {}: {e}", unit_path.display()))?;
-    log.record("systemd", format!("wrote {}", unit_path.display()));
-
-    fs::write(&slice_path, &slice_content)
-        .map_err(|e| format!("write {}: {e}", slice_path.display()))?;
-    log.record("systemd", format!("wrote {}", slice_path.display()));
+    for (path, content, desc) in &units {
+        fs::write(path, content)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        log.record("systemd", format!("wrote {} ({desc})", path.display()));
+    }
 
     run("systemctl", &["daemon-reload"])?;
     log.record("systemd", "daemon-reload".to_string());
@@ -520,32 +674,43 @@ fn install_systemd(cli: &Cli, log: &mut ChangeLog) -> Result<(), String> {
     run("systemctl", &["enable", "daemonclaw.service"])?;
     log.record("systemd", "enabled daemonclaw.service".to_string());
 
+    run("systemctl", &["enable", "daemonclaw-backup.timer"])?;
+    log.record("systemd", "enabled daemonclaw-backup.timer".to_string());
+
     Ok(())
 }
 
-// ── Config installation ──────────────────────────────────────────────
+// ── Backup directory + tmpfiles ──────────────────────────────────────
+// ACCESS_MATRIX.md § External backups: /var/backups/daemonclaw/ root:agents 0750
 
-fn install_config(cli: &Cli, log: &mut ChangeLog) -> Result<(), String> {
-    let config_path = cli.home.join(".daemonclaw/config.toml");
+fn install_backup_infra(log: &mut ChangeLog) -> Result<(), String> {
+    let backup_dir = PathBuf::from("/var/backups/daemonclaw");
+    let tmpfiles_conf = PathBuf::from("/etc/tmpfiles.d/daemonclaw-backups.conf");
 
-    if config_path.exists() {
-        log.record("config", format!("{} already exists — not overwriting", config_path.display()));
-        return Ok(());
+    // Backup directory
+    if backup_dir.exists() {
+        log.record("backup", format!("{} already exists", backup_dir.display()));
+    } else if log.dry_run {
+        log.record("backup", format!("would create {} (root:{AGENTS_GROUP} 0750)", backup_dir.display()));
+    } else {
+        fs::create_dir_all(&backup_dir)
+            .map_err(|e| format!("mkdir {}: {e}", backup_dir.display()))?;
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o750))
+            .map_err(|e| format!("chmod {}: {e}", backup_dir.display()))?;
+        set_ownership(&backup_dir, "root", AGENTS_GROUP)?;
+        log.record("backup", format!("created {} (root:{AGENTS_GROUP} 0750)", backup_dir.display()));
     }
 
-    let content = generate_config(cli);
-
-    if log.dry_run {
-        log.record("config", format!("would write {}", config_path.display()));
-        return Ok(());
+    // tmpfiles rotation config
+    if tmpfiles_conf.exists() {
+        log.record("backup", format!("{} already exists", tmpfiles_conf.display()));
+    } else if log.dry_run {
+        log.record("backup", format!("would write {} (30d rotation)", tmpfiles_conf.display()));
+    } else {
+        fs::write(&tmpfiles_conf, generate_tmpfiles_conf())
+            .map_err(|e| format!("write {}: {e}", tmpfiles_conf.display()))?;
+        log.record("backup", format!("wrote {} (30d rotation)", tmpfiles_conf.display()));
     }
-
-    fs::write(&config_path, &content)
-        .map_err(|e| format!("write {}: {e}", config_path.display()))?;
-    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640))
-        .map_err(|e| format!("chmod {}: {e}", config_path.display()))?;
-    set_ownership(&config_path, &cli.user, &format!("{}-admin-write", cli.user))?;
-    log.record("config", format!("wrote {} (mode 0640, owner {}:{}-admin-write)", config_path.display(), cli.user, cli.user));
 
     Ok(())
 }
@@ -577,14 +742,16 @@ fn main() -> ExitCode {
     }
 
     let mut log = ChangeLog::new(cli.dry_run);
-    let groups = group_defs(&cli.user);
 
     let steps: Vec<(&str, Box<dyn FnOnce(&mut ChangeLog) -> Result<(), String>>)> = vec![
-        ("Creating groups", Box::new(|log| create_groups(&groups, log))),
+        ("Creating groups", Box::new(|log| create_groups(&cli.user, log))),
         ("Creating service account", Box::new(|log| create_user(&cli.user, &cli.home, log))),
         ("Creating directory structure", Box::new(|log| create_directories(&cli.user, &cli.home, log))),
+        ("Setting default ACLs", Box::new(|log| set_default_acls(&cli.home, log))),
+        ("Installing config", Box::new(|log| install_config(&cli, log))),
+        ("Generating secret key", Box::new(|log| install_secret_key(&cli, log))),
         ("Installing systemd units", Box::new(|log| install_systemd(&cli, log))),
-        ("Generating config", Box::new(|log| install_config(&cli, log))),
+        ("Setting up backup infrastructure", Box::new(|log| install_backup_infra(log))),
     ];
 
     for (label, step) in steps {
@@ -593,16 +760,6 @@ fn main() -> ExitCode {
             eprintln!("  FAILED: {e}");
             log.print_summary();
             return ExitCode::FAILURE;
-        }
-    }
-
-    // Final ownership pass on the entire home directory
-    if !cli.dry_run {
-        eprintln!("── Setting ownership ──");
-        if let Err(e) = set_ownership_recursive(&cli.home, &cli.user, &cli.user) {
-            eprintln!("  WARNING: recursive chown failed: {e}");
-        } else {
-            log.record("ownership", format!("chown -R {}:{} {}", cli.user, cli.user, cli.home.display()));
         }
     }
 
@@ -616,10 +773,9 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("Next steps:");
         eprintln!("  1. Copy the daemonclaw binary to {}", cli.bin_path.display());
-        eprintln!("  2. Add your API key to {}", cli.home.join(".daemonclaw/config.toml").display());
-        eprintln!("  3. Add your Telegram bot token to the config");
-        eprintln!("  4. Start the service:  systemctl start daemonclaw");
-        eprintln!("  5. Check status:       journalctl -u daemonclaw -f");
+        eprintln!("  2. Edit /etc/daemonclaw/config.toml — add your API key and Telegram bot token");
+        eprintln!("  3. Start the service:  systemctl start daemonclaw");
+        eprintln!("  4. Check status:       journalctl -u daemonclaw -f");
     }
 
     ExitCode::SUCCESS
