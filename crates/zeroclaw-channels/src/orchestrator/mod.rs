@@ -6282,6 +6282,22 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        "webhook" => {
+            let wh = config
+                .channels
+                .webhook
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("webhook channel not configured"))?;
+            let ch = WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            );
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     Ok(())
