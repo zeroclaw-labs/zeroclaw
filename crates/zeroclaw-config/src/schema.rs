@@ -11354,6 +11354,26 @@ impl Config {
             }
         }
 
+        // Channel reply-intent precheck. Zero timeout or empty/whitespace model would
+        // silently fail open to REPLY and quietly disable the group-chat noise filter
+        // — reject the typo cases explicitly. Use `enabled = false` to disable instead.
+        if self.agent.precheck.timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "agent.precheck.timeout_secs",
+                "agent.precheck.timeout_secs must be greater than 0 (use agent.precheck.enabled = false to disable the precheck)"
+            );
+        }
+        if let Some(ref model) = self.agent.precheck.model
+            && model.trim().is_empty()
+        {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "agent.precheck.model",
+                "agent.precheck.model must not be empty or whitespace; omit the key to fall back to the route model"
+            );
+        }
+
         Ok(())
     }
 
@@ -15989,6 +16009,47 @@ default_model = "persisted-profile"
                 ..Default::default()
             },
         );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_timeout_zero() {
+        let mut config = Config::default();
+        config.agent.precheck.timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.timeout_secs") && msg.contains("greater than 0"),
+            "expected precheck timeout validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_empty_model() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("   ".into());
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.model"),
+            "expected precheck model validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_default_precheck() {
+        let config = Config::default();
+        assert!(
+            config.validate().is_ok(),
+            "default ChannelPrecheckConfig must pass validation"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_precheck_model_override() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("fast-classifier".into());
+        config.agent.precheck.timeout_secs = 3;
         assert!(config.validate().is_ok());
     }
 
