@@ -1293,6 +1293,8 @@ mod tests {
             slot_queue: Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),

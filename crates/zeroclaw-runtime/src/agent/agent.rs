@@ -412,6 +412,40 @@ impl AgentBuilder {
     }
 }
 
+/// How an Agent should source its MCP tools (M2.5).
+///
+/// Three states, in rough order of operational desirability:
+///
+/// 1. [`Shared`](Self::Shared) — the caller (the gateway's
+///    [`SlotRegistry`] or its `/ws/chat` handler) holds a
+///    process-global `Arc<McpRegistry>`. Every Agent built from it
+///    sees the same subprocess tree; 50 slots spawn zero additional
+///    MCP children.
+/// 2. [`Initialize`](Self::Initialize) — no shared registry; call
+///    `McpRegistry::connect_all` inside this Agent's init. Used by
+///    CLI / webhook paths that don't coordinate an outer registry.
+/// 3. [`Skip`](Self::Skip) — don't touch MCP at all. ACP uses this:
+///    `session/new` must return promptly, and MCP startup is an
+///    unbounded-latency external-process operation.
+enum McpSource {
+    Shared(Arc<tools::McpRegistry>),
+    Initialize,
+    Skip,
+}
+
+impl McpSource {
+    /// `Some(reg)` becomes `Shared(reg)`; `None` becomes `Initialize`.
+    /// Matches the semantics of the public `from_config_with_shared_mcp*`
+    /// signatures, where `None` means "caller doesn't manage MCP — do
+    /// what the legacy `initialize_mcp = true` path did."
+    fn from_option(opt: Option<Arc<tools::McpRegistry>>) -> Self {
+        match opt {
+            Some(reg) => Self::Shared(reg),
+            None => Self::Initialize,
+        }
+    }
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -531,10 +565,76 @@ impl Agent {
         .await
     }
 
+    /// Build an Agent that reuses a caller-supplied shared `McpRegistry`
+    /// (M2.5 multi-session dashboard). Non-backchannel variant — callers
+    /// that own an operator approval path should use
+    /// [`from_config_with_shared_mcp_backchannel`] instead.
+    ///
+    /// `shared_mcp == None` falls back to self-initialising MCP, matching
+    /// the semantics of [`from_config_with_session_cwd_and_mcp`] with
+    /// `initialize_mcp = true`.
+    pub async fn from_config_with_shared_mcp(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        shared_mcp: Option<Arc<tools::McpRegistry>>,
+    ) -> Result<Self> {
+        Self::from_config_with_mcp_source_approval_mode(
+            config,
+            session_cwd,
+            McpSource::from_option(shared_mcp),
+            false,
+        )
+        .await
+    }
+
+    /// Backchannel-enabled companion to [`from_config_with_shared_mcp`].
+    ///
+    /// Used by `/ws/chat` and by `SlotRegistry::get_or_spawn` — gateway
+    /// paths that surface tool-approval prompts over the operator's
+    /// dashboard rather than deferring to autonomy-config policy.
+    pub async fn from_config_with_shared_mcp_backchannel(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        shared_mcp: Option<Arc<tools::McpRegistry>>,
+    ) -> Result<Self> {
+        Self::from_config_with_mcp_source_approval_mode(
+            config,
+            session_cwd,
+            McpSource::from_option(shared_mcp),
+            true,
+        )
+        .await
+    }
+
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
+        approval_backchannel: bool,
+    ) -> Result<Self> {
+        Self::from_config_with_mcp_source_approval_mode(
+            config,
+            session_cwd,
+            if initialize_mcp {
+                McpSource::Initialize
+            } else {
+                McpSource::Skip
+            },
+            approval_backchannel,
+        )
+        .await
+    }
+
+    /// Unified internal constructor (M2.5). Branches on [`McpSource`] to
+    /// decide whether to reuse a caller-supplied registry, lazily
+    /// `connect_all` a fresh one, or skip MCP entirely. The former two
+    /// public wrappers (`_and_mcp`, `_backchannel`) delegate here with
+    /// the bool form mapped into `McpSource::Initialize` or `Skip`; the
+    /// `_shared_mcp*` pair routes through with `Shared(reg)`.
+    async fn from_config_with_mcp_source_approval_mode(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        mcp_source: McpSource,
         approval_backchannel: bool,
     ) -> Result<Self> {
         let observer: Arc<dyn Observer> =
@@ -602,63 +702,79 @@ impl Agent {
         );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
-        // Replicates the same MCP initialization logic used in the CLI
-        // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
-        // path also has access to MCP tools.
+        //
+        // Three paths converge here via `McpSource`:
+        //   Shared(reg)  — reuse the caller's registry (gateway startup,
+        //                  SlotRegistry). No new subprocesses spawned.
+        //   Initialize   — `connect_all` here; legacy CLI / webhook
+        //                  callers rely on this to match their MCP
+        //                  semantics.
+        //   Skip         — e.g. ACP, where session/new must return
+        //                  promptly and MCP startup could block.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
-        if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
-            tracing::info!(
-                "Initializing MCP client — {} server(s) configured",
-                config.mcp.servers.len()
-            );
-            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    if config.mcp.deferred_loading {
-                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        tracing::info!(
-                            "MCP deferred: {} tool stub(s) from {} server(s)",
-                            deferred_set.len(),
-                            registry.server_count()
-                        );
-                        let activated =
-                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                        activated_tools = Some(Arc::clone(&activated));
-                        tools.push(Box::new(tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        for name in names {
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                    std::sync::Arc::new(tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if let Some(ref handle) = delegate_handle {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
-                                }
-                                tools.push(Box::new(tools::ArcToolRef(wrapper)));
-                                registered += 1;
-                            }
+        let registry_for_tools: Option<Arc<tools::McpRegistry>> = match mcp_source {
+            McpSource::Shared(reg) => {
+                if config.mcp.enabled {
+                    Some(reg)
+                } else {
+                    None
+                }
+            }
+            McpSource::Initialize => {
+                if config.mcp.enabled && !config.mcp.servers.is_empty() {
+                    tracing::info!(
+                        "Initializing MCP client — {} server(s) configured",
+                        config.mcp.servers.len()
+                    );
+                    match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+                        Ok(registry) => Some(std::sync::Arc::new(registry)),
+                        Err(e) => {
+                            tracing::error!("MCP registry failed to initialize: {e:#}");
+                            None
                         }
-                        tracing::info!(
-                            "MCP: {} tool(s) registered from {} server(s)",
-                            registered,
-                            registry.server_count()
+                    }
+                } else {
+                    None
+                }
+            }
+            McpSource::Skip => None,
+        };
+        if let Some(registry) = registry_for_tools {
+            if config.mcp.deferred_loading {
+                let deferred_set =
+                    tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
+                        .await;
+                tracing::info!(
+                    "MCP deferred: {} tool stub(s) from {} server(s)",
+                    deferred_set.len(),
+                    registry.server_count()
+                );
+                let activated = Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                activated_tools = Some(Arc::clone(&activated));
+                tools.push(Box::new(tools::ToolSearchTool::new(
+                    deferred_set,
+                    activated,
+                )));
+            } else {
+                let names = registry.tool_names();
+                let mut registered = 0usize;
+                for name in names {
+                    if let Some(def) = registry.get_tool_def(&name).await {
+                        let wrapper: std::sync::Arc<dyn tools::Tool> = std::sync::Arc::new(
+                            tools::McpToolWrapper::new(name, def, std::sync::Arc::clone(&registry)),
                         );
+                        if let Some(ref handle) = delegate_handle {
+                            handle.write().push(std::sync::Arc::clone(&wrapper));
+                        }
+                        tools.push(Box::new(tools::ArcToolRef(wrapper)));
+                        registered += 1;
                     }
                 }
-                Err(e) => {
-                    tracing::error!("MCP registry failed to initialize: {e:#}");
-                }
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registered,
+                    registry.server_count()
+                );
             }
         }
 
