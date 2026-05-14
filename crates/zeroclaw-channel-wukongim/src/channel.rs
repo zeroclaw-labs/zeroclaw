@@ -13,13 +13,15 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+use zeroclaw_api::memory_traits::Memory;
 
 use crate::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use crate::config::WuKongIMConfig;
 use crate::connection::{
-    ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams, WUKONGIM_RPC_VERSION,
-    WkChannelType, WkMessageType, WsSink,
+    ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams,
+    SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType,
+    WkMessageType, WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use crate::messaging::{
@@ -37,6 +39,9 @@ pub struct WuKongIMChannel {
     pub(crate) allowed_users: Vec<String>,
     pub(crate) approval_timeout_secs: u64,
     pub(crate) mention_only: bool,
+    pub(crate) dawn_url: String,
+    pub(crate) dawn_token: String,
+    pub(crate) memory: Arc<dyn Memory>,
     pub(crate) pending_responses:
         Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     pub(crate) pending_approvals: Arc<PendingApprovals>,
@@ -45,7 +50,7 @@ pub struct WuKongIMChannel {
 }
 
 impl WuKongIMChannel {
-    pub fn from_config(config: &WuKongIMConfig, workspace_dir: &Path) -> Self {
+    pub fn from_config(config: &WuKongIMConfig, workspace_dir: &Path, memory: Arc<dyn Memory>) -> Self {
         let downloads_dir = if config.downloads_dir.starts_with('/') {
             PathBuf::from(&config.downloads_dir)
         } else {
@@ -60,6 +65,9 @@ impl WuKongIMChannel {
             allowed_users: config.allowed_users.clone(),
             approval_timeout_secs: config.approval_timeout_secs,
             mention_only: config.mention_only,
+            dawn_url: config.dawn_url.clone(),
+            dawn_token: config.dawn_token.clone(),
+            memory,
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
@@ -135,6 +143,245 @@ impl WuKongIMChannel {
         }
         Ok(())
     }
+
+    async fn update_sync_state(&self, channel_id: &str, channel_type: u8, seq: u32, timestamp_ns: i64) -> anyhow::Result<()> {
+        use zeroclaw_api::memory_traits::MemoryCategory;
+
+        // Update channel sequence
+        let seq_key = format!("wukongim:channel_seq:{}:{}", channel_id, channel_type);
+        let current_seq = self.memory.get(&seq_key).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+        if seq > current_seq {
+            self.memory.store(&seq_key, &seq.to_string(), MemoryCategory::Custom("wukongim_seq".to_string()), None).await?;
+        }
+
+        // Update global version
+        let ver_key = "wukongim:sync:max_version";
+        let current_ver = self.memory.get(ver_key).await?.and_then(|e| e.content.parse::<i64>().ok()).unwrap_or(0);
+        if timestamp_ns > current_ver {
+            self.memory.store(ver_key, &timestamp_ns.to_string(), MemoryCategory::Core, None).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn clear_unread(&self, channel_id: &str, channel_type: u8, message_seq: u32) -> anyhow::Result<()> {
+        let url = format!("{}/v1/conversations/clearUnread", self.dawn_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let req = ClearUnreadRequest {
+            uid: self.uid.clone(),
+            channel_id: channel_id.to_string(),
+            channel_type,
+            message_seq,
+        };
+
+        let resp = client.post(&url)
+            .header("X-Assistant-Token", &self.dawn_token)
+            .json(&req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            tracing::warn!("WuKongIM: failed to clear unread for {}:{}: status={}", channel_id, channel_type, resp.status());
+        }
+        Ok(())
+    }
+
+    async fn sync_history(&self) -> anyhow::Result<Vec<RecvNotificationParams>> {
+        use zeroclaw_api::memory_traits::MemoryCategory;
+
+        // 1. Get current version
+        let ver_key = "wukongim:sync:max_version";
+        let version = self.memory.get(ver_key).await?.and_then(|e| e.content.parse::<i64>().ok()).unwrap_or(0);
+
+        // 2. Collect all channel sequences
+        let entries = self.memory.list(Some(&MemoryCategory::Custom("wukongim_seq".to_string())), None).await?;
+        let last_msg_seqs = entries.into_iter()
+            .filter_map(|e| {
+                let key = e.key.strip_prefix("wukongim:channel_seq:")?;
+                Some(format!("{}:{}", key, e.content))
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        tracing::info!(version = version, last_msg_seqs = %last_msg_seqs, "WuKongIM: starting history sync");
+
+        // 3. HTTP Sync
+        let url = format!("{}/v1/conversations/sync", self.dawn_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let req = SyncRequest {
+            uid: self.uid.clone(),
+            version,
+            last_msg_seqs,
+            msg_count: 50,
+        };
+
+        let resp = client.post(&url)
+            .header("X-Assistant-Token", &self.dawn_token)
+            .json(&req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("WuKongIM sync failed: status={}", resp.status());
+        }
+
+        let sync_resp: SyncResponse = resp.json().await?;
+        let mut all_history = Vec::new();
+        for conv in sync_resp.conversations {
+            if let Some(messages) = conv.recents {
+                for m in messages {
+                    let msg_id = if m.message_id.is_string() {
+                        m.message_id.as_str().unwrap_or_default().to_string()
+                    } else {
+                        m.message_id.to_string()
+                    };
+                    
+                    all_history.push(RecvNotificationParams {
+                        message_id: msg_id,
+                        message_seq: m.message_seq,
+                        from_uid: m.from_uid,
+                        channel_id: conv.channel_id.clone(),
+                        channel_type: conv.channel_type,
+                        payload: m.payload,
+                        timestamp: m.timestamp,
+                    });
+                }
+            }
+            // Clear unread after fetch
+            let _ = self.clear_unread(&conv.channel_id, conv.channel_type, conv.last_msg_seq).await;
+            // Update version based on conversation
+            self.update_sync_state(&conv.channel_id, conv.channel_type, conv.last_msg_seq, conv.version).await?;
+        }
+
+        // Sort globally by timestamp
+        all_history.sort_by_key(|m| m.timestamp);
+        Ok(all_history)
+    }
+
+    async fn process_inbound_message(
+        &self,
+        params: RecvNotificationParams,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        if params.from_uid == self.uid { return Ok(()); }
+
+        // Idempotency check: skip if already processed
+        let seq_key = format!("wukongim:channel_seq:{}:{}", params.channel_id, params.channel_type);
+        let current_seq = self.memory.get(&seq_key).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+        if params.message_seq <= current_seq {
+            return Ok(());
+        }
+
+        if !is_user_allowed(&self.allowed_users, &params.from_uid) {
+            tracing::warn!("WuKongIM: unauthorized sender {}", params.from_uid);
+            return Ok(());
+        }
+
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
+        let payload_json: serde_json::Value = serde_json::from_slice(&decoded)?;
+        let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
+
+        // System command — handle la_init_helloworld CMD
+        if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
+            let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+            if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld") {
+                if let Some(content) = payload_json.get("content").and_then(|c| c.as_str()) {
+                    if params.channel_type == WkChannelType::GROUP
+                        && !is_mentioned(&self.uid, &payload_json, content)
+                    {
+                        return Ok(());
+                    }
+                    let target_id = if params.channel_type == WkChannelType::GROUP { &params.channel_id } else { &params.from_uid };
+                    let ch_msg = ChannelMessage {
+                        id: params.message_id.clone(),
+                        sender: target_id.clone(),
+                        reply_target: format!("{}:{}", params.channel_type, target_id),
+                        content: content.to_string(),
+                        channel: "wukongim".to_string(),
+                        timestamp: params.timestamp.max(0) as u64,
+                        thread_ts: None,
+                        interruption_scope_id: None,
+                        attachments: vec![],
+                    };
+                    if tx.send(ch_msg).await.is_ok() {
+                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Interactive response (approval answer)
+        if msg_type == WkMessageType::INTERACTIVE_RESPONSE as u64 {
+            let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+            if let Ok(action) = serde_json::from_value::<WkApprovalAction>(payload_json) {
+                let resp = match action.action.as_str() {
+                    "approve" => Some(ChannelApprovalResponse::Approve),
+                    "deny"    => Some(ChannelApprovalResponse::Deny),
+                    "always"  => Some(ChannelApprovalResponse::AlwaysApprove),
+                    _         => None,
+                };
+                if let Some(r) = resp
+                    && let Some(ptx) = self.pending_approvals.write().await.remove(&action.approval_id)
+                {
+                    let _ = ptx.send(r);
+                }
+            }
+            return Ok(());
+        }
+
+        // mention_only filter for group messages
+        if self.mention_only && params.channel_type == WkChannelType::GROUP {
+            let content_str = payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if !is_mentioned(&self.uid, &payload_json, content_str) {
+                return Ok(());
+            }
+        }
+
+        let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+        // Decode content by message type
+        let content = match msg_type as u32 {
+            WkMessageType::IMAGE => {
+                let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                download_image_as_base64(url).await
+                    .unwrap_or_else(|| format!("[图片下载失败]{}\n请直接描述图片内容", url))
+            }
+            WkMessageType::FILE => {
+                let raw_url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                let url = raw_url.split_whitespace().next().unwrap_or(raw_url);
+                let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
+                match download_file_to_workspace(url, &self.downloads_dir, Some(name)).await {
+                    Ok(local_path) => format!("[文件]{}: {}", name, local_path),
+                    Err(err_msg) => format!("[文件]{}: {} [下载失败: {}]", name, url, err_msg),
+                }
+            }
+            WkMessageType::MARKDOWN => {
+                let text = payload_json.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).unwrap_or("");
+                process_markdown_resources(text, &self.downloads_dir).await
+            }
+            _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+        };
+
+        let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
+
+        let ch_msg = ChannelMessage {
+            id: params.message_id,
+            sender: target_id.clone(),
+            reply_target: format!("{}:{}", params.channel_type, target_id),
+            content,
+            channel: "wukongim".to_string(),
+            timestamp: params.timestamp.max(0) as u64,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        if tx.send(ch_msg).await.is_ok() {
+            self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -168,6 +415,13 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // 1. Fetch history from HTTP (before WS connect to avoid version race)
+        let history = self.sync_history().await.unwrap_or_else(|e| {
+            tracing::error!("WuKongIM: history sync failed: {}", e);
+            vec![]
+        });
+
+        // 2. Connect WebSocket
         tracing::info!("WuKongIM: connecting to {}", self.ws_url);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&self.ws_url).await?;
         let (write, mut read) = ws_stream.split();
@@ -205,6 +459,12 @@ impl Channel for WuKongIMChannel {
         }
         tracing::info!("WuKongIM: connected as {}", self.uid);
 
+        // 3. Process History (now that WS is connected, Agent can reply)
+        for msg in history {
+            let _ = self.process_inbound_message(msg, &tx).await;
+        }
+
+        // 4. Start Live Listening
         let mut hb = tokio::time::interval(PING_INTERVAL);
         let mut last_activity = Instant::now();
 
@@ -232,10 +492,8 @@ impl Channel for WuKongIMChannel {
                     let WsMsg::Text(text) = frame else { continue; };
                     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-                    // pong
                     if val.get("method").and_then(|m| m.as_str()) == Some("pong") { continue; }
 
-                    // RPC response (matched by id)
                     let msg_id = val.get("id").and_then(|i| {
                         if i.is_string() { i.as_str().map(str::to_string) }
                         else if i.is_number() { Some(i.to_string()) }
@@ -248,141 +506,12 @@ impl Channel for WuKongIMChannel {
                         continue;
                     }
 
-                    // Inbound message notification
                     if val.get("method").and_then(|m| m.as_str()) != Some("recv") { continue; }
                     let notif: JsonRpcNotification<RecvNotificationParams> = serde_json::from_value(val)?;
-                    let params = notif.params;
-
-                    if params.from_uid == self.uid { continue; }
-                    if !is_user_allowed(&self.allowed_users, &params.from_uid) {
-                        tracing::warn!("WuKongIM: unauthorized sender {}", params.from_uid);
-                        continue;
-                    }
-
-                    let decoded = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
-                    let payload_json: serde_json::Value = serde_json::from_slice(&decoded)?;
-                    tracing::info!(channel_id = %params.channel_id, channel_type = %params.channel_type, from_uid = %params.from_uid, payload = %payload_json, "WuKongIM recv");
-                    let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
-
-                    // System command — handle la_init_helloworld CMD
-                    if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
-                        let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-                        if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld") {
-                            if let Some(content) = payload_json.get("content").and_then(|c| c.as_str()) {
-                                // For group messages, only process if bot is mentioned
-                                if params.channel_type == WkChannelType::GROUP
-                                    && !is_mentioned(&self.uid, &payload_json, content)
-                                {
-                                    continue;
-                                }
-                                let target_id = if params.channel_type == WkChannelType::GROUP {
-                                    &params.channel_id
-                                } else {
-                                    &params.from_uid
-                                };
-                                let ch_msg = ChannelMessage {
-                                    id: params.message_id.clone(),
-                                    sender: target_id.clone(),
-                                    reply_target: format!("{}:{}", params.channel_type, target_id),
-                                    content: content.to_string(),
-                                    channel: "wukongim".to_string(),
-                                    timestamp: params.timestamp.max(0) as u64,
-                                    thread_ts: None,
-                                    interruption_scope_id: None,
-                                    attachments: vec![],
-                                };
-                                if tx.send(ch_msg).await.is_err() { break; }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Interactive response (approval answer)
-                    if msg_type == WkMessageType::INTERACTIVE_RESPONSE as u64 {
-                        let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-                        if let Ok(action) = serde_json::from_value::<WkApprovalAction>(payload_json) {
-                            let resp = match action.action.as_str() {
-                                "approve" => Some(ChannelApprovalResponse::Approve),
-                                "deny"    => Some(ChannelApprovalResponse::Deny),
-                                "always"  => Some(ChannelApprovalResponse::AlwaysApprove),
-                                _         => None,
-                            };
-                            if let Some(r) = resp
-                                && let Some(ptx) = self.pending_approvals.write().await.remove(&action.approval_id)
-                            {
-                                let _ = ptx.send(r);
-                            }
-                        }
-                        continue;
-                    }
-
-                    // mention_only filter for group messages
-                    if self.mention_only && params.channel_type == WkChannelType::GROUP {
-                        let content_str = payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        if !is_mentioned(&self.uid, &payload_json, content_str) {
-                            continue;
-                        }
-                    }
-
-                    let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-
-                    // Decode content by message type
-                    let content = match msg_type as u32 {
-                        WkMessageType::IMAGE => {
-                            let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                            download_image_as_base64(url).await
-                                .unwrap_or_else(|| format!("[图片下载失败]{}\n请直接描述图片内容", url))
-                        }
-                        WkMessageType::FILE => {
-                            let raw_url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                            let url = raw_url.split_whitespace().next().unwrap_or(raw_url);
-                            let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
-                            tracing::info!("WuKongIM FILE: downloading {} (name={}) to downloads_dir={}", url, name, self.downloads_dir.display());
-                            match download_file_to_workspace(url, &self.downloads_dir, Some(name)).await {
-                                Ok(local_path) => {
-                                    tracing::info!("WuKongIM FILE: downloaded successfully to {}", local_path);
-                                    format!("[文件]{}: {}", name, local_path)
-                                }
-                                Err(err_msg) => {
-                                    tracing::warn!("WuKongIM FILE: download failed: {}", err_msg);
-                                    format!("[文件]{}: {} [下载失败: {}]", name, url, err_msg)
-                                }
-                            }
-                        }
-                        WkMessageType::MARKDOWN => {
-                            let text = payload_json
-                                .get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str())
-                                .unwrap_or("");
-                            tracing::info!("WuKongIM MARKDOWN: processing with downloads_dir={}, text_len={}", self.downloads_dir.display(), text.len());
-                            let result = process_markdown_resources(text, &self.downloads_dir).await;
-                            tracing::info!("WuKongIM MARKDOWN: processed result_len={}", result.len());
-                            result
-                        }
-                        _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-                    };
-
-                    let target_id = if params.channel_type == WkChannelType::PERSONAL {
-                        &params.from_uid
-                    } else {
-                        &params.channel_id
-                    };
-
-                    let ch_msg = ChannelMessage {
-                        id: params.message_id,
-                        sender: target_id.clone(),
-                        reply_target: format!("{}:{}", params.channel_type, target_id),
-                        content,
-                        channel: "wukongim".to_string(),
-                        timestamp: params.timestamp.max(0) as u64,
-                        thread_ts: None,
-                        interruption_scope_id: None,
-                        attachments: vec![],
-                    };
-                    if tx.send(ch_msg).await.is_err() { break; }
+                    let _ = self.process_inbound_message(notif.params, &tx).await;
                 }
             }
         }
-        Ok(())
     }
 
     async fn health_check(&self) -> bool {
@@ -440,6 +569,20 @@ impl Channel for WuKongIMChannel {
 mod tests {
     use super::*;
     use crate::config::WuKongIMConfig;
+    use zeroclaw_api::memory_traits::{Memory, MemoryCategory, MemoryEntry};
+
+    struct MockMemory;
+    #[async_trait::async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str { "mock" }
+        async fn store(&self, _: &str, _: &str, _: MemoryCategory, _: Option<&str>) -> anyhow::Result<()> { Ok(()) }
+        async fn recall(&self, _: &str, _: usize, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<MemoryEntry>> { Ok(None) }
+        async fn list(&self, _: Option<&MemoryCategory>, _: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
+        async fn forget(&self, _: &str) -> anyhow::Result<bool> { Ok(true) }
+        async fn count(&self) -> anyhow::Result<usize> { Ok(0) }
+        async fn health_check(&self) -> bool { true }
+    }
 
     fn make_config(allowed: Vec<String>, mention_only: bool) -> WuKongIMConfig {
         WuKongIMConfig {
@@ -452,14 +595,17 @@ mod tests {
             allowed_users: allowed,
             mention_only,
             approval_timeout_secs: 300,
+            downloads_dir: "downloads".to_string(),
+            dawn_url: "".to_string(),
+            dawn_token: "".to_string(),
         }
     }
 
     #[test]
     fn from_config_maps_fields() {
         let workspace = std::path::PathBuf::from("/tmp/test");
-        let ch =
-            WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true), &workspace);
+        let memory = Arc::new(MockMemory);
+        let ch = WuKongIMChannel::from_config(&make_config(vec!["*".to_string()], true), &workspace, memory);
         assert_eq!(ch.ws_url, "ws://localhost:5200");
         assert_eq!(ch.uid, "bot001");
         assert_eq!(ch.device_id, "web-001");
@@ -473,7 +619,8 @@ mod tests {
     fn channel_name_is_wukongim() {
         use zeroclaw_api::channel::Channel;
         let workspace = std::path::PathBuf::from("/tmp/test");
-        let ch = WuKongIMChannel::from_config(&make_config(vec![], false), &workspace);
+        let memory = Arc::new(MockMemory);
+        let ch = WuKongIMChannel::from_config(&make_config(vec![], false), &workspace, memory);
         assert_eq!(ch.name(), "wukongim");
     }
 }

@@ -8411,6 +8411,13 @@ pub struct WuKongIMConfig {
     /// Default: "downloads" (i.e., {workspace_dir}/downloads)
     #[serde(default = "default_wukongim_downloads_dir")]
     pub downloads_dir: String,
+    /// Dawn API base URL for synchronization and unread clearing
+    #[serde(default)]
+    pub dawn_url: String,
+    /// Assistant token for Dawn API authentication
+    #[serde(default)]
+    #[secret]
+    pub dawn_token: String,
 }
 
 fn default_wukongim_downloads_dir() -> String {

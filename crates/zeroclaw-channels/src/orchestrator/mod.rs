@@ -4526,9 +4526,11 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .wukongim
                 .as_ref()
                 .context("WuKongIM channel is not configured")?;
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "wukongim")?);
             Ok(Arc::new(WuKongIMChannel::from_config(
                 wk,
                 &config.workspace_dir,
+                memory,
             )))
         }
         "wecom" => {
@@ -4776,6 +4778,7 @@ fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
+    _memory: Arc<dyn Memory>,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
@@ -5477,7 +5480,7 @@ fn collect_configured_channels(
         if wk.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
-                channel: Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir)),
+                channel: Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir, _memory.clone())),
             });
         } else {
             tracing::info!("WuKongIM channel configured but disabled (enabled = false)");
@@ -5497,7 +5500,8 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check", &[]);
+    let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "doctor")?);
+    let channels = collect_configured_channels(&config, "health check", &[], memory);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels.nostr {
@@ -5915,7 +5919,7 @@ pub async fn start_channels(
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup", &tool_specs)
+        collect_configured_channels(&config, "runtime startup", &tool_specs, mem.clone())
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -6349,7 +6353,8 @@ pub async fn deliver_announcement(
                 .wukongim
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("wukongim channel not configured"))?;
-            let ch = WuKongIMChannel::from_config(wk, &config.workspace_dir);
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "wukongim")?);
+            let ch = WuKongIMChannel::from_config(wk, &config.workspace_dir, memory);
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }
@@ -11895,7 +11900,8 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let channels = collect_configured_channels(&config, "test", &[]);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let channels = collect_configured_channels(&config, "test", &[], memory);
 
         assert!(
             channels
@@ -11918,7 +11924,8 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let channels = collect_configured_channels(&config, "test", &[]);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let channels = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "disabled email should not be collected"
@@ -11934,7 +11941,8 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let channels = collect_configured_channels(&config, "test", &[]);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let channels = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels
                 .iter()
