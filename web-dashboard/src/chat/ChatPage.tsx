@@ -1,18 +1,35 @@
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { useControlUiBootstrap } from "@/app/ControlUiBootstrapProvider";
 import { SlotSidebar } from "@/chat/SlotSidebar";
+import { ChatView } from "@/chat/ChatView";
+import { ThemeSwitcher } from "@/theme/ThemeSwitcher";
+import { apiFetch } from "@/lib/apiFetch";
+import type { SlotResponse } from "@/chat/slotMutations";
 
 /**
- * Chat page (M3 scaffold).
+ * Chat page (M3, US-001 + US-002).
  *
  * Three-pane layout matching OpenClaw's chat surface (plan §12
  * translation table): sidebar ≤ 280px on the left, chat view centre,
  * optional right panel for side results (M4b+).
  *
- * This scaffold wires the sidebar + a placeholder chat view. Real
- * streaming chat lands in the follow-up M3 sub-commits per §12.1.
+ * Active slot lives in the URL path: `/chat/:slotId` is the active
+ * conversation; bare `/chat` is the empty state. Reloading on a slot
+ * URL re-enters that slot. Streaming chat (US-003) replaces the
+ * placeholder pane once `useSlotStream` lands.
  */
 export function ChatPage() {
   const bootstrap = useControlUiBootstrap();
+  const { slotId } = useParams<{ slotId: string }>();
+  const navigate = useNavigate();
+
+  const handleSelect = (id: string) => {
+    navigate(`/chat/${encodeURIComponent(id)}`);
+  };
+  const handleDeleted = (id: string) => {
+    if (id === slotId) navigate("/chat");
+  };
 
   return (
     <div className="flex h-full">
@@ -21,21 +38,82 @@ export function ChatPage() {
         style={{ width: "280px", borderColor: "var(--color-border)" }}
       >
         <header
-          className="flex items-center justify-between px-4 py-3 border-b"
+          className="flex items-center justify-between gap-2 px-4 py-3 border-b"
           style={{ borderColor: "var(--color-border)" }}
         >
-          <span className="text-sm font-semibold">{bootstrap.assistant_identity.name}</span>
-          <span className="text-xs opacity-50">v{bootstrap.server_version}</span>
+          <span className="text-sm font-semibold truncate">
+            {bootstrap.assistant_identity.name}
+          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs opacity-50">
+              v{bootstrap.server_version}
+            </span>
+            <ThemeSwitcher />
+          </div>
         </header>
-        <SlotSidebar />
+        <SlotSidebar
+          activeSlotId={slotId}
+          onSelectSlot={handleSelect}
+          onSlotDeleted={handleDeleted}
+        />
       </aside>
-      <main className="flex-1 flex items-center justify-center">
-        <p className="opacity-60 text-sm max-w-md text-center">
-          Select a slot from the sidebar, or create one to start chatting.
-          <br />
-          Streaming chat lands in the next M3 sub-commit.
-        </p>
+      <main className="flex-1 flex flex-col min-h-0">
+        {slotId ? <ChatPane slotId={slotId} /> : <EmptyChatPane />}
       </main>
     </div>
   );
+}
+
+function EmptyChatPane() {
+  return (
+    <div className="flex-1 flex items-center justify-center">
+      <p className="opacity-60 text-sm max-w-md text-center">
+        Select a slot from the sidebar, or click <strong>+ New</strong> to
+        start a fresh conversation.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Resolves the slot from the cached `["slots"]` list and hands the
+ * matched row to `ChatView`. The slot-not-found fallback renders a
+ * compact notice rather than a full error screen — the user is one
+ * click away from another slot in the sidebar.
+ */
+function ChatPane({ slotId }: { slotId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["slots"],
+    queryFn: async () =>
+      apiFetch<{ slots: SlotResponse[] }>("/api/slots"),
+    // Already polled by the sidebar at 5s; piggyback on its cache.
+    refetchOnMount: false,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-sm opacity-60">
+        Loading slot…
+      </div>
+    );
+  }
+
+  const slot = data?.slots.find((s) => s.id === slotId);
+  if (!slot) {
+    return (
+      <div className="flex-1 flex items-center justify-center">
+        <div className="text-sm opacity-60 text-center max-w-md">
+          Slot <code className="font-mono">{slotId}</code> not found.
+          <br />
+          It may have been deleted from another tab.
+          <br />
+          <Link className="underline mt-2 inline-block" to="/chat">
+            Back to slot list
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return <ChatView slotId={slot.id} title={slot.title} />;
 }
