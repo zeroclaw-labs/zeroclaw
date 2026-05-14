@@ -28,6 +28,7 @@ pub mod session_queue;
 pub mod slot;
 pub mod slot_agent;
 pub mod slot_events;
+pub mod slot_registry;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
@@ -436,6 +437,18 @@ pub struct AppState {
     pub slot_cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
+    /// Process-global MCP registry (M2.5). Constructed once at gateway
+    /// startup and shared across `/api/tools`, `/ws/chat` legacy
+    /// agents, and slot-spawned agents in `SlotRegistry`. `None` when
+    /// MCP is disabled or failed to initialize; callers treat that as
+    /// "no MCP tools wired" and degrade gracefully.
+    pub mcp_registry: Option<Arc<tools::McpRegistry>>,
+    /// Registry of warm per-slot Agents (M2.5). Each entry holds an
+    /// `Arc<Mutex<Agent>>` plus slot-scoped pending-approval state.
+    /// Populated lazily by the messaging handler via
+    /// `slot_registry.get_or_spawn(...)`. Entries are idle-evicted by a
+    /// background sweep started at gateway startup.
+    pub slot_registry: slot_registry::SlotRegistry,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -601,58 +614,66 @@ pub async fn run_gateway(
     );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
-    // Without this, the `/api/tools` endpoint misses MCP tools.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Gateway: initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set =
-                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
-                            .await;
-                    tracing::info!(
-                        "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    let activated =
-                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                    tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                std::sync::Arc::new(tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_gw {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    tracing::info!(
-                        "Gateway MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
+    //
+    // Construct one process-global `Arc<McpRegistry>` at gateway startup
+    // and share it across:
+    //   - The `/api/tools` spec registry (this block).
+    //   - The `/ws/chat` legacy Agent constructor (ws.rs).
+    //   - Slot-spawned Agents via `SlotRegistry` (api_slots.rs, M2.5+).
+    //
+    // Without sharing, 50 slots + M connections = 50 × M × N MCP child
+    // processes. With sharing, it stays at N regardless of caller count.
+    let shared_mcp_registry: Option<std::sync::Arc<tools::McpRegistry>> =
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            tracing::info!(
+                "Gateway: initializing shared MCP registry — {} server(s) configured",
+                config.mcp.servers.len()
+            );
+            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+                Ok(registry) => Some(std::sync::Arc::new(registry)),
+                Err(e) => {
+                    tracing::error!("Gateway shared MCP registry failed to initialize: {e:#}");
+                    None
                 }
             }
-            Err(e) => {
-                tracing::error!("Gateway MCP registry failed to initialize: {e:#}");
+        } else {
+            None
+        };
+    if let Some(ref registry) = shared_mcp_registry {
+        if config.mcp.deferred_loading {
+            let deferred_set =
+                tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(registry)).await;
+            tracing::info!(
+                "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
+                deferred_set.len(),
+                registry.server_count()
+            );
+            let activated =
+                std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+            tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
+                deferred_set,
+                activated,
+            )));
+        } else {
+            let names = registry.tool_names();
+            let mut registered = 0usize;
+            for name in names {
+                if let Some(def) = registry.get_tool_def(&name).await {
+                    let wrapper: std::sync::Arc<dyn tools::Tool> = std::sync::Arc::new(
+                        tools::McpToolWrapper::new(name, def, std::sync::Arc::clone(registry)),
+                    );
+                    if let Some(ref handle) = delegate_handle_gw {
+                        handle.write().push(std::sync::Arc::clone(&wrapper));
+                    }
+                    tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
+                    registered += 1;
+                }
             }
+            tracing::info!(
+                "Gateway MCP: {} tool(s) registered from {} server(s)",
+                registered,
+                registry.server_count()
+            );
         }
     }
 
@@ -1041,6 +1062,8 @@ pub async fn run_gateway(
             None
         },
         slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        mcp_registry: shared_mcp_registry.clone(),
+        slot_registry: slot_registry::SlotRegistry::new(600),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
@@ -1072,6 +1095,38 @@ pub async fn run_gateway(
             None
         },
     };
+
+    // ── SlotRegistry idle sweep (M2.5) ─────────────────────────────
+    //
+    // Drop warm agents that haven't served a turn in ~10 minutes so a
+    // dashboard left open overnight doesn't pin MCP connections and
+    // memory for every slot the user ever touched. The 60s cadence is
+    // short enough that a typical conversation gap won't cause a
+    // painful cold-spawn, and a conversation that resumes after
+    // eviction just pays the spawn cost once on the first message.
+    {
+        let registry = state.slot_registry.clone();
+        let mut shutdown_rx = state.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let evicted = registry.evict_idle();
+                        if evicted > 0 {
+                            tracing::debug!(evicted, "SlotRegistry: evicted idle warm agents");
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Build router with middleware
     let inner = Router::new()
@@ -2841,6 +2896,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2918,6 +2975,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3380,6 +3439,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3465,6 +3526,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3562,6 +3625,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3631,6 +3696,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3705,6 +3772,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3784,6 +3853,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3860,6 +3931,8 @@ mod tests {
             slot_queue: std::sync::Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
             slot_store: None,
             slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_registry: None,
+            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
