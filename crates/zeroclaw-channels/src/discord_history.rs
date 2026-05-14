@@ -552,3 +552,130 @@ impl Channel for DiscordHistoryChannel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry};
+
+    struct NoopMemory;
+
+    #[async_trait]
+    impl Memory for NoopMemory {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn make_channel(allowed_users: Vec<String>) -> DiscordHistoryChannel {
+        DiscordHistoryChannel::new(
+            "fake-token".into(),
+            None,
+            allowed_users,
+            vec![],
+            Arc::new(NoopMemory),
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn is_user_allowed_empty_list_defaults_open() {
+        // discord_history is a logging channel; an empty allowlist
+        // means "log everyone" rather than "allow no-one". This is
+        // intentional behavior, distinct from the standard variant-A
+        // shape used by other channels.
+        let ch = make_channel(vec![]);
+        assert!(ch.is_user_allowed("any-user"));
+        assert!(ch.is_user_allowed(""));
+    }
+
+    #[test]
+    fn is_user_allowed_wildcard_admits_anyone() {
+        let ch = make_channel(vec!["*".into()]);
+        assert!(ch.is_user_allowed("123"));
+        assert!(ch.is_user_allowed("anyone-at-all"));
+    }
+
+    #[test]
+    fn is_user_allowed_specific_user() {
+        let ch = make_channel(vec!["alice".into()]);
+        assert!(ch.is_user_allowed("alice"));
+        assert!(!ch.is_user_allowed("bob"));
+    }
+
+    #[test]
+    fn is_user_allowed_multi_entry() {
+        // Pins iter().any semantics: with multiple entries, matching
+        // any one of them permits the user. An iter().all() mutation
+        // would fail this test because "alice" is not in "bob"'s
+        // position and vice-versa.
+        let ch = make_channel(vec!["alice".into(), "bob".into(), "carol".into()]);
+        assert!(ch.is_user_allowed("alice"));
+        assert!(ch.is_user_allowed("bob"));
+        assert!(ch.is_user_allowed("carol"));
+        assert!(!ch.is_user_allowed("dave"));
+        assert!(!ch.is_user_allowed(""));
+    }
+
+    #[test]
+    fn is_user_allowed_wildcard_mixed_with_specific() {
+        let ch = make_channel(vec!["alice".into(), "*".into()]);
+        assert!(ch.is_user_allowed("alice"));
+        assert!(ch.is_user_allowed("bob"));
+    }
+
+    #[test]
+    fn is_channel_watched_empty_list_watches_all() {
+        let ch = make_channel(vec![]);
+        assert!(ch.is_channel_watched("any-channel-id"));
+    }
+
+    #[test]
+    fn is_channel_watched_specific() {
+        let mut ch = make_channel(vec![]);
+        ch.channel_ids = vec!["C-1".into(), "C-2".into()];
+        assert!(ch.is_channel_watched("C-1"));
+        assert!(ch.is_channel_watched("C-2"));
+        assert!(!ch.is_channel_watched("C-3"));
+    }
+}
