@@ -12,6 +12,34 @@ use zeroclaw_config::schema::Config;
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunCompletionAction {
+    Reschedule,
+    Disable,
+    Delete,
+}
+
+#[cfg(test)]
+static WRITE_CONNECTION_COUNTS_FOR_TESTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn reset_write_connection_count_for_tests(config: &Config) {
+    let mut counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    counts.insert(cron_db_path(config), 0);
+}
+
+#[cfg(test)]
+pub(crate) fn write_connection_count_for_tests(config: &Config) -> usize {
+    let counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    counts.get(&cron_db_path(config)).copied().unwrap_or(0)
+}
+
 impl rusqlite::types::FromSql for JobType {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let text = value.as_str()?;
@@ -430,38 +458,124 @@ pub fn record_run(
         // cannot grow unboundedly.
         let tx = conn.unchecked_transaction()?;
 
-        tx.execute(
-            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                job_id,
-                started_at.to_rfc3339(),
-                finished_at.to_rfc3339(),
-                status,
-                bounded_output.as_deref(),
-                duration_ms,
-            ],
-        )
-        .context("Failed to insert cron run")?;
-
-        let keep = i64::from(config.cron.max_run_history.max(1));
-        tx.execute(
-            "DELETE FROM cron_runs
-             WHERE job_id = ?1
-               AND id NOT IN (
-                 SELECT id FROM cron_runs
-                 WHERE job_id = ?1
-                 ORDER BY started_at DESC, id DESC
-                 LIMIT ?2
-               )",
-            params![job_id, keep],
-        )
-        .context("Failed to prune cron run history")?;
+        insert_run_and_prune(
+            &tx,
+            config,
+            job_id,
+            started_at,
+            finished_at,
+            status,
+            bounded_output.as_deref(),
+            duration_ms,
+        )?;
 
         tx.commit()
             .context("Failed to commit cron run transaction")?;
         Ok(())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_run_result(
+    config: &Config,
+    job: &CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    job_state_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+    action: RunCompletionAction,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+
+    with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        insert_run_and_prune(
+            &tx,
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            bounded_output.as_deref(),
+            duration_ms,
+        )?;
+
+        apply_run_completion_state(
+            &tx,
+            job,
+            job_state_at,
+            status,
+            bounded_output.as_deref(),
+            action,
+        )?;
+
+        tx.commit()
+            .context("Failed to commit cron run result transaction")?;
+        Ok(())
+    })
+}
+
+/// Persist only the job-state side of a completed cron run.
+///
+/// This is intentionally separate from `persist_run_result` so the scheduler
+/// can recover job state even when run-history persistence fails. The SQL
+/// mutation itself stays in the store layer.
+pub(crate) fn persist_run_completion_state(
+    config: &Config,
+    job: &CronJob,
+    job_state_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    action: RunCompletionAction,
+) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        apply_run_completion_state(conn, job, job_state_at, status, output, action)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_run_and_prune(
+    conn: &Connection,
+    config: &Config,
+    job_id: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            job_id,
+            started_at.to_rfc3339(),
+            finished_at.to_rfc3339(),
+            status,
+            output,
+            duration_ms,
+        ],
+    )
+    .context("Failed to insert cron run")?;
+
+    let keep = i64::from(config.cron.max_run_history.max(1));
+    conn.execute(
+        "DELETE FROM cron_runs
+         WHERE job_id = ?1
+           AND id NOT IN (
+             SELECT id FROM cron_runs
+             WHERE job_id = ?1
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?2
+           )",
+        params![job_id, keep],
+    )
+    .context("Failed to prune cron run history")?;
+
+    Ok(())
 }
 
 fn truncate_cron_output(output: &str) -> String {
@@ -967,6 +1081,16 @@ fn with_initialized_connection<T>(
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
     let db_path = cron_db_path(config);
+    #[cfg(test)]
+    {
+        let mut counts = WRITE_CONNECTION_COUNTS_FOR_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&db_path) {
+            *count += 1;
+        }
+    }
+
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
@@ -978,6 +1102,73 @@ fn with_initialized_connection<T>(
     initialize_schema(&conn)?;
 
     f(&conn)
+}
+
+/// Apply the completion state change for a cron job inside an existing connection.
+///
+/// This keeps the scheduler's normal path and the fallback path using the same
+/// SQL mutation logic while allowing the caller to decide whether the
+/// run-history write should be attempted first.
+fn apply_run_completion_state(
+    conn: &Connection,
+    job: &CronJob,
+    job_state_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    action: RunCompletionAction,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+
+    match action {
+        RunCompletionAction::Reschedule => {
+            let next_run = next_run_for_schedule(&job.schedule, job_state_at)?;
+            let changed = conn
+                .execute(
+                    "UPDATE cron_jobs
+                     SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
+                     WHERE id = ?5",
+                    params![
+                        next_run.to_rfc3339(),
+                        job_state_at.to_rfc3339(),
+                        status,
+                        bounded_output.as_deref(),
+                        job.id,
+                    ],
+                )
+                .context("Failed to update cron job run state")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+        RunCompletionAction::Disable => {
+            let changed = conn
+                .execute(
+                    "UPDATE cron_jobs
+                     SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
+                     WHERE id = ?4",
+                    params![
+                        job_state_at.to_rfc3339(),
+                        status,
+                        bounded_output.as_deref(),
+                        job.id,
+                    ],
+                )
+                .context("Failed to disable completed one-shot cron job")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+        RunCompletionAction::Delete => {
+            let changed = conn
+                .execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])
+                .context("Failed to delete completed one-shot cron job")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn initialize_schema(conn: &Connection) -> Result<()> {
