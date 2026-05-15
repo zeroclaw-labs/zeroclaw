@@ -241,6 +241,26 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     prompt.push_str("- Only use `node` or `npm` if `bun` is explicitly unavailable or the project uses node-specific features.\n");
     prompt.push('\n');
 
+    // ── 2c. File Sharing ─────────────────────────────────────────────
+    let has_dawn_s3 = tools.iter().any(|(name, _)| *name == "dawn_s3");
+    if has_dawn_s3 {
+        prompt.push_str(
+            "## File Sharing\n\n\
+             When you generate a file that the user needs as a final result (such as reports,\n\
+             presentations, PDFs, or any deliverable), use the dawn_s3 tool to upload it\n\
+             and provide the link to the user in markdown format.\n\n\
+             Example response:\n\
+             \"\"\"\n\
+             ✅ PPT 生成成功！\n\
+             \n\
+             文件已生成：[example.pptx](https://s3.example.com/bucket/xxx.pptx)\n\
+             \n\
+             共 12 页幻灯片...\n\
+             \"\"\"\n\n\
+             Do NOT upload temporary files, intermediate scripts, or debug output.\n\n",
+        );
+    }
+
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
         prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
