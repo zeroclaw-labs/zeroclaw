@@ -1464,7 +1464,7 @@ pub fn install_git_skill_source(
     }
 }
 
-pub fn install_clawhub_skill_source(
+pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
@@ -1480,13 +1480,14 @@ pub fn install_clawhub_skill_source(
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
     let resp = client
         .get(&download_url)
         .send()
+        .await
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1496,7 +1497,7 @@ pub fn install_clawhub_skill_source(
         anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
     }
 
-    let bytes = resp.bytes()?.to_vec();
+    let bytes = resp.bytes().await?.to_vec();
     if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
         anyhow::bail!(
             "ClawhHub zip rejected: too large ({} bytes > {})",
