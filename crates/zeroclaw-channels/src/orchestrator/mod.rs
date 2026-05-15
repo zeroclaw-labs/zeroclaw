@@ -12070,6 +12070,8 @@ This is an example JSON object for profile settings."#;
             format: "aieos".into(),
             aieos_path: Some("aieos_identity.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), None);
@@ -12104,6 +12106,8 @@ This is an example JSON object for profile settings."#;
             format: "aieos".into(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Claw"}}}"#.into()),
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let prompt = build_system_prompt(
@@ -12127,6 +12131,8 @@ This is an example JSON object for profile settings."#;
             format: "aieos".into(),
             aieos_path: Some("nonexistent.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let ws = make_workspace();
@@ -12146,6 +12152,8 @@ This is an example JSON object for profile settings."#;
             format: "aieos".into(),
             aieos_path: None,
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let ws = make_workspace();
@@ -12164,6 +12172,8 @@ This is an example JSON object for profile settings."#;
             format: "openclaw".into(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let ws = make_workspace();

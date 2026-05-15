@@ -352,6 +352,8 @@ mod tests {
             format: "aieos".into(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![];

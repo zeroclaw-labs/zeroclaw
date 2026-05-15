@@ -1235,6 +1235,8 @@ mod tests {
             format: "aieos".into(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
         assert!(is_aieos_configured(&config));
     }
@@ -1245,6 +1247,8 @@ mod tests {
             format: "aieos".into(),
             aieos_path: None,
             aieos_inline: Some("{\"identity\":{}}".into()),
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
         assert!(is_aieos_configured(&config));
     }
@@ -1255,6 +1259,8 @@ mod tests {
             format: "openclaw".into(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
         assert!(!is_aieos_configured(&config));
     }
@@ -1265,6 +1271,8 @@ mod tests {
             format: "aieos".into(),
             aieos_path: None,
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
         assert!(!is_aieos_configured(&config));
     }
@@ -1443,6 +1451,8 @@ mod tests {
             format: "aieos".into(),
             aieos_path: Some("identity.json".into()),
             aieos_inline: None,
+            bootstrap_files: None,
+            suppress_missing_files: false,
         };
 
         let identity = load_aieos_identity(&config, temp.path()).unwrap().unwrap();
