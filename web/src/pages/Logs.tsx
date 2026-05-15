@@ -197,7 +197,11 @@ export default function Logs() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Incremental polling — fetch newer-than-newest, append.
+  // One incremental fetch — fetch newer-than-newest, append. Exposed via
+  // a ref so the Pause/Resume button can fire it inline on Resume to
+  // close the gap immediately instead of waiting up to POLL_INTERVAL_MS
+  // for the next scheduled tick.
+  const tickRef = useRef<() => Promise<void>>(async () => {});
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -219,6 +223,7 @@ export default function Logs() {
         // Refresh surfaces errors prominently.
       }
     };
+    tickRef.current = tick;
     const handle = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
@@ -309,7 +314,23 @@ export default function Logs() {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setPaused((value) => !value)}
+            onClick={() => {
+              setPaused((value) => {
+                const next = !value;
+                // On resume, fire one immediate fetch with `since_ts =
+                // newest known` so the gap between pause and resume
+                // closes right away instead of waiting up to
+                // POLL_INTERVAL_MS for the next scheduled tick. The
+                // tick reads `pausedRef`, which is updated by React
+                // after this setState commits — so defer the call to
+                // the next microtask.
+                if (!next) {
+                  pausedRef.current = false;
+                  void Promise.resolve().then(() => tickRef.current());
+                }
+                return next;
+              });
+            }}
             className="btn-electric flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold"
             style={{
               background: paused
