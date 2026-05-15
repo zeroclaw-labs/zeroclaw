@@ -65,8 +65,8 @@ pub use super::cost::{
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
-/// Rolling window size for detecting streamed tool-call payload markers.
-const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
+/// Maximum malformed internal tool-protocol retries before returning a safe fallback.
+const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -216,9 +216,13 @@ pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
 // Re-export tool call parsing from the standalone parser crate.
 pub use zeroclaw_tool_call_parser::{
-    ParsedToolCall, build_native_assistant_history_from_parsed_calls,
-    canonicalize_json_for_tool_signature, detect_tool_call_parse_issue, parse_tool_calls,
-    strip_think_tags, strip_tool_result_blocks,
+    ParsedToolCall, ToolProtocolEnvelopeKind, build_native_assistant_history_from_parsed_calls,
+    canonicalize_json_for_tool_signature, classify_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, detect_tool_call_parse_issue,
+    looks_like_malformed_tool_protocol_envelope,
+    looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
+    looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags, strip_tool_result_blocks,
+    tool_protocol_envelope_mentions_known_tool,
 };
 
 /// Run a future with the thread ID set in task-local storage.
@@ -599,7 +603,383 @@ struct StreamedChatOutcome {
     reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    suppressed_protocol: bool,
     usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+#[derive(Debug, Default)]
+struct StreamTextGuard {
+    // Suspicious leading chunks can split `"toolcalls"` / `<tool_call>` across
+    // deltas. Buffer just that prefix until it is clearly protocol or normal JSON.
+    pending: String,
+    pending_candidate_start: Option<usize>,
+    known_tool_names: HashSet<String>,
+    has_active_tools: bool,
+    suppress_forwarding: bool,
+    suppressed_protocol: bool,
+}
+
+impl StreamTextGuard {
+    fn new(available_tools: Option<&[crate::tools::ToolSpec]>) -> Self {
+        let available_tools = available_tools.unwrap_or(&[]);
+        let known_tool_names = available_tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .collect();
+        Self {
+            known_tool_names,
+            has_active_tools: !available_tools.is_empty(),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> Option<String> {
+        if self.suppress_forwarding || chunk.is_empty() {
+            return None;
+        }
+
+        if self.pending.is_empty() && !starts_suspicious_protocol_prefix(chunk) {
+            if let Some(start) = find_embedded_protocol_candidate_start(chunk) {
+                self.pending_candidate_start = Some(start);
+                self.pending.push_str(&chunk[start..]);
+                return if self.should_suppress_protocol_candidate(&self.pending) {
+                    self.suppress_protocol();
+                    None
+                } else {
+                    self.pending.insert_str(0, &chunk[..start]);
+                    self.evaluate_pending(false)
+                };
+            }
+            if let Some(start) = find_incomplete_protocol_candidate_start(chunk) {
+                self.pending_candidate_start = Some(start);
+                self.pending.push_str(chunk);
+                return None;
+            }
+            return Some(chunk.to_string());
+        }
+
+        self.pending.push_str(chunk);
+        self.evaluate_pending(false)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if self.suppress_forwarding || self.pending.is_empty() {
+            return None;
+        }
+        if let Some(release) = self.evaluate_pending(true) {
+            return Some(release);
+        }
+        if self.suppressed_protocol || self.pending.is_empty() {
+            return None;
+        }
+        if looks_like_malformed_tool_protocol_envelope_for_known_tools(
+            &self.pending,
+            &self.known_tool_names,
+        ) {
+            self.suppress_protocol();
+            return None;
+        }
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    fn evaluate_pending(&mut self, finalizing: bool) -> Option<String> {
+        let candidate = self
+            .pending_candidate_start
+            .and_then(|start| self.pending.get(start..))
+            .unwrap_or(&self.pending);
+
+        if !finalizing && starts_suspicious_tag_or_fence_prefix(candidate) {
+            return None;
+        }
+
+        if self.should_suppress_protocol_candidate(candidate) {
+            self.suppress_protocol();
+            return None;
+        }
+
+        if let Some(is_protocol) =
+            complete_json_fence_protocol_state(candidate, &self.known_tool_names)
+        {
+            if is_protocol && self.has_active_tools {
+                self.suppress_protocol();
+                return None;
+            }
+            self.pending_candidate_start = None;
+            return Some(std::mem::take(&mut self.pending));
+        }
+
+        if complete_non_protocol_json(candidate, &self.known_tool_names) {
+            self.pending_candidate_start = None;
+            return Some(std::mem::take(&mut self.pending));
+        }
+
+        None
+    }
+
+    fn suppress_protocol(&mut self) {
+        self.pending.clear();
+        self.pending_candidate_start = None;
+        self.suppress_forwarding = true;
+        self.suppressed_protocol = true;
+    }
+
+    fn looks_like_active_tool_json(&self, text: &str) -> bool {
+        if self.known_tool_names.is_empty() {
+            return false;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            return false;
+        };
+
+        match value {
+            serde_json::Value::Array(items) => {
+                !items.is_empty() && items.iter().all(|item| self.is_known_tool_payload(item))
+            }
+            serde_json::Value::Object(_) => self.is_known_tool_payload(&value),
+            _ => false,
+        }
+    }
+
+    fn is_known_tool_payload(&self, value: &serde_json::Value) -> bool {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+
+        let (name, has_args) =
+            if let Some(function) = object.get("function").and_then(|value| value.as_object()) {
+                (
+                    function
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| object.get("name").and_then(serde_json::Value::as_str)),
+                    function.contains_key("arguments")
+                        || function.contains_key("parameters")
+                        || object.contains_key("arguments")
+                        || object.contains_key("parameters"),
+                )
+            } else {
+                (
+                    object.get("name").and_then(serde_json::Value::as_str),
+                    object.contains_key("arguments") || object.contains_key("parameters"),
+                )
+            };
+
+        let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+            return false;
+        };
+
+        has_args && self.known_tool_names.contains(&name.to_ascii_lowercase())
+    }
+
+    fn should_suppress_protocol_candidate(&self, text: &str) -> bool {
+        if looks_like_tool_protocol_example(text) {
+            return false;
+        }
+
+        if looks_like_malformed_tool_protocol_envelope_for_known_tools(text, &self.known_tool_names)
+            || contains_tool_protocol_tag_call(text)
+        {
+            return true;
+        }
+
+        if let Some(kind) = classify_tool_protocol_envelope(text) {
+            return matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall)
+                || (self.has_active_tools
+                    && (matches!(kind, ToolProtocolEnvelopeKind::ToolResult)
+                        || tool_protocol_envelope_mentions_known_tool(
+                            text,
+                            &self.known_tool_names,
+                        )));
+        }
+
+        // Parsed JSON that carries protocol-only fields but cannot yield a valid
+        // tool call is an internal protocol failure, not user-facing text.
+        if looks_like_tool_protocol_envelope(text) {
+            return true;
+        }
+
+        self.looks_like_active_tool_json(text)
+    }
+}
+
+fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut earliest: Option<usize> = None;
+
+    for pattern in [
+        "<tool_call",
+        "<toolcall",
+        "<tool-call",
+        "<invoke",
+        "<function",
+        "```tool",
+        "```invoke",
+        "```json",
+    ] {
+        if let Some(idx) = lower.find(pattern) {
+            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+        }
+    }
+
+    for key in ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""] {
+        if let Some(key_idx) = lower.find(key)
+            && let Some(json_start) = text[..key_idx].rfind(['{', '['])
+        {
+            earliest = Some(earliest.map_or(json_start, |current| current.min(json_start)));
+        }
+    }
+
+    earliest
+}
+
+fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut earliest: Option<usize> = None;
+
+    for pattern in [
+        "<tool",
+        "<invoke",
+        "<function",
+        "```tool",
+        "```invoke",
+        "```json",
+    ] {
+        if let Some(idx) = lower.rfind(pattern) {
+            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+        }
+    }
+
+    for delimiter in ['{', '['] {
+        if let Some(idx) = text.rfind(delimiter) {
+            let tail = &lower[idx..];
+            if tail.contains("\"tool")
+                || tail.contains("\"function")
+                || tail.contains("\"call")
+                || tail.len() <= 16
+            {
+                earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+            }
+        }
+    }
+
+    earliest
+}
+
+fn starts_suspicious_protocol_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with('{')
+        || lower.starts_with('[')
+        || lower.starts_with("<tool")
+        || lower.starts_with("<invoke")
+        || lower.starts_with("<function")
+        || lower.starts_with("```tool")
+        || lower.starts_with("```invoke")
+        || lower.starts_with("```json")
+}
+
+fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("<tool")
+        || lower.starts_with("<invoke")
+        || lower.starts_with("<function")
+        || lower.starts_with("```tool")
+        || lower.starts_with("```invoke")
+        || lower.starts_with("```json")
+        || lower.starts_with("[tool_call]")
+}
+
+fn complete_non_protocol_json(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    let trimmed = text.trim();
+    (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+        && (!looks_like_tool_protocol_envelope(trimmed)
+            || !tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
+}
+
+fn complete_json_fence_protocol_state(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> Option<bool> {
+    let trimmed = text.trim();
+    let body = json_fence_body(trimmed)?;
+    Some(
+        looks_like_tool_protocol_envelope(body)
+            && tool_protocol_envelope_mentions_known_tool(body, known_tool_names),
+    )
+}
+
+fn detect_internal_protocol_without_tools(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if looks_like_tool_protocol_example(trimmed) {
+        return None;
+    }
+
+    (looks_like_malformed_tool_protocol_envelope(trimmed)
+        || contains_tool_protocol_tag_call(trimmed)
+        || classify_tool_protocol_envelope(trimmed)
+            .is_some_and(|kind| matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall))
+        || (classify_tool_protocol_envelope(trimmed).is_none()
+            && looks_like_tool_protocol_envelope(trimmed)))
+    .then(|| {
+        "response resembled an internal tool protocol envelope but no tools were enabled".into()
+    })
+}
+
+fn detect_tool_call_parse_issue_for_known_tools(
+    response: &str,
+    parsed_calls: &[ParsedToolCall],
+    known_tool_names: &HashSet<String>,
+) -> Option<String> {
+    if !parsed_calls.is_empty() {
+        return None;
+    }
+
+    let trimmed = response.trim();
+    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
+        return None;
+    }
+
+    let message = "response resembled an internal tool protocol envelope but no valid tool call could be parsed";
+
+    if looks_like_malformed_tool_protocol_envelope_for_known_tools(trimmed, known_tool_names)
+        || contains_tool_protocol_tag_call(trimmed)
+    {
+        return Some(message.into());
+    }
+
+    if let Some(kind) = classify_tool_protocol_envelope(trimmed) {
+        return (matches!(
+            kind,
+            ToolProtocolEnvelopeKind::TaggedToolCall | ToolProtocolEnvelopeKind::ToolResult
+        ) || tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
+        .then(|| message.into());
+    }
+
+    looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
+}
+
+fn json_fence_body(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("```")?;
+    let first_newline = rest.find('\n')?;
+    let language = rest[..first_newline].trim().trim_end_matches('\r');
+    if !language.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    let body_with_close = &rest[first_newline + 1..];
+    let close_start = body_with_close.rfind("```")?;
+    if !body_with_close[close_start + 3..].trim().is_empty() {
+        return None;
+    }
+    Some(body_with_close[..close_start].trim())
 }
 
 async fn consume_provider_streaming_response(
@@ -623,7 +1003,7 @@ async fn consume_provider_streaming_response(
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut suppress_forwarding = false;
-    let mut marker_window = String::new();
+    let mut text_guard = StreamTextGuard::new(request_tools);
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
@@ -657,6 +1037,7 @@ async fn consume_provider_streaming_response(
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
+                text_guard.suppress_forwarding = true;
             }
             StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
                 // Pre-executed tool events are for observability only.
@@ -684,39 +1065,32 @@ async fn consume_provider_streaming_response(
                 }
 
                 outcome.response_text.push_str(&chunk.delta);
-                marker_window.push_str(&chunk.delta);
-
-                if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
-                    let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
-                    let boundary = marker_window
-                        .char_indices()
-                        .find(|(idx, _)| *idx >= keep_from)
-                        .map_or(0, |(idx, _)| idx);
-                    marker_window.drain(..boundary);
-                }
-
-                if !suppress_forwarding && {
-                    let lowered = marker_window.to_ascii_lowercase();
-                    lowered.contains("<tool_call")
-                        || lowered.contains("<toolcall")
-                        || lowered.contains("\"tool_calls\"")
-                } {
-                    suppress_forwarding = true;
-                }
 
                 if suppress_forwarding {
                     continue;
                 }
 
+                let Some(forward_text) = text_guard.push(&chunk.delta) else {
+                    continue;
+                };
+
                 if let Some(tx) = delta_sender {
                     outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
+                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
                         delta_sender = None;
                     }
                 }
             }
         }
     }
+
+    if let Some(forward_text) = text_guard.finish()
+        && let Some(tx) = delta_sender
+    {
+        outcome.forwarded_live_deltas = true;
+        let _ = tx.send(StreamDelta::Text(forward_text)).await;
+    }
+    outcome.suppressed_protocol = text_guard.suppressed_protocol;
 
     Ok(outcome)
 }
@@ -942,6 +1316,7 @@ pub async fn run_tool_call_loop(
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
+    let mut malformed_tool_protocol_retries: usize = 0;
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1043,6 +1418,10 @@ pub async fn run_tool_call_loop(
                 }
             }
         }
+        let known_tool_names: HashSet<String> = tool_specs
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .collect();
         let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -1193,6 +1572,7 @@ pub async fn run_tool_call_loop(
             && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
         let mut streamed_live_deltas = false;
+        let mut streamed_protocol_suppressed = false;
 
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
@@ -1208,6 +1588,7 @@ pub async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    streamed_protocol_suppressed = streamed.suppressed_protocol;
                     let reasoning_content = if streamed.reasoning_content.is_empty() {
                         None
                     } else {
@@ -1323,7 +1704,8 @@ pub async fn run_tool_call_loop(
             tool_calls,
             assistant_history_content,
             native_tool_calls,
-            _parse_issue_detected,
+            parse_issue_detected,
+            protocol_suppressed,
             response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
@@ -1375,18 +1757,40 @@ pub async fn run_tool_call_loop(
                 };
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() && !tool_specs.is_empty() {
+                if calls.is_empty()
+                    && !tool_specs.is_empty()
+                    && !looks_like_tool_protocol_example(&response_text)
+                {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                    if !fallback_text.is_empty() {
+                    let filtered_calls: Vec<ParsedToolCall> = fallback_calls
+                        .into_iter()
+                        .filter(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
+                        .collect();
+                    if !fallback_text.is_empty() && !filtered_calls.is_empty() {
                         parsed_text = fallback_text;
                     }
-                    calls = fallback_calls;
+                    calls = filtered_calls;
                 }
 
                 let parse_issue = if tool_specs.is_empty() {
-                    None
+                    detect_internal_protocol_without_tools(&response_text).or_else(|| {
+                        streamed_protocol_suppressed.then(|| {
+                            "streaming text guard suppressed an internal tool protocol envelope"
+                                .to_string()
+                        })
+                    })
                 } else {
-                    detect_tool_call_parse_issue(&response_text, &calls)
+                    detect_tool_call_parse_issue_for_known_tools(
+                        &response_text,
+                        &calls,
+                        &known_tool_names,
+                    )
+                    .or_else(|| {
+                        streamed_protocol_suppressed.then(|| {
+                            "streaming text guard suppressed an internal tool protocol envelope"
+                                .to_string()
+                        })
+                    })
                 };
                 if let Some(ref issue) = parse_issue {
                     ::zeroclaw_log::record!(
@@ -1454,6 +1858,7 @@ pub async fn run_tool_call_loop(
                     assistant_history_content,
                     native_calls,
                     parse_issue.is_some(),
+                    streamed_protocol_suppressed,
                     streamed_live_deltas,
                 )
             }
@@ -1543,6 +1948,62 @@ pub async fn run_tool_call_loop(
             !tool_calls.is_empty(),
             !native_tool_calls.is_empty(),
         );
+
+        // Native provider tool_calls are converted into parsed `tool_calls`
+        // above; if this branch is reached there is no valid native call to run.
+        if tool_calls.is_empty() && parse_issue_detected {
+            malformed_tool_protocol_retries += 1;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(serde_json::json!({
+                        "channel": channel_name,
+                        "model_provider": provider_name,
+                        "model": model,
+                        "trace_id": turn_id,
+                        "error": "malformed internal tool protocol omitted from channel output",
+                    })),
+                "tool_call_parse_feedback"
+            );
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(serde_json::json!({
+                    "iteration": iteration + 1,
+                    "retry": malformed_tool_protocol_retries,
+                    "max_retries": MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
+                    "response_excerpt": truncate_with_ellipsis(
+                        &scrub_credentials(&response_text),
+                        600
+                    ),
+                    })),
+                "tool_call_parse_feedback_details"
+            );
+
+            if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
+                // This is model feedback, not a tool result: malformed protocol
+                // output has no valid tool_call_id to attach a role=tool message to.
+                history.push(ChatMessage::user(
+                    "[Tool call parse error]\n\
+                     Your previous response looked like an internal tool-call protocol payload, \
+                     but ZeroClaw could not parse it into a valid tool call. Use the supported \
+                     tool-call schema, or answer in natural language if no tool is needed."
+                        .to_string(),
+                ));
+                continue;
+            }
+
+            let fallback =
+                crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+            accumulated_display_text.push_str(&fallback);
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
+            }
+            history.push(ChatMessage::assistant(fallback.to_string()));
+            return Ok(accumulated_display_text);
+        }
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1576,6 +2037,7 @@ pub async fn run_tool_call_loop(
             // When streamed live, the channel already received the deltas.
             if let Some(ref tx) = on_delta
                 && !response_streamed_live
+                && !protocol_suppressed
             {
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
@@ -4693,6 +5155,24 @@ mod tests {
     use zeroclaw_providers::ChatResponse;
     use zeroclaw_providers::router::{Route, RouterModelProvider};
 
+    macro_rules! impl_test_model_provider_attribution {
+        ($ty:ty) => {
+            impl ::zeroclaw_api::attribution::Attributable for $ty {
+                fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                    ::zeroclaw_api::attribution::Role::Provider(
+                        ::zeroclaw_api::attribution::ProviderKind::Model(
+                            ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                        ),
+                    )
+                }
+
+                fn alias(&self) -> &str {
+                    stringify!($ty)
+                }
+            }
+        };
+    }
+
     struct NonVisionModelProvider {
         calls: Arc<AtomicUsize>,
     }
@@ -6654,6 +7134,1199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_retries_malformed_tool_protocol_without_leaking_json() {
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+            "Recovered answer.",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("malformed tool protocol should retry and recover");
+
+        assert_eq!(result, "Recovered answer.");
+        assert!(!result.contains("toolcalls"));
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "malformed alias payload should not execute as a tool call"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
+            "history should include internal parser feedback for the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_unknown_function_call_json_with_tools() {
+        let business_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a support case JSON object"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("business JSON should be returned as normal text");
+
+        assert_eq!(result, business_json);
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "business JSON must not execute any runtime tool"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "business JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_malformed_unknown_tool_calls_json_with_tools() {
+        let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a partial support case JSON object"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("unknown business JSON should be returned as normal text");
+
+        assert_eq!(result, business_json);
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "business JSON must not execute any runtime tool"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "business JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_falls_back_after_repeated_malformed_tool_protocol() {
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#,
+            r#"{"toolcalls":[{"call_id":"call_2","arguments":{"value":"Y"}}]}"#,
+            r#"{"toolcalls":[{"call_id":"call_3","arguments":{"value":"Z"}}]}"#,
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("malformed tool protocol should return a safe fallback");
+
+        assert_eq!(
+            result,
+            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output")
+        );
+        assert!(!result.contains("toolcalls"));
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "malformed protocol should never be executed as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(feedback_count, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_toolcalls_reference_json_when_no_tools_are_enabled() {
+        let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![reference_json]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a toolcalls reference JSON object"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("toolcalls reference JSON should remain visible without tools");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, reference_json);
+        assert_eq!(visible_deltas, reference_json);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "toolcalls reference JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_toolcalls_reference_json_when_no_tools_are_enabled() {
+        let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a toolcalls reference JSON object"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("toolcalls reference JSON should remain visible without tools");
+
+        assert_eq!(result, reference_json);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "toolcalls reference JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_schema_json_array_when_no_tools_are_enabled() {
+        let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![schema]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a JSON schema array"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("schema JSON should remain visible without tools");
+
+        assert_eq!(result, schema);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "plain schema JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_tool_calls_audit_json_when_no_tools_are_enabled() {
+        let audit_json =
+            r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![audit_json]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a tool call audit JSON object"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("audit JSON should remain visible without tools");
+
+        assert_eq!(result, audit_json);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "business tool_calls JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_function_call_reference_json_when_no_tools_are_enabled() {
+        let reference_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("return a function_call reference JSON object"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("reference JSON should remain visible without tools");
+
+        assert_eq!(result, reference_json);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "reference function_call JSON must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_tool_call_tag_example_when_no_tools_are_enabled() {
+        let example = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+This is an example, not an invocation."#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![example]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a tool_call tag example"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("tool_call tag examples should remain visible without tools");
+
+        assert_eq!(result, example);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "tool_call tag examples must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_tool_call_fenced_example_with_registered_tool() {
+        let example = r#"```tool_call
+{"name":"count_tool","arguments":{"value":"X"}}
+```
+This is an example, not an invocation."#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a registered tool_call fenced example"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("registered tool_call fenced examples should remain visible");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, example);
+        assert_eq!(visible_deltas, example);
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "tool-call examples must not execute registered tools"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "tool-call examples must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_tool_call_tag_example_with_registered_tool() {
+        let example = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>
+This is an example, not an invocation."#;
+        let provider = ScriptedModelProvider::from_text_responses(vec![example]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a registered tool_call tag example"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("registered tool_call tag examples should remain visible");
+
+        assert_eq!(result, example);
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "tool-call tag examples must not execute registered tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_tagged_tool_call_with_trailing_text_without_tools() {
+        let leaked = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+Done."#;
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run without tools"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("tagged tool protocol with trailing text should retry and recover");
+
+        assert_eq!(result, "Recovered answer.");
+        assert!(!result.contains("<tool_call>"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
+            "tagged tool protocol with trailing text must trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_embedded_fenced_tool_call_without_tools() {
+        let leaked = r#"Let me call it:
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+Done."#;
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run without tools"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("embedded fenced tool protocol should retry and recover");
+
+        assert_eq!(result, "Recovered answer.");
+        assert!(!result.contains("```tool_call"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
+            "embedded fenced tool protocol must trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_retries_malformed_tool_protocol_fenced_call_without_tools() {
+        let leaked = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run without tools"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("standalone tool_call fence should retry and recover without tools");
+
+        assert_eq!(result, "Recovered answer.");
+        assert!(!result.contains("```tool_call"));
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
+            "standalone tool_call fence must trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_tool_call_fenced_example_when_no_tools_are_enabled() {
+        let example = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a tool_call fenced example"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("tool_call fenced examples should remain visible without tools");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, example);
+        assert_eq!(visible_deltas, example);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "tool_call fenced examples must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_split_tool_call_fenced_example_when_no_tools_are_enabled() {
+        struct SplitFencedExampleProvider;
+        impl_test_model_provider_attribution!(SplitFencedExampleProvider);
+
+        #[async_trait]
+        impl ModelProvider for SplitFencedExampleProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("chat should not be called when streaming succeeds")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        "```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n```",
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        "\nThis is an example, not an invocation.",
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let example = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+        let provider = SplitFencedExampleProvider;
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a split tool_call fenced example"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("split tool_call fenced examples should remain visible without tools");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, example);
+        assert_eq!(visible_deltas, example);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "split tool_call fenced examples must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_json_fenced_tool_protocol_example_when_no_tools_are_enabled()
+     {
+        let example = r#"```json
+{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
+```
+This is an example, not an invocation."#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show a JSON tool_calls example"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("JSON-fenced tool protocol examples should remain visible without tools");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, example);
+        assert_eq!(visible_deltas, example);
+        assert!(
+            history
+                .iter()
+                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+            "JSON-fenced tool protocol examples must not trigger internal parser feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_executes_streamed_tool_call_fence_without_draft_leak() {
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![
+            r#"```tool_call
+{"name":"count_tool","arguments":{"value":"X"}}
+```"#,
+            "Final answer.",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("use the tool"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "matrix",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("streamed fenced tool call should execute and continue");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(result, "Final answer.");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(visible_deltas, "Final answer.");
+        assert!(
+            !visible_deltas.contains("```tool_call"),
+            "streamed fenced tool call must not reach draft updates before execution"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
         let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
@@ -6886,6 +8559,782 @@ mod tests {
         assert!(
             !visible_deltas.contains("<tool_call"),
             "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_buffers_split_tool_protocol_markers() {
+        struct SplitToolProtocolProvider;
+        impl_test_model_provider_attribution!(SplitToolProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for SplitToolProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(r#"{"tool"#))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = SplitToolProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            Some(&[crate::tools::ToolSpec {
+                name: "count_tool".to_string(),
+                description: "Count values".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"toolcalls\""));
+        assert_eq!(
+            visible_deltas, "",
+            "split internal protocol markers must not reach draft updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_buffers_top_level_tool_call_array() {
+        struct TopLevelToolArrayProvider;
+        impl_test_model_provider_attribution!(TopLevelToolArrayProvider);
+
+        #[async_trait]
+        impl ModelProvider for TopLevelToolArrayProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"[{"name":"count_tool","arguments":{"value":"X"}}]"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = TopLevelToolArrayProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            Some(&[crate::tools::ToolSpec {
+                name: "count_tool".to_string(),
+                description: "Count values".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"name\""));
+        assert_eq!(
+            visible_deltas, "",
+            "top-level tool-call arrays must not reach draft updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_schema_array_without_tools() {
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![
+            r#"[{"name":"planner","parameters":{"goal":"string"}}]"#,
+        ]);
+        let messages = vec![ChatMessage::user("return a JSON schema array")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(
+            outcome.response_text,
+            r#"[{"name":"planner","parameters":{"goal":"string"}}]"#
+        );
+        assert_eq!(visible_deltas, outcome.response_text);
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_unknown_function_call_json_with_tools() {
+        let response = r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![response]);
+        let messages = vec![ChatMessage::user("return a support case JSON object")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            Some(&[crate::tools::ToolSpec {
+                name: "count_tool".to_string(),
+                description: "Count values".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(outcome.response_text, response);
+        assert_eq!(visible_deltas, response);
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_malformed_unknown_tool_calls_json_with_tools()
+     {
+        let response = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
+        let provider = StreamingScriptedModelProvider::from_text_responses(vec![response]);
+        let messages = vec![ChatMessage::user(
+            "return a partial support case JSON object",
+        )];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            Some(&[crate::tools::ToolSpec {
+                name: "count_tool".to_string(),
+                description: "Count values".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert_eq!(outcome.response_text, response);
+        assert_eq!(visible_deltas, response);
+        assert!(
+            !outcome.suppressed_protocol,
+            "unknown business JSON must not be suppressed as internal protocol"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_buffers_malformed_tool_protocol_json() {
+        struct MalformedToolProtocolProvider;
+        impl_test_model_provider_attribution!(MalformedToolProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for MalformedToolProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(r#"{"tool_"#))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"calls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = MalformedToolProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"tool_calls\""));
+        assert_eq!(
+            visible_deltas, "",
+            "malformed internal protocol JSON must not reach draft updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_drops_truncated_protocol_at_finish() {
+        struct TruncatedProtocolProvider;
+        impl_test_model_provider_attribution!(TruncatedProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for TruncatedProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"{"tool_call_id":"call_1","content":"raw"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = TruncatedProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"tool_call_id\""));
+        assert_eq!(
+            visible_deltas, "",
+            "truncated internal protocol must not be released at stream finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_json_fenced_tool_protocol_without_tools()
+    {
+        struct JsonFencedToolProtocolProvider;
+        impl_test_model_provider_attribution!(JsonFencedToolProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for JsonFencedToolProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("```json\n"))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"{"tool_calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("\n```"))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = JsonFencedToolProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"tool_calls\""));
+        assert_eq!(
+            visible_deltas, outcome.response_text,
+            "json-fenced protocol-shaped JSON should remain visible when no tools are active"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_buffers_tool_call_fence_with_tools() {
+        struct ToolCallFenceProvider;
+        impl_test_model_provider_attribution!(ToolCallFenceProvider);
+
+        #[async_trait]
+        impl ModelProvider for ToolCallFenceProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("```tool_call\n"))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"{"name":"count_tool","arguments":{"value":"X"}}"#,
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("\n```"))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = ToolCallFenceProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            Some(&[crate::tools::ToolSpec {
+                name: "count_tool".to_string(),
+                description: "Count values".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]),
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("```tool_call"));
+        assert_eq!(
+            visible_deltas, "",
+            "streamed tool_call fences with registered tools must not reach draft updates"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_plain_prefix_before_protocol_without_tools()
+     {
+        struct PrefixedToolProtocolProvider;
+        impl_test_model_provider_attribution!(PrefixedToolProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for PrefixedToolProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"Visible prefix {"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = PrefixedToolProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"toolcalls\""));
+        assert_eq!(
+            visible_deltas, outcome.response_text,
+            "prefixed protocol-shaped JSON should remain visible when no tools are active"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_preserves_split_protocol_after_plain_prefix_without_tools()
+     {
+        struct SplitPrefixedToolProtocolProvider;
+        impl_test_model_provider_attribution!(SplitPrefixedToolProtocolProvider);
+
+        #[async_trait]
+        impl ModelProvider for SplitPrefixedToolProtocolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"Visible prefix {"tool"#,
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"calls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#,
+                    ))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = SplitPrefixedToolProtocolProvider;
+        let messages = vec![ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&tx),
+        )
+        .await
+        .expect("streaming should finish");
+        drop(tx);
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+
+        assert!(outcome.response_text.contains("\"toolcalls\""));
+        assert_eq!(
+            visible_deltas, outcome.response_text,
+            "split prefixed protocol-shaped JSON should remain visible when no tools are active"
         );
     }
 
