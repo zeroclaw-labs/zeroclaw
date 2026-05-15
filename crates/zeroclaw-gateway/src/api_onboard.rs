@@ -189,10 +189,9 @@ pub struct OnboardStatusResponse {
 
 /// Pure derivation of the onboard-status response from a config snapshot.
 /// `needs_onboarding` is `false` iff at least one `[agents.<alias>]` block
-/// is dispatchable (`AliasedAgentConfig::is_dispatchable`). Providers
-/// configured without an agent bound to them aren't a completion signal —
-/// `state.model.is_empty()` still bounces chat dispatch with 503 in that
-/// state, so reporting `needs_onboarding: false` there would be a lie.
+/// is dispatchable (`AliasedAgentConfig::is_dispatchable`). A provider
+/// without a bound agent is not a completion signal: `state.model.is_empty()`
+/// still bounces chat dispatch with 503 in that state.
 #[must_use]
 pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResponse {
     let dispatchable = cfg.agents.values().any(|a| a.is_dispatchable());
@@ -213,8 +212,7 @@ pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardSt
 /// fresh-install redirect. The daemon writes a default `config.toml` on
 /// first init, so file existence isn't a useful "is the user new?" check.
 /// Onboarding is complete iff at least one agent has its
-/// `model_provider`, `risk_profile`, and `runtime_profile` bound — the
-/// minimum surface a dispatched turn touches.
+/// `model_provider`, `risk_profile`, and `runtime_profile` bound.
 pub async fn handle_onboard_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();

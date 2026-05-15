@@ -45,10 +45,11 @@ impl ResolvedPeers {
         false
     }
 
-    /// Whether the bound agent accepts inbound from `origin` on
-    /// `channel_type`. Unknown origins default-accept (peer groups
-    /// are an additive allowlist for cross-agent traffic, not a
-    /// global inbound filter).
+    /// NOT a security gate. Unknown senders return `true` by design;
+    /// peer groups are an additive routing hint for cross-agent traffic,
+    /// not a global inbound allowlist. Callers must have already
+    /// authenticated the sender (channel auth, signed webhook, etc.)
+    /// before reaching this check.
     #[must_use]
     pub fn allows_inbound(&self, channel_type: &str, origin: &str) -> bool {
         let normalized = origin.trim_start_matches('@').to_ascii_lowercase();
