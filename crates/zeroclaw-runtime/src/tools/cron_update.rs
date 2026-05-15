@@ -138,12 +138,16 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
+                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook"],
                                     "description": "Channel type to deliver output to"
                                 },
                                 "to": {
                                     "type": "string",
-                                    "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                                    "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, webhook recipient, etc."
+                                },
+                                "thread_id": {
+                                    "type": "string",
+                                    "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
                                 },
                                 "best_effort": {
                                     "type": "boolean",
@@ -462,9 +466,27 @@ mod tests {
             .as_array()
             .expect("patch.delivery.channel must have an enum");
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        for ch in &["telegram", "discord", "slack", "mattermost", "matrix"] {
+        for ch in &[
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "matrix",
+            "qq",
+            "webhook",
+        ] {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }
+
+        // patch.delivery exposes thread_id so the webhook channel can route callbacks
+        // back to the originating conversation.
+        let delivery_props = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("patch.delivery must have properties");
+        assert!(
+            delivery_props.contains_key("thread_id"),
+            "patch.delivery missing thread_id"
+        );
     }
 
     #[tokio::test]

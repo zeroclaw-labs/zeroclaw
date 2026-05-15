@@ -1505,10 +1505,10 @@ async fn main() -> Result<()> {
         // registered"). `register_delivery_fn` is idempotent (backed by
         // `OnceLock::set`), so calling it once here is safe.
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |config, channel, target, output| {
+            |config, channel, target, thread_id, output| {
                 Box::pin(async move {
                     zeroclaw_channels::orchestrator::deliver_announcement(
-                        &config, &channel, &target, &output,
+                        &config, &channel, &target, thread_id, &output,
                     )
                     .await
                 })
