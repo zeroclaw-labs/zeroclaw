@@ -103,6 +103,95 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
+/// Trust tier of a skill listed in the `zeroclaw-skills` registry.
+///
+/// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
+/// "no recognized tier tag" fallback and is treated like `Community` for trust
+/// purposes when displaying the install banner.
+///
+/// `Featured` is intentionally kept as a distinct variant even though it
+/// renders identically to `Community` today: the registry's `Featured` tag is
+/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
+/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
+/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
+/// Keeping the variant now avoids a churn-y enum extension once that copy
+/// lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTier {
+    Official,
+    Community,
+    Featured,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryIndex {
+    #[serde(default)]
+    skills: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEntry {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn tier_from_tags(tags: &[String]) -> SkillTier {
+    let has = |needle: &str| tags.iter().any(|t| t.eq_ignore_ascii_case(needle));
+    if has("Official") {
+        SkillTier::Official
+    } else if has("Community") {
+        SkillTier::Community
+    } else if has("Featured") {
+        SkillTier::Featured
+    } else {
+        SkillTier::Unknown
+    }
+}
+
+/// Look up a skill in `<registry_dir>/registry.json` and return its trust tier
+/// and version. Returns `(SkillTier::Unknown, None)` if the index file is
+/// missing, malformed, or does not list the skill.
+pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier, Option<String>) {
+    let path = registry_dir.join("registry.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Ok(index) = serde_json::from_str::<RegistryIndex>(&data) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Some(entry) = index.skills.into_iter().find(|e| e.name == name) else {
+        return (SkillTier::Unknown, None);
+    };
+    (tier_from_tags(&entry.tags), entry.version)
+}
+
+/// Build the install-time tier banner. `Official` skills get a single
+/// informational line; everything else (including `Featured` and the
+/// missing-tag fallback) gets the Community warn block.
+pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+    let version_label = version.unwrap_or("?");
+    match tier {
+        SkillTier::Official => {
+            format!("Installing {name} v{version_label} — Official (zeroclaw-labs maintained)\n")
+        }
+        SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => format!(
+            "Installing {name} v{version_label} — Community submission\n\
+             This skill is not audited by ZeroClaw. Review the skill content\n\
+             and run `zeroclaw skills audit {name}` before granting any\n\
+             permissions or running it in production.\n"
+        ),
+    }
+}
+
+/// Print the install-time tier banner to stdout.
+pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) {
+    print!("{}", build_install_tier_banner(name, version, tier));
+}
+
 /// Emit a user-visible warning when a skill directory is skipped due to audit
 /// findings. When the findings mention blocked scripts and `allow_scripts` is
 /// `false`, the message includes actionable remediation guidance so users know
@@ -1601,6 +1690,7 @@ pub fn install_registry_skill_source(
     allow_scripts: bool,
     workspace_dir: &Path,
     registry_url: Option<&str>,
+    suppress_tier_banner: bool,
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
@@ -1614,6 +1704,11 @@ pub fn install_registry_skill_source(
             "skill '{source}' not found in the registry.\nAvailable skills: {}",
             available.join(", ")
         );
+    }
+
+    if !suppress_tier_banner {
+        let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
+        print_install_tier_banner(source, version.as_deref(), tier);
     }
 
     install_local_skill_source(
@@ -1746,6 +1841,127 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_official() {
+        assert_eq!(
+            tier_from_tags(&["Official".into(), "Featured".into()]),
+            SkillTier::Official
+        );
+        // Case-insensitive match.
+        assert_eq!(tier_from_tags(&["official".into()]), SkillTier::Official);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_community() {
+        assert_eq!(tier_from_tags(&["Community".into()]), SkillTier::Community);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_featured_only() {
+        assert_eq!(tier_from_tags(&["Featured".into()]), SkillTier::Featured);
+    }
+
+    #[test]
+    fn tier_from_tags_falls_back_to_unknown_when_no_tier_tag() {
+        assert_eq!(tier_from_tags(&[]), SkillTier::Unknown);
+        assert_eq!(
+            tier_from_tags(&["productivity".into(), "automation".into()]),
+            SkillTier::Unknown
+        );
+    }
+
+    #[test]
+    fn build_install_tier_banner_official_is_single_line() {
+        let banner = build_install_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
+        assert!(banner.contains("Official (zeroclaw-labs maintained)"));
+        assert!(banner.contains("Installing auto-coder v0.3.0"));
+        assert!(!banner.contains("not audited"));
+        // One trailing newline, no warn block.
+        assert_eq!(banner.lines().count(), 1);
+    }
+
+    #[test]
+    fn build_install_tier_banner_community_warns() {
+        let banner =
+            build_install_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        assert!(banner.contains("zeroclaw skills audit discord-moderator"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_featured_uses_community_warning() {
+        let banner = build_install_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_unknown_falls_back_to_community() {
+        let banner = build_install_tier_banner("legacy", None, SkillTier::Unknown);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        // Missing version is rendered as `v?` rather than panicking.
+        assert!(banner.contains("v?"));
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_resolves_from_registry_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let json = r#"{
+            "version": 1,
+            "skills": [
+                { "name": "auto-coder", "version": "0.3.0", "tags": ["Official", "Featured"] },
+                { "name": "discord-moderator", "version": "0.1.2", "tags": ["Community"] },
+                { "name": "hand-picked", "version": "1.0.0", "tags": ["Featured"] },
+                { "name": "untagged", "version": "0.0.1", "tags": ["productivity"] }
+            ]
+        }"#;
+        std::fs::write(tmp.path().join("registry.json"), json).unwrap();
+
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "auto-coder"),
+            (SkillTier::Official, Some("0.3.0".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "discord-moderator"),
+            (SkillTier::Community, Some("0.1.2".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "hand-picked"),
+            (SkillTier::Featured, Some("1.0.0".to_string()))
+        );
+        // Skill present but no tier tag → Unknown (treated as Community by the banner).
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "untagged"),
+            (SkillTier::Unknown, Some("0.0.1".to_string()))
+        );
+        // Skill not in registry.json at all → Unknown with no version.
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "missing"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_missing_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_malformed_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("registry.json"), "{ not json").unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
     }
 }
 
