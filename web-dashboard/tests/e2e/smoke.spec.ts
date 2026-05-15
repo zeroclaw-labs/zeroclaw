@@ -110,6 +110,60 @@ test("create slot via +New posts to /api/slots and shows the new row", async ({
   expect(createCalls).toBe(1);
 });
 
+test("rename Cancel button does not commit the draft (PR #5 race fix)", async ({
+  page,
+}) => {
+  // Regression for the race surfaced in PR #5 review: the rename input's
+  // `onBlur={onCommit}` previously fired BEFORE the Cancel button's
+  // `onClick`, so any draft typed before clicking Cancel got committed
+  // and Cancel never actually cancelled. The fix moved Save/Cancel to
+  // `onMouseDown` with `preventDefault` so they pre-empt blur.
+  await page.route("**/api/control-ui/config", (route) =>
+    route.fulfill({ json: BOOTSTRAP_BODY }),
+  );
+
+  const slot: MockSlot = {
+    id: "slot-original",
+    session_id: "sess-1",
+    title: "Original Title",
+    state: "idle",
+    message_count: 0,
+    dirty: false,
+    created_at: 1,
+    updated_at: 1,
+  };
+  let patchCalls = 0;
+
+  await page.route("**/api/slots", (route) => {
+    route.fulfill({ json: { slots: [slot] } });
+  });
+  await page.route("**/api/slots/slot-original", (route) => {
+    if (route.request().method() === "PATCH") {
+      patchCalls += 1;
+    }
+    route.fulfill({ json: slot });
+  });
+
+  await page.goto("/");
+
+  // Wait for the slot row to render in the sidebar before triggering rename.
+  await expect(page.getByRole("button", { name: "Original Title" })).toBeVisible();
+
+  // Hover the row to reveal the action menu, then click rename.
+  await page.getByRole("button", { name: "Original Title" }).hover();
+  await page.getByRole("button", { name: "Rename slot" }).click();
+
+  // Type a new draft, then cancel.
+  const input = page.getByRole("textbox", { name: "Rename slot" });
+  await input.fill("Pretend Edit That Should Not Save");
+  await page.getByRole("button", { name: "Cancel" }).click();
+
+  // The PATCH endpoint must NOT have been hit. If the regression
+  // returns, blur-driven commit fires and patchCalls becomes 1.
+  await page.waitForTimeout(150); // brief settle window for any stray mutation
+  expect(patchCalls).toBe(0);
+});
+
 test("theme toggle persists across reload", async ({ page }) => {
   await page.route("**/api/control-ui/config", (route) =>
     route.fulfill({ json: BOOTSTRAP_BODY }),

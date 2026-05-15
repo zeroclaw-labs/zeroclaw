@@ -10,10 +10,8 @@
  * keyboard palette can reuse them without lifting the sidebar's
  * presentational state.
  */
-import { useState, type KeyboardEvent } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState, type KeyboardEvent, type MouseEvent } from "react";
 import { Plus, Pencil, Copy, Trash2, Check, X } from "lucide-react";
-import { apiFetch } from "@/lib/apiFetch";
 import {
   useCreateSlot,
   useRenameSlot,
@@ -21,14 +19,7 @@ import {
   useDuplicateSlot,
   type SlotResponse,
 } from "@/chat/slotMutations";
-
-interface SlotListResponse {
-  slots: SlotResponse[];
-}
-
-async function fetchSlots(): Promise<SlotListResponse> {
-  return apiFetch<SlotListResponse>("/api/slots");
-}
+import { useSlotsQuery } from "@/chat/slotsQuery";
 
 interface SlotSidebarProps {
   activeSlotId?: string;
@@ -42,13 +33,7 @@ export function SlotSidebar({
   onSelectSlot,
   onSlotDeleted,
 }: SlotSidebarProps) {
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["slots"],
-    queryFn: fetchSlots,
-    // Polled hydration. Once the subscribe-mode WS hook lands, this
-    // becomes WS-driven and the interval drops out.
-    refetchInterval: 5_000,
-  });
+  const { data, isLoading, error, refetch } = useSlotsQuery();
 
   const createSlot = useCreateSlot();
   const renameSlot = useRenameSlot();
@@ -266,6 +251,20 @@ function RenameRow({ draft, onChange, onCommit, onCancel }: RenameRowProps) {
       onCancel();
     }
   };
+  // Save/Cancel use `onMouseDown` with `preventDefault`, not `onClick`.
+  // Without that, clicking the button first triggers the input's `blur`
+  // event, which fires `onCommit` and unmounts the RenameRow before
+  // `onClick` can dispatch — the explicit Cancel button would never
+  // run. `preventDefault` keeps focus on the input so blur-driven
+  // commit doesn't pre-empt the explicit handler.
+  const handleSaveDown = (e: MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    onCommit();
+  };
+  const handleCancelDown = (e: MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    onCancel();
+  };
   return (
     <div className="flex items-center gap-1">
       <input
@@ -278,29 +277,32 @@ function RenameRow({ draft, onChange, onCommit, onCancel }: RenameRowProps) {
         style={{ borderColor: "var(--color-border)" }}
         aria-label="Rename slot"
       />
-      <IconButton label="Save" onClick={onCommit}>
+      <IconButton label="Save" onMouseDown={handleSaveDown}>
         <Check size={12} aria-hidden="true" />
       </IconButton>
-      <IconButton label="Cancel" onClick={onCancel}>
+      <IconButton label="Cancel" onMouseDown={handleCancelDown}>
         <X size={12} aria-hidden="true" />
       </IconButton>
     </div>
   );
 }
 
-function IconButton({
-  label,
-  onClick,
-  children,
-}: {
+interface IconButtonProps {
   label: string;
-  onClick: () => void;
+  /** Default activation handler. Unused when `onMouseDown` is provided. */
+  onClick?: () => void;
+  /** Use `onMouseDown` when the button must fire before a sibling input's
+   *  `blur` event runs — see RenameRow's Save/Cancel handlers. */
+  onMouseDown?: (e: MouseEvent<HTMLButtonElement>) => void;
   children: React.ReactNode;
-}) {
+}
+
+function IconButton({ label, onClick, onMouseDown, children }: IconButtonProps) {
   return (
     <button
       type="button"
       onClick={onClick}
+      onMouseDown={onMouseDown}
       title={label}
       aria-label={label}
       className="p-1 rounded hover:bg-[color:var(--color-surface-muted)]"

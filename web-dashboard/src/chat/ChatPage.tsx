@@ -1,11 +1,9 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
 import { useControlUiBootstrap } from "@/app/ControlUiBootstrapProvider";
 import { SlotSidebar } from "@/chat/SlotSidebar";
 import { ChatView } from "@/chat/ChatView";
 import { ThemeSwitcher } from "@/theme/ThemeSwitcher";
-import { apiFetch } from "@/lib/apiFetch";
-import type { SlotResponse } from "@/chat/slotMutations";
+import { useSlotsQuery } from "@/chat/slotsQuery";
 
 /**
  * Chat page (M3, US-001 + US-002).
@@ -80,15 +78,15 @@ function EmptyChatPane() {
  * matched row to `ChatView`. The slot-not-found fallback renders a
  * compact notice rather than a full error screen — the user is one
  * click away from another slot in the sidebar.
+ *
+ * Uses the shared `useSlotsQuery` hook so this component and
+ * `SlotSidebar` register a single query observer. React Query keys on
+ * the `queryKey` alone, so two `useQuery({queryKey:["slots"]})` calls
+ * with different `queryFn`s would silently let the first-mounted
+ * observer win — see PR #5 review thread.
  */
 function ChatPane({ slotId }: { slotId: string }) {
-  const { data, isLoading } = useQuery({
-    queryKey: ["slots"],
-    queryFn: async () =>
-      apiFetch<{ slots: SlotResponse[] }>("/api/slots"),
-    // Already polled by the sidebar at 5s; piggyback on its cache.
-    refetchOnMount: false,
-  });
+  const { data, isLoading } = useSlotsQuery();
 
   if (isLoading) {
     return (

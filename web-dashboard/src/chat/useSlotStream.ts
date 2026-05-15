@@ -178,8 +178,15 @@ export function useSlotStream(slotId: string | undefined): UseSlotStream {
 
 /**
  * Consume an SSE stream: read chunks, decode UTF-8, accumulate buffer,
- * split on `\n\n`, parse each event's `data:` lines into JSON, hand the
- * resulting frame to the caller.
+ * split on event terminators, parse each event's `data:` lines into
+ * JSON, hand the resulting frame to the caller.
+ *
+ * The SSE spec (HTML5 §9.2.4) defines three valid line terminators:
+ * `\n`, `\r\n`, and bare `\r`. Event terminators are two of those in a
+ * row. We normalise CRLF and bare CR to LF on each chunk so the rest
+ * of the parser only deals with `\n\n` boundaries — without that, an
+ * upstream proxy that rewrites line endings would leave frames stuck
+ * in the buffer forever.
  */
 async function consumeSseStream(
   body: ReadableStream<Uint8Array>,
@@ -189,10 +196,30 @@ async function consumeSseStream(
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
 
+  // Pending CR carried over from the previous chunk: if a chunk ends
+  // with `\r`, we don't yet know whether the next chunk starts with
+  // `\n` (making the pair a CRLF that should normalise to a single
+  // `\n`) or with another character (making the `\r` a bare-CR line
+  // terminator). Holding the trailing CR until the next read keeps the
+  // normalisation deterministic without rescanning the whole buffer.
+  let pendingCr = false;
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    let chunk = decoder.decode(value, { stream: true });
+    if (pendingCr) {
+      chunk = "\r" + chunk;
+      pendingCr = false;
+    }
+    if (chunk.endsWith("\r")) {
+      chunk = chunk.slice(0, -1);
+      pendingCr = true;
+    }
+    // Normalise: `\r\n` first so the second pass doesn't double-flip
+    // CRLF into `\n\n` (which would split mid-event).
+    chunk = chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    buffer += chunk;
 
     let boundary = buffer.indexOf("\n\n");
     while (boundary !== -1) {
