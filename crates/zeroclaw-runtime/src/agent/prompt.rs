@@ -129,11 +129,7 @@ impl PromptSection for IdentitySection {
         // is treated as if no override were set — the allowlist is the security
         // contract, not a soft hint.
         let profile = match ctx.personality_override {
-            Some(filename)
-                if personality::EDITABLE_PERSONALITY_FILES
-                    .iter()
-                    .any(|allowed| *allowed == filename) =>
-            {
+            Some(filename) if personality::EDITABLE_PERSONALITY_FILES.contains(&filename) => {
                 personality::load_personality_files(ctx.workspace_dir, &[filename])
             }
             _ => personality::load_personality(ctx.workspace_dir),
