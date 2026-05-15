@@ -844,10 +844,11 @@ function sectionTabsForDirectForm(
   return null;
 }
 
-// Standalone rate-sheet editor for `/config/cost` → Rates tab. Picks
-// category + provider type, then defers to CostRatesEditor for the
-// resource list / row editor (which is the same widget embedded on the
-// provider alias's own Costs tab).
+// Standalone rate-sheet editor for `/config/cost` → Rates tab. The
+// operator picks category + provider type explicitly; nothing is
+// auto-selected. URL params `?category=...&provider=...` hydrate the
+// pickers, so deep links from elsewhere (e.g. the dashboard's "Spend by
+// model" rows) can land here with the right slot already in view.
 //
 // Provider-type options come straight from the schema via
 // `GET /api/config/templates` — every `cost.rates.providers.<category>.<type>`
@@ -855,8 +856,16 @@ function sectionTabsForDirectForm(
 // hand-typed slot table on the frontend; adding a provider slot in
 // `for_each_*_provider_slot!` is the single source of truth.
 function CostRatesStandalone({ onSaved }: { onSaved?: () => void }) {
-  const [category, setCategory] = useState<CostRatesCategory>('models');
-  const [providerType, setProviderType] = useState<string>('');
+  const location = useLocation();
+  const params = new URLSearchParams(location.search);
+  const urlCategory = params.get('category');
+  const urlProvider = params.get('provider');
+  const isValidCategory = (v: string | null): v is CostRatesCategory =>
+    v === 'models' || v === 'tts' || v === 'transcription';
+  const [category, setCategory] = useState<'' | CostRatesCategory>(
+    isValidCategory(urlCategory) ? urlCategory : '',
+  );
+  const [providerType, setProviderType] = useState<string>(urlProvider ?? '');
   const [providerTypeOptions, setProviderTypeOptions] = useState<
     Record<CostRatesCategory, string[]>
   >({ models: [], tts: [], transcription: [] });
@@ -895,12 +904,7 @@ function CostRatesStandalone({ onSaved }: { onSaved?: () => void }) {
     };
   }, []);
 
-  const options = providerTypeOptions[category];
-  useEffect(() => {
-    if (options.length === 0) return;
-    const first = options[0];
-    if (first && !options.includes(providerType)) setProviderType(first);
-  }, [category, options, providerType]);
+  const options = category ? providerTypeOptions[category] : [];
 
   return (
     <div className="flex flex-col gap-4">
@@ -909,9 +913,14 @@ function CostRatesStandalone({ onSaved }: { onSaved?: () => void }) {
           <span style={{ color: 'var(--pc-text-secondary)' }}>Category</span>
           <select
             value={category}
-            onChange={(e) => setCategory(e.target.value as CostRatesCategory)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setCategory(isValidCategory(v) ? v : '');
+              setProviderType('');
+            }}
             className="input-electric text-sm px-2 py-1 appearance-none cursor-pointer"
           >
+            <option value="">select a category...</option>
             <option value="models">models (USD per 1M tokens)</option>
             <option value="tts">tts (USD per 1M chars)</option>
             <option value="transcription">transcription (USD per minute)</option>
@@ -922,25 +931,28 @@ function CostRatesStandalone({ onSaved }: { onSaved?: () => void }) {
           <select
             value={providerType}
             onChange={(e) => setProviderType(e.target.value)}
-            disabled={loadingTemplates || options.length === 0}
+            disabled={loadingTemplates || !category || options.length === 0}
             className="input-electric text-sm px-2 py-1 appearance-none cursor-pointer"
           >
-            {options.length === 0 ? (
-              <option value="">
-                {loadingTemplates ? 'loading…' : 'no providers'}
+            <option value="">
+              {!category
+                ? 'pick a category first'
+                : loadingTemplates
+                  ? 'loading...'
+                  : options.length === 0
+                    ? 'no providers'
+                    : 'select a provider...'}
+            </option>
+            {options.map((p) => (
+              <option key={p} value={p}>
+                {p}
               </option>
-            ) : (
-              options.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))
-            )}
+            ))}
           </select>
         </label>
       </div>
 
-      {providerType && (
+      {category && providerType && (
         <CostRatesEditor
           category={category}
           providerType={providerType}

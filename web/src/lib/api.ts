@@ -1259,8 +1259,11 @@ export function deleteMemory(key: string, agent?: string): Promise<void> {
 // Cost
 // ---------------------------------------------------------------------------
 
-export function getCost(): Promise<CostSummary> {
-  return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
+export type CostRange = 'today' | 'last_7_days' | 'last_30_days' | 'current_month' | 'all_time';
+
+export function getCost(range?: CostRange): Promise<CostSummary> {
+  const url = range ? `/api/cost?range=${encodeURIComponent(range)}` : '/api/cost';
+  return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
     unwrapField(data, 'cost'),
   );
 }

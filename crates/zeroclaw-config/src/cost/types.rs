@@ -100,6 +100,40 @@ pub enum UsagePeriod {
     Month,
 }
 
+macro_rules! emit_cost_range {
+    ($(($variant:ident, $primary:literal $(, $alias:literal)*)),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum CostRange {
+            $($variant,)+
+        }
+
+        impl CostRange {
+            pub fn from_wire(s: &str) -> Option<Self> {
+                match s {
+                    $($primary $(| $alias)* => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! for_each_cost_range_slot {
+    ($mac:ident) => {
+        $mac! {
+            (Today, "today"),
+            (Last7Days, "last_7_days", "7d"),
+            (Last30Days, "last_30_days", "30d"),
+            (CurrentMonth, "current_month", "month"),
+            (AllTime, "all_time", "all"),
+        }
+    };
+}
+
+for_each_cost_range_slot!(emit_cost_range);
+
 /// A single cost record for persistent storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {

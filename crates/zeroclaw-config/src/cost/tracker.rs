@@ -1,9 +1,10 @@
 use super::types::{
-    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+    AgentCostStats, BudgetCheck, CostRange, CostRecord, CostSummary, ModelStats, TokenUsage,
+    UsagePeriod,
 };
 use crate::schema::CostConfig;
 use anyhow::{Context, Result, anyhow};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -158,12 +159,61 @@ impl CostTracker {
         self.get_summary_filtered(None)
     }
 
+    pub fn get_summary_in_range(&self, range: CostRange) -> Result<CostSummary> {
+        self.get_summary_in_range_filtered(range, None)
+    }
+
     /// Get the current cost summary scoped to a single agent alias. The
     /// session/day/month figures and `by_model` are filtered to records
     /// attributed to that alias; `by_agent` is left empty since the
     /// caller already chose the dimension.
     pub fn get_summary_for_agent(&self, agent_alias: &str) -> Result<CostSummary> {
         self.get_summary_filtered(Some(agent_alias))
+    }
+
+    fn get_summary_in_range_filtered(
+        &self,
+        range: CostRange,
+        agent_filter: Option<&str>,
+    ) -> Result<CostSummary> {
+        let (daily_cost, monthly_cost) = {
+            let mut storage = self.lock_storage();
+            storage.get_aggregated_costs()?
+        };
+        let records = {
+            let mut storage = self.lock_storage();
+            storage.records_in_range(range)?
+        };
+
+        let session_costs = self.lock_session_costs();
+        let matches_agent = |record: &CostRecord| match agent_filter {
+            Some(alias) => record.agent_alias.as_deref() == Some(alias),
+            None => true,
+        };
+
+        let session_scoped: Vec<&CostRecord> =
+            session_costs.iter().filter(|r| matches_agent(r)).collect();
+        let session_cost: f64 = session_scoped.iter().map(|r| r.usage.cost_usd).sum();
+        let total_tokens: u64 = session_scoped.iter().map(|r| r.usage.total_tokens).sum();
+        let request_count = session_scoped.len();
+
+        let range_scoped: Vec<&CostRecord> = records.iter().filter(|r| matches_agent(r)).collect();
+        let by_model = build_model_stats(range_scoped.iter().copied());
+        let by_agent = if agent_filter.is_some() || !self.config.track_per_agent {
+            HashMap::new()
+        } else {
+            build_agent_stats(&records)
+        };
+
+        Ok(CostSummary {
+            session_cost_usd: session_cost,
+            daily_cost_usd: daily_cost,
+            monthly_cost_usd: monthly_cost,
+            total_tokens,
+            request_count,
+            by_model,
+            by_agent,
+        })
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -519,13 +569,35 @@ impl CostStorage {
     /// calendar month. Used to build per-agent rollups without folding a
     /// new aggregate table into the JSONL file.
     fn daily_records(&mut self) -> Result<Vec<CostRecord>> {
+        self.records_in_range(CostRange::CurrentMonth)
+    }
+
+    fn records_in_range(&mut self, range: CostRange) -> Result<Vec<CostRecord>> {
         self.ensure_period_cache_current()?;
-        let year = self.cached_year;
-        let month = self.cached_month;
+        let now = Utc::now();
+        let today = now.date_naive();
+        let cutoff: Option<chrono::DateTime<Utc>> = match range {
+            CostRange::Today => None,
+            CostRange::Last7Days => Some(now - ChronoDuration::days(7)),
+            CostRange::Last30Days => Some(now - ChronoDuration::days(30)),
+            CostRange::CurrentMonth => None,
+            CostRange::AllTime => None,
+        };
+        let year = now.year();
+        let month = now.month();
         let mut out = Vec::new();
         self.for_each_record(|record| {
             let ts = record.usage.timestamp.naive_utc();
-            if ts.year() == year && ts.month() == month {
+            let keep = match range {
+                CostRange::Today => ts.date() == today,
+                CostRange::Last7Days | CostRange::Last30Days => match cutoff {
+                    Some(c) => record.usage.timestamp >= c,
+                    None => true,
+                },
+                CostRange::CurrentMonth => ts.year() == year && ts.month() == month,
+                CostRange::AllTime => true,
+            };
+            if keep {
                 out.push(record);
             }
         })?;

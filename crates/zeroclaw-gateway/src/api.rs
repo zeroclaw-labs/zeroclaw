@@ -945,11 +945,16 @@ pub async fn handle_api_memory_delete(
 pub struct CostQuery {
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub range: Option<String>,
 }
 
 /// GET /api/cost — cost summary. Pass `?agent=<alias>` for per-agent
 /// rollup; omit it for the global summary which also embeds a
-/// `by_agent` map when per-agent tracking is enabled.
+/// `by_agent` map when per-agent tracking is enabled. `?range=` widens
+/// the rollup window — accepted: today (default), last_7_days, last_30_days,
+/// current_month, all_time. The short aliases `7d`, `30d`, `month`, `all`
+/// also resolve.
 pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -959,10 +964,16 @@ pub async fn handle_api_cost(
         return e.into_response();
     }
 
+    let range = query
+        .range
+        .as_deref()
+        .and_then(|s| zeroclaw_runtime::cost::types::CostRange::from_wire(s))
+        .unwrap_or(zeroclaw_runtime::cost::types::CostRange::Today);
+
     if let Some(ref tracker) = state.cost_tracker {
         let result = match query.agent.as_deref().filter(|s| !s.is_empty()) {
             Some(alias) => tracker.get_summary_for_agent(alias),
-            None => tracker.get_summary(),
+            None => tracker.get_summary_in_range(range),
         };
         match result {
             Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),

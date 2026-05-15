@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Clock,
   Globe,
@@ -45,6 +45,7 @@ import {
   getMapKeys,
 } from '@/lib/api';
 import { resolveModelToProviderType } from '@/lib/configuredModels';
+import type { CostRange } from '@/lib/api';
 import type { MemoryEntry } from '@/types/api';
 import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
 import AgentCard from '@/components/AgentCard';
@@ -1274,6 +1275,7 @@ function parseTab(raw: string | null): TabId {
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
+  const [costRange, setCostRange] = useState<CostRange>('today');
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1304,7 +1306,7 @@ export default function Dashboard() {
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
-      Promise.all([getStatus(), getCost()])
+      Promise.all([getStatus(), getCost(costRange)])
         .then(([s, c]) => {
           if (cancelled) return;
           setStatus(s);
@@ -1322,7 +1324,7 @@ export default function Dashboard() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [costRange]);
 
   if (error) {
     return (
@@ -1398,7 +1400,9 @@ export default function Dashboard() {
       {activeTab === 'channels' && <ChannelsTab />}
       {activeTab === 'memories' && <MemoriesTab />}
       {activeTab === 'health' && <HealthTab status={status} />}
-      {activeTab === 'cost' && <CostTab cost={cost} />}
+      {activeTab === 'cost' && (
+        <CostTab cost={cost} range={costRange} onRangeChange={setCostRange} />
+      )}
     </div>
   );
 }
@@ -1509,27 +1513,78 @@ function HealthTab({ status }: { status: StatusResponse }) {
 // click-through resolves the provider type by walking configured
 // `providers.models.<type>.<alias>.model` (the model id is the rate
 // sheet key; the alias is its home) and lands on that type's Costs tab.
-function CostTab({ cost }: { cost: CostSummary }) {
+const COST_RANGE_OPTIONS: { value: CostRange; label: string; window: string }[] = [
+  { value: 'today', label: 'Today', window: 'today' },
+  { value: 'last_7_days', label: 'Last 7 days', window: 'last 7 days' },
+  { value: 'last_30_days', label: 'Last 30 days', window: 'last 30 days' },
+  { value: 'current_month', label: 'This month', window: 'this month' },
+  { value: 'all_time', label: 'All time', window: 'all time' },
+];
+
+function CostTab({
+  cost,
+  range,
+  onRangeChange,
+}: {
+  cost: CostSummary;
+  range: CostRange;
+  onRangeChange: (next: CostRange) => void;
+}) {
   const byModel = Object.values(cost.by_model);
   const byAgent = Object.values(cost.by_agent);
+  const navigate = useNavigate();
+  const windowLabel =
+    COST_RANGE_OPTIONS.find((o) => o.value === range)?.window ?? String(range);
+  // Cache the model→type lookup once resolved so consecutive clicks
+  // are instant. Starts empty: the per-row click handler resolves
+  // on-demand, so there's no race with an in-flight initial fetch.
   const [modelToType, setModelToType] = useState<Record<string, string>>({});
 
-  useEffect(() => {
-    let cancelled = false;
-    void resolveModelToProviderType('models')
-      .then((map) => {
-        if (!cancelled) setModelToType(map);
-      })
-      .catch(() => {
-        /* model→type lookup is a UI nicety, not load-bearing */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const openModelRates = async (modelId: string) => {
+    let map = modelToType;
+    if (!(modelId in map)) {
+      try {
+        const fresh = await resolveModelToProviderType('models');
+        map = fresh;
+        setModelToType(fresh);
+      } catch {
+        /* fall through to the unscoped rates editor */
+      }
+    }
+    const type = map[modelId];
+    if (type) {
+      navigate(
+        `/config/providers.models/${encodeURIComponent(type)}?tab=costs`,
+      );
+    } else {
+      // No configured provider claims this model id; land on the
+      // standalone Rates view with the URL params hydrating the
+      // category so the operator can pick the right slot manually.
+      navigate(
+        `/config/cost?tab=rates&category=models&resource=${encodeURIComponent(modelId)}`,
+      );
+    }
+  };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="flex flex-col gap-6">
+      <div className="flex items-center gap-2">
+        <label className="text-xs uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+          Window
+        </label>
+        <select
+          value={range}
+          onChange={(e) => onRangeChange(e.target.value as CostRange)}
+          className="input-electric text-sm px-2 py-1 appearance-none cursor-pointer"
+        >
+          {COST_RANGE_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="card p-5 animate-slide-in-up">
         <div className="flex items-center gap-2 mb-5">
           <DollarSign className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
@@ -1569,7 +1624,7 @@ function CostTab({ cost }: { cost: CostSummary }) {
             className="text-sm font-semibold uppercase tracking-wider"
             style={{ color: 'var(--pc-text-primary)' }}
           >
-            Spend by agent · today
+            Spend by agent · {windowLabel}
           </h2>
         </div>
         {byAgent.length === 0 ? (
@@ -1604,14 +1659,12 @@ function CostTab({ cost }: { cost: CostSummary }) {
                     className="flex items-center gap-3 text-xs flex-wrap"
                     style={{ color: 'var(--pc-text-muted)' }}
                   >
-                    <span>{row.request_count} responses</span>
-                    <span>
-                      in {row.input_tokens.toLocaleString()}
-                      {row.cached_input_tokens > 0
-                        ? ` (${row.cached_input_tokens.toLocaleString()} cached)`
-                        : ''}
-                    </span>
-                    <span>out {row.output_tokens.toLocaleString()}</span>
+                    <span>{row.request_count} exchanges</span>
+                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
+                    {row.cached_input_tokens > 0 && (
+                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
+                    )}
+                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
                   </div>
                 </li>
               ))}
@@ -1626,65 +1679,54 @@ function CostTab({ cost }: { cost: CostSummary }) {
             className="text-sm font-semibold uppercase tracking-wider"
             style={{ color: 'var(--pc-text-primary)' }}
           >
-            Spend by model · today
+            Spend by model · {windowLabel}
           </h2>
         </div>
         {byModel.length === 0 ? (
           <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-            No model usage recorded today.
+            No model usage recorded in this window.
           </p>
         ) : (
           <ul className="space-y-2 text-sm">
             {byModel
               .slice()
               .sort((a, b) => b.cost_usd - a.cost_usd)
-              .map((row) => {
-                const type = modelToType[row.model];
-                const target = type
-                  ? `/config/providers.models/${encodeURIComponent(type)}?tab=costs`
-                  : `/config/cost?tab=rates`;
-                const label = type ? `models.${type}.${row.model}` : row.model;
-                return (
-                  <li
-                    key={row.model}
-                    className="flex flex-col gap-1 rounded-xl px-3 py-2"
-                    style={{ background: 'var(--pc-bg-elevated)' }}
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <Link
-                        to={target}
-                        className="font-mono break-all hover:underline"
-                        style={{ color: 'var(--pc-text-primary)' }}
-                        title={
-                          type
-                            ? `Open cost.rates.providers.models.${type}.${row.model}`
-                            : 'Open cost.rates editor'
-                        }
-                      >
-                        {label}
-                      </Link>
-                      <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-                        {formatUSD(row.cost_usd)}
-                      </span>
-                    </div>
-                    <div
-                      className="flex items-center gap-3 text-xs flex-wrap"
-                      style={{ color: 'var(--pc-text-muted)' }}
+              .map((row) => (
+                <li
+                  key={row.model}
+                  className="flex flex-col gap-1 rounded-xl px-3 py-2"
+                  style={{ background: 'var(--pc-bg-elevated)' }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void openModelRates(row.model)}
+                      className="font-mono break-all hover:underline text-left"
+                      style={{ color: 'var(--pc-text-primary)', background: 'transparent' }}
+                      title={`Open the rate sheet entry for ${row.model}`}
                     >
-                      <span>{row.request_count} responses</span>
-                      <span>
-                        in {row.input_tokens.toLocaleString()}
-                        {row.cached_input_tokens > 0
-                          ? ` (${row.cached_input_tokens.toLocaleString()} cached)`
-                          : ''}
-                      </span>
-                      <span>out {row.output_tokens.toLocaleString()}</span>
-                    </div>
-                  </li>
-                );
-              })}
+                      {row.model}
+                    </button>
+                    <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
+                      {formatUSD(row.cost_usd)}
+                    </span>
+                  </div>
+                  <div
+                    className="flex items-center gap-3 text-xs flex-wrap"
+                    style={{ color: 'var(--pc-text-muted)' }}
+                  >
+                    <span>{row.request_count} exchanges</span>
+                    <span>{row.input_tokens.toLocaleString()} input tokens</span>
+                    {row.cached_input_tokens > 0 && (
+                      <span>{row.cached_input_tokens.toLocaleString()} cached</span>
+                    )}
+                    <span>{row.output_tokens.toLocaleString()} output tokens</span>
+                  </div>
+                </li>
+              ))}
           </ul>
         )}
+      </div>
       </div>
     </div>
   );
