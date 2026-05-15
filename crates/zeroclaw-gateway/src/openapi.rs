@@ -65,7 +65,9 @@ pub fn build_spec() -> serde_json::Value {
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, SecretResponse,
     };
+    use crate::api_providers::{ProviderInfo, ProviderListResponse};
     use crate::api_slots::{SlotApproveRequest, SlotMessageRequest};
+    use crate::persona::{PersonaError, PersonaListResponse, PersonaPreset};
     use crate::slot::{
         Slot, SlotAgentConfig, SlotCreateRequest, SlotDuplicateRequest, SlotError,
         SlotListResponse, SlotMode, SlotPatchRequest, SlotResponse, SlotState, SlotUpdate,
@@ -104,6 +106,11 @@ pub fn build_spec() -> serde_json::Value {
             "SlotError":            schema_value::<SlotError>(),
             "SlotMessageRequest":   schema_value::<SlotMessageRequest>(),
             "SlotApproveRequest":   schema_value::<SlotApproveRequest>(),
+            "ProviderInfo":         schema_value::<ProviderInfo>(),
+            "ProviderListResponse": schema_value::<ProviderListResponse>(),
+            "PersonaPreset":        schema_value::<PersonaPreset>(),
+            "PersonaListResponse":  schema_value::<PersonaListResponse>(),
+            "PersonaError":         schema_value::<PersonaError>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -502,6 +509,93 @@ pub fn build_spec() -> serde_json::Value {
                     "404": {
                         "description": "Slot does not exist.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
+                    }
+                }
+            }
+        },
+        "/api/providers": {
+            "get": {
+                "tags": ["providers"],
+                "summary": "List configured model providers",
+                "description": "Returns one entry per configured `[providers.models.*]` section with id, human-readable display name, the provider entry's currently-configured model, and a `is_fallback` flag identifying the gateway's fallback. Empty list when no providers are configured. The slot settings drawer reads this to populate its provider dropdown.",
+                "responses": {
+                    "200": {
+                        "description": "Provider list (alphabetical by id).",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderListResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/personas": {
+            "get": {
+                "tags": ["personas"],
+                "summary": "List persona presets",
+                "description": "Returns every persona preset under `<workspace_dir>/personas/`, alphabetical by name. On first call against an empty/missing personas dir, the four bundled defaults (`claude-code-default`, `codex-researcher`, `gemini-cli-coder`, `bedrock-claude`) are seeded.",
+                "responses": {
+                    "200": {
+                        "description": "Persona preset list.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaListResponse" } } }
+                    }
+                }
+            },
+            "post": {
+                "tags": ["personas"],
+                "summary": "Create or overwrite a persona preset",
+                "description": "Upserts the persona keyed by `name` in the request body. Names are sandboxed via `[A-Za-z0-9._-]+` (1..=64 chars, no leading dot).",
+                "requestBody": {
+                    "required": true,
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Persona saved.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
+                    },
+                    "400": {
+                        "description": "Invalid persona name.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
+                    }
+                }
+            }
+        },
+        "/api/personas/{name}": {
+            "parameters": [{
+                "name": "name",
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" },
+                "description": "Persona name."
+            }],
+            "get": {
+                "tags": ["personas"],
+                "summary": "Read a persona preset by name",
+                "responses": {
+                    "200": {
+                        "description": "Persona body.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
+                    },
+                    "400": {
+                        "description": "Invalid persona name.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
+                    },
+                    "404": {
+                        "description": "Persona does not exist.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
+                    }
+                }
+            },
+            "delete": {
+                "tags": ["personas"],
+                "summary": "Delete a persona preset",
+                "responses": {
+                    "204": { "description": "Persona deleted." },
+                    "400": {
+                        "description": "Invalid persona name.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
+                    },
+                    "404": {
+                        "description": "Persona does not exist.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
                     }
                 }
             }

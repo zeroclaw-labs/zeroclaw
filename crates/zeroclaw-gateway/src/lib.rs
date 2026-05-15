@@ -13,9 +13,12 @@ pub mod api_config;
 pub mod api_onboard;
 pub mod api_pairing;
 pub mod api_personality;
+pub mod api_personas;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+pub mod api_providers;
 pub mod api_slots;
+pub mod persona;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 pub mod auth_rate_limit;
@@ -1307,6 +1310,22 @@ pub async fn run_gateway(
         .route(
             "/api/slots/{id}/approve",
             post(api_slots::handle_api_slots_approve),
+        )
+        // ── Providers list (M4a — slot agent config UI) ──
+        .route(
+            "/api/providers",
+            get(api_providers::handle_api_providers_list),
+        )
+        // ── Persona presets (M4a — slot agent config UI) ──
+        .route(
+            "/api/personas",
+            get(api_personas::handle_api_personas_list)
+                .post(api_personas::handle_api_personas_upsert),
+        )
+        .route(
+            "/api/personas/{name}",
+            get(api_personas::handle_api_personas_get)
+                .delete(api_personas::handle_api_personas_delete),
         )
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))

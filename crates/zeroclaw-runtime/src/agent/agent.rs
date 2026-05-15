@@ -71,6 +71,12 @@ pub struct Agent {
     /// `start_channels`; this is the alternate path for environments that
     /// build an Agent directly without `start_channels`.
     channel_handles: AgentChannelHandles,
+    /// Optional personality filename — restricts the prompt's identity
+    /// section to a single allowlisted file (e.g. `"SOUL.md"`) instead of
+    /// loading the full default set. Frozen at agent construction time;
+    /// used by the multi-session dashboard's slot agents (M4a) so each
+    /// slot speaks with the operator's chosen voice.
+    personality_override: Option<String>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -152,6 +158,7 @@ pub struct AgentBuilder {
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
+    personality_override: Option<String>,
 }
 
 impl Default for AgentBuilder {
@@ -190,6 +197,7 @@ impl AgentBuilder {
             activated_tools: None,
             hook_runner: None,
             approval_manager: None,
+            personality_override: None,
         }
     }
 
@@ -346,6 +354,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Restrict the prompt's identity section to a single allowlisted
+    /// personality filename (e.g. `"SOUL.md"`). When `None` the default
+    /// loader's full file set is used. See [`PromptContext`].
+    pub fn personality_override(mut self, filename: Option<String>) -> Self {
+        self.personality_override = filename;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -408,6 +424,7 @@ impl AgentBuilder {
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             channel_handles: AgentChannelHandles::default(),
+            personality_override: self.personality_override,
         })
     }
 }
@@ -583,6 +600,7 @@ impl Agent {
             session_cwd,
             McpSource::from_option(shared_mcp),
             false,
+            None,
         )
         .await
     }
@@ -602,6 +620,30 @@ impl Agent {
             session_cwd,
             McpSource::from_option(shared_mcp),
             true,
+            None,
+        )
+        .await
+    }
+
+    /// Backchannel-enabled constructor that pins a per-slot personality
+    /// override. The dashboard's [`SlotRegistry`] uses this so each warm
+    /// slot agent loads only its operator-selected personality file
+    /// (e.g. `"SOUL.md"`) into the prompt instead of the full default
+    /// set. Filename must be in
+    /// [`personality::EDITABLE_PERSONALITY_FILES`]; out-of-allowlist
+    /// values are silently ignored at prompt-build time.
+    pub async fn from_config_with_shared_mcp_backchannel_personality(
+        config: &Config,
+        session_cwd: Option<&Path>,
+        shared_mcp: Option<Arc<tools::McpRegistry>>,
+        personality_override: Option<String>,
+    ) -> Result<Self> {
+        Self::from_config_with_mcp_source_approval_mode(
+            config,
+            session_cwd,
+            McpSource::from_option(shared_mcp),
+            true,
+            personality_override,
         )
         .await
     }
@@ -621,6 +663,7 @@ impl Agent {
                 McpSource::Skip
             },
             approval_backchannel,
+            None,
         )
         .await
     }
@@ -636,6 +679,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         mcp_source: McpSource,
         approval_backchannel: bool,
+        personality_override: Option<String>,
     ) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -916,6 +960,7 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(approval_manager)))
+            .personality_override(personality_override)
             .build()?;
 
         agent.channel_handles = AgentChannelHandles {
@@ -985,6 +1030,7 @@ impl Agent {
             sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            personality_override: self.personality_override.as_deref(),
         };
         self.prompt_builder.build(&ctx)
     }

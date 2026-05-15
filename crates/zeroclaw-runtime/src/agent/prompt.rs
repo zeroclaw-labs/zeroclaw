@@ -29,6 +29,12 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// When `Some`, the [`IdentitySection`] loads only this filename out of
+    /// the [`personality::EDITABLE_PERSONALITY_FILES`] allowlist instead of
+    /// the default loader's full list. Used by the multi-session dashboard
+    /// to give each slot its own voice (M4a). Unknown filenames silently
+    /// fall back to the default loader.
+    pub personality_override: Option<&'a str>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -113,8 +119,25 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        // Use the personality module for structured file loading.
-        let profile = personality::load_personality(ctx.workspace_dir);
+        // Personality loading. Two contracts coexist intentionally:
+        //   - Default (no override): load the full PERSONALITY_FILES set
+        //     so identity + agent + memory layers all reach the prompt.
+        //   - Override set and allowlisted: load that one file and only
+        //     that one. Used by the multi-session dashboard so each slot
+        //     speaks with one voice the user picked.
+        // An override that names a filename outside EDITABLE_PERSONALITY_FILES
+        // is treated as if no override were set — the allowlist is the security
+        // contract, not a soft hint.
+        let profile = match ctx.personality_override {
+            Some(filename)
+                if personality::EDITABLE_PERSONALITY_FILES
+                    .iter()
+                    .any(|allowed| *allowed == filename) =>
+            {
+                personality::load_personality_files(ctx.workspace_dir, &[filename])
+            }
+            _ => personality::load_personality(ctx.workspace_dir),
+        };
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -367,6 +390,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let section = IdentitySection;
@@ -399,6 +423,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -421,6 +446,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -443,6 +469,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -488,6 +515,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -531,6 +559,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -560,6 +589,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -602,6 +632,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -637,6 +668,7 @@ mod tests {
 
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -673,6 +705,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -701,6 +734,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            personality_override: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -737,6 +771,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            personality_override: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -748,5 +783,86 @@ mod tests {
             output.contains("bypass oversight"),
             "supervised should include 'bypass oversight' instructions"
         );
+    }
+
+    /// M4a personality override: when `personality_override` names an
+    /// allowlisted file, IdentitySection loads only that file's content
+    /// — even if other personality files exist on disk. This is what
+    /// gives each dashboard slot its own voice.
+    #[test]
+    fn identity_section_personality_override_loads_only_named_file() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_persona_override_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "SOUL_VOICE_TOKEN").unwrap();
+        std::fs::write(workspace.join("IDENTITY.md"), "IDENTITY_VOICE_TOKEN").unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            personality_override: Some("SOUL.md"),
+        };
+
+        let output = IdentitySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("SOUL_VOICE_TOKEN"),
+            "override-named SOUL.md should be loaded into the identity section",
+        );
+        assert!(
+            !output.contains("IDENTITY_VOICE_TOKEN"),
+            "override should restrict to the single named file; IDENTITY.md must NOT appear",
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// M4a override allowlist contract: filenames outside
+    /// [`personality::EDITABLE_PERSONALITY_FILES`] do not narrow the
+    /// loader — the default file set is loaded as if no override were
+    /// set. The allowlist is the security boundary; an attacker-shaped
+    /// path like `../etc/passwd` cannot leak file contents through this
+    /// surface even if the slot's stored config has been tampered with.
+    #[test]
+    fn identity_section_personality_override_outside_allowlist_is_ignored() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_persona_outside_allowlist_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "SOUL_DEFAULT_TOKEN").unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            // Not in EDITABLE_PERSONALITY_FILES — allowlist drops it.
+            personality_override: Some("../etc/passwd"),
+        };
+
+        let output = IdentitySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("SOUL_DEFAULT_TOKEN"),
+            "out-of-allowlist override is ignored; the default loader \
+             (which knows SOUL.md) is used as if no override were set",
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

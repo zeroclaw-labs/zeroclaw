@@ -11,7 +11,7 @@
  * presentational state.
  */
 import { useState, type KeyboardEvent, type MouseEvent } from "react";
-import { Plus, Pencil, Copy, Trash2, Check, X } from "lucide-react";
+import { Plus, Pencil, Copy, Trash2, Check, X, Settings } from "lucide-react";
 import {
   useCreateSlot,
   useRenameSlot,
@@ -20,6 +20,8 @@ import {
   type SlotResponse,
 } from "@/chat/slotMutations";
 import { useSlotsQuery } from "@/chat/slotsQuery";
+import { PersonaBadge } from "@/chat/PersonaBadge";
+import { SettingsDrawer } from "@/settings/SettingsDrawer";
 
 interface SlotSidebarProps {
   activeSlotId?: string;
@@ -41,6 +43,10 @@ export function SlotSidebar({
   const duplicateSlot = useDuplicateSlot();
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [settingsSlotId, setSettingsSlotId] = useState<string | null>(null);
+  const settingsSlot =
+    (settingsSlotId && data?.slots.find((s) => s.id === settingsSlotId)) ||
+    null;
 
   const handleCreate = () => {
     createSlot.mutate(
@@ -170,6 +176,7 @@ export function SlotSidebar({
                     onRename={() => startRename(slot)}
                     onDuplicate={() => handleDuplicate(slot)}
                     onDelete={() => handleDelete(slot)}
+                    onOpenSettings={() => setSettingsSlotId(slot.id)}
                   />
                 )}
               </li>
@@ -177,6 +184,10 @@ export function SlotSidebar({
           })}
         </ul>
       )}
+      <SettingsDrawer
+        slot={settingsSlot}
+        onClose={() => setSettingsSlotId(null)}
+      />
     </div>
   );
 }
@@ -188,6 +199,7 @@ interface SlotRowProps {
   onRename: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
+  onOpenSettings: () => void;
 }
 
 function SlotRow({
@@ -197,6 +209,7 @@ function SlotRow({
   onRename,
   onDuplicate,
   onDelete,
+  onOpenSettings,
 }: SlotRowProps) {
   return (
     <div className="flex items-center gap-1">
@@ -207,7 +220,8 @@ function SlotRow({
         aria-current={isActive ? "page" : undefined}
       >
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate">{slot.title}</span>
+          <span className="truncate flex-1">{slot.title}</span>
+          <PersonaBadge config={slot.agent_config} />
           <SlotStateBadge state={slot.state} />
         </div>
         {slot.workspace ? (
@@ -220,6 +234,9 @@ function SlotRow({
         // selection from the parent button.
         onClick={(e) => e.stopPropagation()}
       >
+        <IconButton label="Slot settings" onClick={onOpenSettings}>
+          <Settings size={12} aria-hidden="true" />
+        </IconButton>
         <IconButton label="Rename slot" onClick={onRename}>
           <Pencil size={12} aria-hidden="true" />
         </IconButton>
