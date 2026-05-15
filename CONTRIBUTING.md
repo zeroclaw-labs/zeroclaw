@@ -59,7 +59,6 @@ Pre-push hook opt-ins (set the env var to enable for one push):
 | Variable | Effect |
 |---|---|
 | `ZEROCLAW_STRICT_LINT=1` | Strict lint pass on the full repo |
-| `ZEROCLAW_STRICT_DELTA_LINT=1` | Strict lint on changed Rust lines only |
 | `ZEROCLAW_DOCS_LINT=1` | Markdown gate on changed lines |
 | `ZEROCLAW_DOCS_LINKS=1` | Link check on added links only |
 

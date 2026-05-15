@@ -35,7 +35,7 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (full lint + test + build + strict delta) |
+| PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
@@ -51,8 +51,8 @@ deliberate tag push.
 
 1. Contributor opens or updates a PR targeting `master`.
 2. `ci.yml` runs:
-   - `lint` — `cargo fmt --all -- --check`, `cargo clippy -D warnings`,
-     `cargo check --features ci-all`, strict delta lint on changed lines
+   - `lint` — `cargo fmt --all -- --check`, `cargo clippy --workspace
+     --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
      (PRs only).
    - `build` — matrix across `x86_64-unknown-linux-gnu`,
      `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
@@ -109,7 +109,7 @@ for the full procedure. In summary:
 ```mermaid
 flowchart TD
   A["PR opened or updated → master"] --> B["ci.yml"]
-  B --> L["lint\nfmt · clippy · check-features · strict-delta"]
+  B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
   L --> BLD["build\nLinux · macOS · Windows"]
   L --> CHK["check\nall features · no default features"]

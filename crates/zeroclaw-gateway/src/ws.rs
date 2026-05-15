@@ -218,7 +218,8 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-    let mut memory_session_id = session_id.clone();
+    // Match the sanitized form persisted by memory backend migrations.
+    let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
@@ -284,7 +285,8 @@ async fn handle_socket(
                             "WebSocket connect params received"
                         );
                         if let Some(sid) = &cp.session_id {
-                            memory_session_id = sid.clone();
+                            memory_session_id =
+                                zeroclaw_api::session_keys::sanitize_session_key(sid);
                             debug!(
                                 session_id = sid,
                                 "WebSocket connect session override received"
@@ -727,9 +729,28 @@ async fn process_chat_message(
     // tool approval could neither be sent to the client nor answered before
     // the timeout fired.
     let forward_fut = async {
+        let mut cancel_drained = false;
         loop {
             tokio::select! {
                 biased;
+                // ── Cancellation arm ─────────────────────────────
+                // When `/abort` cancels the token, immediately drop every
+                // parked oneshot sender so any in-flight `request_approval`
+                // unblocks via the "sender dropped → deny" path in
+                // `WsApprovalChannel`. Without this, the approval future
+                // races only its own `timeout_secs` (default 120s) and
+                // ignores the cancel token, so the abort sits idle for up
+                // to two minutes before the tool loop even gets a chance
+                // to observe the cancellation.
+                _ = cancel_token.cancelled(), if !cancel_drained => {
+                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                    drop(drained);
+                    cancel_drained = true;
+                    // Fall through; the agent loop will now wake from the
+                    // approval await, see the cancel token, and propagate
+                    // a ToolLoopCancelled error which closes event_rx and
+                    // breaks this loop on the `event_rx.recv()` arm below.
+                }
                 client_msg = receiver.next() => {
                     // On client disconnect, `receiver.next()` returns `None`
                     // (stream end) or `Err(_)` repeatedly. A bare `continue`

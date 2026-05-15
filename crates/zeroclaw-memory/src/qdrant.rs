@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
+use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Qdrant vector database memory backend.
 ///
@@ -40,6 +42,9 @@ impl QdrantMemory {
 
         // Ensure collection exists with correct schema
         mem.ensure_collection().await?;
+        if mem.embedder.dimensions() > 0 {
+            mem.migrate_session_ids_to_sanitized().await?;
+        }
         mem.initialized.set(()).ok();
 
         Ok(mem)
@@ -73,6 +78,9 @@ impl QdrantMemory {
         self.initialized
             .get_or_try_init(|| async {
                 self.ensure_collection().await?;
+                if self.embedder.dimensions() > 0 {
+                    self.migrate_session_ids_to_sanitized().await?;
+                }
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
@@ -160,6 +168,107 @@ impl QdrantMemory {
         Ok(())
     }
 
+    /// One-shot, idempotent normalization of `payload.session_id`.
+    ///
+    /// Mirrors the SQLite-backed migration: rewrite rows that were persisted
+    /// before the orchestrator sanitized session keys at the source so the
+    /// new sanitized recall filter still matches them. Iterates the
+    /// collection with a paginated scroll, gathers distinct `session_id`
+    /// values, and issues one `set payload` per (old → new) pair where the
+    /// sanitized form differs from the stored one.
+    async fn migrate_session_ids_to_sanitized(&self) -> Result<()> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut next_offset: Option<serde_json::Value> = None;
+
+        loop {
+            let mut scroll_body = serde_json::json!({
+                "limit": 1000,
+                "with_payload": true,
+                "with_vector": false,
+            });
+            if let Some(ref offset) = next_offset {
+                scroll_body["offset"] = offset.clone();
+            }
+
+            let resp = self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/collections/{}/points/scroll", self.collection),
+                )
+                .json(&scroll_body)
+                .send()
+                .await
+                .context("failed to scroll Qdrant for session_id migration")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant scroll failed during migration ({status}): {text}");
+            }
+
+            let page: QdrantScrollResult = resp.json().await?;
+            for point in &page.result.points {
+                if let Some(ref payload) = point.payload
+                    && let Some(ref sid) = payload.session_id
+                {
+                    seen.insert(sid.clone());
+                }
+            }
+
+            match page.result.next_page_offset {
+                Some(offset) if !offset.is_null() => next_offset = Some(offset),
+                _ => break,
+            }
+        }
+
+        let mut rewritten = 0usize;
+        for old in &seen {
+            let new = sanitize_session_key(old);
+            if new == *old {
+                continue;
+            }
+
+            let body = serde_json::json!({
+                "payload": { "session_id": new },
+                "filter": {
+                    "must": [{
+                        "key": "session_id",
+                        "match": { "value": old }
+                    }]
+                }
+            });
+
+            let resp = self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/collections/{}/points/payload", self.collection),
+                )
+                .query(&[("wait", "true")])
+                .json(&body)
+                .send()
+                .await
+                .context("failed to set payload during Qdrant session_id migration")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant set payload failed during migration ({status}): {text}");
+            }
+
+            rewritten += 1;
+        }
+
+        if rewritten > 0 {
+            tracing::info!(
+                rewritten,
+                collection = %self.collection,
+                "Normalized session_id payload values in Qdrant collection to sanitized form"
+            );
+        }
+
+        Ok(())
+    }
+
     fn category_to_str(category: &MemoryCategory) -> String {
         match category {
             MemoryCategory::Core => "core".to_string(),
@@ -212,6 +321,8 @@ struct QdrantScrollResult {
 #[derive(Debug, Deserialize)]
 struct QdrantScrollPoints {
     points: Vec<QdrantPoint>,
+    #[serde(default)]
+    next_page_offset: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

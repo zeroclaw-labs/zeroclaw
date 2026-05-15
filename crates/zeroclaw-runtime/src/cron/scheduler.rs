@@ -1,7 +1,7 @@
+use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    due_jobs, next_run_for_schedule, record_last_run_with_status, record_run, remove_job,
-    reschedule_after_run_with_status, sync_declarative_jobs, update_job,
+    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
+    next_run_for_schedule, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -357,7 +357,10 @@ async fn run_agent_job(
         Err(e) => {
             // Purge memories written during this failed run so they don't
             // pollute future recall and cause context snowball.
-            let mem_session_key = format!("cli:{}", session_path.display());
+            let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                "cli:{}",
+                session_path.display()
+            ));
             if let Ok(mem) = zeroclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,
@@ -405,56 +408,61 @@ async fn persist_job_result(
         }
     }
 
-    let _ = record_run(
+    let action = if is_one_shot_auto_delete(job) && success {
+        RunCompletionAction::Delete
+    } else if matches!(job.schedule, Schedule::At { .. }) {
+        RunCompletionAction::Disable
+    } else {
+        RunCompletionAction::Reschedule
+    };
+
+    let job_state_at = Utc::now();
+    if let Err(e) = persist_run_result(
         config,
-        &job.id,
+        job,
         started_at,
         finished_at,
+        job_state_at,
         &persisted_status,
         Some(&persisted_output),
         duration_ms,
-    );
+        action,
+    ) {
+        tracing::warn!("Failed to persist scheduler run result: {e}");
 
-    if is_one_shot_auto_delete(job) {
-        if success {
-            if let Err(e) = remove_job(config, &job.id) {
-                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
-                // Fall back to disabling the job so it won't re-trigger.
-                let _ = update_job(
-                    config,
-                    &job.id,
-                    CronJobPatch {
-                        enabled: Some(false),
-                        ..CronJobPatch::default()
-                    },
+        if action == RunCompletionAction::Delete {
+            // Best-effort fallback for the legacy behavior: a successful
+            // auto-delete one-shot should not be picked up again if the
+            // combined history+state transaction fails while inserting or
+            // pruning the run row.
+            if let Err(disable_err) = persist_run_completion_state(
+                config,
+                job,
+                job_state_at,
+                &persisted_status,
+                Some(&persisted_output),
+                RunCompletionAction::Disable,
+            ) {
+                tracing::warn!(
+                    "Failed to disable one-shot cron job after history persistence failure: {disable_err}"
                 );
             }
         } else {
-            let _ = record_last_run_with_status(
+            // For recurring jobs and non-delete one-shots, keep the scheduler
+            // moving even if run-history persistence fails.
+            if let Err(state_err) = persist_run_completion_state(
                 config,
-                &job.id,
-                finished_at,
+                job,
+                job_state_at,
                 &persisted_status,
-                &persisted_output,
-            );
-            if let Err(e) = update_job(
-                config,
-                &job.id,
-                CronJobPatch {
-                    enabled: Some(false),
-                    ..CronJobPatch::default()
-                },
+                Some(&persisted_output),
+                action,
             ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
+                tracing::warn!(
+                    "Failed to update cron job state after history persistence failure: {state_err}"
+                );
             }
         }
-        return success;
-    }
-
-    if let Err(e) =
-        reschedule_after_run_with_status(config, job, &persisted_status, &persisted_output)
-    {
-        tracing::warn!("Failed to persist scheduler run result: {e}");
     }
 
     success
@@ -1108,6 +1116,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_job_result_uses_one_write_connection_for_recurring_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        crate::cron::store::reset_write_connection_count_for_tests(&config);
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+
+        assert!(success);
+        assert_eq!(
+            crate::cron::store::write_connection_count_for_tests(&config),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_prunes_run_history_and_updates_last_fields() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.cron.max_run_history = 2;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let base = Utc::now();
+
+        for idx in 0..3 {
+            let started = base + ChronoDuration::seconds(idx);
+            let finished = started + ChronoDuration::milliseconds(10);
+            let output = format!("run-{idx}");
+
+            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            assert!(success);
+        }
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].output.as_deref(), Some("run-2"));
+        assert_eq!(runs[1].output.as_deref(), Some("run-1"));
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert_eq!(updated.last_output.as_deref(), Some("run-2"));
+        assert!(updated.last_run.is_some());
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_rolls_back_run_history_when_job_state_update_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let original_next_run = job.next_run;
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let conn =
+            rusqlite::Connection::open(config.workspace_dir.join("cron").join("jobs.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_cron_job_update
+             BEFORE UPDATE ON cron_jobs
+             BEGIN
+                 SELECT RAISE(ABORT, 'blocked update');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+
+        assert!(success);
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.next_run, original_next_run);
+        assert!(stored.last_run.is_none());
+        assert!(stored.last_status.is_none());
+        assert!(stored.last_output.is_none());
+    }
+
+    #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1158,6 +1245,119 @@ mod tests {
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_uses_one_write_connection_for_failed_one_shot_disable() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_agent_job(
+            &config,
+            Some("one-shot".into()),
+            crate::cron::Schedule::At { at },
+            "Hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        crate::cron::store::reset_write_connection_count_for_tests(&config);
+        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+
+        assert!(!success);
+        assert_eq!(
+            crate::cron::store::write_connection_count_for_tests(&config),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_falls_back_to_state_update_when_history_prune_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.cron.max_run_history = 1;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        let original_next_run = job.next_run;
+        let seed_started = Utc::now() - ChronoDuration::minutes(20);
+        let seed_finished = seed_started + ChronoDuration::milliseconds(10);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let conn =
+            rusqlite::Connection::open(config.workspace_dir.join("cron").join("jobs.db")).unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                job.id,
+                seed_started.to_rfc3339(),
+                seed_finished.to_rfc3339(),
+                "seed",
+                "seed",
+                10,
+            ],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_cron_run_prune
+             BEFORE DELETE ON cron_runs
+             BEGIN
+                 SELECT RAISE(ABORT, 'blocked prune');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "seed");
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert_eq!(updated.last_output.as_deref(), Some("ok"));
+        assert!(updated.last_run.is_some());
+        assert!(updated.next_run >= original_next_run);
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_falls_back_to_disable_when_auto_delete_history_insert_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_once_at(&config, at, "echo one-shot-shell").unwrap();
+        assert!(job.delete_after_run);
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let conn =
+            rusqlite::Connection::open(config.workspace_dir.join("cron").join("jobs.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_cron_run_insert
+             BEFORE INSERT ON cron_runs
+             BEGIN
+                 SELECT RAISE(ABORT, 'blocked insert');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let updated = cron::get_job(&config, &job.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert_eq!(updated.last_output.as_deref(), Some("ok"));
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
     }
 
     #[tokio::test]

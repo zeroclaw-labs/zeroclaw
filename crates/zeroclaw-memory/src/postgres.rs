@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
@@ -138,7 +139,62 @@ impl PostgresMemory {
             "
         ))?;
 
+        Self::migrate_session_ids_to_sanitized(client, qualified_table)?;
+
         Ok(())
+    }
+
+    /// One-shot, idempotent normalization of `memories.session_id`.
+    ///
+    /// Mirrors the SQLite path: the orchestrator sanitizes session keys at
+    /// the source so the runtime HashMap, on-disk JSONL filename, and the
+    /// `session_id` filter for recall all agree. Rows written before that
+    /// fix retained the raw, un-sanitized form (e.g. `slack_C123_1.2_user one`)
+    /// and would be invisible to the new sanitized recall filter. Rewrite
+    /// them once at startup; later runs find nothing to update because
+    /// `sanitize_session_key` is idempotent.
+    fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
+        let select = format!(
+            "SELECT DISTINCT session_id FROM {qualified_table} WHERE session_id IS NOT NULL"
+        );
+        let rows = client.query(&select, &[])?;
+        let distinct: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+
+        let rewrites = Self::compute_session_id_rewrites(&distinct);
+        if rewrites.is_empty() {
+            return Ok(());
+        }
+
+        let update = format!("UPDATE {qualified_table} SET session_id = $1 WHERE session_id = $2");
+        let stmt = client.prepare(&update)?;
+        for (old, new) in &rewrites {
+            client.execute(&stmt, &[new, old])?;
+        }
+
+        tracing::info!(
+            rewritten = rewrites.len(),
+            "Normalized session_id values in memories table to sanitized form"
+        );
+
+        Ok(())
+    }
+
+    /// Pure plan of `(old, new)` `session_id` rewrites for the rows whose
+    /// stored value differs from its sanitized form. Extracted from
+    /// `migrate_session_ids_to_sanitized` so the rewrite logic is
+    /// unit-testable without a live PostgreSQL instance.
+    fn compute_session_id_rewrites(distinct: &[String]) -> Vec<(String, String)> {
+        distinct
+            .iter()
+            .filter_map(|old| {
+                let new = sanitize_session_key(old);
+                if new == *old {
+                    None
+                } else {
+                    Some((old.clone(), new))
+                }
+            })
+            .collect()
     }
 
     fn category_to_str(category: &MemoryCategory) -> String {
@@ -504,6 +560,68 @@ mod tests {
         assert!(
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    // ── session_id migration ──────────────────────────────────────
+    //
+    // End-to-end migration coverage requires a live PostgreSQL instance, and
+    // the crate's existing Postgres test suite does not run one in CI. The
+    // unit tests below exercise the rewrite plan against the same
+    // `sanitize_session_key` helper used by the migration SQL, which is
+    // sufficient to verify the contract that `migrate_session_ids_to_sanitized`
+    // relies on: which values change, which stay, and idempotence on re-run.
+
+    #[test]
+    fn rewrites_only_values_that_change_under_sanitization() {
+        let distinct = vec![
+            "slack_C123_1.2_user one".to_string(),
+            "already_sanitized".to_string(),
+            "whatsapp_123@g.us_alice".to_string(),
+            "abc-DEF_123".to_string(),
+        ];
+
+        let rewrites = PostgresMemory::compute_session_id_rewrites(&distinct);
+        assert_eq!(rewrites.len(), 2, "only the two raw forms need rewriting");
+
+        let by_old: std::collections::HashMap<_, _> = rewrites.into_iter().collect();
+        assert_eq!(
+            by_old.get("slack_C123_1.2_user one").map(String::as_str),
+            Some("slack_C123_1_2_user_one")
+        );
+        assert_eq!(
+            by_old.get("whatsapp_123@g.us_alice").map(String::as_str),
+            Some("whatsapp_123_g_us_alice")
+        );
+    }
+
+    #[test]
+    fn no_rewrites_when_all_values_already_sanitized() {
+        let distinct = vec![
+            "slack_C123_1_2_user_one".to_string(),
+            "abc-DEF_123".to_string(),
+            "".to_string(),
+        ];
+        let rewrites = PostgresMemory::compute_session_id_rewrites(&distinct);
+        assert!(
+            rewrites.is_empty(),
+            "no UPDATE should be issued when every value is already sanitized"
+        );
+    }
+
+    #[test]
+    fn rewrite_plan_is_idempotent_when_reapplied() {
+        let raw = "slack_C123_1.2_user one";
+        let sanitized = sanitize_session_key(raw);
+
+        let first = PostgresMemory::compute_session_id_rewrites(&[raw.to_string()]);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1, sanitized);
+
+        let second = PostgresMemory::compute_session_id_rewrites(&[sanitized]);
+        assert!(
+            second.is_empty(),
+            "re-running the plan over the rewritten value yields no further rewrite"
         );
     }
 }
