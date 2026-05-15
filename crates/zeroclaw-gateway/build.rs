@@ -70,6 +70,6 @@ fn ensure_embedded_web_dist_when_enabled() {
 
     assert!(
         web_dist.join("index.html").exists(),
-        "feature `embedded-web` requires `web/dist/index.html`; run: cd web && npm ci && npm run build"
+        "feature `embedded-web` requires `web/dist/index.html`; run: cargo web build"
     );
 }

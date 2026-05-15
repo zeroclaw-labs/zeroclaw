@@ -137,6 +137,54 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Synchronous variant of [`Self::load_profiles`] for callers outside
+    /// an async context. Walks `workspaces_dir` with `std::fs` instead of
+    /// `tokio::fs` so it can run during sync tool registration.
+    pub fn load_profiles_blocking(&mut self) -> Result<()> {
+        self.profiles.clear();
+
+        let dir = &self.workspaces_dir;
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("reading workspaces directory: {}", dir.display()))?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let profile_path = path.join("profile.toml");
+            if !profile_path.exists() {
+                continue;
+            }
+            match std::fs::read_to_string(&profile_path) {
+                Ok(contents) => match toml::from_str::<WorkspaceProfile>(&contents) {
+                    Ok(profile) => {
+                        self.profiles.insert(profile.name.clone(), profile);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping malformed workspace profile {}: {e}",
+                            profile_path.display()
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping unreadable workspace profile {}: {e}",
+                        profile_path.display()
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Switch to the named workspace. Returns an error if it does not exist.
     pub fn switch(&mut self, name: &str) -> Result<&WorkspaceProfile> {
         if !self.profiles.contains_key(name) {
@@ -363,6 +411,31 @@ mod tests {
         assert_eq!(mgr2.list(), vec!["loaded_ws"]);
         let profile = mgr2.get("loaded_ws").unwrap();
         assert_eq!(profile.name, "loaded_ws");
+    }
+
+    #[tokio::test]
+    async fn workspace_manager_load_profiles_blocking_matches_async() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = WorkspaceManager::new(tmp.path().to_path_buf());
+        mgr.create("ws_a").await.unwrap();
+        mgr.create("ws_b").await.unwrap();
+
+        let mut mgr2 = WorkspaceManager::new(tmp.path().to_path_buf());
+        mgr2.load_profiles_blocking().unwrap();
+
+        let mut names = mgr2.list();
+        names.sort();
+        assert_eq!(names, vec!["ws_a".to_string(), "ws_b".to_string()]);
+        assert_eq!(mgr2.get("ws_a").unwrap().name, "ws_a");
+    }
+
+    #[test]
+    fn workspace_manager_load_profiles_blocking_handles_missing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does_not_exist");
+        let mut mgr = WorkspaceManager::new(missing);
+        mgr.load_profiles_blocking().unwrap();
+        assert!(mgr.list().is_empty());
     }
 
     #[tokio::test]

@@ -27,21 +27,8 @@ impl CronUpdateTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         None
     }
@@ -151,12 +138,16 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
+                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook"],
                                     "description": "Channel type to deliver output to"
                                 },
                                 "to": {
                                     "type": "string",
-                                    "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                                    "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, webhook recipient, etc."
+                                },
+                                "thread_id": {
+                                    "type": "string",
+                                    "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
                                 },
                                 "best_effort": {
                                     "type": "boolean",
@@ -475,41 +466,27 @@ mod tests {
             .as_array()
             .expect("patch.delivery.channel must have an enum");
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        for ch in &["telegram", "discord", "slack", "mattermost", "matrix"] {
+        for ch in &[
+            "telegram",
+            "discord",
+            "slack",
+            "mattermost",
+            "matrix",
+            "qq",
+            "webhook",
+        ] {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }
-    }
 
-    #[tokio::test]
-    async fn blocks_update_when_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool
-            .execute(json!({
-                "job_id": job.id,
-                "patch": { "enabled": false }
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
+        // patch.delivery exposes thread_id so the webhook channel can route callbacks
+        // back to the originating conversation.
+        let delivery_props = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("patch.delivery must have properties");
         assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Rate limit exceeded")
+            delivery_props.contains_key("thread_id"),
+            "patch.delivery missing thread_id"
         );
-        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
     }
 
     #[tokio::test]

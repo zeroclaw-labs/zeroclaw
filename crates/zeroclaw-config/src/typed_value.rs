@@ -89,6 +89,24 @@ pub fn coerce_for_set_prop(
             ),
         )),
 
+        // Struct-shaped scalar (e.g. `Option<ModelPricing>`): JSON object
+        // expected. Field shape is validated by serde when `set_prop`
+        // deserializes back into the target type.
+        (Some(PropKind::Object), serde_json::Value::Object(_)) => serde_json::to_string(value)
+            .map_err(|e| {
+                ConfigApiError::new(
+                    ConfigApiCode::ValueTypeMismatch,
+                    format!("could not serialize JSON value: {e}"),
+                )
+            }),
+        (Some(PropKind::Object), other) => Err(ConfigApiError::new(
+            ConfigApiCode::ValueTypeMismatch,
+            format!(
+                "object field requires a JSON object; got {}",
+                json_type_name(other),
+            ),
+        )),
+
         // Bool fields.
         (Some(PropKind::Bool), serde_json::Value::Bool(b)) => Ok(b.to_string()),
         (Some(PropKind::Bool), serde_json::Value::String(s))

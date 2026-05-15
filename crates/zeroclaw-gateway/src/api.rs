@@ -116,6 +116,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "provider": config.providers.fallback,
         "model": state.model,
         "temperature": state.temperature,
@@ -355,7 +356,11 @@ pub async fn handle_api_cron_run(
         && let (Some(channel), Some(target)) =
             (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
         && let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
-            &config, channel, target, &output,
+            &config,
+            channel,
+            target,
+            job.delivery.thread_id.as_deref(),
+            &output,
         )
         .await
     {
@@ -574,17 +579,16 @@ pub async fn handle_api_integrations(
     }
 
     let config = state.config.lock().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations();
+    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
     let integrations: Vec<serde_json::Value> = entries
         .iter()
         .map(|entry| {
-            let status = (entry.status_fn)(&config);
             serde_json::json!({
                 "name": entry.name,
                 "description": entry.description,
                 "category": entry.category,
-                "status": status,
+                "status": entry.status,
             })
         })
         .collect();
@@ -602,21 +606,20 @@ pub async fn handle_api_integrations_settings(
     }
 
     let config = state.config.lock().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations();
+    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
     let mut settings = serde_json::Map::new();
     for entry in &entries {
-        let status = (entry.status_fn)(&config);
         let enabled = matches!(
-            status,
+            entry.status,
             zeroclaw_runtime::integrations::IntegrationStatus::Active
         );
         settings.insert(
-            entry.name.to_string(),
+            entry.name.clone(),
             serde_json::json!({
                 "enabled": enabled,
                 "category": entry.category,
-                "status": status,
+                "status": entry.status,
             }),
         );
     }

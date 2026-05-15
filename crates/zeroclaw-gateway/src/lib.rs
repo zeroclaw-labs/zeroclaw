@@ -30,6 +30,7 @@ pub mod tls;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
+pub mod ws_approval;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -57,10 +58,10 @@ use zeroclaw_channels::{
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
@@ -485,8 +486,13 @@ pub async fn run_gateway(
         )?);
     // Three-step model resolution mirroring agent::Agent::from_config (#6099):
     // (1) the fallback provider's `model`, (2) the first configured
-    // `[providers.models.*]` model with a WARN naming what to set, (3) hard
-    // fail with an actionable error. No silent vendor-default substitution.
+    // `[providers.models.*]` model with a WARN naming what to set, (3) leave
+    // the model empty so the gateway boots and the dashboard can complete
+    // browser-based onboarding at /onboard. The chat-dispatch path checks
+    // `state.model.is_empty()` and returns a structured needs-onboarding
+    // error before any provider call, so the original "no silent vendor-
+    // default substitution" guarantee from #6099 is preserved at request-
+    // time rather than at boot.
     let model = match fallback
         .and_then(|e| e.model.as_deref())
         .map(str::trim)
@@ -505,13 +511,14 @@ pub async fn run_gateway(
                 m
             }
             None => {
-                anyhow::bail!(
-                    "no model configured: providers.fallback = {:?} resolves with no model, \
-                     and no [providers.models.*] entry has a `model` field set. \
-                     Configure at least one [providers.models.<name>] model = \"...\" \
-                     before starting the gateway.",
-                    config.providers.fallback,
-                )
+                tracing::warn!(
+                    "Gateway booting without a configured model. Visit \
+                     http://{display_addr}/onboard to complete browser \
+                     onboarding. Chat endpoints will return 503 \
+                     needs_onboarding until at least one \
+                     [providers.models.<name>] model = \"...\" is set."
+                );
+                String::new()
             }
         },
     };
@@ -768,17 +775,28 @@ pub async fn run_gateway(
         .map(|gp| Arc::new(GmailPushChannel::new(gp.clone())));
 
     // ── Session persistence for WS chat ─────────────────────
+    // Routes through `make_session_backend` so `[channels].session_backend`
+    // is the single source of truth for which backend stores sessions.
+    // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
+    // to SQLite while channel + tool reads went to JSONL — the original
+    // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match SqliteSessionBackend::new(&config.workspace_dir) {
-            Ok(b) => {
-                tracing::info!("Gateway session persistence enabled (SQLite)");
+        match zeroclaw_infra::make_session_backend(
+            &config.workspace_dir,
+            &config.channels.session_backend,
+        ) {
+            Ok(backend) => {
+                tracing::info!(
+                    "Gateway session persistence enabled (backend={})",
+                    config.channels.session_backend,
+                );
                 if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = b.cleanup_stale(config.gateway.session_ttl_hours)
+                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
                     tracing::info!("Cleaned up {cleaned} stale gateway sessions");
                 }
-                Some(Arc::new(b))
+                Some(backend)
             }
             Err(e) => {
                 tracing::warn!("Session persistence disabled: {e}");
@@ -890,7 +908,14 @@ pub async fn run_gateway(
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
+        println!(
+            "     To pair a new device: {}",
+            format_paircode_recovery_command(host, actual_port)
+        );
+        println!(
+            "     Fallback: {}",
+            format_paircode_recovery_curl(host, actual_port, pfx)
+        );
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
@@ -928,13 +953,23 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Wrap observer with broadcast capability for SSE
-    let broadcast_observer: Arc<dyn zeroclaw_runtime::observability::Observer> =
-        Arc::new(sse::BroadcastObserver::new(
-            zeroclaw_runtime::observability::create_observer(&config.observability),
-            event_tx.clone(),
-            event_buffer.clone(),
-        ));
+    // Install the SSE broadcast hook before building any observer so that
+    // events emitted by the agent's per-call observer (built inside
+    // `process_message`) also reach `/api/events`. The state-level observer
+    // is just the configured backend — `TeeObserver` (created by
+    // `create_observer`) tees its events into the hook automatically.
+    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
+        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
+    );
+    zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
+
+    // Bound into AppState. Not a broadcaster — the broadcaster is the
+    // `broadcast_layer` installed above as the global hook. This is the
+    // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
+    // which tees events into the hook on every record.
+    let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+        zeroclaw_runtime::observability::create_observer(&config.observability),
+    );
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -978,7 +1013,7 @@ pub async fn run_gateway(
         nextcloud_talk_webhook_secret,
         wati: wati_channel,
         gmail_push: gmail_push_channel,
-        observer: broadcast_observer,
+        observer: state_observer,
         tools_registry,
         cost_tracker,
         event_tx,
@@ -1131,6 +1166,10 @@ pub async fn run_gateway(
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
         .route("/api/devices", get(api_pairing::list_devices))
+        .route(
+            "/api/devices/me/capabilities",
+            post(api_pairing::update_my_capabilities),
+        )
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
         .route(
             "/api/devices/{id}/token/rotate",
@@ -1314,6 +1353,26 @@ pub async fn run_gateway(
     Ok(())
 }
 
+fn format_paircode_recovery_command(host: &str, port: u16) -> String {
+    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
+    if let Some(host_arg) = paircode_recovery_host_arg(host) {
+        cmd.push_str(" --host ");
+        cmd.push_str(host_arg);
+    }
+    cmd
+}
+
+fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
+    match host {
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
+        _ => Some(host),
+    }
+}
+
+fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1342,20 +1401,12 @@ fn prometheus_disabled_hint() -> String {
 fn prometheus_observer_from_state(
     observer: &dyn zeroclaw_runtime::observability::Observer,
 ) -> Option<&zeroclaw_runtime::observability::PrometheusObserver> {
+    // `TeeObserver::as_any` returns the primary observer, so a single direct
+    // downcast finds the PrometheusObserver whether the state observer is the
+    // raw backend or wrapped by the factory tee.
     observer
         .as_any()
         .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-        .or_else(|| {
-            observer
-                .as_any()
-                .downcast_ref::<sse::BroadcastObserver>()
-                .and_then(|broadcast| {
-                    broadcast
-                        .inner()
-                        .as_any()
-                        .downcast_ref::<zeroclaw_runtime::observability::PrometheusObserver>()
-                })
-        })
 }
 
 /// GET /metrics — Prometheus text exposition format
@@ -1475,31 +1526,124 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
+/// Result of a gateway chat turn. Carries the response text plus per-turn
+/// token / cost totals captured from the cost-tracking scope (when present)
+/// so callers can populate observer-event annotations without racing
+/// concurrent webhook traffic that shares the same `CostTracker`.
+struct GatewayChatOutcome {
+    response: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
+/// Returns a structured `needs_onboarding` error when `model` is empty
+/// or whitespace-only, otherwise `None`. Empty model means the gateway
+/// booted with nothing configured (fresh install). Callers refuse the
+/// dispatch with this marker instead of calling the provider with an
+/// empty model id. Mirrors `agent::Agent::from_config` (#6099) at
+/// request-time so `/onboard` stays reachable.
+fn needs_onboarding_for(model: &str) -> Option<anyhow::Error> {
+    if model.trim().is_empty() {
+        Some(anyhow::anyhow!(
+            "needs_onboarding: gateway has no model configured. Complete \
+             browser onboarding at /onboard, or set [providers.models.<name>] \
+             model = \"...\" before sending messages."
+        ))
+    } else {
+        None
+    }
+}
+
+/// True when `e` carries the marker produced by `needs_onboarding_for`.
+/// Used by chat-dispatch error paths to map the marker to a 503
+/// `needs_onboarding` HTTP response or a more accurate channel-side
+/// reply, instead of the generic 500 / "sorry" catch-all.
+fn is_needs_onboarding_err(e: &anyhow::Error) -> bool {
+    e.to_string().contains("needs_onboarding")
+}
+
+/// Reply text sent over a channel SDK when chat dispatch refuses
+/// because the gateway has no model configured. Resolved through the
+/// shared Fluent catalog (`channel-needs-onboarding-reply` in
+/// `crates/zeroclaw-runtime/locales/<locale>/cli.ftl`) so non-English
+/// operators see localized text instead of a Rust-side English literal.
+fn needs_onboarding_channel_reply() -> String {
+    i18n::get_required_cli_string("channel-needs-onboarding-reply")
+}
+
 /// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GatewayChatOutcome> {
+    if let Some(err) = needs_onboarding_for(&state.model) {
+        return Err(err);
+    }
+
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock provider directly
-    // instead of bootstrapping the full agent runtime.
+    // instead of bootstrapping the full agent runtime. The mock path
+    // doesn't go through the cost-tracking scope, so usage stays None.
     #[cfg(test)]
     {
         let _ = session_id;
-        return state
+        let response = state
             .provider
             .chat_with_system(None, message, &state.model, Some(state.temperature))
-            .await;
+            .await?;
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+        })
     }
 
     #[cfg(not(test))]
     {
         let config = state.config.lock().clone();
-        Box::pin(zeroclaw_runtime::agent::process_message(
-            config, message, session_id,
-        ))
-        .await
+        // Scope the cost tracking context so per-LLM-call usage flows into the
+        // gateway's cost tracker and costs.jsonl. Without this scope, the
+        // tracker exists on AppState but never receives any records from the
+        // runtime tool loop. The context's per-scope `turn_usage` accumulator
+        // also lets us read out this turn's tokens / cost after the scope
+        // exits without racing concurrent webhook traffic that shares the
+        // same tracker.
+        let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(state.config.lock().cost.prices.clone()),
+            )
+        });
+        let captured_usage = cost_tracking_context
+            .as_ref()
+            .map(|ctx| ctx.turn_usage.clone());
+        let response = Box::pin(
+            zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                cost_tracking_context,
+                zeroclaw_runtime::agent::process_message(config, message, session_id),
+            ),
+        )
+        .await?;
+        let usage = captured_usage
+            .map(|cell| *cell.lock())
+            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+        let (input_tokens, output_tokens, cost_usd) = match usage {
+            Some(u) => (
+                Some(u.input_tokens),
+                Some(u.output_tokens),
+                Some(u.cost_usd),
+            ),
+            None => (None, None, None),
+        };
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        })
     }
 }
 
@@ -1640,8 +1784,22 @@ async fn handle_webhook(
     );
 
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await {
-        Ok(response) => {
+        Ok(GatewayChatOutcome {
+            response,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        }) => {
             let duration = started_at.elapsed();
+            // Per-turn token / cost annotation captured from the cost-tracking
+            // scope inside `run_gateway_chat_with_tools` (None outside of test
+            // / when no LLM call recorded). Cost is also persisted to
+            // /api/cost and costs.jsonl via the same scope.
+            let tokens_used = input_tokens
+                .zip(output_tokens)
+                .map(|(i, o)| i + o)
+                .or(input_tokens)
+                .or(output_tokens);
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
@@ -1661,8 +1819,8 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used: None,
-                    cost_usd: None,
+                    tokens_used,
+                    cost_usd,
                 },
             );
 
@@ -1703,9 +1861,21 @@ async fn handle_webhook(
                 },
             );
 
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            if is_needs_onboarding_err(&e) {
+                tracing::warn!(
+                    "Webhook chat refused: gateway has no model configured; \
+                     visit /onboard"
+                );
+                let body = serde_json::json!({
+                    "error": "needs_onboarding",
+                    "url": "/onboard"
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+            } else {
+                tracing::error!("Webhook provider error: {}", sanitized);
+                let err = serde_json::json!({"error": "LLM request failed"});
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            }
         }
     }
 }
@@ -1867,7 +2037,7 @@ async fn handle_whatsapp_message(
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1877,13 +2047,17 @@ async fn handle_whatsapp_message(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WhatsApp chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for WhatsApp message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -1987,7 +2161,7 @@ async fn handle_linq_webhook(
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1997,13 +2171,17 @@ async fn handle_linq_webhook(
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "Linq chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for Linq message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2102,7 +2280,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         ))
         .await
         {
-            Ok(response) => {
+            Ok(GatewayChatOutcome { response, .. }) => {
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -2112,13 +2290,17 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                 }
             }
             Err(e) => {
-                tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
+                let reply = if is_needs_onboarding_err(&e) {
+                    tracing::warn!(
+                        "WATI chat refused: gateway has no model configured; \
+                         visit /onboard"
+                    );
+                    needs_onboarding_channel_reply()
+                } else {
+                    tracing::error!("LLM error for WATI message: {e:#}");
+                    "Sorry, I couldn't process your message right now.".to_string()
+                };
+                let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -2190,52 +2372,66 @@ async fn handle_nextcloud_talk_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    for msg in &messages {
-        tracing::info!(
-            "Nextcloud Talk message from {}: {}",
-            msg.sender,
-            truncate_with_ellipsis(&msg.content, 50)
-        );
-        let session_id = sender_session_id("nextcloud_talk", msg);
+    // Spawn per-message processing so the webhook returns 200 quickly.
+    // Nextcloud Talk cancels webhook requests that don't complete within ~5s
+    // (see #6156); slow local models routinely exceed that. Each message gets
+    // its own task — the LLM call and reply are independent of the ack.
+    for msg in messages {
+        let state = state.clone();
+        let nextcloud_talk = Arc::clone(nextcloud_talk);
+        tokio::spawn(async move {
+            tracing::info!(
+                "Nextcloud Talk message from {}: {}",
+                msg.sender,
+                truncate_with_ellipsis(&msg.content, 50)
+            );
+            let session_id = sender_session_id("nextcloud_talk", &msg);
 
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = nextcloud_talk_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        match Box::pin(run_gateway_chat_with_tools(
-            &state,
-            &msg.content,
-            Some(&session_id),
-        ))
-        .await
-        {
-            Ok(response) => {
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
+            if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
+                let key = nextcloud_talk_memory_key(&msg);
+                let _ = state
+                    .mem
+                    .store(
+                        &key,
+                        &msg.content,
+                        MemoryCategory::Conversation,
+                        Some(&session_id),
+                    )
                     .await;
             }
-        }
+
+            match Box::pin(run_gateway_chat_with_tools(
+                &state,
+                &msg.content,
+                Some(&session_id),
+            ))
+            .await
+            {
+                Ok(GatewayChatOutcome { response, .. }) => {
+                    if let Err(e) = nextcloud_talk
+                        .send(&SendMessage::new(response, &msg.reply_target))
+                        .await
+                    {
+                        tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    let reply = if is_needs_onboarding_err(&e) {
+                        tracing::warn!(
+                            "Nextcloud Talk chat refused: gateway has no model configured; \
+                             visit /onboard"
+                        );
+                        needs_onboarding_channel_reply()
+                    } else {
+                        tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
+                        "Sorry, I couldn't process your message right now.".to_string()
+                    };
+                    let _ = nextcloud_talk
+                        .send(&SendMessage::new(reply, &msg.reply_target))
+                        .await;
+                }
+            }
+        });
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
@@ -2533,6 +2729,38 @@ mod tests {
     }
 
     #[test]
+    fn paircode_recovery_command_includes_alternate_port() {
+        assert_eq!(
+            format_paircode_recovery_command("127.0.0.1", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_specific_host_when_needed() {
+        assert_eq!(
+            format_paircode_recovery_command("192.168.1.20", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_targets_running_instance() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_path_prefix() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[test]
     fn gateway_timeout_falls_back_to_default() {
         // When env var is not set, should return the default constant
         // SAFETY: test-only, single-threaded test runner.
@@ -2644,18 +2872,13 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let event_tx = tokio::sync::broadcast::channel(16).0;
-        let event_buffer = Arc::new(sse::EventBuffer::new(16));
-        let wrapped = sse::BroadcastObserver::new(
-            Box::new(zeroclaw_runtime::observability::PrometheusObserver::new()),
-            event_tx.clone(),
-            event_buffer,
-        );
+        let prom = zeroclaw_runtime::observability::PrometheusObserver::new();
         zeroclaw_runtime::observability::Observer::record_event(
-            &wrapped,
+            &prom,
             &zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick,
         );
 
-        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(wrapped);
+        let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
@@ -3641,6 +3864,124 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
+    // Regression for #6156: handler must return 200 OK before the (potentially
+    // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
+    // request at its ~5s timeout.
+    #[derive(Default)]
+    struct SlowProvider {
+        calls: AtomicUsize,
+        started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Provider for SlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.started_tx.lock().take() {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("slow ok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider_impl = Arc::new(SlowProvider {
+            calls: AtomicUsize::new(0),
+            started_tx: Mutex::new(Some(started_tx)),
+        });
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            String::new(),
+            vec!["*".into()],
+        ));
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: Some(channel),
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let start = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_nextcloud_talk_webhook(
+                State(state),
+                HeaderMap::new(),
+                Bytes::from(body),
+            )),
+        )
+        .await
+        .expect("webhook must return before 2s deadline (regression #6156)")
+        .into_response();
+
+        let elapsed = start.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler returned after {elapsed:?}; expected fast return for #6156"
+        );
+
+        // Confirm the spawned task actually started the LLM call (i.e., the
+        // ack didn't just skip processing). The 30s sleep is still in flight.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("spawned LLM call did not start within 2s")
+            .expect("started_tx sender was dropped");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
     // ══════════════════════════════════════════════════════════
     // WhatsApp Signature Verification Tests (CWE-345 Prevention)
     // ══════════════════════════════════════════════════════════
@@ -4056,5 +4397,92 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_empty_model() {
+        let err =
+            needs_onboarding_for("").expect("empty model must produce a needs_onboarding error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs_onboarding"),
+            "error must carry the needs_onboarding marker for callers to map to 503; got: {msg}"
+        );
+        assert!(
+            msg.contains("/onboard"),
+            "error must point the user at /onboard; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_flags_whitespace_only_model() {
+        assert!(
+            needs_onboarding_for("   ").is_some(),
+            "whitespace-only model must be treated as empty"
+        );
+        assert!(
+            needs_onboarding_for("\n\t ").is_some(),
+            "tabs and newlines count as empty too"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_for_passes_real_model() {
+        assert!(
+            needs_onboarding_for("anthropic/claude-sonnet-4").is_none(),
+            "a real model id must not be flagged"
+        );
+        assert!(
+            needs_onboarding_for("  gpt-4  ").is_none(),
+            "leading/trailing whitespace around a real model id must not be flagged"
+        );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_marker_from_helper() {
+        let err = needs_onboarding_for("").expect("empty model produces marker");
+        assert!(
+            is_needs_onboarding_err(&err),
+            "the marker emitted by needs_onboarding_for must be detected"
+        );
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("upstream timeout: provider returned 504");
+        assert!(
+            !is_needs_onboarding_err(&err),
+            "unrelated errors must not be misclassified as needs_onboarding"
+        );
+        let err = anyhow::anyhow!("invalid api key");
+        assert!(!is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn is_needs_onboarding_err_detects_via_substring() {
+        // Defends the contract that the substring marker is the
+        // detection key — not the exact string. Wrappers (e.g.
+        // anyhow::Error::context) must not break the check.
+        let err = anyhow::anyhow!("provider call failed").context("needs_onboarding: empty model");
+        assert!(is_needs_onboarding_err(&err));
+    }
+
+    #[test]
+    fn needs_onboarding_channel_reply_resolves_via_fluent() {
+        // The Fluent key channel-needs-onboarding-reply must resolve
+        // to real text from the embedded en/cli.ftl, not the missing-
+        // key fallback `{channel-needs-onboarding-reply}` that
+        // `missing_cli_string` produces. Guarding this in a test
+        // keeps the i18n contract from quietly drifting if the key
+        // gets renamed in lib.rs without a matching ftl edit.
+        let reply = needs_onboarding_channel_reply();
+        assert!(
+            !reply.starts_with('{') && !reply.ends_with('}'),
+            "fluent missing-key fallback leaked into channel reply: {reply:?}"
+        );
+        assert!(
+            reply.to_lowercase().contains("onboarding"),
+            "channel reply must mention onboarding so users know what's missing: {reply:?}"
+        );
     }
 }

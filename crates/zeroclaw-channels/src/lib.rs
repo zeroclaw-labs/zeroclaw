@@ -1,5 +1,7 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
+
 pub mod orchestrator;
 pub mod util;
 

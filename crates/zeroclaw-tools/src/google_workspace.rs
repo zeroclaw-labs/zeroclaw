@@ -384,7 +384,12 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
-        let mut cmd = tokio::process::Command::new("gws");
+        // Resolve `gws` via PATH so Windows `.cmd` shims (e.g. npm-installed
+        // `gws.cmd`) are picked up — `Command::new` on Windows does not append
+        // PATHEXT itself. Falls back to bare "gws" so the not-found error path
+        // below still fires when the binary is genuinely missing.
+        let gws_path: std::path::PathBuf = which::which("gws").unwrap_or_else(|_| "gws".into());
+        let mut cmd = tokio::process::Command::new(gws_path);
         cmd.args(&cmd_args);
         cmd.env_clear();
         // gws needs PATH to find itself and HOME/APPDATA for credential storage
@@ -482,6 +487,16 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    // Regression for #6410: PATH resolution must produce a usable PathBuf
+    // even when `gws` is not installed, so the executor can still emit the
+    // documented "Failed to execute gws" error rather than panicking.
+    #[test]
+    fn gws_path_resolution_falls_back_when_not_on_path() {
+        let resolved: std::path::PathBuf =
+            which::which("definitely-not-a-real-binary-zc6410").unwrap_or_else(|_| "gws".into());
+        assert_eq!(resolved.as_os_str(), "gws");
     }
 
     #[test]

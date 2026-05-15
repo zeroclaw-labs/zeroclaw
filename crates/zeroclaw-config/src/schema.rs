@@ -603,15 +603,56 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Per-provider input/output token pricing (USD per 1M tokens). When set,
+    /// merged into the cost-tracking lookup at `<provider_id>/<model>` so the
+    /// budget surface attributes spend correctly even when the same model is
+    /// served by different providers at different rates. Top-level
+    /// `[cost.prices.<key>]` entries continue to take precedence on conflict;
+    /// this field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
     /// Currently consulted only by the Groq factory, which defaults to
     /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400 (#5848). Setting `native_tools = true` re-enables
-    /// native tool calling for Groq models that support it.
+    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
+    /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Enable or disable chain-of-thought thinking for models that support it
+    /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
+    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
+    /// in the request body; mirrors the Ollama provider's `think` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
+    /// in the request body (llama.cpp-specific). Use this to pass model-family
+    /// template variables that control behaviour not exposed by other fields.
+    /// Example (Qwen3 thinking suppression):
+    ///   `chat_template_kwargs = { enable_thinking = false }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override the Ollama `num_ctx` (context window, in tokens) sent on
+    /// every `/api/chat` request. Only consulted when this profile resolves
+    /// to the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_CTX`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_ctx: Option<u32>,
+    /// Override the Ollama `num_predict` (max output tokens) sent on every
+    /// `/api/chat` request. Only consulted when this profile resolves to
+    /// the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `Provider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins — full
+    /// backward compatibility. Only consulted when this profile
+    /// resolves to the `ollama` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_temperature_override: Option<f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1594,6 +1635,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
 
+    /// Channel reply-intent precheck configuration (model override, timeout).
+    #[nested]
+    #[serde(default)]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Maximum characters for a single tool result before truncation.
     /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
     /// middle. Set to `0` to disable truncation. Default: `50000`.
@@ -1659,6 +1705,7 @@ impl Default for AgentConfig {
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
@@ -1890,11 +1937,30 @@ impl Default for PipelineConfig {
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
+///
+/// # Privacy and cost note
+///
+/// Tool results that print real local image paths (e.g. shell tools doing
+/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
+/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
+/// This means image bytes that previously stayed local will be uploaded to
+/// the configured provider when surfaced by a tool.
+///
+/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
+/// image budget, but operators running shell-style tools over directories of
+/// personal or sensitive images should be aware of the upload semantics. See
+/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
+    ///
+    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older images are
+    /// dropped first when the cumulative count exceeds this limit. Acts as
+    /// the upper bound on per-turn upload cost when tool outputs surface
+    /// local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -2764,6 +2830,12 @@ impl Default for BrowserComputerUseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Browser",
+    description = "Chrome/Chromium control",
+    status_field = "enabled"
+)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default = "default_true")]
@@ -3427,6 +3499,12 @@ pub struct GoogleWorkspaceAllowedOperation {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "google-workspace"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Google Workspace",
+    description = "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+    status_field = "enabled"
+)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
@@ -5838,7 +5916,7 @@ pub struct AutonomyConfig {
     /// Extra directory roots the agent may read/write outside the workspace.
     /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
-    #[serde(default)]
+    #[serde(default, alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
 
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
@@ -6367,6 +6445,12 @@ impl Default for HeartbeatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Cron",
+    description = "Scheduled tasks",
+    status_field = "enabled"
+)]
 pub struct CronConfig {
     /// Enable the cron subsystem. Default: `true`.
     #[serde(default = "default_true")]
@@ -6465,6 +6549,11 @@ pub struct DeliveryConfigDecl {
     /// Target/recipient identifier.
     #[serde(default)]
     pub to: Option<String>,
+    /// Optional thread/conversation identifier carried into the outbound send.
+    /// Required by channels that route on a separate `thread_id` field (e.g.
+    /// webhook callbacks bridging into agent-chat platforms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
@@ -6694,103 +6783,169 @@ pub struct ChannelsConfig {
     pub cli: bool,
     /// Telegram bot channel configuration.
     #[nested]
+    #[display_name = "Telegram"]
+    #[description = "Bot API — long-polling"]
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
     #[nested]
+    #[display_name = "Discord"]
+    #[description = "Servers, channels & DMs"]
     pub discord: Option<DiscordConfig>,
     /// Discord history channel — logs ALL messages and forwards @mentions to agent.
     #[nested]
+    #[display_name = "Discord History"]
+    #[description = "Logs all messages, forwards mentions to the agent"]
     pub discord_history: Option<DiscordHistoryConfig>,
     /// Slack bot channel configuration.
     #[nested]
+    #[display_name = "Slack"]
+    #[description = "Workspace apps via Web API"]
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration.
     #[nested]
+    #[display_name = "Mattermost"]
+    #[description = "Self-hosted team chat"]
     pub mattermost: Option<MattermostConfig>,
     /// Webhook channel configuration.
     #[nested]
+    #[display_name = "Webhooks"]
+    #[description = "HTTP endpoint for triggers"]
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     #[nested]
+    #[display_name = "iMessage"]
+    #[description = "macOS AppleScript bridge"]
     pub imessage: Option<IMessageConfig>,
     /// Matrix channel configuration.
     #[nested]
+    #[display_name = "Matrix"]
+    #[description = "Matrix protocol (Element)"]
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
     #[nested]
+    #[display_name = "Signal"]
+    #[description = "Privacy-focused via signal-cli"]
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     #[nested]
+    #[display_name = "WhatsApp"]
+    #[description = "Meta Cloud API or Web mode"]
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     #[nested]
+    #[display_name = "Linq"]
+    #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
+    #[display_name = "WATI"]
+    #[description = "WhatsApp Business API gateway"]
     pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     #[nested]
+    #[display_name = "Nextcloud Talk"]
+    #[description = "Self-hosted Nextcloud chat"]
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     #[nested]
+    #[display_name = "Email"]
+    #[description = "IMAP / SMTP inbox bridge"]
     pub email: Option<crate::scattered_types::EmailConfig>,
     /// Gmail Pub/Sub push notification channel configuration.
     #[nested]
+    #[display_name = "Gmail Push"]
+    #[description = "Pub/Sub push notifications for Gmail"]
     pub gmail_push: Option<crate::scattered_types::GmailPushConfig>,
     /// IRC channel configuration.
     #[nested]
+    #[display_name = "IRC"]
+    #[description = "Classic IRC with SASL / NickServ"]
     pub irc: Option<IrcConfig>,
     /// Lark channel configuration.
     #[nested]
+    #[display_name = "Lark"]
+    #[description = "ByteDance Lark / Feishu international"]
     pub lark: Option<LarkConfig>,
     /// LINE Messaging API channel configuration.
     #[nested]
+    #[display_name = "LINE"]
+    #[description = "LINE Messaging API"]
     pub line: Option<LineConfig>,
     /// Feishu channel configuration.
     #[nested]
+    #[display_name = "Feishu"]
+    #[description = "ByteDance Feishu (China)"]
     pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     #[nested]
+    #[display_name = "DingTalk"]
+    #[description = "DingTalk Stream Mode"]
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     #[nested]
+    #[display_name = "WeCom"]
+    #[description = "WeChat Enterprise Bot Webhook"]
     pub wecom: Option<WeComConfig>,
     /// WeChat personal iLink Bot channel configuration (QR code login).
     #[nested]
+    #[display_name = "WeChat"]
+    #[description = "WeChat personal iLink Bot (QR login)"]
     pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     #[nested]
+    #[display_name = "QQ Official"]
+    #[description = "Tencent QQ Bot SDK"]
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
     #[nested]
+    #[display_name = "X / Twitter"]
+    #[description = "X / Twitter API"]
     pub twitter: Option<TwitterConfig>,
     /// Mochat customer service channel configuration.
     #[nested]
+    #[display_name = "Mochat"]
+    #[description = "Mochat customer service"]
     pub mochat: Option<MochatConfig>,
     #[cfg(feature = "channel-nostr")]
     #[nested]
+    #[display_name = "Nostr"]
+    #[description = "Decentralized DMs (NIP-04)"]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     #[nested]
+    #[display_name = "ClawdTalk"]
+    #[description = "ClawdTalk voice channel"]
     pub clawdtalk: Option<crate::scattered_types::ClawdTalkConfig>,
     /// Reddit channel configuration (OAuth2 bot).
     #[nested]
+    #[display_name = "Reddit"]
+    #[description = "Reddit OAuth2 bot"]
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
+    #[display_name = "Bluesky"]
+    #[description = "Bluesky / AT Protocol"]
     pub bluesky: Option<BlueskyConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
+    #[display_name = "Voice Call"]
+    #[description = "Twilio / Telnyx / Plivo voice calls"]
     pub voice_call: Option<crate::scattered_types::VoiceCallConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     #[nested]
+    #[display_name = "Voice Wake"]
+    #[description = "Local wake-word detection"]
     pub voice_wake: Option<VoiceWakeConfig>,
     /// Voice duplex configuration (full-duplex voice over WebSocket).
     #[nested]
+    #[display_name = "Voice Duplex"]
+    #[description = "Full-duplex voice over WebSocket"]
     pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
+    #[display_name = "MQTT"]
+    #[description = "MQTT SOP listener"]
     pub mqtt: Option<MqttConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
@@ -7774,6 +7929,17 @@ pub struct NextcloudTalkConfig {
     /// If not set, defaults to an empty string (no self-message filtering by name).
     #[serde(default)]
     pub bot_name: Option<String>,
+    /// Controls whether and how streaming draft updates are delivered.
+    ///
+    /// - `"off"` (default) — responses are sent as a single final message.
+    /// - `"partial"` — a placeholder is posted first and edited incrementally
+    ///   as tokens arrive, making long responses visible in real time.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval in milliseconds between consecutive OCS edit calls per
+    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -9575,6 +9741,13 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return Ok(expand_tilde_path(custom));
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -10009,6 +10182,45 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Collect the `IntegrationDescriptor` from every nested config that
+    /// declares one via `#[integration(...)]`. Adding a new toggleable
+    /// integration is one struct-level attribute on the new config + one
+    /// row in this method. The integrations registry consumes the result
+    /// without per-vendor branches.
+    pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
+        vec![
+            self.browser.integration_descriptor(),
+            self.cron.integration_descriptor(),
+            self.google_workspace.integration_descriptor(),
+        ]
+    }
+
+    /// Combine top-level `[cost.prices.<key>]` entries with any per-provider
+    /// `pricing` entries declared on `[providers.models.<id>]`. Per-provider
+    /// pricing is keyed as `<provider_id>/<model>` to align with the lookup
+    /// pattern in `record_tool_loop_cost_usage` (qualified `<provider>/<model>`
+    /// → bare `<model>` → suffix-after-last-slash). The qualified-first lookup
+    /// order is what makes per-provider disambiguation actually take effect:
+    /// an operator who sets `[providers.models.openai.pricing]` for `gpt-4o`
+    /// gets that rate even if a generic `[cost.prices.gpt-4o]` is also set.
+    /// Top-level entries still win on exact-key conflict so existing operator
+    /// overrides keyed as `<provider>/<model>` are never silently shadowed.
+    pub fn combined_pricing(&self) -> std::collections::HashMap<String, ModelPricing> {
+        let mut combined = self.cost.prices.clone();
+        for (provider_id, provider) in &self.providers.models {
+            let (Some(pricing), Some(model)) = (&provider.pricing, &provider.model) else {
+                continue;
+            };
+            if model.is_empty() {
+                continue;
+            }
+            combined
+                .entry(format!("{provider_id}/{model}"))
+                .or_insert_with(|| pricing.clone());
+        }
+        combined
+    }
+
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
     ///
     /// Keys present in `Config::default()` serialization pass immediately.
@@ -11147,6 +11359,26 @@ impl Config {
             }
         }
 
+        // Channel reply-intent precheck. Zero timeout or empty/whitespace model would
+        // silently fail open to REPLY and quietly disable the group-chat noise filter
+        // — reject the typo cases explicitly. Use `enabled = false` to disable instead.
+        if self.agent.precheck.timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "agent.precheck.timeout_secs",
+                "agent.precheck.timeout_secs must be greater than 0 (use agent.precheck.enabled = false to disable the precheck)"
+            );
+        }
+        if let Some(ref model) = self.agent.precheck.model
+            && model.trim().is_empty()
+        {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "agent.precheck.model",
+                "agent.precheck.model must not be empty or whitespace; omit the key to fall back to the route model"
+            );
+        }
+
         Ok(())
     }
 
@@ -11742,7 +11974,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Falls back to `<workspace>/sops` when omitted.
+    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
+    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
+    /// resolve the default `<workspace>/sops` for offline inspection.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -11824,6 +12058,17 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
 );
+
+impl HasPropKind for ModelPricing {
+    // ModelPricing is a 2-field struct (`input`, `output`). Wire form is a
+    // JSON object (e.g. `{"input": 1.0, "output": 2.5}`); the dashboard
+    // renders a sub-form for the inner fields. `PropKind::Object` (vs
+    // `String`) is what makes the round-trip through `Config::set_prop`
+    // succeed — `parse_prop_value` parses the JSON into a TOML table so
+    // serde deserializes it back into the typed `ModelPricing` instead
+    // of failing on a TOML string (#6357 review).
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
@@ -12276,6 +12521,36 @@ auto_save = true
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_roundtrip() {
+        let toml = r#"
+            ollama_num_ctx = 16384
+            ollama_num_predict = 4096
+            ollama_temperature_override = 0.5
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.ollama_num_ctx, Some(16384));
+        assert_eq!(parsed.ollama_num_predict, Some(4096));
+        assert_eq!(parsed.ollama_temperature_override, Some(0.5));
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ModelProviderConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ollama_num_ctx, Some(16384));
+        assert_eq!(reparsed.ollama_num_predict, Some(4096));
+        assert_eq!(reparsed.ollama_temperature_override, Some(0.5));
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_default_to_none() {
+        let toml = r#"
+            api_key = "sk-test"
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.ollama_num_ctx.is_none());
+        assert!(parsed.ollama_num_predict.is_none());
+        assert!(parsed.ollama_temperature_override.is_none());
     }
 
     #[test]
@@ -15163,6 +15438,25 @@ model = "primary-model"
     }
 
     #[test]
+    async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir = std::env::temp_dir().join("zeroclaw-test-profile");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
+
+        let result = default_path_under_config_dir("knowledge.db");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+
+        assert_eq!(
+            result,
+            custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
+            "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
+        );
+    }
+
+    #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -15720,6 +16014,47 @@ default_model = "persisted-profile"
                 ..Default::default()
             },
         );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_timeout_zero() {
+        let mut config = Config::default();
+        config.agent.precheck.timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.timeout_secs") && msg.contains("greater than 0"),
+            "expected precheck timeout validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_empty_model() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("   ".into());
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.model"),
+            "expected precheck model validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_default_precheck() {
+        let config = Config::default();
+        assert!(
+            config.validate().is_ok(),
+            "default ChannelPrecheckConfig must pass validation"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_precheck_model_override() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("fast-classifier".into());
+        config.agent.precheck.timeout_secs = 3;
         assert!(config.validate().is_ok());
     }
 
@@ -16456,6 +16791,8 @@ group_policy = "disabled"
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let json = serde_json::to_string(&nc).unwrap();
@@ -18700,5 +19037,221 @@ allowed_users = ["@u:m"]
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+    }
+
+    // ── combined_pricing: per-provider + top-level merge (#6251) ──────
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing { input, output }
+    }
+
+    fn config_with_provider(
+        provider_id: &str,
+        model: Option<&str>,
+        per_provider_pricing: Option<ModelPricing>,
+    ) -> Config {
+        let mut config = Config::default();
+        // Start clean: Config::default() seeds CostConfig::default() which calls
+        // get_default_pricing(); for these tests we want a deterministic baseline.
+        config.cost.prices.clear();
+        config.providers.models.insert(
+            provider_id.to_string(),
+            ModelProviderConfig {
+                model: model.map(ToString::to_string),
+                pricing: per_provider_pricing,
+                ..ModelProviderConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn combined_pricing_passes_through_when_no_per_provider_pricing() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+        config
+            .cost
+            .prices
+            .insert("openai/gpt-4o".into(), pricing(2.5, 10.0));
+
+        let combined = config.combined_pricing();
+        assert_eq!(combined.len(), 1);
+        let entry = combined.get("openai/gpt-4o").expect("top-level entry");
+        assert_eq!(entry.input, 2.5);
+        assert_eq!(entry.output, 10.0);
+    }
+
+    #[test]
+    async fn combined_pricing_merges_per_provider_into_provider_slash_model_key() {
+        let config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("anthropic/claude-sonnet-4-5")
+            .expect("per-provider pricing keyed as <provider_id>/<model>");
+        assert_eq!(entry.input, 3.0);
+        assert_eq!(entry.output, 15.0);
+    }
+
+    #[test]
+    async fn combined_pricing_top_level_wins_on_conflict() {
+        let mut config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+        // Operator pinned a different rate at the top level — must survive.
+        config
+            .cost
+            .prices
+            .insert("anthropic/claude-sonnet-4-5".into(), pricing(2.0, 8.0));
+
+        let combined = config.combined_pricing();
+        let entry = combined.get("anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(
+            entry.input, 2.0,
+            "top-level [cost.prices] override must not be silently shadowed by per-provider pricing"
+        );
+        assert_eq!(entry.output, 8.0);
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_no_model() {
+        // Provider has pricing but no `model` set — we cannot synthesize the
+        // <provider_id>/<model> key, so the entry must be skipped (not crash,
+        // not produce a malformed key).
+        let config = config_with_provider("openrouter", None, Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "per-provider pricing without `model` is silently skipped, got {combined:?}"
+        );
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_empty_model() {
+        let config = config_with_provider("openrouter", Some(""), Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "empty model string must be treated the same as missing, got {combined:?}"
+        );
+    }
+
+    // ── set_prop round-trip for `pricing` (#6357 review) ──────────────
+    //
+    // Dashboard / JSON-patch callers send `pricing` as a JSON object
+    // (`{"input": 1.0, "output": 2.5}`). Before #6357 review, `pricing` was
+    // classified as `PropKind::String`, which meant `parse_prop_value`
+    // inserted the JSON text as a TOML string and serde failed to
+    // deserialize it back into `Option<ModelPricing>`. The fix classifies
+    // `ModelPricing` as `PropKind::Object` and routes through `json_to_toml`
+    // so the value lands as a typed inline table. These tests pin that
+    // contract end-to-end through `Config::set_prop` and the wire-form
+    // coercion at `coerce_for_set_prop`.
+
+    #[test]
+    async fn set_prop_round_trips_per_provider_pricing_object() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        // Caller hits `Config::set_prop` directly with the JSON-stringified
+        // object that the dashboard / CLI hand off after type coercion.
+        config
+            .set_prop(
+                "providers.models.openai.pricing",
+                r#"{"input": 1.5, "output": 6.0}"#,
+            )
+            .expect("set_prop must accept a JSON object for pricing");
+
+        // Round-trip 1: typed access on the struct must reflect the write.
+        let pricing = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone())
+            .expect("pricing must round-trip back into a typed ModelPricing, not a string");
+        assert_eq!(pricing.input, 1.5);
+        assert_eq!(pricing.output, 6.0);
+
+        // Round-trip 2: the merged pricing map (the runtime/channel cost
+        // contexts consume this) must show the new values keyed under
+        // `<provider_id>/<model>`.
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("openai/gpt-4o")
+            .expect("set_prop write must surface in combined_pricing");
+        assert_eq!(entry.input, 1.5);
+        assert_eq!(entry.output, 6.0);
+    }
+
+    #[test]
+    async fn set_prop_pricing_rejects_non_object_string_payload() {
+        // Sanity: a quoted JSON string (which is what the buggy
+        // `PropKind::String` path would have silently accepted by writing
+        // the raw text into a TOML string field) must NOT round-trip into
+        // a typed `ModelPricing`. The fix is `PropKind::Object`, which
+        // requires a JSON object; anything else fails set_prop and leaves
+        // the field unchanged. We assert the failure is observable AND
+        // that no garbage state was written.
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        let result = config.set_prop(
+            "providers.models.openai.pricing",
+            "\"{\\\"input\\\":1.5,\\\"output\\\":6.0}\"",
+        );
+        assert!(
+            result.is_err(),
+            "a JSON string in place of an object must be rejected by set_prop"
+        );
+        // Pricing must still be `None` — no partial / garbage write.
+        let pricing_after = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone());
+        assert!(
+            pricing_after.is_none(),
+            "rejected set_prop must not mutate pricing, got {pricing_after:?}"
+        );
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_round_trips_pricing_payload() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        // Dashboard / CLI sends a real JSON object; the coercion layer
+        // must hand it back as a JSON-stringified object (the wire form
+        // that `parse_prop_value`'s `Object` arm consumes).
+        let coerced = coerce_for_set_prop(
+            &serde_json::json!({"input": 1.5, "output": 6.0}),
+            Some(PropKind::Object),
+        )
+        .expect("JSON object payload must coerce successfully for an Object field");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&coerced).expect("coerced output must remain valid JSON");
+        assert_eq!(parsed, serde_json::json!({"input": 1.5, "output": 6.0}));
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_rejects_non_object() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        let err = coerce_for_set_prop(
+            &serde_json::json!("{\"input\":1.5}"),
+            Some(PropKind::Object),
+        )
+        .expect_err("a JSON string is not a JSON object — must be rejected");
+        assert!(
+            err.message.contains("object"),
+            "rejection message must name the object requirement, got: {}",
+            err.message
+        );
     }
 }

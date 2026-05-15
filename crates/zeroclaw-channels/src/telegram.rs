@@ -774,6 +774,124 @@ impl TelegramChannel {
         }
     }
 
+    /// Check whether a voice reply should be queued for the given recipient and
+    /// content. Shared between `send()` and `finalize_draft()` so the TTS
+    /// voice-reply path works regardless of `stream_mode`.
+    ///
+    /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
+    /// debounce is skipped and `synthesize_and_send_voice` is called directly,
+    /// since the text is already the final response.
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
+        let is_voice_chat = self
+            .voice_chats
+            .lock()
+            .map(|vs| vs.contains(recipient))
+            .unwrap_or(false);
+
+        if !is_voice_chat || self.tts_config.is_none() {
+            return;
+        }
+
+        // Only queue substantive natural-language replies for voice.
+        // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+        let is_substantive = content.len() > 40
+            && !content.starts_with("http")
+            && !content.starts_with('{')
+            && !content.starts_with('[')
+            && !content.starts_with("Error")
+            && !content.contains("```")
+            && !content.contains("tool_call")
+            && !content.contains("wttr.in");
+
+        if !is_substantive {
+            return;
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let voice_chats = self.voice_chats.clone();
+        let api_base = self.api_base.clone();
+        let bot_token = self.bot_token.clone();
+        let tts_config = self.tts_config.clone().unwrap();
+
+        if immediate {
+            // Finalize path: text is already the final answer — no debounce.
+            let text = content.to_string();
+            let recipient = recipient.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            });
+            return;
+        }
+
+        // Send path: debounce to coalesce multi-part tool-chain responses.
+        if let Ok(mut pv) = self.pending_voice.lock() {
+            pv.insert(
+                recipient.to_string(),
+                (content.to_string(), std::time::Instant::now()),
+            );
+        }
+
+        let pending = self.pending_voice.clone();
+        let recipient = recipient.to_string();
+        tokio::spawn(async move {
+            // Wait 10 seconds — long enough for the agent to finish its
+            // full tool chain and send the final answer.
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            // Atomic check-and-remove: only one task gets the value
+            let to_voice = pending.lock().ok().and_then(|mut pv| {
+                if let Some((_, ts)) = pv.get(&recipient)
+                    && ts.elapsed().as_secs() >= 8
+                {
+                    return pv.remove(&recipient).map(|(text, _)| text);
+                }
+                None
+            });
+
+            if let Some(text) = to_voice {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
     async fn synthesize_and_send_voice(
         api_base: &str,
@@ -949,6 +1067,43 @@ impl TelegramChannel {
             .and_then(|t| t.as_str())
             .map(|t| t == "group" || t == "supergroup")
             .unwrap_or(false)
+    }
+
+    /// Apply the `mention_only` gate to a non-text update (photo / document /
+    /// voice) using its caption as the channel for the mention.
+    ///
+    /// Returns:
+    /// - `Some(None)` — gate does not apply (DM, or `mention_only = false`,
+    ///   or the message is not in a group). The caller should use the raw
+    ///   caption / transcript as-is.
+    /// - `Some(Some(normalized))` — caption mentions the bot; the mention
+    ///   has been stripped and the resulting text is suitable for use as
+    ///   message content.
+    /// - `None` — gated and rejected; the caller must drop the update
+    ///   without performing any expensive work (no download, no
+    ///   transcription).
+    ///
+    /// Voice notes typically arrive without a caption, so under
+    /// `mention_only = true` they are rejected here before transcription
+    /// runs. If a future change wants to honor a verbal mention inside the
+    /// transcript, this gate would need to be split into a pre-download and
+    /// a post-transcription stage. See #6229.
+    fn check_media_mention_gate(
+        &self,
+        message: &serde_json::Value,
+        caption: Option<&str>,
+    ) -> Option<Option<String>> {
+        let is_group = Self::is_group_message(message);
+        if !self.mention_only || !is_group {
+            return Some(caption.map(String::from));
+        }
+        let bot_username_guard = self.bot_username.lock();
+        let bot_username = bot_username_guard.as_ref()?;
+        let caption = caption?;
+        if !Self::contains_bot_mention(caption, bot_username) {
+            return None;
+        }
+        Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
     fn is_user_allowed(&self, username: &str) -> bool {
@@ -1251,6 +1406,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // Apply mention_only gate before downloading. Photo / document
+        // updates carry no `text` field, so the text-only gate in
+        // `parse_update_message` can never see them and they used to slip
+        // through unconditionally. See #6229.
+        let gated_caption =
+            self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -1323,7 +1485,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // pipeline validates vision capability. Non-image files always get
         // [Document:] format regardless of Telegram's classification.
         let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
-        if let Some(caption) = &attachment.caption
+        // `gated_caption` is the caption with any bot mention stripped when
+        // `mention_only` applied; otherwise the raw caption (or None).
+        if let Some(caption) = gated_caption.as_deref()
             && !caption.is_empty()
         {
             use std::fmt::Write;
@@ -1385,6 +1549,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if !self.is_any_user_allowed(identities.iter().copied()) {
             return None;
         }
+
+        // Apply mention_only gate before downloading + transcribing. Voice
+        // notes typically have no caption, so under `mention_only = true`
+        // they are rejected here — the bot has no reliable way to know it
+        // was mentioned without first transcribing, and we don't want to
+        // pay that cost for messages that will likely be dropped. See #6229.
+        // The transcription itself is discarded; we only care whether the
+        // gate returns Some (allowed) vs None (rejected).
+        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
+        self.check_media_mention_gate(message, voice_caption)?;
 
         let chat_id = message
             .get("chat")
@@ -2674,6 +2848,9 @@ impl Channel for TelegramChannel {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
+        // Queue TTS voice reply — immediate mode since text is already final
+        self.try_queue_voice_reply(recipient, text, true);
+
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -2869,80 +3046,7 @@ impl Channel for TelegramChannel {
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Text in → text out. Voice in → text + voice out.
-        let is_voice_chat = self
-            .voice_chats
-            .lock()
-            .map(|vs| vs.contains(&message.recipient))
-            .unwrap_or(false);
-
-        if is_voice_chat && self.tts_config.is_some() {
-            // Only queue substantive natural-language replies for voice.
-            // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
-
-            if is_substantive {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
-                let pending = self.pending_voice.clone();
-                let voice_chats = self.voice_chats.clone();
-                let api_base = self.api_base.clone();
-                let bot_token = self.bot_token.clone();
-                let chat_id_owned = chat_id.to_string();
-                let thread_id_owned = thread_id.map(str::to_string);
-                let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
-                tokio::spawn(async move {
-                    // Wait 10 seconds — long enough for the agent to finish its
-                    // full tool chain and send the final answer.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-                    // Atomic check-and-remove: only one task gets the value
-                    let to_voice = pending.lock().ok().and_then(|mut pv| {
-                        if let Some((_, ts)) = pv.get(&recipient)
-                            && ts.elapsed().as_secs() >= 8
-                        {
-                            return pv.remove(&recipient).map(|(text, _)| text);
-                        }
-                        None
-                    });
-
-                    if let Some(text) = to_voice {
-                        if let Ok(mut vc) = voice_chats.lock() {
-                            vc.remove(&recipient);
-                        }
-                        match Self::synthesize_and_send_voice(
-                            &api_base,
-                            &bot_token,
-                            &chat_id_owned,
-                            thread_id_owned.as_deref(),
-                            &text,
-                            &tts_config,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Telegram: TTS voice reply failed: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        self.try_queue_voice_reply(&message.recipient, &content, false);
 
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
@@ -4435,6 +4539,124 @@ mod tests {
 
         let ch_disabled = TelegramChannel::new("token".into(), vec!["*".into()], false);
         assert!(!ch_disabled.mention_only);
+    }
+
+    fn group_message_with_caption(caption: Option<&str>) -> serde_json::Value {
+        let mut msg = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": -1, "type": "group" }
+        });
+        if let Some(c) = caption {
+            msg["caption"] = serde_json::Value::String(c.to_string());
+        }
+        msg
+    }
+
+    /// Regression test for #6229 — when `mention_only = true` and a group
+    /// photo/document arrives without any caption mentioning the bot, the
+    /// gate must reject it. Before the fix, photo/document updates skipped
+    /// the gate entirely (the gate only inspected `message.text`) and the
+    /// bot replied to every photo posted in a group.
+    #[test]
+    fn check_media_mention_gate_rejects_group_media_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let no_caption = group_message_with_caption(None);
+        assert!(
+            ch.check_media_mention_gate(&no_caption, None).is_none(),
+            "no caption + mention_only group ⇒ reject"
+        );
+        let unrelated_caption = group_message_with_caption(Some("nice photo"));
+        assert!(
+            ch.check_media_mention_gate(&unrelated_caption, Some("nice photo"))
+                .is_none(),
+            "caption without bot mention + mention_only group ⇒ reject"
+        );
+        let other_bot_caption = group_message_with_caption(Some("hey @otherbot look"));
+        assert!(
+            ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look"))
+                .is_none(),
+            "caption mentioning a different bot ⇒ reject"
+        );
+    }
+
+    /// When the caption mentions the bot, the gate passes and returns the
+    /// caption with the mention stripped — matching the text-message
+    /// behavior of `normalize_incoming_content`.
+    #[test]
+    fn check_media_mention_gate_accepts_and_strips_caption_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let msg = group_message_with_caption(Some("@mybot describe this"));
+        let result = ch.check_media_mention_gate(&msg, Some("@mybot describe this"));
+        assert_eq!(
+            result,
+            Some(Some("describe this".to_string())),
+            "mention should be stripped, remaining caption preserved"
+        );
+    }
+
+    /// `mention_only = true` only applies to groups. DMs always pass with
+    /// the caption preserved verbatim.
+    #[test]
+    fn check_media_mention_gate_passes_dm_unchanged() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        let dm = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" },
+            "caption": "hello"
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm, Some("hello")),
+            Some(Some("hello".to_string())),
+            "DM media must always pass with caption verbatim"
+        );
+        let dm_no_caption = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" }
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm_no_caption, None),
+            Some(None),
+            "DM media with no caption must pass"
+        );
+    }
+
+    /// When `mention_only = false` the gate is a no-op even in groups.
+    #[test]
+    fn check_media_mention_gate_passes_when_mention_only_disabled() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let group_no_caption = group_message_with_caption(None);
+        assert_eq!(
+            ch.check_media_mention_gate(&group_no_caption, None),
+            Some(None),
+            "mention_only off ⇒ all media pass"
+        );
+    }
+
+    /// Edge case: `mention_only = true` and the bot username has not yet
+    /// been resolved (e.g., `/getMe` hasn't completed). The gate must
+    /// reject in groups rather than fail-open, matching the existing text
+    /// path's behavior at telegram.rs:1640.
+    #[test]
+    fn check_media_mention_gate_rejects_group_when_bot_username_unknown() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        // Do NOT set bot_username — leave it None.
+        let group = group_message_with_caption(Some("@somebody hi"));
+        assert!(
+            ch.check_media_mention_gate(&group, Some("@somebody hi"))
+                .is_none(),
+            "missing bot_username in group must fail closed"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

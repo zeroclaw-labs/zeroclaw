@@ -61,13 +61,23 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<SystemPrompt>,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+}
+
+/// Claude opus-4-7 rejects `temperature` with a 400 on the native Anthropic API,
+/// matching the Bedrock behavior fixed in #6144. Omit `temperature` for the
+/// opus-4-7 family so that confirmed #6147 requests use the model default.
+/// Substring match covers any future inference-profile or version-suffix
+/// variants.
+fn anthropic_model_omits_temperature(model: &str) -> bool {
+    model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -584,18 +594,41 @@ impl AnthropicProvider {
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     ) {
-        use tokio::io::AsyncBufReadExt;
         use tokio_util::io::StreamReader;
 
         let byte_stream = response
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
+        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+    }
+
+    /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
+    /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
+    async fn parse_anthropic_sse_from_reader<R>(
+        reader: R,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+
         let mut lines = reader.lines();
 
         let mut tool_id: Option<String> = None;
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
+
+        // Anthropic emits usage in two places: `message_start` carries the
+        // input-token count + prompt-cache reads; `message_delta` carries
+        // running output-token totals (each delta supersedes the prior). We
+        // capture both, then emit one `StreamEvent::Usage` at `message_stop`
+        // so the gateway accumulator and `record_turn_cost()` see the same
+        // signal Anthropic sends — closes the original #6001 live repro,
+        // which was Anthropic-shaped streaming.
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
+        let mut cached_input_tokens: Option<u64> = None;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -621,15 +654,23 @@ impl AnthropicProvider {
                         .and_then(|m| m.get("model"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
-                    let input_tokens = event
-                        .get("message")
-                        .and_then(|m| m.get("usage"))
+                    let usage = event.get("message").and_then(|m| m.get("usage"));
+                    let observed_input = usage
                         .and_then(|u| u.get("input_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
+                        .and_then(|t| t.as_u64());
+                    let observed_cached = usage
+                        .and_then(|u| u.get("cache_read_input_tokens"))
+                        .and_then(|t| t.as_u64());
+                    if let Some(v) = observed_input {
+                        input_tokens = Some(v);
+                    }
+                    if let Some(v) = observed_cached {
+                        cached_input_tokens = Some(v);
+                    }
                     tracing::debug!(
                         model = %model,
-                        input_tokens = input_tokens,
+                        input_tokens = ?observed_input,
+                        cached_input_tokens = ?observed_cached,
                         "Anthropic stream: message_start"
                     );
                 }
@@ -715,26 +756,39 @@ impl AnthropicProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
-                    let output_tokens = event
+                    // Anthropic's running-total: each `message_delta`
+                    // supersedes the previous one, so we always overwrite.
+                    let observed_output = event
                         .get("usage")
                         .and_then(|u| u.get("output_tokens"))
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(0);
+                        .and_then(|t| t.as_u64());
+                    if let Some(v) = observed_output {
+                        output_tokens = Some(v);
+                    }
                     if stop_reason == "max_tokens" {
                         tracing::warn!(
-                            output_tokens = output_tokens,
+                            output_tokens = ?observed_output,
                             "Anthropic response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
                     } else {
                         tracing::debug!(
                             stop_reason = %stop_reason,
-                            output_tokens = output_tokens,
+                            output_tokens = ?observed_output,
                             "Anthropic stream: message_delta"
                         );
                     }
                 }
                 "message_stop" => {
                     tracing::debug!("Anthropic stream: message_stop");
+                    if input_tokens.is_some() || output_tokens.is_some() {
+                        let _ = tx
+                            .send(Ok(StreamEvent::Usage(TokenUsage {
+                                input_tokens,
+                                output_tokens,
+                                cached_input_tokens,
+                            })))
+                            .await;
+                    }
                     let _ = tx.send(Ok(StreamEvent::Final)).await;
                     return;
                 }
@@ -799,7 +853,11 @@ impl Provider for AnthropicProvider {
                     cache_control: None,
                 }],
             }],
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: None,
             tool_choice: None,
             stream: None,
@@ -872,7 +930,11 @@ impl Provider for AnthropicProvider {
             max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: native_tools,
             tool_choice,
             stream: None,
@@ -1033,7 +1095,11 @@ impl Provider for AnthropicProvider {
             max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: native_tools,
             tool_choice,
             stream: Some(true),
@@ -1099,6 +1165,130 @@ impl Provider for AnthropicProvider {
 mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+
+    /// Fake Anthropic SSE stream covering the message_start → content → delta
+    /// → stop sequence with usage in both the start frame and the stop delta.
+    /// Each `data:` line is one Anthropic event per the streaming spec.
+    fn fake_anthropic_sse() -> &'static [u8] {
+        b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":314,\"cache_read_input_tokens\":42}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":27}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_emitted_before_final() {
+        // The original #6001 live repro was Anthropic streaming; before this
+        // PR the message_start / message_delta usage frames were only logged
+        // at DEBUG and never surfaced as `StreamEvent::Usage`. Now they are.
+        use std::io::Cursor;
+
+        let bytes = fake_anthropic_sse();
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(ev);
+        }
+
+        let states: Vec<&str> = events
+            .iter()
+            .map(|e| match e.as_ref() {
+                Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ToolCall(_)) => "tool_call",
+                Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
+                Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
+                Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::Final) => "final",
+                Err(_) => "err",
+            })
+            .collect();
+
+        // Required ordering: usage event must appear before Final so the
+        // gateway accumulator can capture it within the same turn boundary.
+        let usage_pos = states
+            .iter()
+            .position(|s| *s == "usage")
+            .unwrap_or_else(|| panic!("expected Usage event in stream, got {states:?}"));
+        let final_pos = states
+            .iter()
+            .position(|s| *s == "final")
+            .unwrap_or_else(|| panic!("expected Final event in stream, got {states:?}"));
+        assert!(
+            usage_pos < final_pos,
+            "Usage must come before Final, got {states:?}"
+        );
+
+        // The Usage payload must carry both input + output token counts plus
+        // the cached-input prompt-cache reads from message_start.
+        let usage = events
+            .iter()
+            .find_map(|e| match e.as_ref() {
+                Ok(StreamEvent::Usage(u)) => Some(u.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            usage.input_tokens,
+            Some(314),
+            "input_tokens from message_start usage frame"
+        );
+        assert_eq!(
+            usage.output_tokens,
+            Some(27),
+            "output_tokens from message_delta usage frame"
+        );
+        assert_eq!(
+            usage.cached_input_tokens,
+            Some(42),
+            "cache_read_input_tokens from message_start"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_omitted_when_provider_does_not_send_usage() {
+        // Backward-compat: a stream that never emits a usage frame must not
+        // synthesize a zero-valued Usage event. Consumers should treat
+        // absence as "usage unavailable" rather than "usage was zero."
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_usage = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if matches!(ev, Ok(StreamEvent::Usage(_))) {
+                saw_usage = true;
+            }
+        }
+        assert!(
+            !saw_usage,
+            "must not emit Usage when provider sent no usage frames"
+        );
+    }
 
     #[test]
     fn creates_with_key() {
@@ -1321,6 +1511,63 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
+    }
+
+    // ── Opus 4.7 temperature-omission tests (issue #6147) ────────
+
+    #[test]
+    fn anthropic_model_omits_temperature_matches_opus_4_7() {
+        assert!(anthropic_model_omits_temperature("claude-opus-4-7"));
+        assert!(anthropic_model_omits_temperature(
+            "claude-opus-4-7-20260101"
+        ));
+    }
+
+    #[test]
+    fn anthropic_model_omits_temperature_skips_other_models() {
+        assert!(!anthropic_model_omits_temperature("claude-opus-4-6"));
+        assert!(!anthropic_model_omits_temperature("claude-sonnet-4-6"));
+        assert!(!anthropic_model_omits_temperature("claude-haiku-4-5"));
+        assert!(!anthropic_model_omits_temperature("claude-3-opus"));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_without_temperature_when_none() {
+        let req = NativeChatRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("max_tokens"));
+        assert!(
+            !json.contains("temperature"),
+            "expected temperature to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_with_temperature_when_some() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"temperature\":0.7"),
+            "expected temperature to be present, got: {json}"
+        );
     }
 
     #[test]
@@ -1695,7 +1942,7 @@ mod tests {
                     cache_control: None,
                 }],
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             tools: None,
             tool_choice: None,
             stream: None,

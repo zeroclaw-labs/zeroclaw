@@ -201,6 +201,9 @@ pub enum StreamEvent {
     PreExecutedToolCall { name: String, args: String },
     /// The result of a pre-executed tool call.
     PreExecutedToolResult { name: String, output: String },
+    /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
+    /// Providers that do not surface usage in streaming responses simply omit this event.
+    Usage(TokenUsage),
     /// Stream has completed.
     Final,
 }

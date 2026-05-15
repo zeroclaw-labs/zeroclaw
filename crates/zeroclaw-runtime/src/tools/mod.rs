@@ -223,9 +223,18 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
             security.clone(),
         )),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(FileEditTool::new(security.clone())),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),
@@ -263,6 +272,18 @@ pub fn register_skill_tools(
         }
     }
 }
+
+/// Always-on built-in tools that surface in the integrations panel as
+/// `(display_name, description)` pairs. The integrations registry consumes
+/// this verbatim — adding a new always-on built-in is one row here, no
+/// edit to the registry. Tools with a config struct (Browser, Cron,
+/// GoogleWorkspace) declare themselves via the `#[integration(...)]`
+/// attribute on the schema struct instead.
+pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
+    ("Shell", "Terminal command execution"),
+    ("File System", "Read/write files"),
+    ("Weather", "Forecasts & conditions (wttr.in)"),
+];
 
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
@@ -355,9 +376,18 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )),
-        Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),
@@ -366,10 +396,19 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(RateLimitedTool::new(
+            CronAddTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(RateLimitedTool::new(
+            CronRemoveTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            CronUpdateTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -445,7 +484,7 @@ pub fn all_tools_with_runtime(
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
         tool_arcs.push(Arc::new(ReadSkillTool::new(
-            workspace_dir.to_path_buf(),
+            root_config.workspace_dir.clone(),
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
             root_config.skills.allow_scripts,
@@ -459,23 +498,26 @@ pub fn all_tools_with_runtime(
             browser_config.allowed_domains.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            BrowserTool::new_with_backend(
+                security.clone(),
+                browser_config.allowed_domains.clone(),
+                browser_config.session_name.clone(),
+                browser_config.backend.clone(),
+                browser_config.native_headless,
+                browser_config.native_webdriver_url.clone(),
+                browser_config.native_chrome_path.clone(),
+                ComputerUseConfig {
+                    endpoint: browser_config.computer_use.endpoint.clone(),
+                    api_key: browser_config.computer_use.api_key.clone(),
+                    timeout_ms: browser_config.computer_use.timeout_ms,
+                    allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                    window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                    max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                    max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+                },
+            ),
             security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.session_name.clone(),
-            browser_config.backend.clone(),
-            browser_config.native_headless,
-            browser_config.native_webdriver_url.clone(),
-            browser_config.native_chrome_path.clone(),
-            ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
-                timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-            },
         )));
     }
 
@@ -494,24 +536,30 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            HttpRequestTool::new(
+                security.clone(),
+                http_config.allowed_domains.clone(),
+                http_config.max_response_size,
+                http_config.timeout_secs,
+                http_config.allow_private_hosts,
+            ),
             security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-            http_config.allow_private_hosts,
         )));
     }
 
     if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            WebFetchTool::new(
+                security.clone(),
+                web_fetch_config.allowed_domains.clone(),
+                web_fetch_config.blocked_domains.clone(),
+                web_fetch_config.max_response_size,
+                web_fetch_config.timeout_secs,
+                web_fetch_config.firecrawl.clone(),
+                web_fetch_config.allowed_private_hosts.clone(),
+            ),
             security.clone(),
-            web_fetch_config.allowed_domains.clone(),
-            web_fetch_config.blocked_domains.clone(),
-            web_fetch_config.max_response_size,
-            web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
-            web_fetch_config.allowed_private_hosts.clone(),
         )));
     }
 
@@ -651,9 +699,9 @@ pub fn all_tools_with_runtime(
 
     // Claude Code delegation tool
     if root_config.claude_code.enabled {
-        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            ClaudeCodeTool::new(security.clone(), root_config.claude_code.clone()),
             security.clone(),
-            root_config.claude_code.clone(),
         )));
     }
 
@@ -663,50 +711,64 @@ pub fn all_tools_with_runtime(
             "http://{}:{}",
             root_config.gateway.host, root_config.gateway.port
         );
-        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            ClaudeCodeRunnerTool::new(
+                security.clone(),
+                root_config.claude_code_runner.clone(),
+                gateway_url,
+            ),
             security.clone(),
-            root_config.claude_code_runner.clone(),
-            gateway_url,
         )));
     }
 
     // Codex CLI delegation tool
     if root_config.codex_cli.enabled {
-        tool_arcs.push(Arc::new(CodexCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            CodexCliTool::new(security.clone(), root_config.codex_cli.clone()),
             security.clone(),
-            root_config.codex_cli.clone(),
         )));
     }
 
     // Gemini CLI delegation tool
     if root_config.gemini_cli.enabled {
-        tool_arcs.push(Arc::new(GeminiCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            GeminiCliTool::new(security.clone(), root_config.gemini_cli.clone()),
             security.clone(),
-            root_config.gemini_cli.clone(),
         )));
     }
 
     // OpenCode CLI delegation tool
     if root_config.opencode_cli.enabled {
-        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            OpenCodeCliTool::new(security.clone(), root_config.opencode_cli.clone()),
             security.clone(),
-            root_config.opencode_cli.clone(),
         )));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
     #[cfg(feature = "rag-pdf")]
-    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
 
-    // Session tools (JSONL path). If a separate SQLite registration path is
-    // added, these tools need to be registered there too.
-    if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
-        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(session_store);
+    // Session tools share the channel orchestrator's backend via the
+    // `make_session_backend` factory, keyed off `[channels].session_backend`.
+    // Previously the tools opened the JSONL `SessionStore` while the
+    // gateway WS path opened `SqliteSessionBackend`, so any session
+    // created via /ws/chat was invisible to `sessions_list` /
+    // `sessions_history`. Routing both call sites through the factory
+    // closes that gap and honors the operator's configured backend.
+    if let Ok(backend) =
+        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+    {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
@@ -753,9 +815,9 @@ pub fn all_tools_with_runtime(
 
     // SOP tools (registered when sops_dir is configured)
     if root_config.sop.sops_dir.is_some() {
-        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
-            root_config.sop.clone(),
-        )));
+        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
+        engine.reload(workspace_dir);
+        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
@@ -931,7 +993,10 @@ pub fn all_tools_with_runtime(
         } else {
             std::path::PathBuf::from(&root_config.workspace.workspaces_dir)
         };
-        let ws_manager = zeroclaw_config::workspace::WorkspaceManager::new(workspaces_dir);
+        let mut ws_manager = zeroclaw_config::workspace::WorkspaceManager::new(workspaces_dir);
+        if let Err(e) = ws_manager.load_profiles_blocking() {
+            tracing::warn!("failed to load workspace profiles at startup: {e}");
+        }
         tool_arcs.push(Arc::new(WorkspaceTool::new(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
             security.clone(),

@@ -23,11 +23,13 @@ prepare() {
 build() {
   cd "${_reponame}-${pkgver}"
 
-  # Build web dashboard (served from filesystem at runtime)
-  cd web && npm ci && npm run build && cd ..
-
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+
+  # Build web dashboard (served from filesystem at runtime)
+  cd web && npm ci && cd ..
+  cargo web build
+
   cargo build --frozen --release --profile dist --features channel-matrix,channel-lark
 }
 

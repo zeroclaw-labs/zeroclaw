@@ -403,6 +403,24 @@ async fn prompt_field(
                 }
             }
         }
+        PropKind::Object => {
+            // Struct-shaped scalar (e.g. providers.models.<id>.pricing).
+            // Same TUI fallback as ObjectArray: edit as raw JSON; the
+            // dashboard renders a proper sub-form.
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            match ui.string(prompt, prefill).await? {
+                Answer::Back => return Ok(Nav::Back),
+                Answer::Value(new) => {
+                    if (is_set || !new.is_empty()) && new != current {
+                        persist(cfg, name, &new).await?;
+                    }
+                }
+            }
+        }
     }
     Ok(Nav::Done)
 }

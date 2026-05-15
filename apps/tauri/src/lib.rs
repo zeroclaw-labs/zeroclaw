@@ -1,11 +1,14 @@
 //! ZeroClaw Desktop — Tauri application library.
 
+pub mod capabilities;
 pub mod commands;
 pub mod gateway_client;
 pub mod health;
+pub mod macos;
 pub mod state;
 pub mod tray;
 
+use commands::onboarding::read_onboarding_complete;
 use gateway_client::GatewayClient;
 use state::shared_state;
 use tauri::{Manager, RunEvent};
@@ -85,8 +88,11 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // When a second instance launches, focus the existing window.
-            if let Some(window) = app.get_webview_window("main") {
+            // When a second instance launches, focus whichever surface is current.
+            let target = app
+                .get_webview_window("onboarding")
+                .or_else(|| app.get_webview_window("main"));
+            if let Some(window) = target {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -99,6 +105,14 @@ pub fn run() {
             commands::pairing::initiate_pairing,
             commands::pairing::get_devices,
             commands::agent::send_message,
+            commands::permissions::get_permissions_status,
+            commands::permissions::request_permission,
+            commands::permissions::open_privacy_settings,
+            commands::onboarding::get_onboarding_state,
+            commands::onboarding::complete_onboarding,
+            commands::onboarding::reset_onboarding,
+            capabilities::screenshot::take_screenshot,
+            capabilities::applescript::run_applescript,
         ])
         .setup(move |app| {
             // Set macOS dock icon (needed for dev builds without .app bundle).
@@ -107,6 +121,15 @@ pub fn run() {
 
             // Set up the system tray.
             let _ = tray::setup_tray(app);
+
+            // First-run: show onboarding window if the user hasn't completed it.
+            // Otherwise stay tray-only — main window opens on demand from the tray.
+            if !read_onboarding_complete(app.handle())
+                && let Some(window) = app.get_webview_window("onboarding")
+            {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
 
             // Auto-pair with gateway and inject token into the WebView.
             let app_handle = app.handle().clone();

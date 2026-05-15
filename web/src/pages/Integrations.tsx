@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Puzzle, Check, Zap, Clock } from 'lucide-react';
+import { Puzzle, Check, Zap } from 'lucide-react';
 import type { Integration } from '@/types/api';
 import { getIntegrations } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -21,14 +21,6 @@ function statusBadge(status: Integration['status']) {
         color: 'var(--pc-accent)',
         border: 'var(--pc-accent-dim)',
         bg: 'var(--pc-accent-glow)'
-      };
-    case 'ComingSoon':
-      return {
-        icon: Clock,
-        label: t('integrations.status_coming_soon'),
-        color: 'var(--pc-text-muted)',
-        border: 'var(--pc-border)',
-        bg: 'transparent'
       };
   }
 }

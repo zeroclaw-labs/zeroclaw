@@ -14,6 +14,8 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { useEffect, useState } from 'react';
+import { getStatus } from '@/lib/api';
 
 interface NavItem {
   to: string;
@@ -198,6 +200,14 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
 }
 
 function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'desktop' | 'mobile' }) {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getStatus()
+      .then((s) => { if (s.version) setVersion(s.version); })
+      .catch(() => { /* silently ignore */ });
+  }, []);
+
   if (layout === 'mobile') {
     return (
       <div
@@ -205,6 +215,11 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
       >
         ZeroClaw Gateway
+        {version && (
+          <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
+            v{version}
+          </div>
+        )}
       </div>
     );
   }
@@ -223,6 +238,11 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
       }}
     >
       {!collapsed && 'ZeroClaw Gateway'}
+      {!collapsed && version && (
+        <div style={{ marginTop: '2px', fontSize: '9px', textTransform: 'none', letterSpacing: 'normal' }}>
+          v{version}
+        </div>
+      )}
     </div>
   );
 }

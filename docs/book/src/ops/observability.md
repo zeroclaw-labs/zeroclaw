@@ -143,12 +143,39 @@ Separate from the general logs, tool receipts are written to:
 
 One JSON line per tool invocation. Greppable, append-only, persistent across restarts. See [Tool receipts](../security/tool-receipts.md).
 
+## Cost & token tracking
+
+Every gateway-served turn (WebSocket chat, channel webhook, simple webhook) records its token usage and computed cost to:
+
+```
+<workspace>/state/costs.jsonl
+```
+
+One JSON line per LLM call, with input/output token counts and cost in USD. The accumulator behind `GET /api/cost` reads from the same source — call it any time for a session, daily, and monthly summary.
+
+Per-model pricing comes from `[cost.prices]` in `config.toml`. Models without an entry record token counts with a zero cost; budget enforcement still works on the recorded counts. The WebSocket `done` frame echoes the same numbers so browser clients can show usage without a second round-trip:
+
+```json
+{
+  "type": "done",
+  "full_response": "...",
+  "input_tokens": 142,
+  "output_tokens": 87,
+  "tokens_used": 229,
+  "cost_usd": 0.000456,
+  "model": "claude-sonnet-4-20250514",
+  "provider": "anthropic"
+}
+```
+
+Token fields are `null` when the upstream provider does not surface usage in streaming responses (most OpenAI-compatible providers do; Anthropic streaming reports usage too, but only via its native event format — non-OpenAI-shaped providers may not).
+
 ## Health endpoints
 
 The gateway exposes three health views:
 
 ```bash
-curl -s http://localhost:42617/health              # { "status": "ok", "version": "0.7.4" }
+curl -s http://localhost:42617/health              # { "status": "ok", "version": "0.7.5" }
 curl -s http://localhost:42617/health/channels     # per-channel status
 curl -s http://localhost:42617/health/providers    # per-provider status + error rate
 ```
