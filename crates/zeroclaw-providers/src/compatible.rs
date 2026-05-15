@@ -548,11 +548,22 @@ impl OpenAiCompatibleProvider {
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
-        supports_reasoning_effort
-            .then(|| self.reasoning_effort.clone())
-            .flatten()
+        let effort = self.reasoning_effort.as_ref()?;
+        let id = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        let is_openai_reasoning_model = id == "o1"
+            || id.starts_with("o1-")
+            || id == "o3"
+            || id.starts_with("o3-")
+            || id == "o4"
+            || id.starts_with("o4-")
+            || id.starts_with("gpt-5");
+        let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
+
+        (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
     }
 }
 
@@ -3373,10 +3384,26 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+    fn reasoning_effort_only_applies_to_openai_and_selected_codex_models() {
         let provider = make_provider("test", "https://example.com", None)
             .with_reasoning_effort(Some("high".to_string()));
 
+        assert_eq!(
+            provider.reasoning_effort_for_model("o1-preview"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("openai/o3-mini"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("o4-mini"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string())
+        );
         assert_eq!(
             provider.reasoning_effort_for_model("gpt-5.3-codex"),
             Some("high".to_string())
@@ -3384,6 +3411,15 @@ mod tests {
         assert_eq!(
             provider.reasoning_effort_for_model("openai/gpt-5"),
             Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-4-codex"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("llama-3-codex"),
+            None,
+            "generic codex-like model names must not receive OpenAI-only reasoning_effort",
         );
         assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
     }

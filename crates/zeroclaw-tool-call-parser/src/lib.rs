@@ -1513,6 +1513,14 @@ pub fn build_native_assistant_history_from_parsed_calls(
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
 ) -> Option<String> {
+    // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
+    // assistant messages that carry `tool_calls: []`. When there are no
+    // parsed calls, return None so the caller falls through to a plain
+    // text assistant message. See #6298.
+    if tool_calls.is_empty() {
+        return None;
+    }
+
     let calls_json = tool_calls
         .iter()
         .map(|tc| {
@@ -1548,6 +1556,52 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls() {
+        // Regression: strict providers (DeepSeek V4, NVIDIA NIM) reject
+        // assistant messages carrying `tool_calls: []`. Empty input must
+        // not produce a serialised assistant message with an empty array.
+        // See #6298.
+        let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
+        assert!(
+            result.is_none(),
+            "expected None for empty tool_calls slice, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls_with_reasoning() {
+        // Even with reasoning_content set, an empty tool_calls slice must
+        // collapse to None — the caller falls back to a plain assistant
+        // message, and the reasoning round-trip happens through a separate
+        // path that does not produce `tool_calls: []`.
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer text",
+            &[],
+            Some("deep thought"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_emits_tool_calls_when_non_empty() {
+        // No-regression check: the normal path with a real parsed call
+        // still produces a serialised assistant message and the
+        // `tool_calls` field is a non-empty array.
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_1".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let s = result.expect("Some(_) for non-empty tool_calls");
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        let arr = parsed["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("shell"));
+    }
 
     #[test]
     fn parse_arguments_value_unwraps_nested_object_string() {

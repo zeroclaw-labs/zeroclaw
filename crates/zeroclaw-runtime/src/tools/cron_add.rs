@@ -60,8 +60,10 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ, Webhook), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         For webhook deliveries that must thread through the originating conversation, also set \
+         delivery.thread_id=\"<reply_target>\". \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -148,12 +150,16 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
                             "type": "string",
-                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, webhook recipient, etc."
+                        },
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
                         },
                         "best_effort": {
                             "type": "boolean",
@@ -762,6 +768,63 @@ mod tests {
                 .unwrap_or_default();
 
         assert!(values.iter().any(|value| value == "matrix"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_webhook_and_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+
+        let channel_enum = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            channel_enum.iter().any(|value| value == "webhook"),
+            "delivery.channel enum must include webhook"
+        );
+
+        let delivery_props = schema["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("delivery must have properties");
+        assert!(
+            delivery_props.contains_key("thread_id"),
+            "delivery schema must expose thread_id so the webhook channel can route callbacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_announce_job_persists_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "webhook",
+                    "to": "user-42",
+                    "thread_id": "conv-99",
+                    "best_effort": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("webhook"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("user-42"));
+        assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("conv-99"));
+        assert!(jobs[0].delivery.best_effort);
     }
 
     #[test]
