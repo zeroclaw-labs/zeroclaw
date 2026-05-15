@@ -246,6 +246,8 @@ mod tests {
     use super::*;
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
     use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
@@ -258,6 +260,71 @@ mod tests {
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    #[cfg(unix)]
+    struct LongLivedStdinRuntime {
+        inherited_stdin: std::fs::File,
+    }
+
+    #[cfg(unix)]
+    impl LongLivedStdinRuntime {
+        fn new() -> (Self, std::fs::File) {
+            use std::os::fd::FromRawFd;
+
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` initializes both file descriptors on success.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "pipe should be available for unix stdin test");
+
+            // SAFETY: both descriptors were just returned by `pipe` and are
+            // now owned by these RAII wrappers.
+            let read_fd = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+            let write_fd = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+            (
+                Self {
+                    inherited_stdin: read_fd,
+                },
+                write_fd,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    impl RuntimeAdapter for LongLivedStdinRuntime {
+        fn name(&self) -> &str {
+            "long-lived-stdin"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(command)
+                .current_dir(workspace_dir)
+                .stdin(std::process::Stdio::from(self.inherited_stdin.try_clone()?));
+            Ok(cmd)
+        }
     }
 
     /// Returns the fully-wrapped shell tool as it is composed in production:
@@ -308,6 +375,31 @@ mod tests {
             .expect("echo command execution should succeed");
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_closes_inherited_stdin_pipe() {
+        // Unix can model the ACP-style long-lived stdin pipe with pipe(2)
+        // without adding test dependencies. The contract under test is that
+        // ShellTool replaces any runtime-provided stdin with EOF-producing null.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let (runtime, _write_guard) = LongLivedStdinRuntime::new();
+        let tool = ShellTool::new(security, Arc::new(runtime)).with_timeout_secs(1);
+
+        let result = tool
+            .execute(json!({"command": "cat"}))
+            .await
+            .expect("stdin-reading command should return a result");
+
+        assert!(result.success, "cat should exit after receiving EOF");
+        assert_eq!(result.output, "");
         assert!(result.error.is_none());
     }
 
