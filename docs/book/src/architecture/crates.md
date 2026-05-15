@@ -107,9 +107,21 @@ Dynamic plugin loader for out-of-process tool implementations. See [Developing �
 
 Hardware abstraction — GPIO, I2C, SPI, USB. Platform-gated. See [Hardware → Overview](../hardware/index.md).
 
+### `zeroclaw-log`
+
+The single emission surface for every log event in the workspace. Owns
+the on-disk JSONL schema (`LogEvent`), the alias-bound attribution
+registry (`ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES`), the
+`tracing-subscriber` Layer that captures every `tracing::*` call, the
+`record!` / `scope!` / `spawn!` macros, the rolling-trim writer, the
+paginated cursor reader behind `/api/logs`, and the bridge to the
+typed `Observer` for Prometheus / OTel consumers. See
+[`architecture/logging.md`](./logging.md).
+
 ### `zeroclaw-infra`
 
-Tracing, metrics, structured logging. All crates emit events via this layer.
+Process-level support: debouncers, watchdogs, the SQLite session
+backend. Not a tracing/metrics layer — that's `zeroclaw-log`.
 
 ### `zeroclaw-macros`
 

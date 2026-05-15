@@ -22,6 +22,7 @@
 - [Overview](./architecture/overview.md)
 - [Request lifecycle](./architecture/request-lifecycle.md)
 - [Crates](./architecture/crates.md)
+- [Logging](./architecture/logging.md)
 - [Multi-agent runtime](./architecture/multi-agent.md)
 
 # Reference

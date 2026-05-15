@@ -184,12 +184,13 @@ When all retries are exhausted on a single provider, the failure surfaces to the
 
 ## Debugging
 
-Enable runtime traces to see retry and key-rotation behavior:
+Persisted logs (`"rolling"` is the default) capture retry and
+key-rotation behaviour:
 
 ```toml
 [observability]
-runtime_trace_mode = "rolling"
-runtime_trace_path = "state/runtime-trace.jsonl"
+log_persistence = "rolling"
+log_persistence_path = "state/runtime-trace.jsonl"
 ```
 
 Then query traces:
