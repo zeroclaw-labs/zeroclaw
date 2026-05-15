@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "dev": "vite",
     "preview": "vite preview",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "test": "playwright test",
+    "test:install": "playwright install --with-deps chromium"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",
@@ -19,6 +21,7 @@
     "react-router-dom": "^7.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^25.3.0",
     "@types/react": "^19.0.7",
