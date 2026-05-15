@@ -23,8 +23,11 @@ import {
   type KeyboardEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
-import { Send, Square } from "lucide-react";
+import { Send, Square, Wrench, FileText } from "lucide-react";
 import { useSlotStream, type ChatMessage } from "@/chat/useSlotStream";
+import { useSlotEvents } from "@/lib/slotEvents";
+import { useApprovalsForSlot } from "@/tools/approvalQueue";
+import { ApprovalCard } from "@/tools/ApprovalCard";
 
 interface ChatViewProps {
   slotId: string;
@@ -45,6 +48,16 @@ export function ChatView({ slotId, title }: ChatViewProps) {
   useEffect(() => {
     reset();
   }, [slotId, reset]);
+
+  // Open the slot's chat channel so the global approval store (an
+  // all-listener) hears permission events for this slot.
+  useSlotEvents({ channels: [`chat:${slotId}`], onEvent: () => {} });
+
+  // Match approvals to tool_calls by tool_name — the backend mints
+  // request_ids and call_ids independently, so until permission_request
+  // frames carry call_id, the most recent matching approval wins.
+  // Unanchored approvals are rendered at the tail.
+  const approvals = useApprovalsForSlot(slotId);
 
   // Autoscroll to bottom on new messages or while streaming. Use
   // `useLayoutEffect` so the scroll happens before the browser paints
@@ -94,11 +107,33 @@ export function ChatView({ slotId, title }: ChatViewProps) {
           </p>
         ) : (
           <ul className="flex flex-col gap-3">
-            {messages.map((m) => (
-              <li key={m.id}>
-                <MessageBubble message={m} />
-              </li>
-            ))}
+            {messages.map((m) => {
+              const approval =
+                m.kind === "tool_call" && m.toolCall
+                  ? approvals.find((a) => a.tool_name === m.toolCall!.name)
+                  : undefined;
+              return (
+                <li key={m.id}>
+                  <MessageBubble message={m} />
+                  {approval ? <ApprovalCard approval={approval} /> : null}
+                </li>
+              );
+            })}
+            {/* Unanchored approvals (arrived before their tool_call). */}
+            {approvals
+              .filter(
+                (a) =>
+                  !messages.some(
+                    (m) =>
+                      m.kind === "tool_call" &&
+                      m.toolCall?.name === a.tool_name,
+                  ),
+              )
+              .map((a) => (
+                <li key={`unanchored-${a.request_id}`}>
+                  <ApprovalCard approval={a} />
+                </li>
+              ))}
           </ul>
         )}
         {error ? (
@@ -174,6 +209,12 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       </div>
     );
   }
+  if (message.kind === "tool_call" && message.toolCall) {
+    return <ToolCallBubble call={message.toolCall} />;
+  }
+  if (message.kind === "tool_result" && message.toolResult) {
+    return <ToolResultBubble result={message.toolResult} />;
+  }
   return (
     <div className="max-w-[80%]">
       <div
@@ -187,5 +228,86 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         )}
       </div>
     </div>
+  );
+}
+
+function ToolCallBubble({
+  call,
+}: {
+  call: NonNullable<ChatMessage["toolCall"]>;
+}) {
+  const argsString = (() => {
+    try {
+      return typeof call.arguments === "string"
+        ? call.arguments
+        : JSON.stringify(call.arguments, null, 2);
+    } catch {
+      return "[unserializable arguments]";
+    }
+  })();
+  return (
+    <details
+      className="text-xs rounded border max-w-[80%]"
+      style={{
+        borderColor: "var(--color-border)",
+        background: "var(--color-surface-muted)",
+      }}
+    >
+      <summary
+        className="flex items-center gap-1 px-2 py-1 cursor-pointer select-none"
+        style={{ color: "var(--color-text)" }}
+      >
+        <Wrench size={11} aria-hidden="true" />
+        <span className="font-mono">{call.name}</span>
+        <span style={{ color: "var(--color-text-muted)" }}>(call)</span>
+      </summary>
+      <pre
+        className="px-2 py-1 text-[11px] font-mono whitespace-pre-wrap break-words"
+        style={{
+          background: "var(--color-surface)",
+          color: "var(--color-text-muted)",
+          maxHeight: "200px",
+          overflow: "auto",
+        }}
+      >
+        {argsString}
+      </pre>
+    </details>
+  );
+}
+
+function ToolResultBubble({
+  result,
+}: {
+  result: NonNullable<ChatMessage["toolResult"]>;
+}) {
+  return (
+    <details
+      className="text-xs rounded border max-w-[80%]"
+      style={{
+        borderColor: "var(--color-border)",
+        background: "var(--color-surface-muted)",
+      }}
+    >
+      <summary
+        className="flex items-center gap-1 px-2 py-1 cursor-pointer select-none"
+        style={{ color: "var(--color-text)" }}
+      >
+        <FileText size={11} aria-hidden="true" />
+        <span className="font-mono">{result.name}</span>
+        <span style={{ color: "var(--color-text-muted)" }}>(result)</span>
+      </summary>
+      <pre
+        className="px-2 py-1 text-[11px] font-mono whitespace-pre-wrap break-words"
+        style={{
+          background: "var(--color-surface)",
+          color: "var(--color-text-muted)",
+          maxHeight: "200px",
+          overflow: "auto",
+        }}
+      >
+        {result.output}
+      </pre>
+    </details>
   );
 }

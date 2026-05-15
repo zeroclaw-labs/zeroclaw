@@ -24,6 +24,12 @@
 import { useCallback, useRef, useState } from "react";
 import { getToken } from "@/lib/auth";
 
+export type ChatMessageKind =
+  | "text"
+  | "tool_call"
+  | "tool_result"
+  | "approval";
+
 export interface ChatMessage {
   /** Stable id used as React key. */
   id: string;
@@ -31,6 +37,28 @@ export interface ChatMessage {
   content: string;
   /** True while still receiving deltas; flips to false on `done` or stop. */
   streaming?: boolean;
+  /** Discriminator added in M4b: defaults to `"text"` for back-compat
+   *  with the M3 message shape. */
+  kind?: ChatMessageKind;
+  /** Tool-call metadata (kind === "tool_call"). */
+  toolCall?: {
+    callId: string;
+    name: string;
+    arguments: unknown;
+  };
+  /** Tool-result metadata (kind === "tool_result"). */
+  toolResult?: {
+    callId: string;
+    name: string;
+    output: string;
+  };
+  /** Approval anchor (kind === "approval"): the renderer looks up the
+   *  matching pending approval from the approval queue and renders an
+   *  `<ApprovalCard />` here. Storing only the request_id keeps the
+   *  message log resilient to the approval store's lifecycle. */
+  approval?: {
+    requestId: string;
+  };
 }
 
 interface ChatFrame {
@@ -40,6 +68,9 @@ interface ChatFrame {
     role?: string;
     content?: string;
     done?: boolean;
+    id?: string;
+    tool?: string;
+    arguments?: unknown;
   };
 }
 
@@ -255,24 +286,68 @@ function applyFrame(
 ): void {
   if (frame.type !== "chat" || !frame.data) return;
   const role = frame.data.role;
-  // M3 only renders assistant content. `thinking` and `tool_call`
-  // arrive on the same stream — accept-but-ignore until M4b lands the
-  // dedicated UI for them. `user` echoes are not expected here (the
-  // user message was appended optimistically by `send()`).
-  if (role !== "assistant") return;
-  const content = frame.data.content ?? "";
-  const done = frame.data.done === true;
-  setMessages((prev) =>
-    prev.map((m) =>
-      m.id === assistantId
-        ? {
-            ...m,
-            content: m.content + content,
-            streaming: !done,
-          }
-        : m,
-    ),
-  );
+  if (role === "assistant") {
+    // Append assistant text deltas to the streaming bubble.
+    const content = frame.data.content ?? "";
+    const done = frame.data.done === true;
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === assistantId
+          ? {
+              ...m,
+              content: m.content + content,
+              streaming: !done,
+            }
+          : m,
+      ),
+    );
+    return;
+  }
+  if (role === "tool_call" && frame.data.id) {
+    // Insert before the streaming assistant bubble so the chat reads
+    // in execution order; assistant text continues streaming after.
+    const callId = frame.data.id;
+    const name = frame.data.tool ?? "tool";
+    setMessages((prev) =>
+      insertBeforeAssistant(prev, assistantId, {
+        id: `tc_${callId}`,
+        role: "assistant",
+        kind: "tool_call",
+        content: "",
+        toolCall: { callId, name, arguments: frame.data?.arguments },
+      }),
+    );
+    return;
+  }
+  if (role === "tool_result" && frame.data.id) {
+    const callId = frame.data.id;
+    const name = frame.data.tool ?? "tool";
+    const output = frame.data.content ?? "";
+    setMessages((prev) =>
+      insertBeforeAssistant(prev, assistantId, {
+        id: `tr_${callId}`,
+        role: "assistant",
+        kind: "tool_result",
+        content: "",
+        toolResult: { callId, name, output },
+      }),
+    );
+    return;
+  }
+  // `thinking` and `user` echoes are intentionally not rendered.
+}
+
+function insertBeforeAssistant(
+  prev: ChatMessage[],
+  assistantId: string,
+  insert: ChatMessage,
+): ChatMessage[] {
+  // De-dup on re-delivery.
+  const existing = prev.findIndex((m) => m.id === insert.id);
+  if (existing >= 0) return prev.map((m, i) => (i === existing ? insert : m));
+  const idx = prev.findIndex((m) => m.id === assistantId);
+  if (idx < 0) return [...prev, insert];
+  return [...prev.slice(0, idx), insert, ...prev.slice(idx)];
 }
 
 function finaliseAssistant(
