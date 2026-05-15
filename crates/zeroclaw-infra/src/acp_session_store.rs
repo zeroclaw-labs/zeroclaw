@@ -2,13 +2,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zeroclaw_api::provider::ConversationMessage;
 
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 pub struct AcpSessionData {
@@ -57,7 +55,6 @@ impl AcpSessionStore {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
         })
     }
 
