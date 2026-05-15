@@ -8395,6 +8395,9 @@ pub async fn deliver_announcement(
                 wh.send_method.clone(),
                 wh.auth_header.clone(),
                 wh.secret.clone(),
+                wh.max_retries,
+                wh.retry_base_delay_ms,
+                wh.retry_max_delay_ms,
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
