@@ -21,28 +21,31 @@ pub fn parse_recipient(recipient: &str) -> (String, u8) {
 }
 
 /// Returns true if the bot (`bot_uid`) is @-mentioned in this group message.
-/// Checks the `mention` object in `payload_json` and falls back to text content scan.
-pub fn is_mentioned(bot_uid: &str, payload_json: &serde_json::Value, content: &str) -> bool {
+///
+/// This version only relies on the structured `mention` object in the payload JSON:
+/// - `mention.all == 1` or `"1"` for @all/@everyone.
+/// - `mention.uids` containing the bot's UID.
+/// 
+/// Text-based pattern matching (e.g., scanning the content for "@bot_uid") is disabled.
+pub fn is_mentioned(bot_uid: &str, payload_json: &serde_json::Value, _content: &str) -> bool {
     if let Some(mention) = payload_json.get("mention") {
+        // Check for @all flag
         if let Some(all) = mention.get("all") {
-            let flagged = all.as_u64() == Some(1)
-                || all.as_str() == Some("1")
-                || all.as_str() == Some("true")
-                || all.as_bool() == Some(true);
-            if flagged {
+            if all.as_u64() == Some(1) || all.as_str() == Some("1") {
                 return true;
             }
         }
-        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array())
-            && uids.iter().any(|u| {
+        // Check if bot's UID is in the uids list
+        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array()) {
+            if uids.iter().any(|u| {
                 u.as_str() == Some(bot_uid)
                     || u.as_u64().map(|n| n.to_string()).as_deref() == Some(bot_uid)
-            })
-        {
-            return true;
+            }) {
+                return true;
+            }
         }
     }
-    content.contains(&format!("@{}", bot_uid)) || content.contains("@all")
+    false
 }
 
 #[cfg(test)]
@@ -81,6 +84,18 @@ mod tests {
     }
 
     #[test]
+    fn mention_check_all_flag_numeric() {
+        let payload = serde_json::json!({ "mention": { "all": 1 } });
+        assert!(is_mentioned("anybot", &payload, ""));
+    }
+
+    #[test]
+    fn mention_check_all_flag_string() {
+        let payload = serde_json::json!({ "mention": { "all": "1" } });
+        assert!(is_mentioned("anybot", &payload, ""));
+    }
+
+    #[test]
     fn mention_check_uid_in_uids_array() {
         let payload = serde_json::json!({
             "mention": { "uids": ["bot001"] }
@@ -89,20 +104,19 @@ mod tests {
     }
 
     #[test]
-    fn mention_check_all_flag() {
-        let payload = serde_json::json!({ "mention": { "all": 1 } });
-        assert!(is_mentioned("anybot", &payload, ""));
-    }
-
-    #[test]
-    fn mention_check_at_in_text() {
+    fn mention_check_at_in_text_is_now_ignored() {
+        // Text-based mentions are now ignored unless metadata flags are present
         let payload = serde_json::json!({});
-        assert!(is_mentioned("bot001", &payload, "@bot001 please help"));
+        assert!(!is_mentioned("bot001", &payload, "@bot001 please help"));
+        assert!(!is_mentioned("bot001", &payload, "@all hello"));
+        assert!(!is_mentioned("bot001", &payload, "@所有人 大家好"));
     }
 
     #[test]
     fn mention_check_not_mentioned() {
-        let payload = serde_json::json!({});
+        let payload = serde_json::json!({
+            "mention": { "all": 0, "uids": ["other_bot"] }
+        });
         assert!(!is_mentioned("bot001", &payload, "hello world"));
     }
 }

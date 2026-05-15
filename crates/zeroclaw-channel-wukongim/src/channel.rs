@@ -400,10 +400,24 @@ impl WuKongIMChannel {
 
         // mention_only filter for group messages
         let mut silent = false;
+        let mut final_content_str = if msg_type == WkMessageType::MARKDOWN as u64 {
+            payload_json.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).unwrap_or("").to_string()
+        } else {
+            payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string()
+        };
+
         if self.mention_only && params.channel_type == WkChannelType::GROUP {
-            let content_str = payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if !is_mentioned(&self.uid, &payload_json, content_str) {
+            let mentioned = is_mentioned(&self.uid, &payload_json, &final_content_str);
+            tracing::info!(
+                "WuKongIM: Group message mention check: mentioned={}, uid={}, content_len={}",
+                mentioned, self.uid, final_content_str.len()
+            );
+
+            if !mentioned {
                 silent = true;
+            } else if !final_content_str.contains(&format!("@{}", self.uid)) {
+                tracing::info!("WuKongIM: Metadata mention detected, prepending bot UID to force orchestrator reply");
+                final_content_str = format!("@{} {}", self.uid, final_content_str);
             }
         }
 
@@ -426,10 +440,9 @@ impl WuKongIMChannel {
                 }
             }
             WkMessageType::MARKDOWN => {
-                let text = payload_json.get("content").and_then(|c| c.get("text")).and_then(|t| t.as_str()).unwrap_or("");
-                process_markdown_resources(text, &self.downloads_dir).await
+                process_markdown_resources(&final_content_str, &self.downloads_dir).await
             }
-            _ => payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+            _ => final_content_str,
         };
 
         let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
