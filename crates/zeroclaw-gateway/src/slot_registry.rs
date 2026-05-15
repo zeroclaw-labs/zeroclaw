@@ -127,10 +127,21 @@ impl SlotRegistry {
         // spawn concurrently. Racy double-spawn for the same slot: the
         // loser's Agent drops on scope exit; we prefer the extant
         // entry.
+        //
+        // Personality wiring (M4a): the slot's
+        // `agent_config.personality` filename — when set — restricts
+        // the agent's prompt-time identity load to that one allowlisted
+        // file. Frozen at spawn per the §4.5 freeze-at-spawn contract;
+        // editing the slot's personality after the agent is warm has no
+        // effect until the slot is evicted and re-spawned.
         let effective_config = apply_slot_overrides(base_config, overrides);
-        let agent =
-            Agent::from_config_with_shared_mcp_backchannel(&effective_config, None, shared_mcp)
-                .await?;
+        let agent = Agent::from_config_with_shared_mcp_backchannel_personality(
+            &effective_config,
+            None,
+            shared_mcp,
+            overrides.personality.clone(),
+        )
+        .await?;
         let agent = Arc::new(tokio::sync::Mutex::new(agent));
 
         let entry = Arc::new(SlotEntry {

@@ -7410,6 +7410,87 @@
         },
         "type": "object"
       },
+      "PersonaError": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Error body for persona endpoints. `code` is a stable string the\nfrontend can switch on.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "PersonaError",
+        "type": "object"
+      },
+      "PersonaListResponse": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`GET /api/personas` response.",
+        "properties": {
+          "personas": {
+            "items": {
+              "$ref": "#/components/schemas/PersonaPreset"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "personas"
+        ],
+        "title": "PersonaListResponse",
+        "type": "object"
+      },
+      "PersonaPreset": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "One persona preset.",
+        "properties": {
+          "description": {
+            "description": "Human-readable description shown in the dropdown.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/SlotMode",
+            "default": "normal",
+            "description": "Operating mode the slot should run in. Defaults to Normal."
+          },
+          "model": {
+            "description": "Optional model override; defaults to the provider's configured\nmodel when omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Stable identifier — used as the TOML filename and as the\n`persona_preset` value the slot stores.",
+            "type": "string"
+          },
+          "personality": {
+            "description": "Optional personality filename (must be in\n`EDITABLE_PERSONALITY_FILES` for the runtime to pick it up).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "description": "Provider id — must match an entry in `[providers.models]`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "provider"
+        ],
+        "title": "PersonaPreset",
+        "type": "object"
+      },
       "PinggyTunnelConfig": {
         "properties": {
           "region": {
@@ -7638,6 +7719,55 @@
           "value"
         ],
         "title": "PropResponse",
+        "type": "object"
+      },
+      "ProviderInfo": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "One configured provider entry.",
+        "properties": {
+          "display_name": {
+            "description": "Human-readable label for the dropdown. Falls back to the id\nwhen the static lookup has no entry.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Map key from `[providers.models.<id>]` — e.g. `\"anthropic\"`,\n`\"claude_code\"`, `\"openai_codex\"`. The slot's\n`agent_config.provider` references this id verbatim.",
+            "type": "string"
+          },
+          "is_fallback": {
+            "description": "`true` when this provider is the gateway's fallback (i.e.\n`providers.fallback == Some(self.id)`). Frontend uses this to\nlabel the default option in the dropdown.",
+            "type": "boolean"
+          },
+          "model": {
+            "description": "The currently configured model for this provider entry, if any.\n`None` means the provider was registered without a default\nmodel — the slot's `agent_config.model` must fill the gap.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "is_fallback"
+        ],
+        "title": "ProviderInfo",
+        "type": "object"
+      },
+      "ProviderListResponse": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "`GET /api/providers` response.",
+        "properties": {
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "title": "ProviderListResponse",
         "type": "object"
       },
       "ProvidersConfig": {
@@ -10890,6 +11020,169 @@
         "summary": "Set one property",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/api/personas": {
+      "get": {
+        "description": "Returns every persona preset under `<workspace_dir>/personas/`, alphabetical by name. On first call against an empty/missing personas dir, the four bundled defaults (`claude-code-default`, `codex-researcher`, `gemini-cli-coder`, `bedrock-claude`) are seeded.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaListResponse"
+                }
+              }
+            },
+            "description": "Persona preset list."
+          }
+        },
+        "summary": "List persona presets",
+        "tags": [
+          "personas"
+        ]
+      },
+      "post": {
+        "description": "Upserts the persona keyed by `name` in the request body. Names are sandboxed via `[A-Za-z0-9._-]+` (1..=64 chars, no leading dot).",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersonaPreset"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaPreset"
+                }
+              }
+            },
+            "description": "Persona saved."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaError"
+                }
+              }
+            },
+            "description": "Invalid persona name."
+          }
+        },
+        "summary": "Create or overwrite a persona preset",
+        "tags": [
+          "personas"
+        ]
+      }
+    },
+    "/api/personas/{name}": {
+      "delete": {
+        "responses": {
+          "204": {
+            "description": "Persona deleted."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaError"
+                }
+              }
+            },
+            "description": "Invalid persona name."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaError"
+                }
+              }
+            },
+            "description": "Persona does not exist."
+          }
+        },
+        "summary": "Delete a persona preset",
+        "tags": [
+          "personas"
+        ]
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaPreset"
+                }
+              }
+            },
+            "description": "Persona body."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaError"
+                }
+              }
+            },
+            "description": "Invalid persona name."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonaError"
+                }
+              }
+            },
+            "description": "Persona does not exist."
+          }
+        },
+        "summary": "Read a persona preset by name",
+        "tags": [
+          "personas"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Persona name.",
+          "in": "path",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/api/providers": {
+      "get": {
+        "description": "Returns one entry per configured `[providers.models.*]` section with id, human-readable display name, the provider entry's currently-configured model, and a `is_fallback` flag identifying the gateway's fallback. Empty list when no providers are configured. The slot settings drawer reads this to populate its provider dropdown.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderListResponse"
+                }
+              }
+            },
+            "description": "Provider list (alphabetical by id)."
+          }
+        },
+        "summary": "List configured model providers",
+        "tags": [
+          "providers"
         ]
       }
     },
