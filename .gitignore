@@ -21,6 +21,8 @@ web/dist/*
 web/src/lib/api-generated.ts
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 .DS_Store
 ._*
 .wt-pr37/

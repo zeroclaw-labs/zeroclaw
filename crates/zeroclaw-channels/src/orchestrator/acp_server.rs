@@ -691,24 +691,19 @@ impl AcpServer {
                 data: None,
             })?;
 
-        let requested_cwd = params
-            .get("cwd")
-            .or_else(|| params.get("workspaceDir"))
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(&data.workspace_dir));
+        let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let workspace_dir = std::fs::canonicalize(&requested_cwd)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&data.workspace_dir));
-
-        let mut agent =
-            Agent::from_config_with_session_cwd_and_mcp(&self.config, Some(&workspace_dir), false)
-                .await
-                .map_err(|e| RpcError {
-                    code: INTERNAL_ERROR,
-                    message: format!("Failed to create agent: {e}"),
-                    data: None,
-                })?;
+        let mut agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &self.config,
+            Some(&workspace_dir),
+            false,
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        })?;
 
         agent.seed_conversation_history(data.messages.clone());
 
@@ -791,24 +786,19 @@ impl AcpServer {
                 data: None,
             })?;
 
-        let requested_cwd = params
-            .get("cwd")
-            .or_else(|| params.get("workspaceDir"))
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(&data.workspace_dir));
+        let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let workspace_dir = std::fs::canonicalize(&requested_cwd)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&data.workspace_dir));
-
-        let mut agent =
-            Agent::from_config_with_session_cwd_and_mcp(&self.config, Some(&workspace_dir), false)
-                .await
-                .map_err(|e| RpcError {
-                    code: INTERNAL_ERROR,
-                    message: format!("Failed to create agent: {e}"),
-                    data: None,
-                })?;
+        let mut agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &self.config,
+            Some(&workspace_dir),
+            false,
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        })?;
 
         agent.seed_conversation_history(data.messages);
 
@@ -1519,9 +1509,24 @@ fn history_notifications_for_message(
                 }),
             }]
         }
-        ConversationMessage::AssistantToolCalls { tool_calls, .. } => tool_calls
-            .iter()
-            .map(|tc| {
+        ConversationMessage::AssistantToolCalls { text, tool_calls, .. } => {
+            let mut notifications = Vec::new();
+            if let Some(t) = text
+                && !t.is_empty()
+            {
+                notifications.push(JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": t }
+                        }
+                    }),
+                });
+            }
+            for tc in tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
                 let acp_content = to_acp_content(&tc.name, &args);
@@ -1540,16 +1545,17 @@ fn history_notifications_for_message(
                 {
                     update["content"] = acp_content;
                 }
-                JsonRpcNotification {
+                notifications.push(JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": update
                     }),
-                }
-            })
-            .collect(),
+                });
+            }
+            notifications
+        }
         ConversationMessage::ToolResults(results) => results
             .iter()
             .map(|r| JsonRpcNotification {

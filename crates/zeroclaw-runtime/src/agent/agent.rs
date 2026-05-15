@@ -493,6 +493,11 @@ impl Agent {
             }
             self.history.push(msg);
         }
+        // Trim immediately so pre_len snapshots (taken before the first turn)
+        // are always within the configured limit; otherwise a long restored
+        // history would cause history[pre_len..] to panic after trim_history
+        // shrinks the vec below pre_len during the turn.
+        self.trim_history();
     }
 
     pub async fn from_config(config: &Config) -> Result<Self> {
