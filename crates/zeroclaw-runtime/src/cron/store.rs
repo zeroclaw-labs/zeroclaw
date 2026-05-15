@@ -318,6 +318,16 @@ pub fn record_last_run(
     output: &str,
 ) -> Result<()> {
     let status = if success { "ok" } else { "error" };
+    record_last_run_with_status(config, job_id, finished_at, status, output)
+}
+
+pub fn record_last_run_with_status(
+    config: &Config,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: &str,
+) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_connection(config, |conn| {
         conn.execute(
@@ -337,8 +347,17 @@ pub fn reschedule_after_run(
     success: bool,
     output: &str,
 ) -> Result<()> {
-    let now = Utc::now();
     let status = if success { "ok" } else { "error" };
+    reschedule_after_run_with_status(config, job, status, output)
+}
+
+pub fn reschedule_after_run_with_status(
+    config: &Config,
+    job: &CronJob,
+    status: &str,
+    output: &str,
+) -> Result<()> {
+    let now = Utc::now();
     let bounded_output = truncate_cron_output(output);
 
     // One-shot `At` schedules have no future occurrence — record the run
@@ -848,6 +867,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         mode: decl.mode.clone(),
         channel: decl.channel.clone(),
         to: decl.to.clone(),
+        thread_id: decl.thread_id.clone(),
         best_effort: decl.best_effort,
     }
 }
@@ -1021,6 +1041,7 @@ mod tests {
                 mode: "announce".into(),
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
+                thread_id: None,
                 best_effort: true,
             }),
         )
@@ -1055,6 +1076,7 @@ mod tests {
                 mode: "announce".into(),
                 channel: Some("discord".into()),
                 to: None,
+                thread_id: None,
                 best_effort: true,
             }),
             false,
@@ -1082,6 +1104,7 @@ mod tests {
                 mode: "annouce".into(),
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
+                thread_id: None,
                 best_effort: true,
             }),
         )

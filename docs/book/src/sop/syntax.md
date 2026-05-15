@@ -1,6 +1,6 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir` (default: `<workspace>/sops`).
+SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir` is omitted from config, CLI commands fall back to `<workspace>/sops` for offline inspection, but runtime SOP execution is disabled.
 
 ## 1. Directory Layout
 

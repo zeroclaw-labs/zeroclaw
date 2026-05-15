@@ -992,9 +992,13 @@ pub fn skills_to_tools(
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::skills::skill_tool::SkillShellTool::new(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new(
                         &skill.name,
                         tool,
+                        security.clone(),
+                    );
+                    tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
+                        inner,
                         security.clone(),
                     )));
                 }

@@ -136,13 +136,38 @@ the handoff.
    gh api repos/zeroclaw-labs/zeroclaw/milestones \
      --jq '.[] | select(.state=="open") | {number: .number, title: .title, description: .description}'
    ```
+   Sort milestones by version order (semver ascending on the title) so
+   "earliest open milestone" is unambiguous in step 4 below.
 
-2. **Compare scope.** Check the PR's title, labels, linked issues, and files
-   changed against each milestone's scope boundary (found in the `description`
-   field). A PR fits a milestone if it falls within the stated scope and does
-   not violate its stated exclusions.
+2. **Classify the PR** before comparing scope:
+   - **Break-fix** — commit title prefix is `fix:` (any scope, e.g. `fix(agent):`) **or** the PR carries a `bug` label. The commit prefix is the primary signal; the label is a secondary confirmation.
+   - **Docs** — commit title prefix is `docs:` (any scope). Treated identically to break-fix for milestone purposes: scope-match first, then fall back to earliest open milestone by version. Documentation supports ongoing milestone work and should ship with it, not queue Jordan.
+   - **Feature** — commit title prefix is `feat:` and no `bug` label.
+   - **Other** — any other conventional type (`refactor:`, `perf:`, `test:`, `ci:`, `build:`, etc.). Treat as break-fix for milestone routing: scope-match first, then fall back to the earliest open milestone. Do not route to @JordanTheJet.
+   - When the prefix and label contradict (e.g. `fix(agent):` title + `enhancement` label), the commit prefix wins.
 
-3. **If the PR fits a milestone:**
+3. **Compare scope against every open milestone.** Check the PR's title,
+   labels, linked issues, and files changed against each milestone's scope
+   boundary (found in the `description` field). Run this step for **all
+   classified PR types** — a fix or doc that's tied to a specific milestone's
+   work belongs there, not automatically in the earliest one.
+
+   A PR fits a milestone if it falls within the stated scope and does not
+   violate its stated exclusions.
+
+4. **Apply the decision tree:**
+
+   | Situation | Action |
+   |---|---|
+   | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
+   | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
+   | No scope match + feature | Tag @JordanTheJet → go to step 6 |
+
+   "Earliest open milestone" means the lowest semver among all currently open
+   milestones (e.g. v0.7.6 before v0.7.7 before v0.8.0). Sort by the version
+   number in the title, not by creation date.
+
+5. **After assigning a milestone:**
 
    a. Set the milestone on the PR:
       ```bash
@@ -156,9 +181,8 @@ the handoff.
         --milestone "<milestone-title>" --state open \
         --search "milestone tracking" --json number,title
       ```
-      If the search returns zero results, skip the body update and fall
-      through to step 4 — treat a missing tracking issue the same as no
-      matching milestone.
+      If the search returns zero results, skip the body update and record
+      "no tracking issue found" in the handoff.
 
    c. Derive the entry format, section placement, and verdict emoji directly
       from the existing entries in the tracking issue body — the live content
@@ -180,7 +204,7 @@ the handoff.
         --body-file tmp/tracking-<milestone-title>.md
       ```
 
-4. **If the PR does not fit any open milestone:**
+6. **Jordan trapdoor — feature with no scope match:**
 
    Post a comment on the PR tagging @JordanTheJet for milestone alignment:
    ```bash
@@ -253,7 +277,11 @@ These norms are documented in
    block unless the active reviewer explicitly asks for that format.
 7. **Always run milestone alignment after posting**, unless the PR is a
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
-   Note the skip reason in the handoff when bypassing.
+   Note the skip reason in the handoff when bypassing. Break-fix (`fix:`
+   prefix or `bug` label) and docs (`docs:` prefix) PRs with no scope match
+   are assigned the earliest open milestone by version order — do not tag
+   @JordanTheJet for those. @JordanTheJet is only the fallback for feature
+   PRs with no scope match.
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.

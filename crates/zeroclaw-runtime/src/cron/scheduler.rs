@@ -1,7 +1,7 @@
 use crate::cron::{
     CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    sync_declarative_jobs, update_job,
+    due_jobs, next_run_for_schedule, record_last_run_with_status, record_run, remove_job,
+    reschedule_after_run_with_status, sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -382,13 +382,26 @@ async fn persist_job_result(
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
+    let mut persisted_status = if success { "ok" } else { "error" }.to_string();
+    let mut persisted_output = output.to_string();
 
     if let Err(e) = deliver_if_configured(config, job, output).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
+            if success {
+                persisted_status = "degraded".to_string();
+            }
         } else {
             success = false;
             tracing::warn!("Cron delivery failed: {e}");
+            persisted_status = "error".to_string();
+        }
+
+        if persisted_output.trim().is_empty() {
+            persisted_output = format!("delivery failed: {e}");
+        } else {
+            persisted_output.push_str("\n\ndelivery failed: ");
+            persisted_output.push_str(&e.to_string());
         }
     }
 
@@ -397,8 +410,8 @@ async fn persist_job_result(
         &job.id,
         started_at,
         finished_at,
-        if success { "ok" } else { "error" },
-        Some(output),
+        &persisted_status,
+        Some(&persisted_output),
         duration_ms,
     );
 
@@ -417,7 +430,13 @@ async fn persist_job_result(
                 );
             }
         } else {
-            let _ = record_last_run(config, &job.id, finished_at, false, output);
+            let _ = record_last_run_with_status(
+                config,
+                &job.id,
+                finished_at,
+                &persisted_status,
+                &persisted_output,
+            );
             if let Err(e) = update_job(
                 config,
                 &job.id,
@@ -432,7 +451,9 @@ async fn persist_job_result(
         return success;
     }
 
-    if let Err(e) = reschedule_after_run(config, job, success, output) {
+    if let Err(e) =
+        reschedule_after_run_with_status(config, job, &persisted_status, &persisted_output)
+    {
         tracing::warn!("Failed to persist scheduler run result: {e}");
     }
 
@@ -484,15 +505,25 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    deliver_announcement(config, channel, target, output).await
+    deliver_announcement(
+        config,
+        channel,
+        target,
+        delivery.thread_id.as_deref(),
+        output,
+    )
+    .await
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
+/// The fourth `Option<String>` is the optional thread/conversation id propagated
+/// to channels whose outbound `thread_id` is distinct from the recipient (webhook).
 pub type DeliveryFn = Box<
     dyn Fn(
             Config,
             String,
             String,
+            Option<String>,
             String,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
@@ -511,6 +542,7 @@ pub async fn deliver_announcement(
     config: &Config,
     channel: &str,
     target: &str,
+    thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
     if let Some(f) = DELIVERY_FN.get() {
@@ -518,6 +550,7 @@ pub async fn deliver_announcement(
             config.clone(),
             channel.to_string(),
             target.to_string(),
+            thread_id.map(str::to_string),
             output.to_string(),
         )
         .await
@@ -1180,6 +1213,7 @@ mod tests {
                 mode: "announce".into(),
                 channel: Some("telegram".into()),
                 to: Some("123456".into()),
+                thread_id: None,
                 best_effort: false,
             }),
             false,
@@ -1202,29 +1236,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_delivery_failure_best_effort_keeps_success() {
+    async fn persist_job_result_delivery_failure_best_effort_marks_degraded() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = cron::add_agent_job(
-            &config,
-            Some("announce-job-best-effort".into()),
-            crate::cron::Schedule::Cron {
-                expr: "*/5 * * * *".into(),
-                tz: None,
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
             },
-            "deliver this",
-            SessionTarget::Isolated,
-            None,
-            Some(DeliveryConfig {
-                mode: "announce".into(),
-                channel: Some("telegram".into()),
-                to: Some("123456".into()),
-                best_effort: true,
-            }),
-            false,
-            None,
-        )
-        .unwrap();
+        ));
+        let mut job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
@@ -1233,11 +1265,18 @@ mod tests {
 
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(updated.enabled);
-        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, "ok");
+        assert_eq!(runs[0].status, "degraded");
     }
 
     #[tokio::test]
@@ -1292,7 +1331,7 @@ mod tests {
         // failure. The caller (persist_job_result) should record the job
         // execution as successful; the missing handler is logged via
         // tracing::warn for operator visibility.
-        deliver_announcement(&config, "telegram", "chat-id", "payload")
+        deliver_announcement(&config, "telegram", "chat-id", None, "payload")
             .await
             .expect("missing delivery handler should be Ok with a warn log");
     }
