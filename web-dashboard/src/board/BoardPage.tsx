@@ -190,7 +190,7 @@ function SlotCard({ slot, lane, approvals }: SlotCardProps) {
     <article
       data-slot-id={slot.id}
       data-board-lane={lane}
-      onClick={() => navigate(`/chat/${slot.id}`)}
+      onClick={() => navigate(`/chat/${encodeURIComponent(slot.id)}`)}
       className="rounded border px-2 py-2 text-sm cursor-pointer hover:bg-[color:var(--color-surface-muted)]"
       style={{
         borderColor: "var(--color-border)",
@@ -243,7 +243,7 @@ function SlotCard({ slot, lane, approvals }: SlotCardProps) {
             Approve {mostRecent.tool_name}
           </button>
           <Link
-            to={`/chat/${slot.id}`}
+            to={`/chat/${encodeURIComponent(slot.id)}`}
             onClick={(e) => e.stopPropagation()}
             className="text-xs underline"
             style={{ color: "var(--color-text-muted)" }}
@@ -278,7 +278,7 @@ function ErroredStrip({ slots }: { slots: SlotResponse[] }) {
         {slots.map((s) => (
           <li key={s.id}>
             <Link
-              to={`/chat/${s.id}`}
+              to={`/chat/${encodeURIComponent(s.id)}`}
               className="text-xs px-2 py-1 rounded border underline"
               style={{ borderColor: "var(--color-border)" }}
             >
@@ -305,6 +305,10 @@ function computeLanes(
     idle: [],
   };
   for (const slot of slots) {
+    // Errored slots only render in ErroredStrip; skip lane assignment
+    // even if they happen to carry a pending approval (otherwise the
+    // slot would duplicate into Needs Approval AND the strip).
+    if (slot.state === "error") continue;
     if (slotsWithApprovals.has(slot.id)) {
       lanes.needs_approval.push(slot);
       continue;
@@ -321,7 +325,6 @@ function computeLanes(
       lanes.idle.push(slot);
       continue;
     }
-    // `error` is handled by ErroredStrip; skip here.
   }
   // Sort within each lane: most-recently-updated first.
   for (const key of LANE_ORDER) {

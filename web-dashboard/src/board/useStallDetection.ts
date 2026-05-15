@@ -76,6 +76,14 @@ export function useStallDetection(slot: SlotResponse): StallStatus {
     };
   }, [slot.state]);
 
+  // Seed from `slot.updated_at` if no delta has been observed locally.
+  // Without this, a slot that was already running before BoardPage
+  // mounted (or that has not emitted a chat delta yet) reports
+  // sinceMs=null forever and never trips the threshold check.
+  // `updated_at` is a unix-second epoch — convert to ms.
+  if (!tracker.lastDeltaAt.has(slot.id)) {
+    tracker.lastDeltaAt.set(slot.id, slot.updated_at * 1000);
+  }
   const last = tracker.lastDeltaAt.get(slot.id);
   const now = Date.now();
   const sinceMs = last === undefined ? null : now - last;

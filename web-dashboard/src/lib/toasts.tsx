@@ -18,8 +18,10 @@ import { Link, useLocation } from "react-router-dom";
 import { Bell, X, AlertTriangle, Info } from "lucide-react";
 import {
   getSlotEventBus,
+  useSlotEvents,
   type SlotBusEvent,
 } from "@/lib/slotEvents";
+import { useSlotsQuery } from "@/chat/slotsQuery";
 
 export type ToastKind = "approval" | "error" | "info";
 
@@ -154,6 +156,20 @@ export function ToastHost() {
   const locationRef = useRef(location.pathname);
   locationRef.current = location.pathname;
 
+  // The bus only delivers events for channels someone has subscribed
+  // to. Without this hook, toasts would only fire for slots whose
+  // `chat:<id>` channel is currently open by another component (i.e.
+  // the active chat view). Open `slots` plus `chat:<id>` for every
+  // cached slot here so approvals for ANY slot reach the toast host
+  // regardless of route. The handler is a no-op — the auto-toast
+  // listener below uses `subscribeAll`.
+  const { data: slotsData } = useSlotsQuery();
+  const channels = [
+    "slots",
+    ...(slotsData?.slots.map((s) => `chat:${s.id}`) ?? []),
+  ];
+  useSlotEvents({ channels, onEvent: () => {} });
+
   useEffect(() => {
     const bus = getSlotEventBus();
     return bus.subscribeAll((event) => {
@@ -167,7 +183,10 @@ export function ToastHost() {
         kind: "approval",
         title: "Tool approval needed",
         body: `${event.data.tool_name} on slot ${event.slot_id}`,
-        link: { to: `/chat/${event.slot_id}`, label: "Open" },
+        link: {
+          to: `/chat/${encodeURIComponent(event.slot_id)}`,
+          label: "Open",
+        },
         approval: {
           slot_id: event.slot_id,
           request_id: event.data.request_id,

@@ -26,7 +26,10 @@ import ReactMarkdown from "react-markdown";
 import { Send, Square, Wrench, FileText } from "lucide-react";
 import { useSlotStream, type ChatMessage } from "@/chat/useSlotStream";
 import { useSlotEvents } from "@/lib/slotEvents";
-import { useApprovalsForSlot } from "@/tools/approvalQueue";
+import {
+  useApprovalsForSlot,
+  type PendingApproval,
+} from "@/tools/approvalQueue";
 import { ApprovalCard } from "@/tools/ApprovalCard";
 
 interface ChatViewProps {
@@ -108,9 +111,12 @@ export function ChatView({ slotId, title }: ChatViewProps) {
         ) : (
           <ul className="flex flex-col gap-3">
             {messages.map((m) => {
+              // Most-recent-wins: when multiple approvals share a tool
+              // name, the latest one is the call we're prompting on.
+              // (Manual reverse loop because Array.findLast is ES2023.)
               const approval =
                 m.kind === "tool_call" && m.toolCall
-                  ? approvals.find((a) => a.tool_name === m.toolCall!.name)
+                  ? findLastApproval(approvals, m.toolCall.name)
                   : undefined;
               return (
                 <li key={m.id}>
@@ -310,4 +316,15 @@ function ToolResultBubble({
       </pre>
     </details>
   );
+}
+
+function findLastApproval(
+  approvals: PendingApproval[],
+  toolName: string,
+): PendingApproval | undefined {
+  for (let i = approvals.length - 1; i >= 0; i--) {
+    const a = approvals[i];
+    if (a && a.tool_name === toolName) return a;
+  }
+  return undefined;
 }
