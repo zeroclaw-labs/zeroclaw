@@ -322,7 +322,7 @@ impl Tool for SessionsSendTool {
 
 /// Returns the session key and metadata for the currently active session.
 /// Reads the session key from the `TOOL_LOOP_SESSION_KEY` task-local,
-/// which is scoped by the gateway WebSocket handler around each agent turn.
+/// which is scoped around gateway and channel agent turns.
 pub struct SessionsCurrentTool {
     backend: Arc<dyn SessionBackend>,
 }

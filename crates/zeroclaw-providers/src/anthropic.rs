@@ -61,13 +61,23 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<SystemPrompt>,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+}
+
+/// Claude opus-4-7 rejects `temperature` with a 400 on the native Anthropic API,
+/// matching the Bedrock behavior fixed in #6144. Omit `temperature` for the
+/// opus-4-7 family so that confirmed #6147 requests use the model default.
+/// Substring match covers any future inference-profile or version-suffix
+/// variants.
+fn anthropic_model_omits_temperature(model: &str) -> bool {
+    model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -843,7 +853,11 @@ impl Provider for AnthropicProvider {
                     cache_control: None,
                 }],
             }],
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: None,
             tool_choice: None,
             stream: None,
@@ -916,7 +930,11 @@ impl Provider for AnthropicProvider {
             max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: native_tools,
             tool_choice,
             stream: None,
@@ -1077,7 +1095,11 @@ impl Provider for AnthropicProvider {
             max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: if anthropic_model_omits_temperature(model) {
+                None
+            } else {
+                Some(temperature)
+            },
             tools: native_tools,
             tool_choice,
             stream: Some(true),
@@ -1491,6 +1513,63 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    // ── Opus 4.7 temperature-omission tests (issue #6147) ────────
+
+    #[test]
+    fn anthropic_model_omits_temperature_matches_opus_4_7() {
+        assert!(anthropic_model_omits_temperature("claude-opus-4-7"));
+        assert!(anthropic_model_omits_temperature(
+            "claude-opus-4-7-20260101"
+        ));
+    }
+
+    #[test]
+    fn anthropic_model_omits_temperature_skips_other_models() {
+        assert!(!anthropic_model_omits_temperature("claude-opus-4-6"));
+        assert!(!anthropic_model_omits_temperature("claude-sonnet-4-6"));
+        assert!(!anthropic_model_omits_temperature("claude-haiku-4-5"));
+        assert!(!anthropic_model_omits_temperature("claude-3-opus"));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_without_temperature_when_none() {
+        let req = NativeChatRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("max_tokens"));
+        assert!(
+            !json.contains("temperature"),
+            "expected temperature to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_with_temperature_when_some() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 4096,
+            system: None,
+            messages: vec![],
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"temperature\":0.7"),
+            "expected temperature to be present, got: {json}"
+        );
+    }
+
     #[test]
     fn detects_auth_from_jwt_shape() {
         let kind = detect_auth_kind("a.b.c", None);
@@ -1863,7 +1942,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     cache_control: None,
                 }],
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             tools: None,
             tool_choice: None,
             stream: None,

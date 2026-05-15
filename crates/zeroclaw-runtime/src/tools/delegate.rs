@@ -1,4 +1,4 @@
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -20,6 +20,17 @@ use zeroclaw_providers::{self, ChatMessage, Provider};
 /// leaves it unset; matches the longstanding agentic default that balances
 /// coherence with enough variety to explore tool options.
 const DELEGATE_AGENTIC_DEFAULT_TEMPERATURE: f64 = 0.7;
+
+fn current_tool_loop_session_key() -> Option<String> {
+    TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
+}
+
+async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+}
 
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -645,80 +656,84 @@ impl DelegateTool {
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         let task_id_clone = task_id.clone();
+        let parent_session_key = current_tool_loop_session_key();
 
         tokio::spawn(async move {
-            // Build an inner DelegateTool for the spawned context
-            let inner = DelegateTool {
-                agents,
-                security,
-                fallback_credential,
-                provider_runtime_options,
-                depth,
-                parent_tools,
-                multimodal_config,
-                delegate_config,
-                workspace_dir: workspace_dir.clone(),
-                cancellation_token: child_token.clone(),
-                memory: None,
-            };
+            scope_delegate_session_key(parent_session_key, async move {
+                // Build an inner DelegateTool for the spawned context
+                let inner = DelegateTool {
+                    agents,
+                    security,
+                    fallback_credential,
+                    provider_runtime_options,
+                    depth,
+                    parent_tools,
+                    multimodal_config,
+                    delegate_config,
+                    workspace_dir: workspace_dir.clone(),
+                    cancellation_token: child_token.clone(),
+                    memory: None,
+                };
 
-            let args_inner = json!({
-                "agent": agent_name_owned,
-                "prompt": full_prompt,
-            });
+                let args_inner = json!({
+                    "agent": agent_name_owned,
+                    "prompt": full_prompt,
+                });
 
-            // Race the delegation against cancellation
-            let outcome = tokio::select! {
-                () = child_token.cancelled() => {
-                    Err("Cancelled by parent session".to_string())
-                }
-                result = Box::pin(inner.execute_sync(&agent_name_owned, &full_prompt, &args_inner)) => {
-                    match result {
-                        Ok(tool_result) => {
-                            if tool_result.success {
-                                Ok(tool_result.output)
-                            } else {
-                                Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
-                            }
-                        }
-                        Err(e) => Err(e.to_string()),
+                // Race the delegation against cancellation
+                let outcome = tokio::select! {
+                    () = child_token.cancelled() => {
+                        Err("Cancelled by parent session".to_string())
                     }
-                }
-            };
+                    result = Box::pin(inner.execute_sync(&agent_name_owned, &full_prompt, &args_inner)) => {
+                        match result {
+                            Ok(tool_result) => {
+                                if tool_result.success {
+                                    Ok(tool_result.output)
+                                } else {
+                                    Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
+                                }
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                };
 
-            let finished_at = chrono::Utc::now().to_rfc3339();
-            let final_result = match outcome {
-                Ok(output) => BackgroundDelegateResult {
-                    task_id: task_id_clone.clone(),
-                    agent: agent_name_owned,
-                    status: BackgroundTaskStatus::Completed,
-                    output: Some(output),
-                    error: None,
-                    started_at,
-                    finished_at: Some(finished_at),
-                },
-                Err(err) => {
-                    let status = if err.contains("Cancelled") {
-                        BackgroundTaskStatus::Cancelled
-                    } else {
-                        BackgroundTaskStatus::Failed
-                    };
-                    BackgroundDelegateResult {
+                let finished_at = chrono::Utc::now().to_rfc3339();
+                let final_result = match outcome {
+                    Ok(output) => BackgroundDelegateResult {
                         task_id: task_id_clone.clone(),
                         agent: agent_name_owned,
-                        status,
-                        output: None,
-                        error: Some(err),
+                        status: BackgroundTaskStatus::Completed,
+                        output: Some(output),
+                        error: None,
                         started_at,
                         finished_at: Some(finished_at),
+                    },
+                    Err(err) => {
+                        let status = if err.contains("Cancelled") {
+                            BackgroundTaskStatus::Cancelled
+                        } else {
+                            BackgroundTaskStatus::Failed
+                        };
+                        BackgroundDelegateResult {
+                            task_id: task_id_clone.clone(),
+                            agent: agent_name_owned,
+                            status,
+                            output: None,
+                            error: Some(err),
+                            started_at,
+                            finished_at: Some(finished_at),
+                        }
                     }
-                }
-            };
+                };
 
-            let result_path = results_dir.join(format!("{}.json", task_id_clone));
-            if let Ok(bytes) = serde_json::to_vec_pretty(&final_result) {
-                let _ = tokio::fs::write(&result_path, &bytes).await;
-            }
+                let result_path = results_dir.join(format!("{}.json", task_id_clone));
+                if let Ok(bytes) = serde_json::to_vec_pretty(&final_result) {
+                    let _ = tokio::fs::write(&result_path, &bytes).await;
+                }
+            })
+            .await;
         });
 
         Ok(ToolResult {
@@ -799,6 +814,7 @@ impl DelegateTool {
             .try_with(Clone::clone)
             .ok()
             .flatten();
+        let parent_session_key = current_tool_loop_session_key();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -817,6 +833,7 @@ impl DelegateTool {
             let prompt = prompt.to_string();
             let args_clone = args.clone();
             let receipt_scope = parent_receipt_scope.clone();
+            let session_key = parent_session_key.clone();
 
             handles.push(tokio::spawn(async move {
                 let inner = DelegateTool {
@@ -833,11 +850,14 @@ impl DelegateTool {
                     memory: None,
                 };
                 let agent_name_for_return = agent_name.clone();
-                let result = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                    .scope(receipt_scope, async move {
-                        Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await
-                    })
-                    .await;
+                let result = scope_delegate_session_key(session_key, async move {
+                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                        .scope(receipt_scope, async move {
+                            Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await
+                        })
+                        .await
+                })
+                .await;
                 (agent_name_for_return, result)
             }));
         }
@@ -1077,6 +1097,7 @@ impl DelegateTool {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            sends_native_tool_specs: false,
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
@@ -1979,6 +2000,25 @@ mod tests {
             "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
             receipts[0]
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_spawn_helper_forwards_session_key() {
+        let seen = TOOL_LOOP_SESSION_KEY
+            .scope(Some("channel_session".to_string()), async {
+                let session_key = current_tool_loop_session_key();
+                tokio::spawn(async move {
+                    scope_delegate_session_key(session_key, async {
+                        current_tool_loop_session_key()
+                    })
+                    .await
+                })
+                .await
+                .unwrap()
+            })
+            .await;
+
+        assert_eq!(seen.as_deref(), Some("channel_session"));
     }
 
     #[tokio::test]

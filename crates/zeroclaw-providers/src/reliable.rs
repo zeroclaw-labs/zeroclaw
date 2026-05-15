@@ -763,8 +763,9 @@ impl Provider for ReliableProvider {
 
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .first()
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn chat_with_tools(
@@ -2993,5 +2994,67 @@ mod tests {
             assert!(take_last_provider_fallback().is_none());
         })
         .await;
+    }
+
+    // Regression for #6589: ReliableProvider::supports_vision() must reflect the
+    // primary (first) provider, not .any() across the fallback chain. This mirrors
+    // supports_native_tools() which already uses .first().
+    #[test]
+    fn supports_vision_reflects_first_provider_not_any_fallback() {
+        struct VisionMock(bool);
+
+        #[async_trait]
+        impl Provider for VisionMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_vision(&self) -> bool {
+                self.0
+            }
+        }
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionMock(false)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionMock(true)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            0,
+        );
+
+        assert!(
+            !provider.supports_vision(),
+            "ReliableProvider with non-vision primary must report supports_vision()=false even when a fallback supports vision"
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(VisionMock(true)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(VisionMock(false)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            0,
+        );
+
+        assert!(provider.supports_vision());
     }
 }

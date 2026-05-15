@@ -61,22 +61,9 @@ impl Tool for FileWriteTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // Security check: validate path is within workspace or allowed_roots
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         let full_path = self.security.resolve_tool_path(path);
 
@@ -149,14 +136,6 @@ impl Tool for FileWriteTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
@@ -175,6 +154,7 @@ impl Tool for FileWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -185,6 +165,21 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileWriteTool::new(security)
+    }
+
+    /// Wraps `FileWriteTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     fn test_tool_with(
@@ -321,26 +316,34 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = test_tool(dir.clone());
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "../../etc/evil", "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_write_blocks_absolute_path() {
-        let tool = test_tool(std::env::temp_dir());
+        let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "/etc/evil", "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -422,31 +425,6 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
-        assert!(!dir.join("out.txt").exists());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn file_write_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
-        let result = tool
-            .execute(json!({"path": "out.txt", "content": "should-block"}))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
         assert!(!dir.join("out.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

@@ -290,6 +290,75 @@
 
 ---
 
+## Breaking Changes
+
+### Ollama provider sends explicit `num_ctx` / `num_predict` on every request
+
+The Ollama provider now stamps `num_ctx=8192` and `num_predict=2048` into the
+`options` block of every `/api/chat` request body. Previously these fields were
+unset on the wire, defaulting to Ollama's server-side `num_ctx=2048` and
+`num_predict=128` — which silently truncated prompts and responses on any
+structured tool-calling workflow (200 OK with garbage rather than an error).
+
+For most deployments this is strictly an improvement. **Operators on tight VRAM
+budgets** should be aware that jumping from server-default `num_ctx=2048` to
+the new `8192` increases the model's context-allocation footprint and can OOM
+the GPU on small cards. Pin lower values via the new optional fields under
+`[providers.models.<name>]` if needed:
+
+```toml
+[providers.models.my-ollama-llama3]
+kind = "ollama"
+ollama_num_ctx = 4096           # default 8192
+ollama_num_predict = 1024       # default 2048
+ollama_temperature_override = 0.1   # optional; when unset, per-call temperature wins
+```
+
+The new defaults are sent on every `/api/chat` request unless lower numeric
+values are pinned via `ollama_num_ctx` / `ollama_num_predict` as shown above.
+There is no in-config way to omit these keys from the wire body in this
+release: VRAM-constrained operators (or operators whose server caps these
+values lower than `8192` / `2048`) should pin lower supported numerics via
+the fields above. Operators running an Ollama build old enough to outright
+reject the keys themselves will need to upgrade Ollama or wait on a
+follow-up that introduces a true omit mode. (`ollama_temperature_override`
+is the one knob with a true `None` semantic — when it is unset, the
+per-call temperature passed through `Provider::chat_with_system` wins and
+`temperature` on the wire continues to reflect the call site rather than
+this config.)
+
+---
+
+## Behavior Changes
+
+### Tool outputs that mention local image paths are now uploaded to the provider
+
+Tool results — including `shell` and skill output — that print real local
+image paths (e.g. `ls /pictures`, `find . -name '*.png'`, an image-generation
+tool that prints the saved file path) are now canonicalized into
+`[IMAGE:...]` markers before history replay and base64-inlined into the next
+provider request. This is the fix for #6097 (local image reading failed) and
+#5453 (WebSocket `/ws/chat` did not process `[IMAGE:]` markers), and brings
+the agent and provider sides of the multimodal pipeline back into parity.
+
+The behavior shift is real and worth flagging: image bytes that previously
+stayed on the local filesystem when surfaced by a shell-style tool are now
+uploaded to whichever provider the next turn dispatches to. Only paths where
+`Path::is_file()` returns `true` and the extension is one of `png`, `jpg`,
+`jpeg`, `webp`, `gif`, `bmp` are wrapped, and existing `[IMAGE:...]` markers
+are not double-wrapped, but operators running shell tools over directories
+of personal or sensitive images should be aware.
+
+The per-request image budget (`max_images`, default `4`) and the LRU
+`trim_old_images` policy bound the cumulative upload cost — older images are
+dropped before the cap is exceeded — but the privacy posture has shifted.
+See `docs/book/src/contributing/privacy.md` and the new doc note on
+`MultimodalConfig.max_images` for the current upload semantics. Operators
+who do not want this behavior can keep tool outputs free of literal image
+paths, or scope shell tools away from image-bearing directories. (#6183)
+
+---
+
 ## Contributors
 
 - @abhinavmathur-atlan
