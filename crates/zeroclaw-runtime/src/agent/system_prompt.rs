@@ -233,6 +233,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     });
     prompt.push('\n');
 
+    // ── 2b. Node.js Runtime Preference ───────────────────────────────
+    prompt.push_str("## Node.js Runtime Preference\n\n");
+    prompt.push_str("- When executing JavaScript/TypeScript, prefer `bun` over `node`.\n");
+    prompt.push_str("- Use `bun run <script>` or `bun <script>` instead of `node <script>`.\n");
+    prompt.push_str("- For package management, prefer `bun install` over `npm install`.\n");
+    prompt.push_str("- Only use `node` or `npm` if `bun` is explicitly unavailable or the project uses node-specific features.\n");
+    prompt.push('\n');
+
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
         prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
