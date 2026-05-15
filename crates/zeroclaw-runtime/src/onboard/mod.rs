@@ -122,53 +122,81 @@ async fn dispatch_section(
     flags: &Flags,
     section: Section,
 ) -> Result<Nav> {
+    // Each arm's future is `Box::pin`'d so the enclosing state machine
+    // holds a small pointer, not the inlined union of every section
+    // handler's locals. Without this the test thread's 2 MiB stack
+    // overflows on the deepest interactive wizards (notably the model-
+    // provider model-discovery path).
     match section {
-        Section::ModelProviders => model_providers(cfg, ui, flags).await,
-        // TTS and transcription typed-family sections share the same
-        // shape as model_providers but don't have an interactive wizard
-        // yet — operators configure them via /config or `zeroclaw config
-        // set providers.tts.<type>.<alias>.<field> ...`. Listing them
-        // here keeps the wizard order matching the canonical const.
+        Section::ModelProviders => Box::pin(model_providers(cfg, ui, flags)).await,
         Section::TtsProviders | Section::TranscriptionProviders => {
-            no_wizard_acknowledge(
+            Box::pin(no_wizard_acknowledge(
                 ui,
                 section,
                 &format!(
                     "No interactive wizard yet. Configure via the dashboard at \
-                     /config/{section} or \
-                     `zeroclaw config set {section}.<type>.<alias>.<field> <value>`."
+                 /config/{section} or \
+                 `zeroclaw config set {section}.<type>.<alias>.<field> <value>`."
                 ),
-            )
+            ))
             .await
         }
-        Section::Channels => channels(cfg, ui, flags).await,
-        Section::Memory => memory(cfg, ui, flags).await,
-        Section::Hardware => hardware(cfg, ui, flags).await,
-        Section::Tunnel => tunnel(cfg, ui, flags).await,
-        Section::Agents => agents(cfg, ui, flags).await,
-        Section::Skills => skills(cfg, ui, flags).await,
+        Section::Channels => Box::pin(channels(cfg, ui, flags)).await,
+        Section::Memory => Box::pin(memory(cfg, ui, flags)).await,
+        Section::Hardware => Box::pin(hardware(cfg, ui, flags)).await,
+        Section::Tunnel => Box::pin(tunnel(cfg, ui, flags)).await,
+        Section::Agents => Box::pin(agents(cfg, ui, flags)).await,
+        Section::Skills => Box::pin(skills(cfg, ui, flags)).await,
         Section::SkillBundles => {
-            one_tier_alias_section(cfg, ui, section, "skill-bundles", "Skill bundle").await
+            Box::pin(one_tier_alias_section(
+                cfg,
+                ui,
+                section,
+                "skill-bundles",
+                "Skill bundle",
+            ))
+            .await
         }
         Section::RiskProfiles => {
-            one_tier_alias_section(cfg, ui, section, "risk-profiles", "Risk profile").await
+            Box::pin(one_tier_alias_section(
+                cfg,
+                ui,
+                section,
+                "risk-profiles",
+                "Risk profile",
+            ))
+            .await
         }
         Section::RuntimeProfiles => {
-            one_tier_alias_section(cfg, ui, section, "runtime-profiles", "Runtime profile").await
+            Box::pin(one_tier_alias_section(
+                cfg,
+                ui,
+                section,
+                "runtime-profiles",
+                "Runtime profile",
+            ))
+            .await
         }
         Section::PeerGroups => {
-            one_tier_alias_section(cfg, ui, section, "peer-groups", "Peer group").await
+            Box::pin(one_tier_alias_section(
+                cfg,
+                ui,
+                section,
+                "peer-groups",
+                "Peer group",
+            ))
+            .await
         }
         acknowledge_only_sections!() => {
-            no_wizard_acknowledge(
+            Box::pin(no_wizard_acknowledge(
                 ui,
                 section,
                 &format!(
                     "Configured via the dashboard at /config/{section} or \
-                     `zeroclaw config set {section}.<alias>.<field> <value>` \
-                     (not part of the initial wizard)."
+                 `zeroclaw config set {section}.<alias>.<field> <value>` \
+                 (not part of the initial wizard)."
                 ),
-            )
+            ))
             .await
         }
     }
@@ -2284,9 +2312,14 @@ mod tests {
             .with("api-key", "sk-custom-test")
             .with("Model", "qwen-local");
 
-        run(&mut cfg, &mut ui, Some(Section::ModelProviders), &flags)
-            .await
-            .unwrap();
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
 
         let model_cfg = cfg
             .providers
@@ -2347,9 +2380,14 @@ mod tests {
             ..Default::default()
         };
         let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Some(Section::ModelProviders), &flags)
-            .await
-            .unwrap();
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
 
         let model_cfg = cfg
             .providers
@@ -2383,9 +2421,14 @@ mod tests {
             ..Default::default()
         };
         let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Some(Section::ModelProviders), &prime)
-            .await
-            .unwrap();
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &prime,
+        ))
+        .await
+        .unwrap();
         let after_first = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
 
         let mut ui = QuickUi::new();
@@ -2415,7 +2458,7 @@ mod tests {
         let flags = Flags::default();
 
         let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
+        Box::pin(run(&mut cfg, &mut ui, Some(Section::Channels), &flags))
             .await
             .unwrap();
 
@@ -2429,7 +2472,7 @@ mod tests {
         let after_first = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
 
         let mut ui = QuickUi::new();
-        run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
+        Box::pin(run(&mut cfg, &mut ui, Some(Section::Channels), &flags))
             .await
             .unwrap();
         let after_second = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
@@ -2460,7 +2503,7 @@ mod tests {
             // default empty list. Same shape as proxy-url above.
             .with("excluded-tools", "")
             .with_sequence("Channel", ["telegram", "Done"]);
-        run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
+        Box::pin(run(&mut cfg, &mut ui, Some(Section::Channels), &flags))
             .await
             .unwrap();
 
@@ -2495,7 +2538,7 @@ mod tests {
             // default empty list.
             .with("excluded-tools", "")
             .with_sequence("Channel", ["mochat", "Done"]);
-        run(&mut cfg, &mut ui, Some(Section::Channels), &flags)
+        Box::pin(run(&mut cfg, &mut ui, Some(Section::Channels), &flags))
             .await
             .unwrap();
 
