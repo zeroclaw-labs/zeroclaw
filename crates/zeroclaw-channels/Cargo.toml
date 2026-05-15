@@ -26,7 +26,7 @@ directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 matrix-sdk = { version = "0.17", optional = true, default-features = false, features = ["e2e-encryption", "markdown", "sqlite"] }
 mime_guess = { version = "2", optional = true }

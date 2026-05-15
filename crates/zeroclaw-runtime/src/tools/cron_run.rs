@@ -123,8 +123,14 @@ impl Tool for CronRunTool {
         if job.delivery.mode.eq_ignore_ascii_case("announce")
             && let (Some(channel), Some(target)) =
                 (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-            && let Err(e) =
-                cron::scheduler::deliver_announcement(&self.config, channel, target, &output).await
+            && let Err(e) = cron::scheduler::deliver_announcement(
+                &self.config,
+                channel,
+                target,
+                job.delivery.thread_id.as_deref(),
+                &output,
+            )
+            .await
         {
             if job.delivery.best_effort {
                 tracing::warn!(

@@ -63,7 +63,8 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("delivery.channel is required for announce mode");
     };
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq"
+        | "webhook" => {}
         other => bail!("unsupported delivery channel: {other}"),
     }
 
@@ -743,5 +744,48 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, JobType::Shell);
         assert_eq!(jobs[0].command, "echo ok");
+    }
+}
+
+#[cfg(test)]
+mod validate_delivery_tests {
+    use super::*;
+    use crate::cron::types::DeliveryConfig;
+
+    #[test]
+    fn validate_delivery_accepts_webhook_with_thread_id() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("webhook".into()),
+            to: Some("user-42".into()),
+            thread_id: Some("conv-99".into()),
+            best_effort: true,
+        };
+        validate_delivery_config(Some(&delivery)).expect("webhook with thread_id must validate");
+    }
+
+    #[test]
+    fn validate_delivery_accepts_webhook_without_thread_id() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("webhook".into()),
+            to: Some("user-42".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
+    }
+
+    #[test]
+    fn validate_delivery_rejects_unknown_channel() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("imaginary".into()),
+            to: Some("user-42".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let err = validate_delivery_config(Some(&delivery)).expect_err("unknown channel must fail");
+        assert!(err.to_string().contains("unsupported delivery channel"));
     }
 }
