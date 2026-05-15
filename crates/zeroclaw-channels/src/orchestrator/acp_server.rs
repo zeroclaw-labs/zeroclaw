@@ -1509,7 +1509,9 @@ fn history_notifications_for_message(
                 }),
             }]
         }
-        ConversationMessage::AssistantToolCalls { text, tool_calls, .. } => {
+        ConversationMessage::AssistantToolCalls {
+            text, tool_calls, ..
+        } => {
             let mut notifications = Vec::new();
             if let Some(t) = text
                 && !t.is_empty()

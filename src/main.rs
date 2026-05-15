@@ -1570,12 +1570,11 @@ async fn main() -> Result<()> {
             if let Some(timeout) = session_timeout {
                 acp_config.session_timeout_secs = timeout;
             }
-            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(
-                &config.workspace_dir,
-            )
-            .map(std::sync::Arc::new)
-            .inspect_err(|e| warn!("Failed to open ACP session store: {e}"))
-            .ok();
+            let store =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.workspace_dir)
+                    .map(std::sync::Arc::new)
+                    .inspect_err(|e| warn!("Failed to open ACP session store: {e}"))
+                    .ok();
             let server = if let Some(store) = store {
                 std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
                     config, acp_config, store,
