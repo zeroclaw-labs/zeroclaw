@@ -88,6 +88,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
@@ -437,22 +438,25 @@ impl InFlightTaskCompletion {
 
 fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
-    match &msg.thread_ts {
+    let raw = match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
         None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
+    // after a restart; otherwise hydration loads sessions under the on-disk
+    // (sanitized) name while lookup keeps producing the un-sanitized form.
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
@@ -693,14 +697,31 @@ fn build_channel_system_prompt(
     }
 
     if !reply_target.is_empty() {
+        // For most channels, `reply_target` is the address to send to (channel/room
+        // ID for Slack/Discord/Matrix, peer ID for Telegram/Signal). The webhook
+        // channel is the exception: its outbound JSON has both `recipient` and
+        // `thread_id`, and downstream services routing through it expect the
+        // *sender* as the recipient and the *thread/conversation* identifier in
+        // `thread_id`. Reusing `reply_target` as `to` for webhook would strip the
+        // thread context and the receiver would discard the callback.
+        let delivery_hint = if channel_name.eq_ignore_ascii_case("webhook") {
+            format!(
+                "delivery={{\"mode\":\"announce\",\"channel\":\"{channel_name}\",\
+                 \"to\":\"{sender}\",\"thread_id\":\"{reply_target}\"}}"
+            )
+        } else {
+            format!(
+                "delivery={{\"mode\":\"announce\",\"channel\":\"{channel_name}\",\
+                 \"to\":\"{reply_target}\"}}"
+            )
+        };
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
              reply_target={reply_target}, sender={sender}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
              When scheduling delayed messages or reminders \
-             via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
-             \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
+             via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user."
         );
         prompt.push_str(&context);
@@ -2050,14 +2071,16 @@ fn is_group_reply_target(reply_target: &str) -> bool {
     reply_target.contains("@g.us") || reply_target.starts_with("group:")
 }
 
-fn sender_memory_session_ids<'a>(
-    msg: &'a zeroclaw_api::channel::ChannelMessage,
-    history_key: &'a str,
-) -> Vec<Option<&'a str>> {
+fn sender_memory_session_ids(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    history_key: &str,
+) -> Vec<String> {
+    // Match the sanitized form persisted by memory backend migrations.
+    let sanitized_sender = sanitize_session_key(&msg.sender);
     if is_group_reply_target(&msg.reply_target) {
-        vec![Some(&msg.sender)]
+        vec![sanitized_sender]
     } else {
-        vec![Some(history_key), Some(&msg.sender)]
+        vec![history_key.to_string(), sanitized_sender]
     }
 }
 
@@ -2977,11 +3000,15 @@ async fn process_channel_message(
 
     let mem_recall_start = Instant::now();
     let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
+    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
+        .iter()
+        .map(|s| Some(s.as_str()))
+        .collect();
     let sender_memory_fut = build_memory_context_for_sessions(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        sender_session_ids.as_slice(),
+        sender_session_id_refs.as_slice(),
     );
 
     let (sender_memory, group_memory) = if is_group_chat {
@@ -3066,15 +3093,59 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let precheck_cfg = ctx.prompt_config.agent.precheck.clone();
+    let reply_intent = if precheck_cfg.enabled {
+        let precheck_model = precheck_cfg
+            .model
+            .as_deref()
+            .unwrap_or(route.model.as_str());
+        let precheck_start = Instant::now();
+        let precheck_timeout = Duration::from_secs(precheck_cfg.timeout_secs);
+        match tokio::time::timeout(
+            precheck_timeout,
+            classify_channel_reply_intent(
+                active_provider.as_ref(),
+                history[0].content.as_str(),
+                &history,
+                precheck_model,
+                runtime_defaults.temperature,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = precheck_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    elapsed_ms,
+                    model = precheck_model,
+                    "⏱ Reply-intent precheck completed"
+                );
+                outcome
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    model = precheck_model,
+                    "Reply-intent precheck failed, defaulting to REPLY"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            }
+            Err(_) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = precheck_start.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    elapsed_ms,
+                    timeout_secs = precheck_cfg.timeout_secs,
+                    model = precheck_model,
+                    "Reply-intent precheck timed out, defaulting to REPLY"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            }
+        }
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -6152,10 +6223,16 @@ pub async fn start_channels(
 
 /// Deliver a cron job announcement to a configured channel.
 /// Scans for credential leaks before delivery.
+///
+/// `thread_id` is forwarded to channels whose outbound `thread_id` is distinct
+/// from the recipient (notably the webhook channel, which serialises both into
+/// the JSON callback). For channels that do not honour `thread_ts` it is a
+/// harmless no-op.
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
     target: &str,
+    thread_id: Option<String>,
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
@@ -6167,12 +6244,14 @@ pub async fn deliver_announcement(
         zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
     };
 
+    let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
+
     // Use the live channel instance when available — critical for Matrix E2EE which must
     // reuse the authenticated client rather than re-running session restore per delivery.
     if let Some(registry) = CRON_CHANNEL_REGISTRY.get()
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
-        return ch.send(&SendMessage::new(&safe_output, target)).await;
+        return ch.send(&make_msg(&safe_output)).await;
     }
 
     match channel.to_ascii_lowercase().as_str() {
@@ -6188,8 +6267,7 @@ pub async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "discord" => {
             let dc = config
@@ -6205,8 +6283,7 @@ pub async fn deliver_announcement(
                 dc.mention_only,
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "slack" => {
             let sl = config
@@ -6221,8 +6298,7 @@ pub async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "signal" => {
             let sg = config
@@ -6238,8 +6314,7 @@ pub async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -6255,12 +6330,27 @@ pub async fn deliver_announcement(
                 wc.state_dir.as_ref().map(std::path::PathBuf::from),
             )?
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        "webhook" => {
+            let wh = config
+                .channels
+                .webhook
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("webhook channel not configured"))?;
+            let ch = WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            );
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -7148,6 +7238,55 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("NO_REPLY: not addressed to agent".to_string())
+        }
+    }
+
+    /// Provider that records every `model` value passed to `chat_with_system`
+    /// and short-circuits the agent loop with `NO_REPLY`. Lets a test assert
+    /// which model the precheck used vs the route model.
+    #[derive(Default)]
+    struct PrecheckModelCaptureProvider {
+        models: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PrecheckModelCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(model.to_string());
+            Ok("NO_REPLY: not addressed".to_string())
+        }
+    }
+
+    /// Provider that stalls the precheck call (detected by the classifier's
+    /// prompt prefix) so the orchestrator's `tokio::time::timeout` fires, while
+    /// returning instantly for any post-fail-open agent calls so the test does
+    /// not hang.
+    struct PrecheckSlowProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PrecheckSlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if message.starts_with("Decide whether the assistant should send any visible reply") {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok("REPLY".to_string())
+            } else {
+                Ok("ok".to_string())
+            }
         }
     }
 
@@ -9987,6 +10126,222 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_precheck_uses_configured_model_override() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(PrecheckModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agent.precheck.model = Some("precheck-fast".to_string());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("main-route-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "precheck-model-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-model".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let models = provider_impl
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            models.as_slice(),
+            &["precheck-fast".to_string()],
+            "precheck must use the configured model override; main loop must be skipped on NO_REPLY"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agent.precheck.timeout_secs = 1;
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(PrecheckSlowProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+        });
+
+        let started = Instant::now();
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "precheck-timeout-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        let total = started.elapsed();
+
+        // Fail-open after precheck timeout means the main agent loop runs and
+        // delivers a reply. The slow precheck would otherwise hang for 60s.
+        let sent = channel_impl.sent_messages.lock().await.clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "fail-open after precheck timeout should send exactly one reply, got {sent:?}"
+        );
+        assert!(
+            sent[0].ends_with(":ok"),
+            "expected reply body 'ok' from main loop, got {:?}",
+            sent[0]
+        );
+        assert!(
+            total >= Duration::from_millis(900),
+            "process_channel_message returned in {total:?}; precheck timeout should have waited ~1s"
+        );
+        assert!(
+            total < Duration::from_secs(10),
+            "process_channel_message took {total:?}; should not have waited for the 60s slow precheck"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_adds_and_swaps_reactions() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -10706,8 +11061,8 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         let key = conversation_history_key(&msg);
-        assert!(key.contains("$root:server"));
-        assert!(!key.contains("$reply:server"));
+        assert!(key.contains("_root_server"));
+        assert!(!key.contains("_reply_server"));
     }
 
     #[test]
@@ -10832,7 +11187,10 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
 
         let session_ids = sender_memory_session_ids(&msg, &history_key);
-        let context = build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_ids).await;
+        let session_id_refs: Vec<Option<&str>> =
+            session_ids.iter().map(|s| Some(s.as_str())).collect();
+        let context =
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -10880,10 +11238,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let group_b_sender_session_ids =
             sender_memory_session_ids(&group_b_msg, &group_b_history_key);
-        assert_eq!(group_b_sender_session_ids, vec![Some("U123")]);
+        assert_eq!(group_b_sender_session_ids, vec!["U123".to_string()]);
 
+        let group_b_sender_session_id_refs: Vec<Option<&str>> = group_b_sender_session_ids
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_ids)
+            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
                 .await;
         let group_context =
             build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
@@ -10901,6 +11263,50 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             source_group_context.contains("Group alpha codename is quartz"),
             "source group scope should still recall its own autosaved memory, got: {source_group_context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_session_ids_match_migrated_matrix_sender_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let raw_sender = "@alice:server";
+        let sanitized_sender = sanitize_session_key(raw_sender);
+        assert_eq!(sanitized_sender, "_alice_server");
+
+        mem.store(
+            "alice_fact",
+            "Alice favors filtered coffee",
+            MemoryCategory::Conversation,
+            Some(sanitized_sender.as_str()),
+        )
+        .await
+        .unwrap();
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "evt_1".into(),
+            sender: raw_sender.into(),
+            reply_target: "!room:server".into(),
+            content: "what coffee does alice prefer?".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let history_key = conversation_history_key(&msg);
+        let session_ids = sender_memory_session_ids(&msg, &history_key);
+        assert!(
+            session_ids.contains(&sanitized_sender),
+            "sender session ids must include sanitized sender, got: {session_ids:?}"
+        );
+        let session_id_refs: Vec<Option<&str>> =
+            session_ids.iter().map(|s| Some(s.as_str())).collect();
+        let context =
+            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        assert!(
+            context.contains("Alice favors filtered coffee"),
+            "sender recall must find migrated row stored under sanitized sender, got: {context}"
         );
     }
 
@@ -13449,5 +13855,44 @@ This is an example JSON object for profile settings."#;
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_webhook_cron_hint_carries_thread_id() {
+        // On the webhook channel `reply_target` is the inbound thread/conversation
+        // id, not a recipient. Using it as `delivery.to` would strip the thread
+        // context from the cron-announce callback (see #6634). The hint must
+        // place the sender in `to` and the reply_target in `thread_id`.
+        let prompt = build_channel_system_prompt(
+            "Base.",
+            "webhook",
+            "agent-chat:agent-1:thread-7",
+            "user:abc",
+        );
+        assert!(
+            prompt.contains("\"to\":\"user:abc\""),
+            "webhook cron hint must use sender as `to`: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"thread_id\":\"agent-chat:agent-1:thread-7\""),
+            "webhook cron hint must carry the reply_target as `thread_id`: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"to\":\"agent-chat:agent-1:thread-7\""),
+            "webhook cron hint must not put the thread id in `to`: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
+        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890");
+        assert!(
+            prompt.contains("\"to\":\"C12345\""),
+            "non-webhook cron hint should keep reply_target as `to`: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"thread_id\""),
+            "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
     }
 }
