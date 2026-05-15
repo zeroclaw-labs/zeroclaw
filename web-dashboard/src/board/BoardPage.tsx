@@ -16,6 +16,7 @@ import { useStallDetection } from "@/board/useStallDetection";
 import type { SlotResponse } from "@/chat/slotMutations";
 import { ThemeSwitcher } from "@/theme/ThemeSwitcher";
 import { useControlUiBootstrap } from "@/app/ControlUiBootstrapProvider";
+import { SectionNav } from "@/app/SectionNav";
 
 type Lane = "needs_approval" | "your_turn" | "working" | "idle";
 
@@ -53,20 +54,11 @@ export function BoardPage() {
         className="flex items-center justify-between gap-2 px-4 py-3 border-b"
         style={{ borderColor: "var(--color-border)" }}
       >
-        <nav className="flex items-center gap-3 text-sm">
+        <div className="flex items-center gap-3 text-sm">
           <span className="font-semibold">{bootstrap.assistant_identity.name}</span>
           <span style={{ color: "var(--color-text-muted)" }}>·</span>
-          <Link
-            to="/chat"
-            className="hover:underline"
-            style={{ color: "var(--color-text-muted)" }}
-          >
-            Chat
-          </Link>
-          <Link to="/board" className="font-medium underline">
-            Board
-          </Link>
-        </nav>
+          <SectionNav layout="inline" />
+        </div>
         <div className="flex items-center gap-2">
           <span className="text-xs opacity-50">v{bootstrap.server_version}</span>
           <ThemeSwitcher />
