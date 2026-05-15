@@ -791,8 +791,10 @@ mod tests {
     /// gives each dashboard slot its own voice.
     #[test]
     fn identity_section_personality_override_loads_only_named_file() {
-        let workspace =
-            std::env::temp_dir().join(format!("zeroclaw_persona_override_{}", uuid::Uuid::new_v4()));
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_persona_override_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("SOUL.md"), "SOUL_VOICE_TOKEN").unwrap();
         std::fs::write(workspace.join("IDENTITY.md"), "IDENTITY_VOICE_TOKEN").unwrap();

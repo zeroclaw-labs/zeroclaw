@@ -436,7 +436,10 @@ mod tests {
         )
         .unwrap();
         let seeded = seed_defaults_if_empty(tmp.path()).unwrap();
-        assert!(!seeded, "seed must be a no-op when a persona already exists");
+        assert!(
+            !seeded,
+            "seed must be a no-op when a persona already exists"
+        );
         let presets = load_all(tmp.path()).unwrap();
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].name, "user-custom");
