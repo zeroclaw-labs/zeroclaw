@@ -20,7 +20,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -289,6 +289,11 @@ pub struct AcpServer {
     /// rejected before it can overwrite the active turn's token. If pipelining
     /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Tracks session IDs currently being loaded/resumed (between the initial
+    /// check and the final insert into `sessions`). Used to prevent duplicate
+    /// concurrent restores of the same session and to count in-flight slots
+    /// against `max_sessions`.
+    loading_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
     store: Option<Arc<AcpSessionStore>>,
 }
 
@@ -338,6 +343,7 @@ impl AcpServer {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             writer_rx: std::sync::Mutex::new(writer_rx),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             store,
         }
     }
@@ -561,7 +567,8 @@ impl AcpServer {
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let mut sessions = self.sessions.lock().await;
 
-        if sessions.len() >= self.acp_config.max_sessions {
+        let loading_count = self.loading_sessions.lock().await.len();
+        if sessions.len() + loading_count >= self.acp_config.max_sessions {
             return Err(RpcError {
                 code: SESSION_LIMIT_REACHED,
                 message: format!(
@@ -664,10 +671,21 @@ impl AcpServer {
             data: None,
         })?;
 
-        // Reject if already active in memory
+        // Atomically check and reserve the session slot
         {
             let sessions = self.sessions.lock().await;
-            if sessions.contains_key(&session_id) {
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            if sessions.contains_key(&session_id) || loading.contains(&session_id) {
                 return Err(RpcError {
                     code: INVALID_PARAMS,
                     message: format!(
@@ -676,6 +694,7 @@ impl AcpServer {
                     data: None,
                 });
             }
+            loading.insert(session_id.clone());
         }
 
         let data = store
@@ -689,11 +708,20 @@ impl AcpServer {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
                 data: None,
-            })?;
+            });
+
+        // On error, release the reservation before returning
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let mut agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             Some(&workspace_dir),
             false,
@@ -703,7 +731,15 @@ impl AcpServer {
             code: INTERNAL_ERROR,
             message: format!("Failed to create agent: {e}"),
             data: None,
-        })?;
+        });
+
+        let mut agent = match agent_result {
+            Ok(a) => a,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
 
         agent.seed_conversation_history(data.messages.clone());
 
@@ -716,8 +752,11 @@ impl AcpServer {
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();
+        // Atomically insert and release reservation
         {
             let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
             sessions.insert(
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
@@ -760,9 +799,21 @@ impl AcpServer {
             data: None,
         })?;
 
+        // Atomically check and reserve the session slot
         {
             let sessions = self.sessions.lock().await;
-            if sessions.contains_key(&session_id) {
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            if sessions.contains_key(&session_id) || loading.contains(&session_id) {
                 return Err(RpcError {
                     code: INVALID_PARAMS,
                     message: format!(
@@ -771,6 +822,7 @@ impl AcpServer {
                     data: None,
                 });
             }
+            loading.insert(session_id.clone());
         }
 
         let data = store
@@ -784,11 +836,20 @@ impl AcpServer {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
                 data: None,
-            })?;
+            });
+
+        // On error, release the reservation before returning
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
 
         let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
 
-        let mut agent = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &self.config,
             Some(&workspace_dir),
             false,
@@ -798,7 +859,15 @@ impl AcpServer {
             code: INTERNAL_ERROR,
             message: format!("Failed to create agent: {e}"),
             data: None,
-        })?;
+        });
+
+        let mut agent = match agent_result {
+            Ok(a) => a,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
 
         agent.seed_conversation_history(data.messages);
 
@@ -811,8 +880,11 @@ impl AcpServer {
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();
+        // Atomically insert and release reservation
         {
             let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
             sessions.insert(
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
@@ -923,14 +995,6 @@ impl AcpServer {
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
-        // Snapshot history length before the turn so we can slice the new
-        // messages afterwards without re-running the full history.
-        let pre_len = {
-            let session = session_arc.lock().await;
-            session.agent.history().len()
-        };
-        let session_arc_for_persist = Arc::clone(&session_arc);
-
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
@@ -990,30 +1054,25 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let result = turn_result.map_err(|e| RpcError {
+        let (result_text, new_turn_msgs) = turn_result.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent turn failed: {e}"),
             data: None,
         })?;
 
         // Persist new messages on successful, non-cancelled turns.
-        if let Some(store) = &self.store {
-            let new_messages: Vec<_> = {
-                let session = session_arc_for_persist.lock().await;
-                session.agent.history()[pre_len..].to_vec()
-            };
-            if !new_messages.is_empty()
-                && let Err(e) = store.append_turn(&session_id, &new_messages)
-            {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to persist turn; session continues in memory"
-                );
-            }
+        if let Some(store) = &self.store
+            && !new_turn_msgs.is_empty()
+            && let Err(e) = store.append_turn(&session_id, &new_turn_msgs)
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to persist turn; session continues in memory"
+            );
         }
 
-        Ok(Self::prompt_result(session_id, "end_turn", result))
+        Ok(Self::prompt_result(session_id, "end_turn", result_text))
     }
 
     fn register_cancel_token(
@@ -2670,5 +2729,97 @@ mod tests {
             .expect_err("unknown session must fail");
 
         assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached by an active session created via `session/new`.
+    #[tokio::test]
+    async fn session_load_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // Pre-create a stored session that we'll attempt to load
+        let stored_id = "sess-load-limit-test";
+        store
+            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // Fill the one available slot via session/new
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed when under limit");
+
+        // Now session/load for the stored session must fail with SESSION_LIMIT_REACHED
+        let err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": stored_id }))
+            .await
+            .expect_err("session/load must fail when max_sessions reached");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {:?}",
+            err
+        );
+    }
+
+    /// `session/resume` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached by an active session created via `session/new`.
+    #[tokio::test]
+    async fn session_resume_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // Pre-create a stored session that we'll attempt to resume
+        let stored_id = "sess-resume-limit-test";
+        store
+            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // Fill the one available slot via session/new
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed when under limit");
+
+        // Now session/resume for the stored session must fail with SESSION_LIMIT_REACHED
+        let err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": stored_id }))
+            .await
+            .expect_err("session/resume must fail when max_sessions reached");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {:?}",
+            err
+        );
     }
 }

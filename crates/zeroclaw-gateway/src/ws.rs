@@ -942,7 +942,7 @@ async fn process_chat_message(
     }
 
     match result {
-        Ok(response) => {
+        Ok((response, _)) => {
             // Persist final assistant response. If we saved partial content
             // during streaming, update it in-place; otherwise append fresh.
             if let Some(ref backend) = state.session_backend {
