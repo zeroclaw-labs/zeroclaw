@@ -356,28 +356,24 @@ impl WuKongIMChannel {
         // System command — handle la_init_helloworld CMD
         if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
             let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-            if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld") {
-                if let Some(content) = payload_json.get("content").and_then(|c| c.as_str()) {
-                    if params.channel_type == WkChannelType::GROUP
-                        && !is_mentioned(&self.uid, &payload_json, content)
-                    {
-                        return Ok(());
-                    }
-                    let target_id = if params.channel_type == WkChannelType::GROUP { &params.channel_id } else { &params.from_uid };
-                    let ch_msg = ChannelMessage {
-                        id: params.message_id.clone(),
-                        sender: target_id.clone(),
-                        reply_target: format!("{}:{}", params.channel_type, target_id),
-                        content: content.to_string(),
-                        channel: "wukongim".to_string(),
-                        timestamp: params.timestamp.max(0) as u64,
-                        thread_ts: None,
-                        interruption_scope_id: None,
-                        attachments: vec![],
-                    };
-                    if tx.send(ch_msg).await.is_ok() {
-                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
-                    }
+            if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld")
+                && let Some(content) = payload_json.get("content").and_then(|c| c.as_str())
+                && !(params.channel_type == WkChannelType::GROUP && !is_mentioned(&self.uid, &payload_json, content))
+            {
+                let target_id = if params.channel_type == WkChannelType::GROUP { &params.channel_id } else { &params.from_uid };
+                let ch_msg = ChannelMessage {
+                    id: params.message_id.clone(),
+                    sender: target_id.clone(),
+                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                    content: content.to_string(),
+                    channel: "wukongim".to_string(),
+                    timestamp: params.timestamp.max(0) as u64,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+                if tx.send(ch_msg).await.is_ok() {
+                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
                 }
             }
             return Ok(());
@@ -403,10 +399,11 @@ impl WuKongIMChannel {
         }
 
         // mention_only filter for group messages
+        let mut silent = false;
         if self.mention_only && params.channel_type == WkChannelType::GROUP {
             let content_str = payload_json.get("content").and_then(|c| c.as_str()).unwrap_or("");
             if !is_mentioned(&self.uid, &payload_json, content_str) {
-                return Ok(());
+                silent = true;
             }
         }
 
@@ -441,7 +438,7 @@ impl WuKongIMChannel {
             id: params.message_id,
             sender: target_id.clone(),
             reply_target: format!("{}:{}", params.channel_type, target_id),
-            content,
+            content: if silent { format!("<!-- zeroclaw:silent -->{}", content) } else { content },
             channel: "wukongim".to_string(),
             timestamp: params.timestamp.max(0) as u64,
             thread_ts: None,

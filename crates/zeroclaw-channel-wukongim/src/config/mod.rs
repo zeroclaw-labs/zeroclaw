@@ -20,6 +20,9 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             mention_only: false,
             approval_timeout_secs: 300,
+            downloads_dir: "downloads".to_string(),
+            dawn_url: "".to_string(),
+            dawn_token: "".to_string(),
         };
         assert_eq!(cfg.device_id, "web-001");
         assert_eq!(cfg.device_flag, 2);

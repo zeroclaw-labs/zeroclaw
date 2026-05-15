@@ -464,7 +464,7 @@ mod tests {
             let workspace = create_test_workspace();
             let url = "https://example.com/test.pdf";
 
-            let result = download_file_to_workspace(url, workspace.path()).await;
+            let result = download_file_to_workspace(url, workspace.path(), None).await;
             assert!(result.is_err());
         }
 
