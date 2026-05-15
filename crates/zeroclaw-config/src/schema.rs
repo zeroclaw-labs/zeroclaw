@@ -6543,6 +6543,11 @@ pub struct DeliveryConfigDecl {
     /// Target/recipient identifier.
     #[serde(default)]
     pub to: Option<String>,
+    /// Optional thread/conversation identifier carried into the outbound send.
+    /// Required by channels that route on a separate `thread_id` field (e.g.
+    /// webhook callbacks bridging into agent-chat platforms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,

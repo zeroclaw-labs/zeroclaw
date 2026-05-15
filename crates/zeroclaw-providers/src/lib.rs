@@ -782,29 +782,33 @@ pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
     let fallback = config.providers.fallback_provider();
-    // Resolve merge_system_into_user from the active model provider profile by
-    // matching api_url — apply_named_model_provider_profile() has already run
-    // and rewritten providers.fallback, but providers.models retains all profiles.
-    let merge_system_into_user = fallback
-        .and_then(|e| e.base_url.as_deref())
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .and_then(|active_url| {
-            config.providers.models.values().find(|p| {
-                p.base_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(|u| u.trim_end_matches('/'))
-                    == Some(active_url.trim_end_matches('/'))
+    // Prefer the active fallback profile, and keep the URL-match fallback for
+    // compatibility with older loaded configs that only preserved the base URL.
+    let merge_system_into_user = fallback.is_some_and(|entry| entry.merge_system_into_user)
+        || fallback
+            .and_then(|e| e.base_url.as_deref())
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .and_then(|active_url| {
+                config.providers.models.values().find(|p| {
+                    p.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(|u| u.trim_end_matches('/'))
+                        == Some(active_url.trim_end_matches('/'))
+                })
             })
-        })
-        .map(|p| p.merge_system_into_user)
-        .unwrap_or(false);
+            .map(|p| p.merge_system_into_user)
+            .unwrap_or(false);
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
+        provider_api_url: fallback
+            .and_then(|e| e.base_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToString::to_string),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -1120,6 +1124,18 @@ fn parse_custom_provider_url(
             "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
         ),
     }
+}
+
+fn configured_provider_base_url<'a>(
+    explicit_url: Option<&'a str>,
+    runtime_url: Option<&'a str>,
+    default_url: &'static str,
+) -> &'a str {
+    explicit_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| runtime_url.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(default_url)
 }
 
 /// Factory: create the right provider from config (without custom URL)
@@ -1561,16 +1577,27 @@ fn create_provider_with_url_and_options(
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
+            let base_url = configured_provider_base_url(
+                api_url,
+                options.provider_api_url.as_deref(),
+                "http://localhost:1234/v1",
+            );
             let lm_studio_key = key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            let provider = OpenAiCompatibleProvider::new(
                 "LM Studio",
-                "http://localhost:1234/v1",
+                base_url,
                 Some(lm_studio_key),
                 AuthStyle::Bearer,
-            )))
+            );
+            let provider = if options.merge_system_into_user {
+                provider.with_merge_system_into_user()
+            } else {
+                provider
+            };
+            Ok(compat(provider))
         }
         "llamacpp" | "llama.cpp" => {
             let base_url = api_url
@@ -3226,6 +3253,100 @@ mod tests {
         assert!(create_provider("lmstudio", None).is_ok());
     }
 
+    #[tokio::test]
+    async fn lmstudio_runtime_options_apply_base_url_and_merge_system_messages() {
+        let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("read test server address")
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let header_end = loop {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read request");
+                assert!(
+                    read > 0,
+                    "provider closed connection before sending headers"
+                );
+                bytes.extend_from_slice(&buf[..read]);
+                if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .expect("request includes content-length");
+
+            while bytes.len() < header_end + content_length {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read request body");
+                assert!(read > 0, "provider closed connection before sending body");
+                bytes.extend_from_slice(&buf[..read]);
+            }
+
+            let request = String::from_utf8(bytes).expect("request is valid utf-8");
+            tx.send(request).expect("send captured request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+        });
+
+        let options = ProviderRuntimeOptions {
+            provider_api_url: Some(format!("{base_url}/v1")),
+            merge_system_into_user: true,
+            ..ProviderRuntimeOptions::default()
+        };
+        let provider = create_provider_with_url_and_options("lmstudio", None, None, &options)
+            .expect("create lmstudio provider");
+        let messages = [ChatMessage::system("system-only instruction")];
+        let result = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "local-model",
+                Some(0.0),
+            )
+            .await
+            .expect("lmstudio chat succeeds");
+        assert_eq!(result.text.as_deref(), Some("ok"));
+
+        let request = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("captured provider request");
+        server.join().expect("test server exits cleanly");
+        assert!(request.starts_with("POST /v1/chat/completions "));
+
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("captured request body");
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("provider request body is json");
+        let outbound_messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(outbound_messages.len(), 1);
+        assert_eq!(outbound_messages[0]["role"], "user");
+        assert_eq!(outbound_messages[0]["content"], "system-only instruction");
+    }
+
     #[test]
     fn factory_llamacpp() {
         assert!(create_provider("llamacpp", Some("key")).is_ok());
@@ -3434,6 +3555,57 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active provider profile to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_lmstudio_system_merge_without_base_url() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.insert(
+            "lmstudio".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                merge_system_into_user: true,
+                ..Default::default()
+            },
+        );
+        config.providers.fallback = Some("lmstudio".to_string());
+
+        let options = provider_runtime_options_from_config(&config);
+        assert!(
+            options.merge_system_into_user,
+            "merge_system_into_user must propagate even when LM Studio uses its default base URL"
+        );
+    }
+
+    #[test]
+    fn configured_provider_base_url_ignores_empty_runtime_url() {
+        assert_eq!(
+            configured_provider_base_url(None, Some("   "), "http://localhost:1234/v1"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                Some(" http://explicit.example/v1 "),
+                Some("http://runtime.example/v1"),
+                "http://localhost:1234/v1",
+            ),
+            "http://explicit.example/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                Some("   "),
+                Some(" http://runtime.example/v1 "),
+                "http://localhost:1234/v1",
+            ),
+            "http://runtime.example/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                None,
+                Some(" http://runtime.example/v1 "),
+                "http://localhost:1234/v1",
+            ),
+            "http://runtime.example/v1"
         );
     }
 

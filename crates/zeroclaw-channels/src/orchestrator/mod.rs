@@ -693,14 +693,31 @@ fn build_channel_system_prompt(
     }
 
     if !reply_target.is_empty() {
+        // For most channels, `reply_target` is the address to send to (channel/room
+        // ID for Slack/Discord/Matrix, peer ID for Telegram/Signal). The webhook
+        // channel is the exception: its outbound JSON has both `recipient` and
+        // `thread_id`, and downstream services routing through it expect the
+        // *sender* as the recipient and the *thread/conversation* identifier in
+        // `thread_id`. Reusing `reply_target` as `to` for webhook would strip the
+        // thread context and the receiver would discard the callback.
+        let delivery_hint = if channel_name.eq_ignore_ascii_case("webhook") {
+            format!(
+                "delivery={{\"mode\":\"announce\",\"channel\":\"{channel_name}\",\
+                 \"to\":\"{sender}\",\"thread_id\":\"{reply_target}\"}}"
+            )
+        } else {
+            format!(
+                "delivery={{\"mode\":\"announce\",\"channel\":\"{channel_name}\",\
+                 \"to\":\"{reply_target}\"}}"
+            )
+        };
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
              reply_target={reply_target}, sender={sender}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
              When scheduling delayed messages or reminders \
-             via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
-             \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
+             via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user."
         );
         prompt.push_str(&context);
@@ -6152,10 +6169,16 @@ pub async fn start_channels(
 
 /// Deliver a cron job announcement to a configured channel.
 /// Scans for credential leaks before delivery.
+///
+/// `thread_id` is forwarded to channels whose outbound `thread_id` is distinct
+/// from the recipient (notably the webhook channel, which serialises both into
+/// the JSON callback). For channels that do not honour `thread_ts` it is a
+/// harmless no-op.
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
     target: &str,
+    thread_id: Option<String>,
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
@@ -6167,12 +6190,14 @@ pub async fn deliver_announcement(
         zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
     };
 
+    let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
+
     // Use the live channel instance when available — critical for Matrix E2EE which must
     // reuse the authenticated client rather than re-running session restore per delivery.
     if let Some(registry) = CRON_CHANNEL_REGISTRY.get()
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
-        return ch.send(&SendMessage::new(&safe_output, target)).await;
+        return ch.send(&make_msg(&safe_output)).await;
     }
 
     match channel.to_ascii_lowercase().as_str() {
@@ -6188,8 +6213,7 @@ pub async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "discord" => {
             let dc = config
@@ -6205,8 +6229,7 @@ pub async fn deliver_announcement(
                 dc.mention_only,
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "slack" => {
             let sl = config
@@ -6221,8 +6244,7 @@ pub async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "signal" => {
             let sg = config
@@ -6238,8 +6260,7 @@ pub async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -6255,12 +6276,27 @@ pub async fn deliver_announcement(
                 wc.state_dir.as_ref().map(std::path::PathBuf::from),
             )?
             .with_workspace_dir(config.workspace_dir.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
-                .await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        "webhook" => {
+            let wh = config
+                .channels
+                .webhook
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("webhook channel not configured"))?;
+            let ch = WebhookChannel::new(
+                wh.port,
+                wh.listen_path.clone(),
+                wh.send_url.clone(),
+                wh.send_method.clone(),
+                wh.auth_header.clone(),
+                wh.secret.clone(),
+            );
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -13449,5 +13485,44 @@ This is an example JSON object for profile settings."#;
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_webhook_cron_hint_carries_thread_id() {
+        // On the webhook channel `reply_target` is the inbound thread/conversation
+        // id, not a recipient. Using it as `delivery.to` would strip the thread
+        // context from the cron-announce callback (see #6634). The hint must
+        // place the sender in `to` and the reply_target in `thread_id`.
+        let prompt = build_channel_system_prompt(
+            "Base.",
+            "webhook",
+            "agent-chat:agent-1:thread-7",
+            "user:abc",
+        );
+        assert!(
+            prompt.contains("\"to\":\"user:abc\""),
+            "webhook cron hint must use sender as `to`: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"thread_id\":\"agent-chat:agent-1:thread-7\""),
+            "webhook cron hint must carry the reply_target as `thread_id`: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"to\":\"agent-chat:agent-1:thread-7\""),
+            "webhook cron hint must not put the thread id in `to`: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
+        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890");
+        assert!(
+            prompt.contains("\"to\":\"C12345\""),
+            "non-webhook cron hint should keep reply_target as `to`: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"thread_id\""),
+            "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
     }
 }
