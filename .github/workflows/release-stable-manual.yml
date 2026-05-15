@@ -554,7 +554,7 @@ jobs:
             'port = 42617' \
             'host = "[::]"' \
             'allow_public_bind = true' \
-            'web_dist_dir = "/zeroclaw-data/web/dist"' \
+            'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
             > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
 
           cp Dockerfile.ci docker-ctx/Dockerfile

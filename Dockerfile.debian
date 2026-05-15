@@ -127,12 +127,10 @@ RUN size=$(stat -c%s /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage).
-# Also copy the web dashboard bundle into /zeroclaw-data/web/dist so the
-# runtime stage serves it at GET /. The dashboard was decoupled from the
-# binary in #5665 and is now served from disk at `gateway.web_dist_dir`;
-# without this copy the image would return HTTP 503 on /.
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace /zeroclaw-data/web && \
-    cp -r web/dist /zeroclaw-data/web/dist && \
+# The web dashboard bundle is installed in the runtime stage at
+# /usr/share/zeroclawlabs/web/dist (outside the documented /zeroclaw-data
+# mount point) so a bind mount on /zeroclaw-data cannot shadow it (#6400).
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     printf '%s\n' \
         'workspace_dir = "/zeroclaw-data/workspace"' \
         'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
@@ -145,7 +143,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace /zeroclaw-data/we
         'port = 42617' \
         'host = "[::]"' \
         'allow_public_bind = true' \
-        'web_dist_dir = "/zeroclaw-data/web/dist"' \
+        'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
         '' \
         '[autonomy]' \
         'level = "supervised"' \
@@ -166,6 +164,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
+# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
+COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
