@@ -6,9 +6,13 @@
     <meta name="color-scheme" content="dark light" />
     <title>ZeroClaw Dashboard</title>
     <!--
-      FOUC-avoidance script — ports OpenClaw's approach at ui/index.html:15-55
-      into our three-theme × two-mode system. Applies the stored theme/mode
-      before React hydrates so the first paint already reflects user choice.
+      Adapted from OpenClaw ui/index.html:15-55
+      Original: Copyright (c) 2025 Peter Steinberger (OpenClaw contributors). Licensed MIT.
+      Modifications: Copyright (c) ZeroClaw contributors (this fork).
+      See web-dashboard/LICENSES/OpenClaw-LICENSE for verbatim MIT text.
+
+      FOUC-avoidance script — applies the stored theme/mode before React
+      hydrates so the first paint already reflects user choice.
 
       LocalStorage key: zeroclaw.control.settings.v1
       Theme values: "default" | "monochrome" | "contrast"
