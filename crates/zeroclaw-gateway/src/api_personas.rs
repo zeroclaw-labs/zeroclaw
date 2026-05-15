@@ -297,7 +297,10 @@ mod tests {
         let json = body_to_json(resp).await;
         let personas = json["personas"].as_array().unwrap();
         assert_eq!(personas.len(), 4);
-        let names: Vec<&str> = personas.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = personas
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"claude-code-default"));
         assert!(names.contains(&"codex-researcher"));
         assert!(names.contains(&"gemini-cli-coder"));
@@ -347,8 +350,8 @@ mod tests {
         .await;
         assert_eq!(upsert.status(), StatusCode::OK);
 
-        let get = handle_api_personas_get(State(state), HeaderMap::new(), Path("my-preset".into()))
-            .await;
+        let get =
+            handle_api_personas_get(State(state), HeaderMap::new(), Path("my-preset".into())).await;
         assert_eq!(get.status(), StatusCode::OK);
         let json = body_to_json(get).await;
         assert_eq!(json["name"], "my-preset");
@@ -369,8 +372,7 @@ mod tests {
             mode: crate::slot::SlotMode::Normal,
             description: None,
         };
-        let resp =
-            handle_api_personas_upsert(State(state), HeaderMap::new(), Json(preset)).await;
+        let resp = handle_api_personas_upsert(State(state), HeaderMap::new(), Json(preset)).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 

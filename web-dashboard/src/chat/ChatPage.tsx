@@ -39,9 +39,11 @@ export function ChatPage() {
           className="flex items-center justify-between gap-2 px-4 py-3 border-b"
           style={{ borderColor: "var(--color-border)" }}
         >
-          <span className="text-sm font-semibold truncate">
-            {bootstrap.assistant_identity.name}
-          </span>
+          <nav className="flex items-center gap-2 text-sm">
+            <span className="font-semibold truncate">
+              {bootstrap.assistant_identity.name}
+            </span>
+          </nav>
           <div className="flex items-center gap-2">
             <span className="text-xs opacity-50">
               v{bootstrap.server_version}
@@ -49,6 +51,26 @@ export function ChatPage() {
             <ThemeSwitcher />
           </div>
         </header>
+        <nav
+          className="flex items-center gap-1 px-3 py-1 border-b text-xs"
+          style={{ borderColor: "var(--color-border)" }}
+          aria-label="Dashboard sections"
+        >
+          <Link
+            to="/chat"
+            className="px-2 py-1 rounded font-medium underline"
+            style={{ color: "var(--color-text)" }}
+          >
+            Chat
+          </Link>
+          <Link
+            to="/board"
+            className="px-2 py-1 rounded hover:underline"
+            style={{ color: "var(--color-text-muted)" }}
+          >
+            Board
+          </Link>
+        </nav>
         <SlotSidebar
           activeSlotId={slotId}
           onSelectSlot={handleSelect}
