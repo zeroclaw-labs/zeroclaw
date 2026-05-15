@@ -89,7 +89,7 @@ pub struct SendParams {
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: String,
+    pub payload: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Header>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +116,7 @@ pub struct RecvNotificationParams {
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: String,
+    pub payload: serde_json::Value,
     pub timestamp: i64,
 }
 
@@ -125,6 +125,53 @@ pub struct RecvAckParams {
     #[serde(rename = "messageId")]
     pub message_id: String,
     #[serde(rename = "messageSeq")]
+    pub message_seq: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub uid: String,
+    pub version: i64,
+    #[serde(rename = "last_msg_seqs")]
+    pub last_msg_seqs: String,
+    #[serde(rename = "msg_count")]
+    pub msg_count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncMessage {
+    #[serde(rename = "message_id")]
+    pub message_id: serde_json::Value, // Handle number or string
+    #[serde(rename = "message_seq")]
+    pub message_seq: u32,
+    #[serde(rename = "from_uid")]
+    pub from_uid: String,
+    pub payload: serde_json::Value,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub conversations: Vec<SyncConversation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncConversation {
+    pub channel_id: String,
+    pub channel_type: u8,
+    pub unread: Option<u32>,
+    pub timestamp: i64,
+    pub last_msg_seq: u32,
+    pub version: i64,
+    pub recents: Option<Vec<SyncMessage>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClearUnreadRequest {
+    pub uid: String,
+    pub channel_id: String,
+    pub channel_type: u8,
+    #[serde(rename = "message_seq")]
     pub message_seq: u32,
 }
 

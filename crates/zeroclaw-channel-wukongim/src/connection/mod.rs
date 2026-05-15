@@ -2,9 +2,9 @@
 pub mod protocol;
 
 pub use protocol::{
-    ConnectParams, Header, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RecvAckParams, RecvNotificationParams, SendParams, WUKONGIM_RPC_VERSION, WkChannelType,
-    WkMessageType,
+    ClearUnreadRequest, ConnectParams, Header, JsonRpcError, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, RecvAckParams, RecvNotificationParams, SendParams, SyncConversation,
+    SyncMessage, SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType,
 };
 
 use std::time::Duration;

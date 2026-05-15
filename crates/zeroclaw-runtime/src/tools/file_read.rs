@@ -110,18 +110,24 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Cross-cutting rate limiting and path-allowlist checks live in the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).  Successful reads consume one
+        // budget slot via the outer RateLimitedTool.
+        //
+        // Read-tool exception: post-`PathGuardedTool` resolve/canonicalize
+        // failures (path-traversal that slipped through allowlist, missing
+        // file) also consume one budget slot, charged here, so that callers
+        // cannot probe path existence for free.  The outer wrapper only
+        // records on `success: true`, so calling `record_action()` on these
+        // failure paths charges exactly one slot per attempt — matching the
+        // pre-wrapper semantics where every attempted read cost one slot.
 
         // Validate and build candidate path using workspace_dir directly.
         let full_path = match self.resolve_candidate(path) {
             Ok(p) => p,
             Err(e) => {
+                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -130,21 +136,11 @@ impl Tool for FileReadTool {
             }
         };
 
-        // Record action BEFORE canonicalization so that every non-trivially-rejected
-        // request consumes rate limit budget. This prevents attackers from probing
-        // path existence (via canonicalize errors) without rate limit cost.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         // Canonicalize to resolve symlinks, then enforce workspace boundary.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
+                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -154,6 +150,7 @@ impl Tool for FileReadTool {
         };
 
         if !self.security.is_resolved_path_allowed(&resolved_path) {
+            let _ = self.security.record_action();
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -411,30 +408,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello world")
-            .await
-            .unwrap();
-
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
-        let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn file_read_allows_readonly_mode() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_readonly");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -553,36 +526,6 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn file_read_nonexistent_consumes_rate_limit_budget() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        // Allow only 2 actions total
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
-
-        // Both reads fail (file doesn't exist) but should consume budget
-        let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
-        assert!(!r1.success);
-        assert!(r1.error.as_ref().unwrap().contains("Failed to resolve"));
-
-        let r2 = tool.execute(json!({"path": "nope2.txt"})).await.unwrap();
-        assert!(!r2.success);
-        assert!(r2.error.as_ref().unwrap().contains("Failed to resolve"));
-
-        // Third attempt should be rate limited even though file doesn't exist
-        let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
-        assert!(!r3.success);
-        assert!(
-            r3.error.as_ref().unwrap().contains("Rate limit"),
-            "Expected rate limit error, got: {:?}",
-            r3.error
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -1160,5 +1103,54 @@ mod tests {
         assert!(!result.success);
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// Anti-probing regression: a caller cannot probe file existence for free.
+    /// Both `resolve_candidate` failures and `canonicalize` failures must
+    /// consume one action-budget slot, so repeated probes hit the rate limit.
+    #[tokio::test]
+    async fn file_read_nonexistent_consumes_rate_limit_budget() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Allow only 2 actions total.
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
+
+        // Two failing reads each consume one slot via the inner-tool charge.
+        let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
+        assert!(!r1.success);
+        assert!(
+            r1.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        let r2 = tool.execute(json!({"path": "nope2.txt"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(
+            r2.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        // Third attempt: budget is now exhausted.  The inner tool still
+        // charges, but `record_action()` returns false; the failure error
+        // is unchanged from the caller's perspective (probing failed),
+        // and the budget is observably full (a subsequent allowed read
+        // would have to wait for the window to reset).
+        let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
+        assert!(!r3.success);
+
+        // Verify the budget is actually full by attempting a real read,
+        // which must now report rate-limit exhaustion when wrapped, or at
+        // minimum fail.  Here we use the inner-only tool, so we just
+        // assert that record_action returns false (budget already at cap).
+        // The inner tool's own retry would consume nothing more.
+        assert!(!tool.security.record_action(), "budget must be exhausted");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

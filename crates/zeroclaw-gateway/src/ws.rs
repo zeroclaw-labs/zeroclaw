@@ -731,7 +731,19 @@ async fn process_chat_message(
             tokio::select! {
                 biased;
                 client_msg = receiver.next() => {
-                    let Some(Ok(Message::Text(text))) = client_msg else { continue };
+                    // On client disconnect, `receiver.next()` returns `None`
+                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
+                    // hot-loops the select; cancel the turn so `turn_fut`
+                    // resolves with `ToolLoopCancelled` and `tokio::join!`
+                    // below can return. See #6514.
+                    let text = match client_msg {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            cancel_token.cancel();
+                            break;
+                        }
+                        _ => continue,
+                    };
                     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                         continue;
                     };
@@ -1258,6 +1270,62 @@ mod tests {
         assert!(
             needs_onboarding_ws_error(&config).is_none(),
             "current configured model must allow WebSocket agent construction to continue"
+        );
+    }
+
+    // Regression for #6514. The mid-turn `client_msg` arm in `forward_fut`
+    // must (a) classify stream-end / close / error frames as "client gone"
+    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
+    // can return — a bare `continue` hot-loops the select forever.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DisconnectAction {
+        Break,
+        Continue,
+        ProcessText,
+    }
+
+    fn classify_client_msg(
+        msg: Option<Result<axum::extract::ws::Message, &'static str>>,
+    ) -> DisconnectAction {
+        use axum::extract::ws::Message;
+        match msg {
+            Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
+            _ => DisconnectAction::Continue,
+        }
+    }
+
+    #[test]
+    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
+        use axum::extract::ws::Message;
+        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Close(None)))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Err("io"))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
+            DisconnectAction::Continue,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Text("{}".into())))),
+            DisconnectAction::ProcessText,
+        );
+    }
+
+    #[test]
+    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let clone_for_turn = token.clone();
+        assert!(!clone_for_turn.is_cancelled());
+        token.cancel();
+        assert!(
+            clone_for_turn.is_cancelled(),
+            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
         );
     }
 }

@@ -1497,16 +1497,10 @@ mod inbound {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
+            // Reply anchor: only carry an existing Matrix thread root. A root
+            // timeline event is not a thread, even when outbound replies are
+            // configured to preserve thread context.
+            thread_ts: inbound_thread_ts(thread_id.as_ref()),
             // Interruption scope is for cancellation grouping — only set when
             // the inbound is genuinely *inside* a reply thread.
             interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
@@ -1543,6 +1537,10 @@ mod inbound {
         }
         let root = relates.get("event_id")?.as_str()?;
         root.parse().ok()
+    }
+
+    pub(super) fn inbound_thread_ts(thread_id: Option<&OwnedEventId>) -> Option<String> {
+        thread_id.map(ToString::to_string)
     }
 
     /// Pull the `m.in_reply_to.event_id` from a raw event. This is Matrix's
@@ -1849,18 +1847,21 @@ mod outbound {
     use futures_util::StreamExt;
     use matrix_sdk::{
         Client, Room, RoomState,
-        attachment::AttachmentConfig,
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
         room::{
             edit::EditedContent,
             reply::{EnforceThread, Reply},
         },
         ruma::{
-            OwnedEventId, OwnedRoomId,
+            OwnedEventId, OwnedRoomId, UInt,
             events::{
                 reaction::ReactionEventContent,
                 relation::Annotation,
                 room::message::{
-                    MessageType, ReplyWithinThread, RoomMessageEventContent,
+                    AddMentions, MessageType, ReplyWithinThread, RoomMessageEventContent,
                     RoomMessageEventContentWithoutRelation, TextMessageEventContent,
                 },
             },
@@ -2314,7 +2315,7 @@ mod outbound {
         ) {
             send_threaded_reply(&room, content, anchor, outbox.threads_seen).await?
         } else {
-            room.send(content).await?.event_id
+            room.send(content).await?.response.event_id
         };
 
         let kinds = delivery.failure_kinds();
@@ -2357,13 +2358,14 @@ mod outbound {
                 Reply {
                     event_id: anchor.clone(),
                     enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                    add_mentions: AddMentions::No,
                 },
             )
             .await
             .map_err(|e| anyhow!("make_reply_event failed: {e}"))?;
         ctx_mod::mark_seen(threads_seen, anchor).await;
         let resp = room.send(reply_event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     pub(super) async fn edit(
@@ -2415,7 +2417,7 @@ mod outbound {
                 event_id.clone(),
                 emoji.to_string(),
             ),
-            resp.event_id,
+            resp.response.event_id,
         );
         Ok(())
     }
@@ -2454,7 +2456,8 @@ mod outbound {
         Ok(room)
     }
 
-    enum AttachmentKind {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AttachmentKind {
         Auto,
         Image,
         Audio,
@@ -2469,29 +2472,85 @@ mod outbound {
         kind: AttachmentKind,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mime: mime_guess::Mime = match att.mime_type.as_deref() {
+        let mime = attachment_mime(att);
+        if matches!(kind, AttachmentKind::Voice) {
+            return upload_voice(room, att, &mime, thread_anchor).await;
+        }
+        let config = attachment_config_for(att, kind, &mime, thread_anchor);
+        let resp = room
+            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
+            .await
+            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
+        Ok(resp.event_id)
+    }
+
+    pub(super) fn attachment_config_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> AttachmentConfig {
+        let mut config = AttachmentConfig::new().info(attachment_info_for(att, kind, mime));
+        if let Some(anchor) = thread_anchor {
+            config = config.reply(Some(Reply {
+                event_id: anchor.clone(),
+                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                add_mentions: AddMentions::No,
+            }));
+        }
+        config
+    }
+
+    pub(super) fn attachment_mime(att: &MediaAttachment) -> mime_guess::Mime {
+        match att.mime_type.as_deref() {
             Some(m) => m
                 .parse()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
             None => mime_guess::from_path(&att.file_name)
                 .first()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-        };
-        if matches!(kind, AttachmentKind::Voice) {
-            return upload_voice(room, att, &mime, thread_anchor).await;
         }
-        let mut config = AttachmentConfig::new();
-        if let Some(anchor) = thread_anchor {
-            config = config.reply(Some(Reply {
-                event_id: anchor.clone(),
-                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
-            }));
+    }
+
+    fn attachment_info_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+    ) -> AttachmentInfo {
+        let size = UInt::try_from(att.data.len()).ok();
+        match attachment_info_kind(kind, mime) {
+            AttachmentKind::Image => AttachmentInfo::Image(BaseImageInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Audio => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Video => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::File | AttachmentKind::Auto => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
         }
-        let resp = room
-            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
-            .await
-            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
-        Ok(resp.event_id)
+    }
+
+    fn attachment_info_kind(kind: AttachmentKind, mime: &mime_guess::Mime) -> AttachmentKind {
+        if kind == AttachmentKind::Voice {
+            return AttachmentKind::Voice;
+        }
+        match mime.type_() {
+            mime_guess::mime::IMAGE => AttachmentKind::Image,
+            mime_guess::mime::AUDIO => AttachmentKind::Audio,
+            mime_guess::mime::VIDEO => AttachmentKind::Video,
+            _ => AttachmentKind::File,
+        }
     }
 
     /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
@@ -2538,7 +2597,7 @@ mod outbound {
             );
         }
         let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     fn derive_file_name(target: &str) -> String {
@@ -3786,7 +3845,9 @@ mod tests {
     }
 
     mod thread_extraction {
-        use super::super::inbound::{extract_mentions_user_ids, extract_thread_id};
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, inbound_thread_ts,
+        };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 
@@ -3817,6 +3878,21 @@ mod tests {
                 "content": { "msgtype": "m.text", "body": "hi" }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_message_does_not_become_thread_when_reply_in_thread_enabled() {
+            assert_eq!(inbound_thread_ts(None), None);
+        }
+
+        #[test]
+        fn threaded_message_uses_existing_thread_root() {
+            let root_id = "$root:server".parse().expect("event id");
+
+            assert_eq!(
+                inbound_thread_ts(Some(&root_id)).as_deref(),
+                Some("$root:server")
+            );
         }
 
         #[test]
@@ -4383,6 +4459,110 @@ mod tests {
         fn empty_text_without_attachment_is_error() {
             // True empty-message case: nothing to deliver, surface the error.
             assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+    }
+
+    mod outbound_attachment_info {
+        use super::super::outbound::{AttachmentKind, attachment_config_for};
+        use matrix_sdk::{attachment::AttachmentInfo, ruma::UInt};
+        use zeroclaw_api::media::MediaAttachment;
+
+        fn attachment(file_name: &str, mime_type: &str, len: usize) -> MediaAttachment {
+            MediaAttachment {
+                file_name: file_name.to_string(),
+                data: vec![0; len],
+                mime_type: Some(mime_type.to_string()),
+            }
+        }
+
+        fn info_size(info: AttachmentInfo) -> Option<UInt> {
+            match info {
+                AttachmentInfo::Image(info) => info.size,
+                AttachmentInfo::Video(info) => info.size,
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.size,
+                AttachmentInfo::File(info) => info.size,
+            }
+        }
+
+        #[test]
+        fn structured_file_attachment_carries_matrix_size_info() {
+            let att = attachment("report.pdf", "application/pdf", 4096);
+
+            let mime = super::super::outbound::attachment_mime(&att);
+            let config = attachment_config_for(&att, AttachmentKind::Auto, &mime, None);
+
+            let info = config.info.expect("attachment info is populated");
+            assert!(matches!(info, AttachmentInfo::File(_)));
+            assert_eq!(info_size(info), UInt::try_from(4096usize).ok());
+        }
+
+        #[test]
+        fn media_markers_use_type_specific_matrix_info_with_size() {
+            let cases = [
+                (
+                    AttachmentKind::Image,
+                    attachment("photo.png", "image/png", 17),
+                    "image",
+                ),
+                (
+                    AttachmentKind::Audio,
+                    attachment("clip.ogg", "audio/ogg", 23),
+                    "audio",
+                ),
+                (
+                    AttachmentKind::Video,
+                    attachment("movie.mp4", "video/mp4", 31),
+                    "video",
+                ),
+            ];
+
+            for (kind, att, expected_kind) in cases {
+                let mime = super::super::outbound::attachment_mime(&att);
+                let config = attachment_config_for(&att, kind, &mime, None);
+                let info = config.info.expect("attachment info is populated");
+                match (&info, expected_kind) {
+                    (AttachmentInfo::Image(_), "image") => {}
+                    (AttachmentInfo::Audio(_), "audio") => {}
+                    (AttachmentInfo::Video(_), "video") => {}
+                    _ => panic!("unexpected attachment info kind {info:?}"),
+                }
+                assert_eq!(info_size(info), UInt::try_from(att.data.len()).ok());
+            }
+        }
+
+        #[test]
+        fn attachment_info_kind_matches_final_mime_type() {
+            let image_named_as_file = attachment("photo.png", "image/png", 47);
+            let mime = super::super::outbound::attachment_mime(&image_named_as_file);
+            let config =
+                attachment_config_for(&image_named_as_file, AttachmentKind::File, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::Image(_)),
+                "info must match the MIME-selected Matrix event type"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_named_as_file.data.len()).ok()
+            );
+
+            let image_marker_with_file_mime = attachment("report.pdf", "application/pdf", 53);
+            let mime = super::super::outbound::attachment_mime(&image_marker_with_file_mime);
+            let config = attachment_config_for(
+                &image_marker_with_file_mime,
+                AttachmentKind::Image,
+                &mime,
+                None,
+            );
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::File(_)),
+                "file MIME should use file info so SDK preserves size"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
         }
     }
 }

@@ -380,6 +380,11 @@ pub struct Config {
     #[nested]
     pub notion: NotionConfig,
 
+    /// Dawn S3 compatible storage tool configuration (`[dawn_s3]`).
+    #[serde(default)]
+    #[nested]
+    pub dawn_s3: DawnS3Config,
+
     /// Jira integration configuration (`[jira]`).
     #[serde(default)]
     #[nested]
@@ -1931,11 +1936,30 @@ impl Default for PipelineConfig {
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
+///
+/// # Privacy and cost note
+///
+/// Tool results that print real local image paths (e.g. shell tools doing
+/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
+/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
+/// This means image bytes that previously stayed local will be uploaded to
+/// the configured provider when surfaced by a tool.
+///
+/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
+/// image budget, but operators running shell-style tools over directories of
+/// personal or sensitive images should be aware of the upload semantics. See
+/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
+    ///
+    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older images are
+    /// dropped first when the cumulative count exceeds this limit. Acts as
+    /// the upper bound on per-turn upload cost when tool outputs surface
+    /// local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8388,6 +8412,21 @@ pub struct WuKongIMConfig {
     /// How long (seconds) to wait for the operator to approve a tool call. Default: 300.
     #[serde(default = "default_wukongim_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Directory for downloaded files (relative to workspace or absolute path).
+    /// Default: "downloads" (i.e., {workspace_dir}/downloads)
+    #[serde(default = "default_wukongim_downloads_dir")]
+    pub downloads_dir: String,
+    /// Dawn API base URL for synchronization and unread clearing
+    #[serde(default)]
+    pub dawn_url: String,
+    /// Assistant token for Dawn API authentication
+    #[serde(default)]
+    #[secret]
+    pub dawn_token: String,
+}
+
+fn default_wukongim_downloads_dir() -> String {
+    "downloads".to_string()
 }
 
 impl ChannelConfig for WuKongIMConfig {
@@ -9425,7 +9464,23 @@ impl Default for JiraConfig {
     }
 }
 
-///
+/// Dawn S3 compatible storage tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn-s3"]
+pub struct DawnS3Config {
+    /// Enable the `dawn_s3` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dawn API base URL.
+    #[serde(default)]
+    pub url: String,
+    /// Assistant token for authentication.
+    #[serde(default)]
+    #[secret]
+    pub token: String,
+}
+
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -9742,6 +9797,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
@@ -12734,7 +12790,7 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
-            hooks: HooksConfig::default(),
+hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
@@ -12743,6 +12799,7 @@ auto_save = true
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
@@ -12760,11 +12817,6 @@ auto_save = true
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
         };
-        // Provider fields are now resolved directly — no cache needed.
-
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed = parse_test_config(&toml_str);
-
         assert_eq!(parsed.providers.fallback, config.providers.fallback);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
