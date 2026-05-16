@@ -17,4 +17,4 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 anyhow = "1.0"
 
 [dev-dependencies]
-tokio = { version = "1.50", default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.50", default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "test-util", "time"] }

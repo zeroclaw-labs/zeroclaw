@@ -15,4 +15,4 @@ mod observer;
 mod mock;
 
 pub use toggles::ProgressEventToggles;
-// pub use observer::ProgressReportingObserver;
+pub use observer::ProgressReportingObserver;
