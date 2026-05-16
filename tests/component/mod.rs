@@ -4,6 +4,7 @@ mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
 mod otel_dependency_feature_regression;
+mod plugin_cli;
 mod provider_resolution;
 mod provider_schema;
 mod reply_target_field_regression;

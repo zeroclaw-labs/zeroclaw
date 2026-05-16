@@ -519,6 +519,36 @@ permissions = []
     }
 
     #[test]
+    fn test_install_and_list_use_same_exact_plugins_dir() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        let install_dir = dir.path().join("configured-plugins");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("manifest.toml"),
+            r#"
+name = "installed-plugin"
+version = "0.1.0"
+description = "Installed into configured directory"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("plugin.wasm"), b"not-real-wasm").unwrap();
+
+        let mut install_host = PluginHost::from_plugins_dir(&install_dir).unwrap();
+        install_host.install(source_dir.to_str().unwrap()).unwrap();
+
+        let list_host = PluginHost::from_plugins_dir(&install_dir).unwrap();
+        assert_eq!(list_host.plugins_dir(), install_dir);
+        let plugins = list_host.list_plugins();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "installed-plugin");
+    }
+
+    #[test]
     fn test_discover_with_manifest() {
         let dir = tempdir().unwrap();
         let plugin_dir = dir.path().join("plugins").join("test-plugin");

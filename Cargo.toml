@@ -344,7 +344,11 @@ dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
+plugins-wasm = [
+    "dep:zeroclaw-plugins",
+    "zeroclaw-runtime/plugins-wasm",
+    "zeroclaw-gateway/plugins-wasm",
+]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]

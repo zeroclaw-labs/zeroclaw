@@ -1258,7 +1258,7 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_path = config.plugins.resolved_plugins_dir();
+        let plugin_path = config.resolved_plugins_discovery_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
             match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
@@ -1317,7 +1317,7 @@ pub fn all_tools_with_runtime(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+    use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig, PluginsConfig};
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {
@@ -1428,6 +1428,54 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn all_tools_discovers_plugins_from_configured_plugins_dir() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_dir = tmp.path().join("configured-plugins");
+        let plugin_dir = plugins_dir.join("configured-tool");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "configured-tool"
+version = "0.1.0"
+description = "configured plugin tool"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#,
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new());
+        let mut cfg = test_config(&tmp);
+        cfg.plugins = PluginsConfig {
+            enabled: true,
+            plugins_dir: plugins_dir.to_string_lossy().into_owned(),
+            ..PluginsConfig::default()
+        };
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"configured-tool"));
     }
 
     #[test]

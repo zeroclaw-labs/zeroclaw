@@ -7019,6 +7019,17 @@ fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
 
+fn has_plugin_entries(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_dir() && path.join("manifest.toml").is_file()
+    })
+}
+
 fn default_max_plugins() -> usize {
     50
 }
@@ -7036,12 +7047,61 @@ impl Default for PluginsConfig {
 }
 
 impl PluginsConfig {
-    /// Resolve the configured plugin installation/discovery directory.
+    /// Resolve the configured plugin installation directory.
     ///
-    /// CLI plugin management and runtime plugin discovery both use this helper
-    /// so `plugins.plugins_dir` remains the single source of truth.
+    /// CLI plugin install/remove commands use this helper so writes always go
+    /// to the configured `plugins.plugins_dir`.
     pub fn resolved_plugins_dir(&self) -> PathBuf {
         expand_tilde_path(&self.plugins_dir)
+    }
+
+    /// Resolve the plugin discovery directory, preserving the pre-#6254
+    /// `workspace_dir/plugins` location when the configured default directory
+    /// has no installed plugins yet.
+    ///
+    /// Explicit `plugins.plugins_dir` values always win. For omitted/default
+    /// configs, discovery first uses the new default config-dir location, then
+    /// falls back to the legacy workspace location if it contains plugins.
+    pub fn resolved_plugins_discovery_dir(
+        &self,
+        config_path: &Path,
+        workspace_dir: &Path,
+    ) -> PathBuf {
+        let configured_dir = self.resolved_plugins_dir();
+        let legacy_dir = workspace_dir.join("plugins");
+
+        if !self.uses_default_plugins_dir(config_path) {
+            return configured_dir;
+        }
+
+        if has_plugin_entries(&configured_dir) {
+            return configured_dir;
+        }
+
+        if has_plugin_entries(&legacy_dir) {
+            return legacy_dir;
+        }
+
+        configured_dir
+    }
+
+    fn uses_default_plugins_dir(&self, config_path: &Path) -> bool {
+        let configured_dir = expand_tilde_path(&self.plugins_dir);
+        if configured_dir == expand_tilde_path(&default_plugins_dir()) {
+            return true;
+        }
+
+        config_path
+            .parent()
+            .is_some_and(|config_dir| configured_dir == config_dir.join("plugins"))
+    }
+}
+
+impl Config {
+    /// Resolve the plugin discovery directory for this loaded config.
+    pub fn resolved_plugins_discovery_dir(&self) -> PathBuf {
+        self.plugins
+            .resolved_plugins_discovery_dir(&self.config_path, &self.workspace_dir)
     }
 }
 
@@ -17231,6 +17291,120 @@ mod tests {
         assert_eq!(
             config.resolved_plugins_dir(),
             expand_tilde_path("~/.zeroclaw/plugins")
+        );
+    }
+
+    #[test]
+    async fn plugins_config_discovery_uses_explicit_plugins_dir() {
+        let tmp = TempDir::new().unwrap();
+        let configured = tmp.path().join("configured-plugins");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("plugins").join("legacy-plugin")).unwrap();
+        std::fs::write(
+            workspace
+                .join("plugins")
+                .join("legacy-plugin")
+                .join("manifest.toml"),
+            "name = \"legacy-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+
+        let config = PluginsConfig {
+            plugins_dir: configured.to_string_lossy().into_owned(),
+            ..PluginsConfig::default()
+        };
+
+        assert_eq!(config.resolved_plugins_dir(), configured);
+        let config_path = tmp.path().join("config.toml");
+        assert_eq!(
+            config.resolved_plugins_discovery_dir(&config_path, &workspace),
+            configured
+        );
+    }
+
+    #[test]
+    async fn plugins_config_discovery_falls_back_to_legacy_workspace_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let configured = config_dir.join("plugins");
+        let workspace = config_dir.join("workspace");
+        let legacy_plugin = workspace.join("plugins").join("legacy-plugin");
+        std::fs::create_dir_all(&legacy_plugin).unwrap();
+        std::fs::write(
+            legacy_plugin.join("manifest.toml"),
+            "name = \"legacy-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+
+        let config = PluginsConfig {
+            plugins_dir: configured.to_string_lossy().into_owned(),
+            ..PluginsConfig::default()
+        };
+
+        assert_eq!(config.resolved_plugins_dir(), configured);
+        let config_path = config_dir.join("config.toml");
+        assert_eq!(
+            config.resolved_plugins_discovery_dir(&config_path, &workspace),
+            workspace.join("plugins")
+        );
+    }
+
+    #[test]
+    async fn plugins_config_discovery_falls_back_for_custom_workspace_name() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let configured = config_dir.join("plugins");
+        let workspace = tmp.path().join("project-a");
+        let legacy_plugin = workspace.join("plugins").join("legacy-plugin");
+        std::fs::create_dir_all(&legacy_plugin).unwrap();
+        std::fs::write(
+            legacy_plugin.join("manifest.toml"),
+            "name = \"legacy-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+
+        let config = PluginsConfig {
+            plugins_dir: configured.to_string_lossy().into_owned(),
+            ..PluginsConfig::default()
+        };
+
+        assert_eq!(
+            config.resolved_plugins_discovery_dir(&config_dir.join("config.toml"), &workspace),
+            workspace.join("plugins")
+        );
+    }
+
+    #[test]
+    async fn plugins_config_discovery_prefers_default_plugins_dir_when_populated() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let configured = config_dir.join("plugins");
+        let workspace = config_dir.join("workspace");
+        let configured_plugin = configured.join("configured-plugin");
+        let legacy_plugin = workspace.join("plugins").join("legacy-plugin");
+        std::fs::create_dir_all(&configured_plugin).unwrap();
+        std::fs::create_dir_all(&legacy_plugin).unwrap();
+        std::fs::write(
+            configured_plugin.join("manifest.toml"),
+            "name = \"configured-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_plugin.join("manifest.toml"),
+            "name = \"legacy-plugin\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+
+        let config = PluginsConfig {
+            plugins_dir: configured.to_string_lossy().into_owned(),
+            ..PluginsConfig::default()
+        };
+
+        assert_eq!(config.resolved_plugins_dir(), configured);
+        let config_path = config_dir.join("config.toml");
+        assert_eq!(
+            config.resolved_plugins_discovery_dir(&config_path, &workspace),
+            configured
         );
     }
 
