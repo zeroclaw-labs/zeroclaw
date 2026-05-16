@@ -21,6 +21,7 @@ pub mod skill_http {
     pub use zeroclaw_runtime::skills::skill_http::*;
 }
 
+#[allow(dead_code)]
 pub async fn handle_command(
     command: crate::SkillCommands,
     config: &crate::config::Config,
