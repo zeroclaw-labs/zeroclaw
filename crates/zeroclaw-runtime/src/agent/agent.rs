@@ -585,11 +585,7 @@ impl Agent {
         // file writes (and downstream markdown-memory backends) don't
         // hit ENOENT on a fresh install.
         if let Err(e) = tokio::fs::create_dir_all(&agent_workspace).await {
-            tracing::warn!(
-                agent = %agent_alias,
-                workspace = %agent_workspace.display(),
-                "Failed to create per-agent workspace dir (continuing): {e}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to create per-agent workspace dir (continuing): ");
         }
         // Seed the agent's bootstrap files (AGENTS.md / SOUL.md /
         // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
@@ -597,11 +593,7 @@ impl Agent {
         // fills in the gaps so a freshly-created agent has a basic
         // identity to load.
         if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
-            tracing::warn!(
-                agent = %agent_alias,
-                workspace = %agent_workspace.display(),
-                "Failed to ensure per-agent bootstrap files (continuing with whatever exists): {e}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
             let mut policy = SecurityPolicy::from_risk_profile(
@@ -688,10 +680,7 @@ impl Agent {
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
-            tracing::info!(
-                "Initializing MCP client — {} server(s) configured",
-                config.mcp.servers.len()
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Initializing MCP client — {} server(s) configured", config.mcp.servers.len()));
             match tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
@@ -700,11 +689,7 @@ impl Agent {
                             std::sync::Arc::clone(&registry),
                         )
                         .await;
-                        tracing::info!(
-                            "MCP deferred: {} tool stub(s) from {} server(s)",
-                            deferred_set.len(),
-                            registry.server_count()
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP deferred: {} tool stub(s) from {} server(s)", deferred_set.len(), registry.server_count()));
                         let activated =
                             Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
                         activated_tools = Some(Arc::clone(&activated));
@@ -730,15 +715,11 @@ impl Agent {
                                 registered += 1;
                             }
                         }
-                        tracing::info!(
-                            "MCP: {} tool(s) registered from {} server(s)",
-                            registered,
-                            registry.server_count()
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP: {} tool(s) registered from {} server(s)", registered, registry.server_count()));
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = ?e, "MCP registry failed to initialize");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "MCP registry failed to initialize");
                 }
             }
         }
@@ -971,10 +952,7 @@ impl Agent {
                     tool_args = a;
                 }
                 crate::hooks::HookResult::Cancel(reason) => {
-                    tracing::info!(
-                        tool = %call.name, %reason,
-                        "tool call cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
                     return ToolExecutionResult {
                         name: call.name.clone(),
                         output: format!("Cancelled by hook: {reason}"),
@@ -1038,12 +1016,7 @@ impl Agent {
                         }
                         Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!(
-                                tool = %tool_name,
-                                channel = %ch_name,
-                                error = %e,
-                                "channel approval request failed"
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tool_name, "channel": ch_name, "error": e.to_string()})), "channel approval request failed");
                         }
                     }
                 }
@@ -1058,12 +1031,9 @@ impl Agent {
                         ApprovalResponse::No
                     }
                     None => {
-                        tracing::warn!(
-                            tool = %tool_name,
-                            "no approval channel handled this request — denying. \
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tool_name})), "no approval channel handled this request — denying. \
                              Configure a back-channel (ACP or WS) that implements \
-                             request_approval to enable interactive approval."
-                        );
+                             request_approval to enable interactive approval.");
                         ApprovalResponse::No
                     }
                 };
@@ -1203,14 +1173,7 @@ impl Agent {
                 .get(&decision.hint)
                 .map(String::as_str)
                 .unwrap_or("unknown");
-            tracing::info!(
-                target: "query_classification",
-                hint = decision.hint.as_str(),
-                model = resolved_model,
-                rule_priority = decision.priority,
-                message_length = user_message.len(),
-                "Classified message route"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": decision.hint.as_str(), "model": resolved_model, "rule_priority": decision.priority, "message_length": user_message.len()})), "Classified message route");
             return format!("hint:{}", decision.hint);
         }
 
@@ -1220,13 +1183,7 @@ impl Agent {
             if let Some(hint) = ac.hint_for(tier)
                 && self.available_hints.contains(&hint.to_string())
             {
-                tracing::info!(
-                    target: "query_classification",
-                    hint = hint,
-                    complexity = ?tier,
-                    message_length = user_message.len(),
-                    "Auto-classified by complexity"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint, "complexity": format!("{:?}", tier), "message_length": user_message.len()})), "Auto-classified by complexity");
                 return format!("hint:{hint}");
             }
         }
@@ -1935,6 +1892,17 @@ mod tests {
             Ok(guard.remove(0))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "MockModelProvider" }
+    }
+
 
     struct ModelCaptureModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -1972,6 +1940,17 @@ mod tests {
             Ok(guard.remove(0))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for ModelCaptureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "ModelCaptureModelProvider" }
+    }
+
 
     struct MultimodalCaptureProvider {
         seen_user_messages: Arc<Mutex<Vec<String>>>,
@@ -2046,6 +2025,17 @@ mod tests {
             true
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MultimodalCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "MultimodalCaptureProvider" }
+    }
+
 
     struct MockTool;
 
@@ -2135,6 +2125,17 @@ mod tests {
     struct ApprovalChannel {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         requests: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ApprovalChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
     }
 
     #[async_trait]
@@ -3092,6 +3093,17 @@ mod tests {
             }
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamToolCaptureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamToolCaptureModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn turn_streamed_passes_tool_specs_to_provider() {
@@ -3270,6 +3282,17 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for PreExecutedToolModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "PreExecutedToolModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn pre_executed_tool_results_keep_ids_when_calls_overlap() {
@@ -3363,7 +3386,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         agent
-            .turn(&format!("inspect [IMAGE:{}]", image_path.display()))
+            .turn(&format!("inspect [IMAGE:{}]", image_path.display().to_string()))
             .await
             .expect("turn should succeed");
 
@@ -3415,7 +3438,7 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
         agent
             .turn_streamed(
-                &format!("inspect [IMAGE:{}]", image_path.display()),
+                &format!("inspect [IMAGE:{}]", image_path.display().to_string()),
                 event_tx,
                 None,
             )
@@ -3682,6 +3705,17 @@ mod tests {
             }
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for NarrationStreamModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "NarrationStreamModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn streaming_narration_with_tool_calls_produces_no_consecutive_assistant_entries() {

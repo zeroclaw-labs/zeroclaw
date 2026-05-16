@@ -402,11 +402,11 @@ mod tests {
         let image = dir.path().join("generated.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
 
-        let input = format!("Image generated successfully.\nFile: {}", image.display());
+        let input = format!("Image generated successfully.\nFile: {}", image.display().to_string());
         let output = canonicalize_tool_result_media_markers(&input);
 
         assert!(output.contains("[IMAGE:"));
-        assert!(output.contains(&format!("[IMAGE:{}]", image.display())));
+        assert!(output.contains(&format!("[IMAGE:{}]", image.display().to_string())));
     }
 
     #[test]

@@ -194,6 +194,15 @@ mod tests {
             self.recall(query, limit, session_id, since, until).await
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str { "MockMemory" }
+    }
+
 
     #[async_trait]
     impl Memory for MockMemoryWithEntries {
@@ -271,6 +280,15 @@ mod tests {
             self.recall(query, limit, session_id, since, until).await
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemoryWithEntries {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str { "MockMemoryWithEntries" }
+    }
+
 
     #[tokio::test]
     async fn default_loader_formats_context() {

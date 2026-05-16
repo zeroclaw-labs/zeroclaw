@@ -299,12 +299,8 @@ fn scoped_validate(
         if touches_dirty || err_path.is_empty() {
             return Err(api_err);
         }
-        tracing::warn!(
-            path = %err_path,
-            "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
-             surfacing as a warning: {}",
-            api_err.message,
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": err_path})), &format!("validate() failed on a path outside this PATCH's dirty set; saving anyway and \
+             surfacing as a warning: {}", api_err.message));
         return Ok(vec![
             zeroclaw_config::validation_warnings::ValidationWarning::new(
                 "pre_existing_validation_error",
@@ -553,7 +549,7 @@ pub async fn handle_prop_put(
         if let Err(e) =
             zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
         {
-            tracing::warn!(error = %e, "failed to apply PUT comment to config.toml");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to apply PUT comment to config.toml");
         }
     }
 
@@ -856,37 +852,17 @@ pub async fn handle_delete_map_key(
                 let archive_root = parent.join("_deleted");
                 let archive_dir = archive_root.join(format!("{}-{ts}", q.key));
                 if let Err(err) = tokio::fs::create_dir_all(&archive_root).await {
-                    tracing::warn!(
-                        agent = %q.key,
-                        archive = %archive_root.display(),
-                        "agent alias removed from config but archive dir creation failed: {err}",
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_root.display().to_string(), "err": err.to_string()})), "agent alias removed from config but archive dir creation failed");
                 } else if let Err(err) = tokio::fs::rename(&workspace, &archive_dir).await {
-                    tracing::warn!(
-                        agent = %q.key,
-                        from = %workspace.display(),
-                        to = %archive_dir.display(),
-                        "agent alias removed from config but workspace archive failed: {err}",
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "from": workspace.display().to_string(), "to": archive_dir.display().to_string(), "err": err.to_string()})), "agent alias removed from config but workspace archive failed");
                 } else {
-                    tracing::info!(
-                        agent = %q.key,
-                        archive = %archive_dir.display(),
-                        "agent workspace archived after alias removal",
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_dir.display().to_string()})), "agent workspace archived after alias removal");
                 }
             }
             match state.mem.purge_agent(&q.key).await {
-                Ok(rows) if rows > 0 => tracing::info!(
-                    agent = %q.key,
-                    rows,
-                    "agent memory rows purged after alias removal",
-                ),
+                Ok(rows) if rows > 0 => ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": q.key, "rows": rows})), "agent memory rows purged after alias removal"),
                 Ok(_) => {}
-                Err(err) => tracing::warn!(
-                    agent = %q.key,
-                    "purge_agent failed (backend may not support it): {err}",
-                ),
+                Err(err) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "err": err.to_string()})), "purge_agent failed (backend may not support it)"),
             }
         }
         working.mark_dirty(&format!("{}.{}", q.path, q.key));
@@ -944,10 +920,7 @@ pub async fn handle_map_key(
                 zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &key)
                 && let Err(e) = tokio::fs::create_dir_all(&dir).await
             {
-                tracing::warn!(
-                    "skill-bundle '{key}' directory creation failed at {}: {e}",
-                    dir.display(),
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("skill-bundle '{key}' directory creation failed at {}: {e}", dir.display().to_string()));
             }
         }
 
@@ -1271,7 +1244,7 @@ pub async fn handle_patch(
     let config_path = working.config_path.clone();
     // Collect non-fatal validation warnings against the post-save state
     // before working is moved into persist_and_swap. Same signal as
-    // `tracing::warn!` from `validate()`, surfaced structured so dashboard
+    // `zeroclaw_log::record!` from `validate()`, surfaced structured so dashboard
     // callers see it.
     let mut warnings = working.collect_warnings();
     warnings.extend(scoped_validation_warnings);
@@ -1284,7 +1257,7 @@ pub async fn handle_patch(
     {
         // Comments are best-effort decoration; surface as a non-fatal warn.
         // The patch itself succeeded — return success but log the failure.
-        tracing::warn!(error = %e, "failed to apply PATCH op comments to config.toml");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to apply PATCH op comments to config.toml");
     }
 
     axum::Json(PatchResponse {
@@ -1416,7 +1389,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                 None => {
                     return error_response(ConfigApiError::new(
                         ConfigApiCode::InternalError,
-                        format!("config path has no parent: {}", config_path.display()),
+                        format!("config path has no parent: {}", config_path.display().to_string()),
                     ));
                 }
             };
@@ -1425,7 +1398,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                 None => {
                     return error_response(ConfigApiError::new(
                         ConfigApiCode::InternalError,
-                        format!("config path has no file name: {}", config_path.display()),
+                        format!("config path has no file name: {}", config_path.display().to_string()),
                     ));
                 }
             };

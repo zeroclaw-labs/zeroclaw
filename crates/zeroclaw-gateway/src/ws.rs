@@ -70,7 +70,6 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 
 /// Default wall-clock budget for the operator to answer an
@@ -316,20 +315,11 @@ async fn handle_socket(
             Ok(Message::Text(text)) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
                     if cp.msg_type == "connect" {
-                        debug!(
-                            session_id = ?cp.session_id,
-                            device_name = ?cp.device_name,
-                            capabilities = ?cp.capabilities,
-                            cwd = ?cp.cwd,
-                            "WebSocket connect params received"
-                        );
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": cp.session_id, "device_name": cp.device_name, "capabilities": cp.capabilities, "cwd": cp.cwd})), "WebSocket connect params received");
                         if let Some(sid) = &cp.session_id {
                             memory_session_id =
                                 zeroclaw_api::session_keys::sanitize_session_key(sid);
-                            debug!(
-                                session_id = sid,
-                                "WebSocket connect session override received"
-                            );
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": sid})), "WebSocket connect session override received");
                         }
                         if cp.cwd.is_some() {
                             requested_cwd = cp.cwd;
@@ -388,7 +378,7 @@ async fn handle_socket(
         {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!(error = %e, "Agent initialization failed");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Agent initialization failed");
                 let err = serde_json::json!({
                     "type": "error",
                     "message": format!("Failed to initialise agent: {e}"),
@@ -541,7 +531,7 @@ async fn handle_socket(
                     if let Some(tx) = pending_approvals.lock().remove(request_id) {
                         let _ = tx.send(decision.expect("checked above"));
                     } else {
-                        debug!(%request_id, "approval_response with no matching pending request");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
                     }
                     continue;
                 }
@@ -631,10 +621,7 @@ async fn handle_socket(
                         "timeout_secs": timeout_secs,
                     }),
                     other => {
-                        tracing::warn!(
-                            kind = ?other,
-                            "non-ApprovalRequest event leaked into approval channel"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": format!("{:?}", other)})), "non-ApprovalRequest event leaked into approval channel");
                         continue;
                     }
                 };
@@ -824,7 +811,7 @@ async fn process_chat_message(
                     if let Some(tx) = pending_approvals.lock().remove(request_id) {
                         let _ = tx.send(decision.expect("checked above"));
                     } else {
-                        debug!(%request_id, "approval_response with no matching pending request (mid-turn)");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
                     }
                 }
                 approval = approval_event_rx.recv() => {
@@ -1011,7 +998,7 @@ async fn process_chat_message(
                     )
                     .await
                     {
-                        tracing::debug!(error = ?e, "WS memory consolidation skipped");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "WS memory consolidation skipped");
                     }
                 });
             }
@@ -1089,7 +1076,7 @@ async fn process_chat_message(
                 let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
             }
 
-            tracing::error!(error = %e, "Agent turn failed");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Agent turn failed");
             let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
             let error_code = if sanitized.to_lowercase().contains("api key")
                 || sanitized.to_lowercase().contains("authentication")
@@ -1210,11 +1197,7 @@ fn record_turn_cost(
     );
     let cost_usd = usage.cost_usd;
     if let Err(error) = tracker.record_usage(usage) {
-        tracing::warn!(
-            provider = provider_name,
-            model,
-            "Failed to record gateway turn cost: {error}"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"provider": provider_name, "model": model, "error": error.to_string()})), "Failed to record gateway turn cost");
     }
     Some(cost_usd)
 }

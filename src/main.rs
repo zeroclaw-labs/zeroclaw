@@ -41,73 +41,6 @@ use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
-use tracing::{info, warn};
-use tracing_subscriber::field::Visit;
-use tracing_subscriber::fmt::FormatFields;
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{EnvFilter, fmt};
-
-/// Custom tracing event formatter that prefixes each log line with
-/// the active agent's alias, e.g. `[default] starting agent loop`,
-/// `[research-bot] tool.call tool=glob_search`. When no
-/// `agent_alias` field is present anywhere in the span scope, the
-/// line is prefixed with `[system]` so boot, migration, and other
-/// install-wide messages are visually distinct from per-agent
-/// activity.
-struct AgentAliasFormatter {
-    inner: tracing_subscriber::fmt::format::Format<
-        tracing_subscriber::fmt::format::Full,
-        tracing_subscriber::fmt::time::SystemTime,
-    >,
-}
-
-impl AgentAliasFormatter {
-    fn new() -> Self {
-        Self {
-            inner: tracing_subscriber::fmt::format::Format::default(),
-        }
-    }
-}
-
-impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for AgentAliasFormatter
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'writer> FormatFields<'writer> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
-        event: &tracing::Event<'_>,
-    ) -> std::fmt::Result {
-        // Walk leaf→root through the span scope, picking the most
-        // specific alias-bound label available. agent_alias wins; if
-        // an event is emitted outside any agent context (channel
-        // listener, cron tick), fall back to the channel composite so
-        // the line still carries identity rather than the opaque
-        // `[system]` bucket.
-        let label = ctx
-            .event_scope()
-            .and_then(|scope| {
-                scope.into_iter().find_map(|span| {
-                    span.extensions()
-                        .get::<ZeroclawAttribution>()
-                        .and_then(|attribution| {
-                            attribution
-                                .get("agent_alias")
-                                .or_else(|| attribution.get("channel"))
-                                .map(str::to_string)
-                        })
-                })
-            })
-            .unwrap_or_else(|| "system".to_string());
-        write!(writer, "[{label}] ")?;
-        self.inner.format_event(ctx, writer, event)
-    }
-}
-
-use zeroclaw_log::ZeroclawAttribution;
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -1325,17 +1258,7 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
-    use tracing_subscriber::layer::SubscriberExt;
-    let subscriber = fmt::Subscriber::builder()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
-        .event_format(AgentAliasFormatter::new())
-        .finish()
-        .with(zeroclaw_log::LogCaptureLayer);
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    zeroclaw_log::install_global_subscriber(default_log_level);
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // model_provider flags were given, it runs the full interactive wizard; otherwise
@@ -1450,7 +1373,7 @@ async fn main() -> Result<()> {
                                 Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
                             }
                             Err(e) => {
-                                tracing::debug!("TUI init failed: {e:?}");
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"e": e.to_string()})), "TUI init failed");
                                 eprintln!(
                                     "TUI init failed ({e}); falling back to terminal prompts."
                                 );
@@ -1643,7 +1566,7 @@ async fn main() -> Result<()> {
 
             // Wire CLI channel for interactive mode
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+                Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
             Box::pin(agent::run(
@@ -1684,13 +1607,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
-                    info!("🔄 Restarting ZeroClaw Gateway on {addr}");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"addr": addr})), "🔄 Restarting ZeroClaw Gateway on");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
                     match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
                     {
                         Ok(()) => {
-                            info!("   ✓ Existing gateway on {addr} shut down gracefully");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"addr": addr})), "✓ Existing gateway on shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
                             let deadline =
                                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -1698,9 +1621,7 @@ async fn main() -> Result<()> {
                                 match tokio::net::TcpStream::connect(&addr).await {
                                     Err(_) => break, // port is free
                                     Ok(_) if tokio::time::Instant::now() >= deadline => {
-                                        warn!(
-                                            "   Timed out waiting for port {port} to be released"
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"port": port})), "Timed out waiting for port to be released");
                                         break;
                                     }
                                     Ok(_) => {
@@ -1711,7 +1632,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            info!(error = ?e, "   No existing gateway to shut down");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "   No existing gateway to shut down");
                         }
                     }
 
@@ -1794,18 +1715,15 @@ async fn main() -> Result<()> {
                     } else {
                         "Consider installing to /usr/local/bin for system-wide service."
                     };
-                    tracing::warn!(
-                        "Daemon running from user home directory: {}. {install_hint}",
-                        exe.display(),
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Daemon running from user home directory: {}. {install_hint}", exe.display()));
                 }
             }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"host": host})), "🧠 Starting ZeroClaw Daemon on (random port)");
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"host": host, "port": port})), "🧠 Starting ZeroClaw Daemon on");
             }
 
             #[cfg(target_os = "linux")]
@@ -1836,20 +1754,14 @@ async fn main() -> Result<()> {
                         (true, false) => "security.sandbox.backend = \"docker\"",
                         _ => "runtime.kind = \"docker\"",
                     };
-                    warn!(
-                        "Docker memory limits are configured but the Linux kernel has no memcg support. \
-                         Affected config: {which}. \
-                         Consequence: --memory limits are silently ignored; agents can OOM the host. \
-                         Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt \
-                         (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot."
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"which": which})), "Docker memory limits are configured but the Linux kernel has no memcg support. Affected config: . Consequence: --memory limits are silently ignored; agents can OOM the host. Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot.");
                 }
             }
 
             // Wire CLI channel for interactive mode
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+                Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
             // Wire peripheral tools from zeroclaw-hardware
@@ -1929,7 +1841,7 @@ async fn main() -> Result<()> {
                                 SopEngine::new(SopConfig::default())
                             };
                             let engine = Arc::new(Mutex::new(engine));
-                            let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+                            let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                             Box::pin(async move {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
@@ -1951,7 +1863,7 @@ async fn main() -> Result<()> {
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
-                        info!("🔄 Daemon reload — re-reading config from disk");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "🔄 Daemon reload — re-reading config from disk");
                         current_config = Box::pin(Config::load_or_init()).await?;
                         // Continue loop: fresh subsystems with the new config.
                     }
@@ -3229,9 +3141,9 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 /// Log gateway startup message.
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
-        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"host": host})), "🚀 Starting ZeroClaw Gateway on (random port)");
     } else {
-        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"host": host, "port": port})), "🚀 Starting ZeroClaw Gateway on");
     }
 }
 

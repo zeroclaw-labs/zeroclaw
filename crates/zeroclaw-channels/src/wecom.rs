@@ -50,14 +50,17 @@ impl WeComChannel {
         let peers = (self.peer_resolver)();
         let allowed =
             crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive);
-        tracing::trace!(
-            channel = "wecom",
-            alias = %self.alias,
-            user_id = %user_id,
-            allowed,
-            "wecom allowlist decision"
-        );
+        ::zeroclaw_log::record!(TRACE, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "wecom", "alias": self.alias, "user_id": user_id, "allowed": allowed})), "wecom allowlist decision");
         allowed
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WeComChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::WeCom)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -108,7 +111,7 @@ impl Channel for WeComChannel {
         // handled via the gateway webhook subsystem.
         //
         // This listener keeps the channel alive and waits for the sender to close.
-        tracing::info!("channel ready (send-only via Bot Webhook)");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel ready (send-only via Bot Webhook)");
         tx.closed().await;
         Ok(())
     }

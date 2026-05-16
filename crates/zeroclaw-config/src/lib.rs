@@ -1,5 +1,11 @@
 //! Configuration schema, secrets, and related types for ZeroClaw.
 
+// `to_string()` inside `record!` `format!` args is the deliberate pattern
+// for crossing a Serialize→string boundary; clippy can't tell those from
+// redundant calls, so the lint is silenced at the crate root.
+#![allow(clippy::to_string_in_format_args)]
+#![allow(clippy::useless_format)]
+
 pub mod api_error;
 pub mod autonomy;
 pub mod comment_writer;

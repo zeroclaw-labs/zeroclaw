@@ -121,7 +121,7 @@ impl HttpRequestTool {
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "http_request: timeout_secs is 0, using safe default of 30s");
             30
         } else {
             self.timeout_secs

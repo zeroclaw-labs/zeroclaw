@@ -147,7 +147,7 @@ impl AwsCredentials {
             .or(config_region)
             .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
-        tracing::debug!("Loaded AWS credentials via credential_process");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Loaded AWS credentials via credential_process");
 
         Ok(Self {
             access_key_id,
@@ -225,10 +225,7 @@ impl AwsCredentials {
             region.trim().to_string()
         };
 
-        tracing::info!(
-            "Loaded AWS credentials from EC2 instance metadata (role: {})",
-            role
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Loaded AWS credentials from EC2 instance metadata (role: {})", role));
 
         Ok(Self {
             access_key_id,
@@ -580,29 +577,27 @@ struct ResponseToolUseWrapper {
 // ── BedrockModelProvider ─────────────────────────────────────────────
 
 pub struct BedrockModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     auth: Option<BedrockAuth>,
     max_tokens: u32,
     /// Cached SigV4 credentials from `credential_process` (with expiry).
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl Default for BedrockModelProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BedrockModelProvider {
-    pub fn new() -> Self {
+    pub fn new(alias: &str) -> Self {
         // Bearer token takes precedence over SigV4 credentials.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
+                alias: alias.to_string(),
                 auth: Some(BedrockAuth::BearerToken(token)),
                 max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
                 cred_cache: Mutex::new(None),
             };
         }
         Self {
+            alias: alias.to_string(),
             auth: AwsCredentials::from_env()
                 .or_else(|_| AwsCredentials::from_credential_process())
                 .ok()
@@ -612,10 +607,11 @@ impl BedrockModelProvider {
         }
     }
 
-    pub async fn new_async() -> Self {
+    pub async fn new_async(alias: &str) -> Self {
         // Bearer token takes precedence over SigV4 credentials.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
+                alias: alias.to_string(),
                 auth: Some(BedrockAuth::BearerToken(token)),
                 max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
                 cred_cache: Mutex::new(None),
@@ -623,6 +619,7 @@ impl BedrockModelProvider {
         }
         let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
         Self {
+            alias: alias.to_string(),
             auth,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
@@ -630,14 +627,14 @@ impl BedrockModelProvider {
     }
 
     /// Create a model_provider using a Bearer token for authentication.
-    pub fn with_bearer_token(token: &str) -> Self {
+    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
         Self {
+            alias: alias.to_string(),
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         }
     }
-
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
@@ -787,11 +784,8 @@ impl BedrockModelProvider {
                                 .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
                                 .unwrap_or_else(|| "unknown".to_string());
 
-                            tracing::warn!(
-                                "Failed to parse tool result message, creating error \
-                                 toolResult for tool_use_id={}",
-                                tool_use_id
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to parse tool result message, creating error \
+                                 toolResult for tool_use_id={}", tool_use_id));
 
                             ConverseMessage {
                                 role: "user".to_string(),
@@ -914,11 +908,7 @@ impl BedrockModelProvider {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let mut remaining = content;
         let has_image = content.contains("[IMAGE:");
-        tracing::info!(
-            "parse_user_content_blocks called, len={}, has_image={}",
-            content.len(),
-            has_image
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("parse_user_content_blocks called, len={}, has_image={}", content.len(), has_image));
 
         while let Some(start) = remaining.find("[IMAGE:") {
             // Add any text before the marker
@@ -1146,10 +1136,7 @@ impl BedrockModelProvider {
                             {
                                 *bytes = serde_json::json!(format!("<base64 {} chars>", s.len()));
                             }
-                            tracing::info!(
-                                "Bedrock image block: {}",
-                                serde_json::to_string(&b).unwrap_or_default()
-                            );
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Bedrock image block: {}", serde_json::to_string(&b).unwrap_or_default()));
                         }
                     }
                 }
@@ -1377,6 +1364,19 @@ impl ModelProvider for BedrockModelProvider {
 
 // ── Tests ───────────────────────────────────────────────────────
 
+impl ::zeroclaw_api::attribution::Attributable for BedrockModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Bedrock,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1532,7 +1532,7 @@ mod tests {
     #[test]
     fn creates_without_credentials() {
         // ModelProvider should construct even without env vars.
-        let _provider = BedrockModelProvider::new();
+        let _provider = BedrockModelProvider::new("test");
     }
 
     #[tokio::test]
@@ -1544,6 +1544,7 @@ mod tests {
         let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
         let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
@@ -1566,7 +1567,7 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let model_provider = BedrockModelProvider::with_bearer_token("test-api-key");
+        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
         assert!(model_provider.auth.is_some());
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
@@ -1581,7 +1582,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let model_provider = BedrockModelProvider::new();
+        let model_provider = BedrockModelProvider::new("test");
         assert!(matches!(
             model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
@@ -1595,7 +1596,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let model_provider = BedrockModelProvider::new();
+        let model_provider = BedrockModelProvider::new("test");
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
             model_provider.auth,
@@ -1941,6 +1942,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
@@ -1952,6 +1954,7 @@ mod tests {
     #[test]
     fn capabilities_reports_native_tool_calling() {
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
@@ -2280,6 +2283,7 @@ region=ap-southeast-1
     #[test]
     fn cached_credentials_returns_none_when_empty() {
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
@@ -2291,6 +2295,7 @@ region=ap-southeast-1
     fn cached_credentials_returns_some_when_valid() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(Some(make_creds(Some(future)))),
@@ -2304,6 +2309,7 @@ region=ap-southeast-1
     fn cached_credentials_returns_none_when_expired() {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(Some(make_creds(Some(past)))),
@@ -2315,6 +2321,7 @@ region=ap-southeast-1
     fn cache_credentials_stores_and_retrieves() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),

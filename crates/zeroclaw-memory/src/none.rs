@@ -5,12 +5,27 @@ use async_trait::async_trait;
 ///
 /// This backend is used when `memory.backend = "none"` to disable persistence
 /// while keeping the runtime wiring stable.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoneMemory;
+#[derive(Debug, Default, Clone)]
+pub struct NoneMemory {
+    alias: String,
+}
 
 impl NoneMemory {
-    pub fn new() -> Self {
-        Self
+    pub fn new(alias: &str) -> Self {
+        Self {
+            alias: alias.to_string(),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for NoneMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::None,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -97,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn none_memory_is_noop() {
-        let memory = NoneMemory::new();
+        let memory = NoneMemory::new("none");
 
         memory
             .store("k", "v", MemoryCategory::Core, None)

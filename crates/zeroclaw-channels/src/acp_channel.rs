@@ -63,6 +63,17 @@ impl AcpChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for AcpChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.name
+    }
+}
+
 #[async_trait]
 impl Channel for AcpChannel {
     fn name(&self) -> &str {

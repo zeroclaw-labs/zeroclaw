@@ -22,7 +22,7 @@ async fn e2e_live_openai_codex_multi_turn() {
     use zeroclaw::providers::openai_codex::OpenAiCodexModelProvider;
 
     let model_provider =
-        OpenAiCodexModelProvider::new(&ModelProviderRuntimeOptions::default(), None).unwrap();
+        OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None).unwrap();
     let model = "gpt-5.3-codex";
 
     // Turn 1: establish a fact

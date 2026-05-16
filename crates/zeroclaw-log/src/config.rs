@@ -1,12 +1,37 @@
-//! Policy types parsed from [`zeroclaw_config::schema::ObservabilityConfig`].
+//! Policy types parsed from the runtime's observability config.
 //!
-//! Kept in this crate (not in zeroclaw-config) so the on-the-wire TOML
-//! shape stays a pure data type, while the parsed-policy types that drive
-//! runtime decisions live with the consumer.
+//! `zeroclaw-log` defines its own minimal [`LogConfig`] shape so it does
+//! not depend on `zeroclaw-config`. Callers convert the full
+//! `zeroclaw_config::schema::ObservabilityConfig` into a [`LogConfig`]
+//! before calling [`crate::init_from_config`].
 
 use std::path::{Path, PathBuf};
 
-use zeroclaw_config::schema::ObservabilityConfig;
+/// Minimal observability config shape used by the writer + tool-io
+/// capturer. Mirrors the relevant `[observability]` fields of
+/// `zeroclaw_config::schema::ObservabilityConfig`.
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    pub log_persistence: String,
+    pub log_persistence_path: String,
+    pub log_persistence_max_entries: usize,
+    pub log_tool_io: String,
+    pub log_tool_io_truncate_bytes: usize,
+    pub log_tool_io_denylist: Vec<String>,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            log_persistence: "rolling".into(),
+            log_persistence_path: String::new(),
+            log_persistence_max_entries: 10_000,
+            log_tool_io: "redacted".into(),
+            log_tool_io_truncate_bytes: 2048,
+            log_tool_io_denylist: Vec::new(),
+        }
+    }
+}
 
 const DEFAULT_LOG_REL_PATH: &str = "state/runtime-trace.jsonl";
 
@@ -72,7 +97,7 @@ pub struct ResolvedPolicy {
 }
 
 impl ResolvedPolicy {
-    pub fn from_config(config: &ObservabilityConfig, workspace_dir: &Path) -> Self {
+    pub fn from_config(config: &LogConfig, workspace_dir: &Path) -> Self {
         Self {
             storage: StoragePolicy::from_raw(&config.log_persistence),
             path: resolve_path(&config.log_persistence_path, workspace_dir),
@@ -105,8 +130,8 @@ fn resolve_path(raw: &str, workspace_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn make_config() -> ObservabilityConfig {
-        ObservabilityConfig::default()
+    fn make_config() -> LogConfig {
+        LogConfig::default()
     }
 
     #[test]

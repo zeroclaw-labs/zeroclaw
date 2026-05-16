@@ -160,10 +160,7 @@ impl V2Config {
                     "risk_profiles".to_string(),
                     toml::Value::Table(risk_profiles),
                 );
-                tracing::info!(
-                    target: "migration",
-                    "[autonomy] authorization fields → [risk_profiles.default]"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[autonomy] authorization fields → [risk_profiles.default]");
             }
             if let Some(runtime_table) = runtime_fields {
                 let mut runtime_profiles = passthrough
@@ -175,10 +172,7 @@ impl V2Config {
                     "runtime_profiles".to_string(),
                     toml::Value::Table(runtime_profiles),
                 );
-                tracing::info!(
-                    target: "migration",
-                    "[autonomy] budget/timeout fields → [runtime_profiles.default]"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[autonomy] budget/timeout fields → [runtime_profiles.default]");
             }
         }
 
@@ -210,10 +204,7 @@ impl V2Config {
                     "risk_profiles".to_string(),
                     toml::Value::Table(risk_profiles),
                 );
-                tracing::info!(
-                    target: "migration",
-                    "[agent.allowed_tools] → [risk_profiles.default.allowed_tools]"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[agent.allowed_tools] → [risk_profiles.default.allowed_tools]");
             }
             if !agent_table.is_empty() {
                 let mut runtime_profiles = passthrough
@@ -225,17 +216,13 @@ impl V2Config {
                     "runtime_profiles".to_string(),
                     toml::Value::Table(runtime_profiles),
                 );
-                tracing::info!(target: "migration", "[agent] → [runtime_profiles.default]");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[agent] → [runtime_profiles.default]");
             }
         }
 
         // V3 dropped swarms.
         if !swarms.is_empty() {
-            tracing::info!(
-                target: "migration",
-                "[swarms] dropped ({} entries)",
-                swarms.len()
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("[swarms] dropped ({} entries)", swarms.len()));
         }
 
         // 4. cron → restructure
@@ -247,7 +234,7 @@ impl V2Config {
             if !scheduler_extras.is_empty() {
                 merge_into_table(&mut passthrough, "scheduler", scheduler_extras);
             }
-            tracing::info!(target: "migration", "[cron] restructured into [cron.<alias>] + [scheduler]");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[cron] restructured into [cron.<alias>] + [scheduler]");
         }
 
         // V3 eradicated provider fallback. Strip the V2 reliability
@@ -256,10 +243,7 @@ impl V2Config {
             let dropped_fb = reliability_table.remove("fallback_providers").is_some();
             let dropped_mf = reliability_table.remove("model_fallbacks").is_some();
             if dropped_fb || dropped_mf {
-                tracing::info!(
-                    target: "migration",
-                    "[reliability] {{fallback_providers, model_fallbacks}} dropped (provider fallback eradicated in V3)"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[reliability] {{fallback_providers, model_fallbacks}} dropped (provider fallback eradicated in V3)");
             }
         }
 
@@ -272,7 +256,7 @@ impl V2Config {
             })
             .unwrap_or_default();
         if new_providers.remove("fallback").is_some() {
-            tracing::info!(target: "migration", "providers.fallback eradicated");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "providers.fallback eradicated");
         }
         let mut aliased_models = alias_provider_models(new_providers.remove("models"));
 
@@ -336,11 +320,7 @@ impl V2Config {
             passthrough.insert("embedding_routes".to_string(), routes);
         }
         if !new_providers.is_empty() {
-            tracing::warn!(
-                target: "migration",
-                "[providers] residual keys dropped during V3 hoist: {:?}",
-                new_providers.keys().collect::<Vec<_>>()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("[providers] residual keys dropped during V3 hoist: {:?}", new_providers.keys().collect::<Vec<_>>()));
         }
         if let Some(remaining_cost) = cost_passthrough {
             passthrough.insert("cost".to_string(), remaining_cost);
@@ -369,7 +349,7 @@ impl V2Config {
                     toml::Value::Table(peer_groups_for_fold),
                 );
             }
-            tracing::info!(target: "migration", "[channels] sections alias-wrapped, discord_history folded, inbound peer-auth folded into [peer_groups.*]");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[channels] sections alias-wrapped, discord_history folded, inbound peer-auth folded into [peer_groups.*]");
         }
 
         // V3 makes agents explicit — V1/V2 had an implicit single-agent
@@ -442,10 +422,7 @@ fn rename_subkey(table: &mut toml::Table, parent: &str, inner: &str, replacement
     }
     if let Some(value) = parent_tbl.remove(inner) {
         parent_tbl.insert(replacement.to_string(), value);
-        tracing::info!(
-            target: "migration",
-            "[{parent}].{inner} renamed to [{parent}].{replacement} (V3 qualified-noun rename)"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"parent": parent, "inner": inner, "replacement": replacement})), "[]. renamed to []. (V3 qualified-noun rename)");
     }
 }
 
@@ -495,11 +472,7 @@ fn restructure_cron(cron_value: toml::Value) -> (toml::Table, toml::Table) {
     // Anything left was unknown to V2 cron; surface but don't drop silently —
     // dropped fields are visible in INFO logs instead.
     if !cron_table.is_empty() {
-        tracing::info!(
-            target: "migration",
-            "[cron] had unmodeled keys: {:?}",
-            cron_table.keys().collect::<Vec<_>>()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("[cron] had unmodeled keys: {:?}", cron_table.keys().collect::<Vec<_>>()));
     }
 
     (new_cron, scheduler_extras)
@@ -929,10 +902,7 @@ fn fold_providers_globals_into_models(
     }
 
     if any_value_globals {
-        tracing::info!(
-            target: "migration",
-            "[providers] globals folded onto model_providers.{target_type}.{target_alias}"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"target_type": target_type, "target_alias": target_alias})), "[providers] globals folded onto model_providers..");
     }
 }
 
@@ -976,12 +946,9 @@ fn drop_cost_prices_with_logs(prices: &toml::Table) {
             ),
             None => (None, None),
         };
-        tracing::info!(
-            target: "migration",
-            "[cost.prices.{model_id}] dropped (V3 puts pricing on each \
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_id": model_id, "input": format!("{:?}", input), "output": format!("{:?}", output)})), "[cost.prices.] dropped (V3 puts pricing on each \
              [model_providers.<type>.<alias>] block); last-known rates: \
-             input={input:?} output={output:?}"
-        );
+             input= output=");
     }
 }
 
@@ -1046,10 +1013,7 @@ fn synthesize_peer_group_from_allowlist(
         toml::Value::Array(external_peers),
     );
     peer_groups.insert(group_name, toml::Value::Table(group_entry));
-    tracing::info!(
-        target: "migration",
-        "channels.{channel_type}.{channel_alias}.{field_name} folded into [peer_groups.{channel_type}_{channel_alias}]"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_type": channel_type, "channel_alias": channel_alias, "field_name": field_name})), "channels... folded into [peer_groups._]");
 }
 
 /// Wrap V2 `Option<T>` channel sections into V3 `HashMap<String, T>` keyed
@@ -1123,11 +1087,7 @@ fn alias_wrap_channels(channels_value: toml::Value, peer_groups: &mut toml::Tabl
     // Unmodeled channel-section keys: pass through under their original key.
     if !channels_table.is_empty() {
         let leftover_keys: Vec<String> = channels_table.keys().cloned().collect();
-        tracing::info!(
-            target: "migration",
-            "[channels] passthrough for unmodeled keys: {:?}",
-            leftover_keys
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("[channels] passthrough for unmodeled keys: {:?}", leftover_keys));
         for (k, v) in channels_table {
             new_channels.insert(k, v);
         }
@@ -1151,10 +1111,7 @@ fn strip_feishu_block(channels: &mut toml::Table) -> Option<toml::Table> {
     match feishu_value {
         toml::Value::Table(t) => Some(t),
         _ => {
-            tracing::warn!(
-                target: "migration",
-                "[channels.feishu] is not a table; dropping during fold to lark"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[channels.feishu] is not a table; dropping during fold to lark");
             None
         }
     }
@@ -1181,28 +1138,19 @@ fn inject_feishu_as_lark_alias(new_channels: &mut toml::Table, feishu_table: Opt
         .entry("lark".to_string())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let Some(lark_aliases) = lark_entry.as_table_mut() else {
-        tracing::warn!(
-            target: "migration",
-            "[channels.lark] is not a table; cannot inject feishu alias"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[channels.lark] is not a table; cannot inject feishu alias");
         return;
     };
 
     if lark_aliases.contains_key("feishu") {
-        tracing::warn!(
-            target: "migration",
-            "[channels.lark.feishu] already exists; the V2 [channels.feishu] \
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[channels.lark.feishu] already exists; the V2 [channels.feishu] \
              block was dropped to avoid clobbering it. Recover the dropped \
-             value from the pre-migration <config>.backup if needed."
-        );
+             value from the pre-migration <config>.backup if needed.");
         return;
     }
 
     lark_aliases.insert("feishu".to_string(), toml::Value::Table(feishu_table));
-    tracing::info!(
-        target: "migration",
-        "[channels.feishu] folded into [channels.lark.feishu] (use_feishu=true)"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[channels.feishu] folded into [channels.lark.feishu] (use_feishu=true)");
 }
 
 /// Fold V2 `[channels.discord_history]` into `[channels.discord]` in place.
@@ -1272,18 +1220,12 @@ fn fold_discord_history(channels: &mut toml::Table) {
             toml::Value::Boolean(effective_enabled),
         );
     }
-    tracing::info!(
-        target: "migration",
-        "[channels.discord_history] folded into [channels.discord] (archive=true, effective enabled={effective_enabled})"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"effective_enabled": effective_enabled})), "[channels.discord_history] folded into [channels.discord] (archive=true, effective enabled=)");
     if bot_token_conflict {
-        tracing::warn!(
-            target: "migration",
-            "[channels.discord_history].bot_token differed from [channels.discord].bot_token; \
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[channels.discord_history].bot_token differed from [channels.discord].bot_token; \
              the discord_history token was dropped and the discord token survives. \
              Two-bot deployments must reconfigure manually — recover the dropped value \
-             from the pre-migration <config>.backup file adjacent to the migrated config."
-        );
+             from the pre-migration <config>.backup file adjacent to the migrated config.");
     }
 }
 
@@ -1295,22 +1237,13 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
     use crate::migration::fold_string_into_array;
     match channel_type {
         "discord" if fold_string_into_array(instance, "guild_id", "guild_ids") => {
-            tracing::info!(
-                target: "migration",
-                "channels.discord.guild_id folded into channels.discord.guild_ids[]"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.discord.guild_id folded into channels.discord.guild_ids[]");
         }
         "mattermost" if fold_string_into_array(instance, "channel_id", "channel_ids") => {
-            tracing::info!(
-                target: "migration",
-                "channels.mattermost.channel_id folded into channels.mattermost.channel_ids[]"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.mattermost.channel_id folded into channels.mattermost.channel_ids[]");
         }
         "reddit" if fold_string_into_array(instance, "subreddit", "subreddits") => {
-            tracing::info!(
-                target: "migration",
-                "channels.reddit.subreddit folded into channels.reddit.subreddits[]"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.reddit.subreddit folded into channels.reddit.subreddits[]");
         }
         "signal" => {
             // Special: V2 group_id="dm" was a sentinel meaning "DMs only".
@@ -1321,10 +1254,7 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
             {
                 if group_id == "dm" {
                     instance.insert("dm_only".to_string(), toml::Value::Boolean(true));
-                    tracing::info!(
-                        target: "migration",
-                        "channels.signal.group_id=\"dm\" → channels.signal.dm_only=true"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.signal.group_id=\"dm\" → channels.signal.dm_only=true");
                 } else {
                     let entry = instance
                         .entry("group_ids".to_string())
@@ -1335,10 +1265,7 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
                             arr.push(toml::Value::String(group_id));
                         }
                     }
-                    tracing::info!(
-                        target: "migration",
-                        "channels.signal.group_id folded into channels.signal.group_ids[]"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.signal.group_id folded into channels.signal.group_ids[]");
                 }
             }
         }
@@ -1481,22 +1408,16 @@ fn synthesize_agent_brains(
                 "model_provider".to_string(),
                 toml::Value::String(format!("{provider_type}.{provider_alias}")),
             );
-            tracing::info!(
-                target: "migration",
-                "agents.{alias}: inline brain → providers.models.{provider_type}.{provider_alias}"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "provider_type": provider_type, "provider_alias": provider_alias})), "agents.: inline brain → providers.models..");
         } else {
             // No provider declared but operator still set timeout_secs;
             // drop it rather than silently storing on the agent block,
             // since V3 has no agent-level slot for it.
             if provider_timeout_secs.is_some() {
-                tracing::warn!(
-                    target: "migration",
-                    "agents.{alias}.timeout_secs dropped: V3 stores it on \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"alias": alias})), "agents..timeout_secs dropped: V3 stores it on \
                      [model_providers.<type>.<alias>] and this agent has no \
                      inline provider to fold it onto. Set it manually after \
-                     migration."
-                );
+                     migration.");
             }
             if let Some(other) = provider {
                 agent_table.insert("provider".to_string(), other);
@@ -1508,10 +1429,7 @@ fn synthesize_agent_brains(
             agent_table
                 .entry("max_tool_iterations".to_string())
                 .or_insert(v);
-            tracing::info!(
-                target: "migration",
-                "agents.{alias}.max_iterations → agents.{alias}.max_tool_iterations"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias})), "agents..max_iterations → agents..max_tool_iterations");
         }
 
         // V2 per-agent overrides split into authorization (risk) and
@@ -1533,10 +1451,7 @@ fn synthesize_agent_brains(
             agent_table
                 .entry("risk_profile".to_string())
                 .or_insert_with(|| toml::Value::String(profile_alias.clone()));
-            tracing::info!(
-                target: "migration",
-                "agents.{alias}.allowed_tools → risk_profiles.{profile_alias}.allowed_tools"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "profile_alias": profile_alias})), "agents..allowed_tools → risk_profiles..allowed_tools");
         }
 
         if agentic_flag.is_some() || max_depth.is_some() || agentic_timeout_secs.is_some() {
@@ -1554,10 +1469,7 @@ fn synthesize_agent_brains(
             agent_table
                 .entry("runtime_profile".to_string())
                 .or_insert_with(|| toml::Value::String(profile_alias.clone()));
-            tracing::info!(
-                target: "migration",
-                "agents.{alias}: agentic/max_depth/agentic_timeout_secs → runtime_profiles.{profile_alias}"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "profile_alias": profile_alias})), "agents.: agentic/max_depth/agentic_timeout_secs → runtime_profiles.");
         }
 
         // skills_directory → synthesize a per-agent skill_bundle and
@@ -1579,14 +1491,11 @@ fn synthesize_agent_brains(
             if stays_inside_shared {
                 bundle_entry.insert("directory".to_string(), toml::Value::String(skills_dir));
             } else {
-                tracing::warn!(
-                    target: "migration",
-                    "agents.{alias}.skills_directory = \"{skills_dir}\" lies outside \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"alias": alias, "skills_dir": skills_dir, "bundle_alias": bundle_alias})), "agents..skills_directory = \"\" lies outside \
                      <install>/shared/. V3 confines skill-bundles to \
                      <install>/shared/skills/<alias>/; the path was dropped and the bundle \
                      falls back to the default. Copy the V2 skill files into \
-                     <install>/shared/skills/{bundle_alias}/ to restore them."
-                );
+                     <install>/shared/skills// to restore them.");
             }
             install_profile_entry(passthrough, "skill_bundles", &bundle_alias, bundle_entry);
             // V3 AliasedAgentConfig.skill_bundles is Vec<String> of aliases.
@@ -1606,11 +1515,8 @@ fn synthesize_agent_brains(
                 new_list.push(toml::Value::String(bundle_alias.clone()));
             }
             agent_table.insert("skill_bundles".to_string(), toml::Value::Array(new_list));
-            tracing::info!(
-                target: "migration",
-                "agents.{alias}.skills_directory → [skill_bundles.{bundle_alias}] (referenced \
-                 from agents.{alias}.skill_bundles)"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "bundle_alias": bundle_alias})), "agents..skills_directory → [skill_bundles.] (referenced \
+                 from agents..skill_bundles)");
         }
 
         // Every V3 agent must reference a configured risk_profile and
@@ -1795,10 +1701,7 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
             if let Some(toml::Value::String(channel_ref)) = group_table.get("channel") {
                 rewritten_channel_types.push(channel_ref.clone());
             }
-            tracing::info!(
-                target: "migration",
-                "peer_groups.{group_name}.agents rewritten from [\"default\"] to [{replacement_alias:?}] (no agents.default exists)"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"group_name": group_name, "replacement_alias": format!("{:?}", replacement_alias)})), "peer_groups..agents rewritten from [\"default\"] to [] (no agents.default exists)");
         }
     }
 
@@ -1852,10 +1755,7 @@ fn rewrite_dangling_peer_group_agents(passthrough: &mut toml::Table) {
         }
     }
     if !added.is_empty() {
-        tracing::info!(
-            target: "migration",
-            "agents.{replacement_alias}.channels extended with {added:?} so the rewritten peer_groups resolve"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"replacement_alias": replacement_alias, "added": format!("{:?}", added)})), "agents..channels extended with  so the rewritten peer_groups resolve");
     }
 }
 
@@ -1897,10 +1797,7 @@ fn backfill_heartbeat_agent(passthrough: &mut toml::Table) {
     };
     if let Some(toml::Value::Table(hb)) = passthrough.get_mut("heartbeat") {
         hb.insert("agent".to_string(), toml::Value::String(alias.clone()));
-        tracing::info!(
-            target: "migration",
-            "heartbeat.agent unset with heartbeat.enabled = true → backfilled to {alias:?}"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": format!("{:?}", alias)})), "heartbeat.agent unset with heartbeat.enabled = true → backfilled to ");
     }
 }
 
@@ -1930,20 +1827,14 @@ fn lift_top_level_identity_into_agents(passthrough: &mut toml::Table) {
         return;
     };
     let Some(agents_value) = passthrough.get_mut("agents") else {
-        tracing::warn!(
-            target: "migration",
-            "[identity] dropped during V2->V3 (no [agents] table to attach to)"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[identity] dropped during V2->V3 (no [agents] table to attach to)");
         return;
     };
     let Some(agents_table) = agents_value.as_table_mut() else {
         return;
     };
     if agents_table.is_empty() {
-        tracing::warn!(
-            target: "migration",
-            "[identity] dropped during V2->V3 (agents map empty after fold)"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "[identity] dropped during V2->V3 (agents map empty after fold)");
         return;
     }
     let aliases: Vec<String> = agents_table.keys().cloned().collect();
@@ -1961,10 +1852,7 @@ fn lift_top_level_identity_into_agents(passthrough: &mut toml::Table) {
         agent_table.insert("identity".to_string(), identity_value.clone());
         folded += 1;
     }
-    tracing::info!(
-        target: "migration",
-        "[identity] lifted into [agents.<alias>.identity] ({folded} agent(s))",
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"folded": folded})), "[identity] lifted into [agents.<alias>.identity] ( agent(s))");
 }
 
 /// If no agents were declared in V2 input but the V2→V3 fold synthesized at
@@ -2010,10 +1898,7 @@ fn synthesize_default_agent_if_needed(passthrough: &toml::Table) -> toml::Table 
 
     let mut agents = toml::Table::new();
     agents.insert("default".to_string(), toml::Value::Table(default_agent));
-    tracing::info!(
-        target: "migration",
-        "synthesized [agents.default] from V1/V2 implicit single-agent semantics"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "synthesized [agents.default] from V1/V2 implicit single-agent semantics");
     agents
 }
 
@@ -2046,10 +1931,7 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
                 && let Some(v) = t.remove("model_id")
             {
                 t.entry("model".to_string()).or_insert(v);
-                tracing::info!(
-                    target: "migration",
-                    "tts.elevenlabs.model_id renamed to tts.elevenlabs.model"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "tts.elevenlabs.model_id renamed to tts.elevenlabs.model");
             }
             let mut wrapped = toml::Table::new();
             wrapped.insert("default".to_string(), value);
@@ -2058,18 +1940,12 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 
     if tts_table.remove("default_provider").is_some() {
-        tracing::info!(
-            target: "migration",
-            "[tts].default_provider dropped (V3 has no global default-provider; set agent.<X>.tts_provider instead)"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[tts].default_provider dropped (V3 has no global default-provider; set agent.<X>.tts_provider instead)");
     }
 
     if !tts_aliased.is_empty() {
         new_providers.insert("tts".to_string(), toml::Value::Table(tts_aliased));
-        tracing::info!(
-            target: "migration",
-            "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]");
     }
 }
 
@@ -2127,10 +2003,7 @@ fn fold_v2_transcription_into_providers(
         let mut wrapped = toml::Table::new();
         wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
         transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
-        tracing::info!(
-            target: "migration",
-            "[transcription] Groq fields promoted to [transcription_providers.groq.default]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[transcription] Groq fields promoted to [transcription_providers.groq.default]");
     }
 
     // Drop legacy default-provider keys — V3 has no global default-provider
@@ -2142,10 +2015,7 @@ fn fold_v2_transcription_into_providers(
         "default_transcription_provider",
     ] {
         if transcription_table.remove(*legacy_default).is_some() {
-            tracing::info!(
-                target: "migration",
-                "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"legacy_default": legacy_default})), "[transcription]. dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)");
         }
     }
 
@@ -2160,10 +2030,7 @@ fn fold_v2_transcription_into_providers(
                 existing.entry(family).or_insert(value);
             }
         }
-        tracing::info!(
-            target: "migration",
-            "[transcription.<family>] sub-blocks promoted to [transcription_providers.<family>.default]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[transcription.<family>] sub-blocks promoted to [transcription_providers.<family>.default]");
     }
 }
 
@@ -2204,16 +2071,10 @@ fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str
         }
     }
     if renamed > 0 {
-        tracing::info!(
-            target: "migration",
-            "[providers.{routes_key}] {renamed} entry/entries: `provider` field renamed to `model_provider`"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"routes_key": routes_key, "renamed": renamed})), "[providers.]  entry/entries: `provider` field renamed to `model_provider`");
     }
     if promoted > 0 {
-        tracing::info!(
-            target: "migration",
-            "[providers.{routes_key}] {promoted} entry/entries: bare `model_provider` promoted to dotted `<type>.default` form"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"routes_key": routes_key, "promoted": promoted})), "[providers.]  entry/entries: bare `model_provider` promoted to dotted `<type>.default` form");
     }
 }
 
@@ -2272,26 +2133,17 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
 
     if let Some(toml::Value::Table(qdrant_data)) = memory_qdrant {
         merge_storage_default(storage_table, "qdrant", qdrant_data);
-        tracing::info!(
-            target: "migration",
-            "[memory.qdrant] promoted to [storage.qdrant.default]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[memory.qdrant] promoted to [storage.qdrant.default]");
     }
     if let Some(timeout_value) = memory_sqlite_timeout {
         let mut sqlite_fields = toml::Table::new();
         sqlite_fields.insert("open_timeout_secs".to_string(), timeout_value);
         merge_storage_default(storage_table, "sqlite", sqlite_fields);
-        tracing::info!(
-            target: "migration",
-            "memory.sqlite_open_timeout_secs → [storage.sqlite.default].open_timeout_secs"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "memory.sqlite_open_timeout_secs → [storage.sqlite.default].open_timeout_secs");
     }
     if let Some(toml::Value::Table(postgres_vector_data)) = memory_postgres {
         merge_storage_default(storage_table, "postgres", postgres_vector_data);
-        tracing::info!(
-            target: "migration",
-            "[memory.postgres] vector fields promoted to [storage.postgres.default]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[memory.postgres] vector fields promoted to [storage.postgres.default]");
     }
 
     if let Some(provider_section_value) = storage_provider {
@@ -2323,10 +2175,7 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
                 &provider_type,
                 std::mem::take(&mut adapted_fields),
             );
-            tracing::info!(
-                target: "migration",
-                "[storage.provider.config provider={provider_type}] promoted to [storage.{provider_type}.default]"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"provider_type": provider_type})), "[storage.provider.config provider=] promoted to [storage..default]");
         }
     }
 }
@@ -2377,10 +2226,7 @@ fn adapt_storage_provider_config(mut config: toml::Table) -> (String, toml::Tabl
             (provider_type, out)
         }
         _ => {
-            tracing::info!(
-                target: "migration",
-                "[storage.provider.config] unknown provider type {provider_type:?}; passthrough as-is"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"provider_type": format!("{:?}", provider_type)})), "[storage.provider.config] unknown provider type ; passthrough as-is");
             (provider_type, config)
         }
     }
@@ -2446,12 +2292,8 @@ fn fold_security_into_risk_profile(passthrough: &mut toml::Table) {
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
-        tracing::warn!(
-            target: "migration",
-            "[security.resources] dropped during V2→V3 migration (no V3 enforcement \
-             codepath existed; sandbox backends own resource budgets): {}",
-            dropped.join(", ")
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("[security.resources] dropped during V2→V3 migration (no V3 enforcement \
+             codepath existed; sandbox backends own resource budgets): {}", dropped.join(", ")));
     }
 
     let Some(toml::Value::Table(sandbox_table)) = sandbox else {
@@ -2483,10 +2325,7 @@ fn fold_security_into_risk_profile(passthrough: &mut toml::Table) {
         };
         default_profile.entry(target_key.to_string()).or_insert(v);
     }
-    tracing::info!(
-        target: "migration",
-        "[security.sandbox] folded into [risk_profiles.default]"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "[security.sandbox] folded into [risk_profiles.default]");
 }
 
 /// Split a V2 `[autonomy]` block (already key-renamed where applicable)

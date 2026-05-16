@@ -326,7 +326,7 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
 #[async_trait]
-pub trait ModelProvider: Send + Sync {
+pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()

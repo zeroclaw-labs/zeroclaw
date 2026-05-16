@@ -78,11 +78,7 @@ impl PluginHost {
                     && let Ok(manifest) = self.load_manifest(&manifest_path)
                 {
                     if let Err(e) = validate_manifest_shape(&manifest, &path) {
-                        tracing::warn!(
-                            plugin = path.display().to_string(),
-                            error = %e,
-                            "skipping plugin due to invalid manifest shape"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": e.to_string()})), "skipping plugin due to invalid manifest shape");
                         continue;
                     }
 
@@ -102,11 +98,7 @@ impl PluginHost {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                plugin = path.display().to_string(),
-                                error = %e,
-                                "skipping plugin due to signature verification failure"
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": e.to_string()})), "skipping plugin due to signature verification failure");
                         }
                     }
                 }

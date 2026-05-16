@@ -101,6 +101,17 @@ impl ModelProvider for ScriptedModelProvider {
         Ok(guard.remove(0))
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for ScriptedModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str { "ScriptedModelProvider" }
+}
+
 
 /// A mock model_provider that always returns an error.
 struct FailingModelProvider;
@@ -126,6 +137,17 @@ impl ModelProvider for FailingModelProvider {
         anyhow::bail!("model_provider error")
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str { "FailingModelProvider" }
+}
+
 
 /// A simple echo tool that returns its arguments as output.
 struct EchoTool;
@@ -304,6 +326,17 @@ impl ModelProvider for ToolSpecCaptureModelProvider {
         true
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for ToolSpecCaptureModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str { "ToolSpecCaptureModelProvider" }
+}
+
 
 fn make_memory() -> Arc<dyn Memory> {
     let cfg = MemoryConfig {
@@ -1326,7 +1359,7 @@ fn native_format_results_maps_tool_call_ids() {
     let results = vec![
         ToolExecutionResult {
             name: "a".into(),
-            output: format!("File: {}", image_path.display()),
+            output: format!("File: {}", image_path.display().to_string()),
             success: true,
             tool_call_id: Some("tc-001".into()),
         },
@@ -1365,7 +1398,7 @@ fn xml_format_results_wraps_local_image_paths() {
     let dispatcher = XmlToolDispatcher;
     let results = vec![ToolExecutionResult {
         name: "shell".into(),
-        output: format!("Saved image to {}", image_path.display()),
+        output: format!("Saved image to {}", image_path.display().to_string()),
         success: true,
         tool_call_id: None,
     }];
@@ -1429,7 +1462,7 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
             tool_call_id: "tc1".into(),
-            content: format!("Saved image to {}", image_path.display()),
+            content: format!("Saved image to {}", image_path.display().to_string()),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),

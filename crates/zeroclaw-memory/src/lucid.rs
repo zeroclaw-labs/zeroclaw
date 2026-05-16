@@ -10,6 +10,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 pub struct LucidMemory {
+    alias: String,
     local: SqliteMemory,
     lucid_cmd: String,
     token_budget: usize,
@@ -31,8 +32,9 @@ impl LucidMemory {
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
-    pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
+    pub fn new(alias: &str, workspace_dir: &Path, local: SqliteMemory) -> Self {
         Self {
+            alias: alias.to_string(),
             local,
             lucid_cmd: Self::DEFAULT_LUCID_CMD.to_string(),
             token_budget: Self::DEFAULT_TOKEN_BUDGET,
@@ -48,6 +50,7 @@ impl LucidMemory {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn with_options(
+        alias: &str,
         workspace_dir: &Path,
         local: SqliteMemory,
         lucid_cmd: String,
@@ -58,6 +61,7 @@ impl LucidMemory {
         failure_cooldown: Duration,
     ) -> Self {
         Self {
+            alias: alias.to_string(),
             local,
             lucid_cmd,
             token_budget,
@@ -229,7 +233,7 @@ impl LucidMemory {
             "store".to_string(),
             payload,
             format!("--type={}", Self::to_lucid_type(category)),
-            format!("--project={}", self.workspace_dir.display()),
+            format!("--project={}", self.workspace_dir.display().to_string()),
         ]
     }
 
@@ -238,18 +242,14 @@ impl LucidMemory {
             "context".to_string(),
             query.to_string(),
             format!("--budget={}", self.token_budget),
-            format!("--project={}", self.workspace_dir.display()),
+            format!("--project={}", self.workspace_dir.display().to_string()),
         ]
     }
 
     async fn sync_to_lucid_async(&self, key: &str, content: &str, category: &MemoryCategory) {
         let args = self.build_store_args(key, content, category);
         if let Err(error) = self.run_lucid_command(&args, self.store_timeout).await {
-            tracing::debug!(
-                command = %self.lucid_cmd,
-                error = %error,
-                "Lucid store sync failed; sqlite remains authoritative"
-            );
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"command": self.lucid_cmd, "error": error.to_string()})), "Lucid store sync failed; sqlite remains authoritative");
         }
     }
 
@@ -349,11 +349,7 @@ impl Memory for LucidMemory {
             }
             Err(error) => {
                 self.mark_failure_now();
-                tracing::debug!(
-                    command = %self.lucid_cmd,
-                    error = %error,
-                    "Lucid context unavailable; using local sqlite results"
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"command": self.lucid_cmd, "error": error.to_string()})), "Lucid context unavailable; using local sqlite results");
                 Ok(local_results)
             }
         }
@@ -543,9 +539,8 @@ exit 1
     }
 
     fn test_memory(workspace: &Path, cmd: String) -> LucidMemory {
-        let sqlite = SqliteMemory::new(workspace).unwrap();
-        LucidMemory::with_options(
-            workspace,
+        let sqlite = SqliteMemory::new("sqlite", workspace).unwrap();
+        LucidMemory::with_options("test", workspace,
             sqlite,
             cmd,
             200,
@@ -640,9 +635,8 @@ exit 1
         let marker = tmp.path().join("context_calls.log");
         let probe_cmd = write_probe_lucid_script(tmp.path(), &marker);
 
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
-        let memory = LucidMemory::with_options(
-            tmp.path(),
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_options("test", tmp.path(),
             sqlite,
             probe_cmd,
             200,
@@ -712,9 +706,8 @@ exit 1
         let marker = tmp.path().join("failing_context_calls.log");
         let failing_cmd = write_failing_lucid_script(tmp.path(), &marker);
 
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
-        let memory = LucidMemory::with_options(
-            tmp.path(),
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
+        let memory = LucidMemory::with_options("test", tmp.path(),
             sqlite,
             failing_cmd,
             200,
@@ -732,5 +725,16 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::Lucid,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }

@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::warn;
 use zeroclaw_api::tool::ToolSpec;
 
 /// GitHub OAuth client ID for Copilot (VS Code extension).
@@ -189,6 +188,8 @@ struct ResponseMessage {
 /// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
 /// automatically.
 pub struct CopilotModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     github_token: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
     /// preventing duplicate device flow prompts or redundant API calls.
@@ -197,7 +198,7 @@ pub struct CopilotModelProvider {
 }
 
 impl CopilotModelProvider {
-    pub fn new(github_token: Option<&str>) -> Self {
+    pub fn new(alias: &str, github_token: Option<&str>) -> Self {
         let token_dir = directories::ProjectDirs::from("", "", "zeroclaw")
             .map(|dir| dir.config_dir().join("copilot"))
             .unwrap_or_else(|| {
@@ -210,10 +211,7 @@ impl CopilotModelProvider {
             });
 
         if let Err(err) = std::fs::create_dir_all(&token_dir) {
-            warn!(
-                "Failed to create Copilot token directory {:?}: {err}. Token caching is disabled.",
-                token_dir
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to create Copilot token directory {:?}: {err}. Token caching is disabled.", token_dir));
         } else {
             #[cfg(unix)]
             {
@@ -222,15 +220,13 @@ impl CopilotModelProvider {
                 if let Err(err) =
                     std::fs::set_permissions(&token_dir, std::fs::Permissions::from_mode(0o700))
                 {
-                    warn!(
-                        "Failed to set Copilot token directory permissions on {:?}: {err}",
-                        token_dir
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to set Copilot token directory permissions on {:?}: {err}", token_dir));
                 }
             }
         }
 
         Self {
+            alias: alias.to_string(),
             github_token: github_token
                 .filter(|token| !token.is_empty())
                 .map(String::from),
@@ -238,7 +234,6 @@ impl CopilotModelProvider {
             token_dir,
         }
     }
-
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.copilot",
@@ -644,8 +639,8 @@ async fn write_file_secure(path: &Path, content: &str) {
 
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!(error = ?err, "Failed to write secure file"),
-        Err(err) => warn!(error = ?err, "Failed to spawn blocking write"),
+        Ok(Err(err)) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "Failed to write secure file"),
+        Err(err) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "Failed to spawn blocking write"),
     }
 }
 
@@ -726,31 +721,44 @@ impl ModelProvider for CopilotModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for CopilotModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Copilot,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_without_token() {
-        let model_provider = CopilotModelProvider::new(None);
+        let model_provider = CopilotModelProvider::new("test", None);
         assert!(model_provider.github_token.is_none());
     }
 
     #[test]
     fn new_with_token() {
-        let model_provider = CopilotModelProvider::new(Some("ghp_test"));
+        let model_provider = CopilotModelProvider::new("test", Some("ghp_test"));
         assert_eq!(model_provider.github_token.as_deref(), Some("ghp_test"));
     }
 
     #[test]
     fn empty_token_treated_as_none() {
-        let model_provider = CopilotModelProvider::new(Some(""));
+        let model_provider = CopilotModelProvider::new("test", Some(""));
         assert!(model_provider.github_token.is_none());
     }
 
     #[tokio::test]
     async fn cache_starts_empty() {
-        let model_provider = CopilotModelProvider::new(None);
+        let model_provider = CopilotModelProvider::new("test", None);
         let cached = model_provider.refresh_lock.lock().await;
         assert!(cached.is_none());
     }
@@ -779,7 +787,7 @@ mod tests {
 
     #[test]
     fn supports_native_tools() {
-        let model_provider = CopilotModelProvider::new(None);
+        let model_provider = CopilotModelProvider::new("test", None);
         assert!(model_provider.supports_native_tools());
     }
 

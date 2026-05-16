@@ -791,18 +791,18 @@ impl ImageGenerator {
                 "dalle" => self.try_dalle(prompt, &image_dir, &base_name).await,
                 "flux" => self.try_flux(prompt, &image_dir, &base_name).await,
                 other => {
-                    tracing::warn!("Unknown image model_provider '{other}', skipping");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"other": other})), "Unknown image model_provider '', skipping");
                     continue;
                 }
             };
 
             match result {
                 Ok(path) => {
-                    tracing::info!("Image generated via {provider_name}: {}", path.display());
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Image generated via {provider_name}: {}", path.display()));
                     return Ok(path);
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "Image model_provider '{provider_name}' failed");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "provider_name": provider_name})), "Image model_provider '' failed");
                 }
             }
         }
@@ -812,7 +812,7 @@ impl ImageGenerator {
             let svg_path = image_dir.join(format!("{base_name}.svg"));
             let svg_content = Self::generate_fallback_card(prompt, &self.config.card_accent_color);
             tokio::fs::write(&svg_path, &svg_content).await?;
-            tracing::info!("Fallback SVG card generated: {}", svg_path.display());
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Fallback SVG card generated: {}", svg_path.display()));
             return Ok(svg_path);
         }
 

@@ -25,7 +25,7 @@ impl CostTracker {
         let storage_path = resolve_storage_path(workspace_dir)?;
 
         let storage = CostStorage::new(&storage_path).with_context(|| {
-            format!("Failed to open cost storage at {}", storage_path.display())
+            format!("Failed to open cost storage at {}", storage_path.display().to_string())
         })?;
 
         Ok(Self {
@@ -303,7 +303,7 @@ impl CostTracker {
                 match Self::new(config, workspace_dir) {
                     Ok(ct) => Some(Arc::new(ct)),
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Failed to initialize global cost tracker");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to initialize global cost tracker");
                         None
                     }
                 }
@@ -319,19 +319,15 @@ fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
     if !storage_path.exists() && legacy_path.exists() {
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("Failed to create directory {}", parent.display().to_string()))?;
         }
 
         if let Err(error) = fs::rename(&legacy_path, &storage_path) {
-            tracing::warn!(
-                "Failed to move legacy cost storage from {} to {}: {error}; falling back to copy",
-                legacy_path.display(),
-                storage_path.display()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to move legacy cost storage from {} to {}: {error}; falling back to copy", legacy_path.display().to_string(), storage_path.display().to_string()));
             fs::copy(&legacy_path, &storage_path).with_context(|| {
                 format!(
                     "Failed to copy legacy cost storage from {} to {}",
-                    legacy_path.display(),
+                    legacy_path.display().to_string(),
                     storage_path.display()
                 )
             })?;
@@ -416,7 +412,7 @@ impl CostStorage {
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("Failed to create directory {}", parent.display().to_string()))?;
         }
 
         let now = Utc::now();
@@ -447,7 +443,7 @@ impl CostStorage {
         }
 
         let file = File::open(&self.path)
-            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+            .with_context(|| format!("Failed to read cost storage from {}", self.path.display().to_string()))?;
         let reader = BufReader::new(file);
 
         for (line_number, line) in reader.lines().enumerate() {
@@ -467,11 +463,7 @@ impl CostStorage {
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
                 Err(error) => {
-                    tracing::warn!(
-                        "Skipping malformed cost record at {}:{}: {error}",
-                        self.path.display(),
-                        line_number + 1
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Skipping malformed cost record at {}:{}: {error}", self.path.display().to_string(), line_number + 1));
                 }
             }
         }
@@ -523,12 +515,12 @@ impl CostStorage {
             .create(true)
             .append(true)
             .open(&self.path)
-            .with_context(|| format!("Failed to open cost storage at {}", self.path.display()))?;
+            .with_context(|| format!("Failed to open cost storage at {}", self.path.display().to_string()))?;
 
         writeln!(file, "{}", serde_json::to_string(&record)?)
-            .with_context(|| format!("Failed to write cost record to {}", self.path.display()))?;
+            .with_context(|| format!("Failed to write cost record to {}", self.path.display().to_string()))?;
         file.sync_all()
-            .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
+            .with_context(|| format!("Failed to sync cost storage at {}", self.path.display().to_string()))?;
 
         self.ensure_period_cache_current()?;
 

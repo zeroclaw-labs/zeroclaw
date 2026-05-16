@@ -1,117 +1,122 @@
-//! The `record!` macro — a thin syntactic wrapper around `tracing::event!`
-//! that gives every emission site a uniform kwarg API.
+//! `record!` — the sole logging surface for the workspace.
 //!
-//! Architecture: `record!` has NO write path of its own. It expands to a
-//! single `tracing::event!` call. The `LogCaptureLayer` (installed once
-//! in the daemon's tracing-subscriber chain) is the SOLE consumer that
-//! turns tracing events into [`crate::LogEvent`]s and writes them to:
-//!
-//!   1. JSONL persistence (when enabled via `[observability] log_persistence`)
-//!   2. The process-wide broadcast Sender (dashboard SSE)
-//!   3. The Observer bridge (Prometheus / OTel typed metrics)
-//!
-//! Field schema lives in exactly one place: `FieldCollector` in
-//! [`crate::layer`]. The macro doesn't enforce a whitelist; unknown
-//! fields land in the event's `attributes` map. Adding a new typed
-//! field means: add to `LogEvent` struct + add a `FieldCollector` arm.
-//! The macro stays untouched.
-//!
-//! Usage:
+//! Call shape (compile-time-locked via the `Event` struct):
 //!
 //! ```ignore
-//! use zeroclaw_log::record;
+//! use zeroclaw_log::{record, Event, Action, EventOutcome};
 //!
-//! record!(
-//!     INFO,
-//!     action: "llm_request",
-//!     category: "agent",
-//!     outcome: "success",
-//!     agent: agent_alias,
-//!     channel: "discord.clamps",
-//!     model_provider: "anthropic.clamps",
-//!     model: "claude-sonnet-4-6",
-//!     trace_id: turn_id,
-//!     duration_ms: 412_u64,
-//!     message: "LLM request completed",
-//! );
+//! record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
+//! record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"err": "timeout"})), "tool failed");
 //! ```
+//!
+//! Alias-bound attribution (channel, agent_alias, model_provider,
+//! tool, cron_job_id, …) is NOT a call-site argument — it is assembled
+//! automatically by the `LogCaptureLayer` from `attribution_span`s
+//! opened by entry points (channel listeners, the agent loop, cron
+//! tick handlers, the tool executor wrapper). To attach attribution
+//! to a region of work, wrap the work with [`crate::attribution_span`].
 
-/// Emit a structured ZeroClaw log event through `tracing::event!`. The
-/// `LogCaptureLayer` picks it up and routes it to JSONL + broadcast +
-/// Observer bridge.
+/// Emit a structured ZeroClaw log event. The single positional `Event`
+/// expression carries the typed payload; the trailing literal is the
+/// human-readable message.
 #[macro_export]
 macro_rules! record {
-    ($level:ident, $($key:ident : $value:expr),+ $(,)?) => {{
-        // `%` prefix forces tracing to render every value through
-        // `Display`, which any `&str`, `String`, integer, `serde_json::Value`,
-        // or `anyhow::Error` implements. That sidesteps `tracing::Value`'s
-        // restrictive trait set and lets callers pass arbitrary expressions.
-        $crate::tracing::event!(
+    ($level:ident, $event:expr, $msg:expr $(,)?) => {{
+        let __zc_event: $crate::Event = $event;
+        $crate::__private::tracing::event!(
             target: "zeroclaw_log_event",
-            $crate::tracing::Level::$level,
-            $($key = %($value)),+
+            $crate::__private::tracing::Level::$level,
+            zc_name = %__zc_event.name,
+            zc_action = %__zc_event.action.as_str(),
+            zc_outcome = %__zc_event.outcome_str(),
+            zc_category = %__zc_event.category_str(),
+            zc_attrs = %__zc_event.attrs_str(),
+            zc_has_duration = %__zc_event.has_duration(),
+            zc_duration_ms = %__zc_event.duration_ms_or_zero(),
+            zc_file = %file!(),
+            zc_line = %line!(),
+            message = %$msg,
         );
     }};
 }
 
-/// Wrap a future in a tracing span carrying alias-bound attribution.
-/// Field-name set is shared with `record!` (see [`crate::event`]). The
-/// trailing `=> <future>` becomes the body.
+/// Open an attribution span for the given `Attributable` thing. Every
+/// `record!` emitted while the returned span is entered inherits the
+/// thing's role + alias as alias-bound attribution on the resulting
+/// LogEvent. Wrap entry-point work with `.instrument(span)` (async) or
+/// `let _g = span.entered()` (sync).
+#[macro_export]
+macro_rules! attribution_span {
+    ($attributable:expr) => {{
+        let __zc_thing = $attributable;
+        let __zc_role = ::zeroclaw_api::attribution::Attributable::role(__zc_thing);
+        let __zc_alias = ::zeroclaw_api::attribution::Attributable::alias(__zc_thing);
+        $crate::__private::tracing::info_span!(
+            target: "zeroclaw_log_internal_attribution",
+            "zeroclaw_attribution",
+            zc_role_family = %__zc_role.family_str(),
+            zc_role_type = %__zc_role.composite_type().unwrap_or(""),
+            zc_attribution_field = %__zc_role.attribution_field().unwrap_or(""),
+            zc_composite_prefix = %__zc_role.composite_prefix().unwrap_or(""),
+            zc_default_category = %__zc_role.default_category(),
+            zc_alias = %__zc_alias,
+        )
+    }};
+}
+
+/// Open a free-form context span carrying ad-hoc fields (sender id,
+/// message id, turn id, etc.) for every `record!` inside its scope.
+/// Use sparingly — prefer `attribution_span!(thing)` for role-bearing
+/// attribution. This is for transient per-scope identifiers that
+/// aren't tied to an `Attributable`.
+///
+/// Field keys recognized by the layer: `agent_alias`, `tool`,
+/// `session_key`, `cron_job_id`, `risk_profile`, `runtime_profile`,
+/// `memory_namespace`, `skill_bundle`, `knowledge_bundle`, `mcp_bundle`,
+/// `peer_group`, `sop_name`, `model`, `embedding_provider`, `channel`,
+/// `model_provider`, `tts_provider`, `transcription_provider`,
+/// `tunnel_provider`. Anything else lands in event `attributes`.
 #[macro_export]
 macro_rules! scope {
     ($($key:ident : $value:expr),+ $(,)? => $body:expr) => {{
-        use $crate::tracing::Instrument;
-        ($body).instrument($crate::tracing::info_span!(
+        use $crate::__private::tracing::Instrument;
+        ($body).instrument($crate::__private::tracing::info_span!(
+            target: "zeroclaw_log_internal_scope",
             "zeroclaw_scope",
             $($key = %($value)),+
         ))
     }};
 }
 
-/// `tokio::spawn` that propagates the caller's current span into the
-/// spawned task. Use everywhere a per-request / per-message child task
-/// needs the parent's alias-bound attribution for downstream tracing.
+/// `tokio::spawn` that propagates the caller's current span(s) into
+/// the spawned task. Use everywhere a per-message child task needs the
+/// parent's attribution.
 #[macro_export]
 macro_rules! spawn {
     ($body:expr) => {{
         #[allow(unused_imports)]
-        use $crate::tracing::Instrument as _;
+        use $crate::__private::tracing::Instrument as _;
         ::tokio::spawn(($body).in_current_span())
     }};
 }
 
 #[cfg(test)]
 mod tests {
-    // The macro emits a tracing event; verifying the full pipeline
-    // (event → LogCaptureLayer → writer → JSONL) requires the layer to
-    // be installed. The layer is exercised in `crate::layer::tests`
-    // which sets up a subscriber and asserts on the writer's output.
-    // This test just verifies the macro expands and compiles with the
-    // expected kwarg shape.
+    use crate::{Action, Event, EventOutcome};
+    use serde_json::json;
+
     #[test]
-    fn macro_compiles_with_full_kwarg_set() {
-        let agent_alias = "clamps";
-        record!(
-            INFO,
-            action: "test_event",
-            category: "agent",
-            outcome: "success",
-            agent: agent_alias,
-            channel: "discord.clamps",
-            model_provider: "anthropic.clamps",
-            model: "claude-sonnet-4-6",
-            tool: "shell",
-            session_key: "discord.clamps_user_abc",
-            cron_job_id: "uuid-1",
-            duration_ms: 412_u64,
-            trace_id: "trace-abc",
-            span_id: "span-1",
-            message: "hello",
-        );
+    fn record_compiles_minimal() {
+        record!(INFO, Event::new(module_path!(), Action::Note), "hello");
     }
 
     #[test]
-    fn macro_compiles_with_minimal_kwarg_set() {
-        record!(WARN, action: "minimal", message: "tiny event");
+    fn record_compiles_with_attrs_and_outcome() {
+        record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(json!({"code": 42})), "failed");
+    }
+
+    #[test]
+    fn record_compiles_with_duration() {
+        record!(INFO, Event::new(module_path!(), Action::Complete).with_outcome(EventOutcome::Success).with_duration(123), "done");
     }
 }

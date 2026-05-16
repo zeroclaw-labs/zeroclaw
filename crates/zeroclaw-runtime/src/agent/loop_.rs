@@ -924,7 +924,7 @@ pub async fn run_tool_call_loop(
         if let Some(ref budget) = shared_budget {
             let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
             if remaining == 0 {
-                tracing::warn!("Shared iteration budget exhausted at iteration {iteration}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"iteration": iteration})), "Shared iteration budget exhausted at iteration ");
                 break;
             }
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -934,15 +934,10 @@ pub async fn run_tool_call_loop(
         if context_token_budget > 0 {
             let estimated = estimate_history_tokens(history);
             if estimated > context_token_budget {
-                tracing::info!(
-                    estimated,
-                    budget = context_token_budget,
-                    iteration = iteration + 1,
-                    "Preemptive context trim: estimated tokens exceed budget"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"estimated": estimated, "budget": context_token_budget, "iteration": iteration + 1})), "Preemptive context trim: estimated tokens exceed budget");
                 let chars_saved = fast_trim_tool_results(history, 4);
                 if chars_saved > 0 {
-                    tracing::info!(chars_saved, "Preemptive fast-trim applied");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chars_saved": chars_saved})), "Preemptive fast-trim applied");
                 }
                 // If still over budget, use the history pruner for deeper cleanup
                 let recheck = estimate_history_tokens(history);
@@ -957,11 +952,7 @@ pub async fn run_tool_call_loop(
                         },
                     );
                     if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
-                        tracing::info!(
-                            collapsed = stats.collapsed_pairs,
-                            dropped = stats.dropped_messages,
-                            "Preemptive history prune applied"
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"collapsed": stats.collapsed_pairs, "dropped": stats.dropped_messages})), "Preemptive history prune applied");
                     }
                 }
             }
@@ -980,13 +971,7 @@ pub async fn run_tool_call_loop(
             && let Some((new_model_provider, new_model)) = guard.as_ref()
             && (new_model_provider != provider_name || new_model != model)
         {
-            tracing::info!(
-                "Model switch detected: {} {} -> {} {}",
-                provider_name,
-                model,
-                new_model_provider,
-                new_model
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Model switch detected: {} {} -> {} {}", provider_name, model, new_model_provider, new_model));
             return Err(ModelSwitchRequested {
                 model_provider: new_model_provider.clone(),
                 model: new_model.clone(),
@@ -1127,13 +1112,7 @@ pub async fn run_tool_call_loop(
         let should_consume_provider_stream = on_delta.is_some()
             && model_provider.supports_streaming()
             && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
-        tracing::debug!(
-            has_on_delta = on_delta.is_some(),
-            supports_streaming = model_provider.supports_streaming(),
-            should_consume_provider_stream,
-            "Streaming decision for iteration {}",
-            iteration + 1,
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
         let mut streamed_live_deltas = false;
 
         let chat_result = if should_consume_provider_stream {
@@ -1163,12 +1142,7 @@ pub async fn run_tool_call_loop(
                     })
                 }
                 Err(stream_err) => {
-                    tracing::warn!(
-                        model_provider = active_model_provider_name,
-                        model = active_model,
-                        iteration = iteration + 1,
-                        "model_provider streaming failed, falling back to non-streaming chat: {stream_err}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": active_model_provider_name, "model": active_model, "iteration": iteration + 1, "stream_err": stream_err.to_string()})), "model_provider streaming failed, falling back to non-streaming chat: ");
                     runtime_trace::record_event(
                         "llm_stream_fallback",
                         Some(channel_name),
@@ -1183,14 +1157,21 @@ pub async fn run_tool_call_loop(
                         }),
                     );
                     {
-                        let chat_future = active_model_provider.chat(
-                            ChatRequest {
-                                messages: &prepared_messages.messages,
-                                tools: request_tools,
-                            },
-                            active_model,
-                            temperature,
-                        );
+                        use ::zeroclaw_log::Instrument;
+                        let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
+                        let chat_future = ::zeroclaw_log::scope!(
+                            model: active_model,
+                            =>
+                            active_model_provider.chat(
+                                ChatRequest {
+                                    messages: &prepared_messages.messages,
+                                    tools: request_tools,
+                                },
+                                active_model,
+                                temperature,
+                            )
+                        )
+                        .instrument(provider_span);
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
                                 () = token.cancelled() => Err(ToolLoopCancelled.into()),
@@ -1205,14 +1186,21 @@ pub async fn run_tool_call_loop(
         } else {
             // Non-streaming path: wrap with optional per-step timeout from
             // pacing config to catch hung model responses.
-            let chat_future = active_model_provider.chat(
-                ChatRequest {
-                    messages: &prepared_messages.messages,
-                    tools: request_tools,
-                },
-                active_model,
-                temperature,
-            );
+            use ::zeroclaw_log::Instrument;
+            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
+            let chat_future = ::zeroclaw_log::scope!(
+                model: active_model,
+                =>
+                active_model_provider.chat(
+                    ChatRequest {
+                        messages: &prepared_messages.messages,
+                        tools: request_tools,
+                    },
+                    active_model,
+                    temperature,
+                )
+            )
+            .instrument(provider_span);
 
             match pacing.step_timeout_secs {
                 Some(step_secs) if step_secs > 0 => {
@@ -1417,30 +1405,24 @@ pub async fn run_tool_call_loop(
 
                 // Context overflow recovery: trim history and retry
                 if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
-                    tracing::warn!(
-                        iteration = iteration + 1,
-                        "Context window exceeded, attempting in-loop recovery"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"iteration": iteration + 1})), "Context window exceeded, attempting in-loop recovery");
 
                     // Step 1: fast-trim old tool results (cheap)
                     let chars_saved = fast_trim_tool_results(history, 4);
                     if chars_saved > 0 {
-                        tracing::info!(
-                            chars_saved,
-                            "Context recovery: trimmed old tool results, retrying"
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chars_saved": chars_saved})), "Context recovery: trimmed old tool results, retrying");
                         continue;
                     }
 
                     // Step 2: emergency drop oldest non-system messages
                     let dropped = emergency_history_trim(history, 4);
                     if dropped > 0 {
-                        tracing::info!(dropped, "Context recovery: dropped old messages, retrying");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"dropped": dropped})), "Context recovery: dropped old messages, retrying");
                         continue;
                     }
 
                     // Nothing left to trim — truly unrecoverable
-                    tracing::error!("Context overflow unrecoverable: no trimmable messages");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), "Context overflow unrecoverable: no trimmable messages");
                 }
 
                 return Err(e);
@@ -1559,7 +1541,7 @@ pub async fn run_tool_call_loop(
                     .await
                 {
                     crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(tool = %call.name, %reason, "tool call cancelled by hook");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
                         let cancelled = format!("Cancelled by hook: {reason}");
                         runtime_trace::record_event(
                             "tool_call_result",
@@ -1640,7 +1622,7 @@ pub async fn run_tool_call_loop(
                             Ok(Some(r)) => Some(r),
                             Ok(None) => None,
                             Err(e) => {
-                                tracing::warn!(error = ?e, "Channel approval request failed");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Channel approval request failed");
                                 None
                             }
                         }
@@ -1800,7 +1782,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
-                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": tool_name})), "Sending progress start to draft");
                 let _ = tx.send(StreamDelta::Status(progress)).await;
             }
 
@@ -1881,7 +1863,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
-                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "secs": secs})), "Sending progress complete to draft");
                 let _ = tx.send(StreamDelta::Status(progress_msg)).await;
             }
 
@@ -1910,11 +1892,11 @@ pub async fn run_tool_call_loop(
                 match det_result {
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                     crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
-                        tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})), "loop detector warning");
                         append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
-                        tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})), "loop detector blocked tool call");
                         // Replace the tool output with the block message.
                         // We still continue the loop so the LLM sees the block feedback.
                         append_or_merge_system_message(
@@ -1944,7 +1926,7 @@ pub async fn run_tool_call_loop(
             let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled
             if let Some(ref receipt) = outcome.receipt {
-                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": tool_name, "receipt": receipt})), "Tool receipt generated");
                 result_output = format!("{result_output}\n\n[receipt: {receipt}]");
                 if let Some(store) = collected_receipts
                     && let Ok(mut v) = store.lock()
@@ -2056,10 +2038,7 @@ pub async fn run_tool_call_loop(
     );
 
     // Graceful shutdown: ask the LLM for a final summary without tools
-    tracing::warn!(
-        max_iterations,
-        "Max iterations reached, requesting final summary"
-    );
+    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"max_iterations": max_iterations})), "Max iterations reached, requesting final summary");
     history.push(ChatMessage::user(
         "You have reached the maximum number of tool iterations. \
          Please provide your best answer based on the work completed so far. \
@@ -2084,7 +2063,7 @@ pub async fn run_tool_call_loop(
             Ok(accumulated_display_text)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Final summary LLM call failed, bailing");
             anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
         }
     }
@@ -2176,18 +2155,6 @@ pub struct AgentRunOverrides {
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-#[tracing::instrument(
-    skip_all,
-    fields(
-        category = "agent",
-        agent_alias = %agent_alias,
-        risk_profile = tracing::field::Empty,
-        runtime_profile = tracing::field::Empty,
-        memory_namespace = tracing::field::Empty,
-        model_provider = tracing::field::Empty,
-        model = tracing::field::Empty,
-    )
-)]
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -2201,6 +2168,7 @@ pub async fn run(
     allowed_tools: Option<Vec<String>>,
     overrides: AgentRunOverrides,
 ) -> Result<String> {
+    use ::zeroclaw_log::Instrument;
     let agent = config
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
@@ -2213,12 +2181,9 @@ pub async fn run(
             )
         })?
         .clone();
-    {
+    let memory_composite = {
         use zeroclaw_config::multi_agent::MemoryBackendKind;
-        let span = tracing::Span::current();
-        span.record("risk_profile", agent.risk_profile.as_str());
-        span.record("runtime_profile", agent.runtime_profile.as_str());
-        let memory_composite = match agent.memory.backend {
+        match agent.memory.backend {
             MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
             MemoryBackendKind::None => "none".to_string(),
             _ => {
@@ -2230,10 +2195,21 @@ pub async fn run(
                     format!("{kind}.{alias}")
                 }
             }
-        };
-        span.record("memory_namespace", memory_composite.as_str());
-    }
-
+        }
+    };
+    let __zc_alias = agent_alias.to_string();
+    let __zc_attribution_span = ::zeroclaw_log::attribution_span!(
+        &crate::agent::AgentAttribution(__zc_alias.as_str())
+    );
+    let __zc_scope_span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        risk_profile = %agent.risk_profile,
+        runtime_profile = %agent.runtime_profile,
+        memory_namespace = %memory_composite,
+    );
+    let __zc_body = async move {
+        let agent_alias: &str = __zc_alias.as_str();
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -2268,14 +2244,11 @@ pub async fn run(
             .await?
         }
     };
-    tracing::info!(backend = mem.name(), "Memory initialized");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"backend": mem.name()})), "Memory initialized");
 
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
-        tracing::info!(
-            peripherals = ?peripheral_overrides,
-            "Peripheral overrides from CLI (config boards take precedence)"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"peripherals": peripheral_overrides})), "Peripheral overrides from CLI (config boards take precedence)");
     }
 
     // ── Tools (including memory tools and peripherals) ────────────
@@ -2319,7 +2292,7 @@ pub async fn run(
         vec![]
     };
     if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": peripheral_tools.len()})), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
     }
 
@@ -2329,11 +2302,7 @@ pub async fn run(
     // ignored. When `None`, all tools remain available (backward compatible).
     if let Some(ref allow_list) = allowed_tools {
         tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
-        tracing::info!(
-            allowed = allow_list.len(),
-            retained = tools_registry.len(),
-            "Applied capability-based tool access filter"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"allowed": allow_list.len(), "retained": tools_registry.len()})), "Applied capability-based tool access filter");
     }
 
     // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
@@ -2351,10 +2320,7 @@ pub async fn run(
         std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
     > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Initializing MCP client — {} server(s) configured", config.mcp.servers.len()));
         match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
@@ -2364,11 +2330,7 @@ pub async fn run(
                         std::sync::Arc::clone(&registry),
                     )
                     .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP deferred: {} tool stub(s) from {} server(s)", deferred_set.len(), registry.server_count()));
                     deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
                     let activated = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::tools::ActivatedToolSet::new(),
@@ -2397,15 +2359,11 @@ pub async fn run(
                             registered += 1;
                         }
                     }
-                    tracing::info!(
-                        "MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP: {} tool(s) registered from {} server(s)", registered, registry.server_count()));
                 }
             }
             Err(e) => {
-                tracing::error!(error = ?e, "MCP registry failed to initialize");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "MCP registry failed to initialize");
             }
         }
     }
@@ -2436,7 +2394,7 @@ pub async fn run(
     };
 
     {
-        let span = tracing::Span::current();
+        let span = zeroclaw_log::Span::current();
         let mp_composite = match agent_provider_resolved.as_ref() {
             Some((ty, alias, _)) => format!("{ty}.{alias}"),
             None => provider_name.clone(),
@@ -2476,7 +2434,7 @@ pub async fn run(
         .and_then(Result::ok)
         .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
     if let Some(ref rag) = hardware_rag {
-        tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chunks": rag.len()})), "Hardware RAG loaded");
     }
 
     let board_names: Vec<String> = config
@@ -2703,7 +2661,7 @@ pub async fn run(
         let (thinking_directive, effective_msg) =
             match crate::agent::thinking::parse_thinking_directive(&msg) {
                 Some((level, remaining)) => {
-                    tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"thinking_level": level})), "Thinking directive parsed from message");
                     (Some(level), remaining)
                 }
                 None => (None, msg.clone()),
@@ -2823,13 +2781,7 @@ pub async fn run(
                 }
                 Err(e) => {
                     if let Some((new_model_provider, new_model)) = is_model_switch_requested(&e) {
-                        tracing::info!(
-                            "Model switch requested, switching from {} {} to {} {}",
-                            provider_name,
-                            model_name,
-                            new_model_provider,
-                            new_model
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Model switch requested, switching from {} {} to {} {}", provider_name, model_name, new_model_provider, new_model));
 
                         model_provider =
                             zeroclaw_providers::create_routed_model_provider_with_options(
@@ -2869,12 +2821,12 @@ pub async fn run(
                 );
                 match creator.create_from_execution(&msg, &tool_calls, None).await {
                     Ok(Some(slug)) => {
-                        tracing::info!(slug, "Auto-created skill from execution");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"slug": slug})), "Auto-created skill from execution");
                     }
                     Ok(None) => {
-                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Skill creation skipped (duplicate or disabled)");
                     }
-                    Err(e) => tracing::warn!(error = ?e, "Skill creation failed"),
+                    Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Skill creation failed"),
                 }
             }
         }
@@ -2983,7 +2935,7 @@ pub async fn run(
             let (thinking_directive, effective_input) =
                 match crate::agent::thinking::parse_thinking_directive(&user_input) {
                     Some((level, remaining)) => {
-                        tracing::info!(thinking_level = ?level, "Thinking directive parsed");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"thinking_level": level})), "Thinking directive parsed");
                         (Some(level), remaining)
                     }
                     None => (None, user_input.clone()),
@@ -3143,13 +3095,7 @@ pub async fn run(
                         }
                         if let Some((new_model_provider, new_model)) = is_model_switch_requested(&e)
                         {
-                            tracing::info!(
-                                "Model switch requested, switching from {} {} to {} {}",
-                                provider_name,
-                                model_name,
-                                new_model_provider,
-                                new_model
-                            );
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Model switch requested, switching from {} {} to {} {}", provider_name, model_name, new_model_provider, new_model));
 
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
@@ -3176,9 +3122,7 @@ pub async fn run(
                         }
                         // Context overflow recovery: compress and retry
                         if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
-                            tracing::warn!(
-                                "Context overflow in interactive loop, attempting recovery"
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Context overflow in interactive loop, attempting recovery");
                             let mut compressor =
                                 crate::agent::context_compressor::ContextCompressor::new(
                                     agent.context_compression.clone(),
@@ -3197,19 +3141,14 @@ pub async fn run(
                                 .await
                             {
                                 Ok(true) => {
-                                    tracing::info!(
-                                        "Context recovered via compression, retrying turn"
-                                    );
+                                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Context recovered via compression, retrying turn");
                                     continue;
                                 }
                                 Ok(false) => {
-                                    tracing::warn!("Compression ran but couldn't reduce enough");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Compression ran but couldn't reduce enough");
                                 }
                                 Err(compress_err) => {
-                                    tracing::warn!(
-                                        error = %compress_err,
-                                        "Compression failed during recovery"
-                                    );
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": compress_err.to_string()})), "Compression failed during recovery");
                                 }
                             }
                         }
@@ -3255,19 +3194,11 @@ pub async fn run(
                     .await
                 {
                     Ok(result) if result.compressed => {
-                        tracing::info!(
-                            passes = result.passes_used,
-                            before = result.tokens_before,
-                            after = result.tokens_after,
-                            "Context compression complete"
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
                     }
                     Ok(_) => {} // No compression needed
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Context compression failed, falling back to history trim"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Context compression failed, falling back to history trim");
                         trim_history(&mut history, agent.max_history_messages / 2);
                     }
                 }
@@ -3300,20 +3231,22 @@ pub async fn run(
     });
 
     Ok(final_output)
+    };
+    __zc_body
+        .instrument(__zc_scope_span)
+        .instrument(__zc_attribution_span)
+        .await
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-#[tracing::instrument(
-    skip_all,
-    fields(agent_alias = %agent_alias)
-)]
 pub async fn process_message(
     config: Config,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
+    use ::zeroclaw_log::Instrument;
     let agent = config
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
@@ -3326,6 +3259,39 @@ pub async fn process_message(
             )
         })?
         .clone();
+    let memory_composite = {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        match agent.memory.backend {
+            MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
+            MemoryBackendKind::None => "none".to_string(),
+            _ => {
+                let raw = config.memory.backend.trim();
+                if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+                    "none".to_string()
+                } else {
+                    let (kind, alias) = raw.split_once('.').unwrap_or((raw, "default"));
+                    format!("{kind}.{alias}")
+                }
+            }
+        }
+    };
+    let __zc_alias = agent_alias.to_string();
+    let __zc_message = message.to_string();
+    let __zc_session_id = session_id.map(str::to_string);
+    let __zc_attribution_span = ::zeroclaw_log::attribution_span!(
+        &crate::agent::AgentAttribution(__zc_alias.as_str())
+    );
+    let __zc_scope_span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        risk_profile = %agent.risk_profile,
+        runtime_profile = %agent.runtime_profile,
+        memory_namespace = %memory_composite,
+    );
+    let __zc_body = async move {
+        let agent_alias: &str = __zc_alias.as_str();
+        let message: &str = __zc_message.as_str();
+        let session_id: Option<&str> = __zc_session_id.as_deref();
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -3410,10 +3376,7 @@ pub async fn process_message(
         std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
     > = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Initializing MCP client — {} server(s) configured", config.mcp.servers.len()));
         match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
@@ -3422,11 +3385,7 @@ pub async fn process_message(
                         std::sync::Arc::clone(&registry),
                     )
                     .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP deferred: {} tool stub(s) from {} server(s)", deferred_set.len(), registry.server_count()));
                     deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
                     let activated = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::tools::ActivatedToolSet::new(),
@@ -3454,15 +3413,11 @@ pub async fn process_message(
                             registered += 1;
                         }
                     }
-                    tracing::info!(
-                        "MCP: {} tool(s) registered from {} server(s)",
-                        registered,
-                        registry.server_count()
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP: {} tool(s) registered from {} server(s)", registered, registry.server_count()));
                 }
             }
             Err(e) => {
-                tracing::error!(error = ?e, "MCP registry failed to initialize");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "MCP registry failed to initialize");
             }
         }
     }
@@ -3634,7 +3589,7 @@ pub async fn process_message(
     let (thinking_directive, effective_message) =
         match crate::agent::thinking::parse_thinking_directive(message) {
             Some((level, remaining)) => {
-                tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"thinking_level": level})), "Thinking directive parsed from message");
                 (Some(level), remaining)
             }
             None => (None, message.to_string()),
@@ -3716,6 +3671,11 @@ pub async fn process_message(
         None, // channel: process_message path has no channel ref
     )
     .await
+    };
+    __zc_body
+        .instrument(__zc_scope_span)
+        .instrument(__zc_attribution_span)
+        .await
 }
 
 #[cfg(test)]
@@ -4278,6 +4238,17 @@ mod tests {
             Ok("ok".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for NonVisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "NonVisionModelProvider" }
+    }
+
 
     struct VisionModelProvider {
         calls: Arc<AtomicUsize>,
@@ -4329,6 +4300,17 @@ mod tests {
             })
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for VisionModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "VisionModelProvider" }
+    }
+
 
     struct ScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
@@ -4389,6 +4371,17 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("scripted model_provider exhausted responses"))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for ScriptedModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "ScriptedModelProvider" }
+    }
+
 
     struct RecordingModelProvider {
         requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
@@ -4432,6 +4425,17 @@ mod tests {
             })
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for RecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "RecordingModelProvider" }
+    }
+
 
     struct StreamingScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<String>>>,
@@ -4507,6 +4511,17 @@ mod tests {
             ]))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingScriptedModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamingScriptedModelProvider" }
+    }
+
 
     enum NativeStreamTurn {
         ToolCall(ToolCall),
@@ -4622,6 +4637,17 @@ mod tests {
             }
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingNativeToolEventModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamingNativeToolEventModelProvider" }
+    }
+
 
     struct RouteAwareStreamingModelProvider {
         response: String,
@@ -4692,6 +4718,17 @@ mod tests {
             ]))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for RouteAwareStreamingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "RouteAwareStreamingModelProvider" }
+    }
+
 
     struct CountingTool {
         name: String,
@@ -6446,8 +6483,7 @@ mod tests {
         let routed_chat_calls = Arc::clone(&routed_model_provider.chat_calls);
         let routed_last_model = Arc::clone(&routed_model_provider.last_model);
 
-        let router = RouterModelProvider::new(
-            vec![
+        let router = RouterModelProvider::new("test", vec![
                 ("default".to_string(), Box::new(default_model_provider)),
                 ("fast".to_string(), Box::new(routed_model_provider)),
             ],
@@ -6726,7 +6762,7 @@ mod tests {
     #[tokio::test]
     async fn autosave_memory_keys_preserve_multiple_turns() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
         let key1 = autosave_memory_key("user_msg");
         let key2 = autosave_memory_key("user_msg");
@@ -6747,7 +6783,7 @@ mod tests {
     #[tokio::test]
     async fn build_context_ignores_legacy_assistant_autosave_entries() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "assistant_resp_poisoned",
             "User suffered a fabricated event",
@@ -6774,7 +6810,7 @@ mod tests {
     #[tokio::test]
     async fn build_context_ignores_user_autosave_entries() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "user_msg",
             "Original user message with full conversation history",
@@ -6813,7 +6849,7 @@ mod tests {
     #[tokio::test]
     async fn build_context_excludes_conversation_when_flag_set() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         // A Conversation entry written by a chat channel with a non-autosave
         // key (autosave keys are already skipped by the existing filters).
         mem.store(
@@ -7593,6 +7629,17 @@ Let me check the result."#;
                 ]))
             }
         }
+        impl ::zeroclaw_api::attribution::Attributable for MultiChunkModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str { "MultiChunkModelProvider" }
+        }
+
 
         let model_provider = MultiChunkModelProvider;
         let messages = vec![ChatMessage::user("hi")];

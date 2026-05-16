@@ -1760,6 +1760,17 @@ mod tests {
             }
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for OneToolThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "OneToolThenFinalModelProvider" }
+    }
+
 
     struct InfiniteToolCallModelProvider;
 
@@ -1794,6 +1805,17 @@ mod tests {
             })
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for InfiniteToolCallModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "InfiniteToolCallModelProvider" }
+    }
+
 
     struct FailingModelProvider;
 
@@ -1818,6 +1840,17 @@ mod tests {
             Err(anyhow!("model_provider boom"))
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "FailingModelProvider" }
+    }
+
 
     fn agentic_agent_config() -> AliasedAgentConfig {
         AliasedAgentConfig {
@@ -2513,6 +2546,17 @@ mod tests {
             }
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for McpToolThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "McpToolThenFinalModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {

@@ -112,7 +112,7 @@ impl Transport for HardwareSerialTransport {
         let json = serde_json::to_string(cmd)
             .map_err(|e| TransportError::Protocol(format!("failed to serialize command: {e}")))?;
         // Log command name only — never log the full payload (may contain large or sensitive data).
-        tracing::info!(port = %self.port_path, cmd = %cmd.cmd, "serial send");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"port": self.port_path, "cmd": cmd.cmd})), "serial send");
 
         tokio::time::timeout(
             std::time::Duration::from_secs(SEND_TIMEOUT_SECS),

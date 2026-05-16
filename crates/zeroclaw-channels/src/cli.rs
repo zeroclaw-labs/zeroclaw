@@ -4,17 +4,24 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// CLI channel — stdin/stdout, always available, zero deps
-pub struct CliChannel;
-
-impl Default for CliChannel {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct CliChannel {
+    alias: String,
 }
 
 impl CliChannel {
-    pub fn new() -> Self {
-        Self
+    pub fn new(alias: impl Into<String>) -> Self {
+        Self {
+            alias: alias.into(),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for CliChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Cli)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -73,12 +80,12 @@ mod tests {
 
     #[test]
     fn cli_channel_name() {
-        assert_eq!(CliChannel::new().name(), "cli");
+        assert_eq!(CliChannel::new("cli").name(), "cli");
     }
 
     #[tokio::test]
     async fn cli_channel_send_does_not_panic() {
-        let ch = CliChannel::new();
+        let ch = CliChannel::new("cli");
         let result = ch
             .send(&SendMessage {
                 content: "hello".into(),
@@ -94,7 +101,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
-        let ch = CliChannel::new();
+        let ch = CliChannel::new("cli");
         let result = ch
             .send(&SendMessage {
                 content: String::new(),
@@ -110,7 +117,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_channel_health_check() {
-        let ch = CliChannel::new();
+        let ch = CliChannel::new("cli");
         assert!(ch.health_check().await);
     }
 

@@ -133,13 +133,9 @@ impl Tool for CronRunTool {
             .await
         {
             if job.delivery.best_effort {
-                tracing::warn!(
-                    job_id = %job.id,
-                    error = %e,
-                    "cron_run delivery failed (best_effort)"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "cron_run delivery failed (best_effort)");
             } else {
-                tracing::warn!(job_id = %job.id, error = %e, "cron_run delivery failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "cron_run delivery failed");
                 success = false;
             }
         }

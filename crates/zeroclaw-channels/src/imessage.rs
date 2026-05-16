@@ -60,7 +60,7 @@ fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8
         .or_else(|| {
             let parsed = body.as_deref().and_then(extract_text_from_attributed_body);
             if parsed.is_none() && body.as_ref().is_some_and(|b| !b.is_empty()) {
-                tracing::warn!(rowid, "failed to parse attributedBody");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"rowid": rowid})), "failed to parse attributedBody");
             }
             parsed
         })
@@ -162,6 +162,17 @@ fn is_valid_imessage_target(target: &str) -> bool {
     false
 }
 
+impl ::zeroclaw_api::attribution::Attributable for IMessageChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::IMessage,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for IMessageChannel {
     fn name(&self) -> &str {
@@ -204,7 +215,7 @@ end tell"#
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("iMessage channel listening (AppleScript bridge)...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "iMessage channel listening (AppleScript bridge)...");
 
         // Query the Messages SQLite database for new messages
         // The database is at ~/Library/Messages/chat.db
@@ -316,7 +327,7 @@ end tell"#
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "iMessage poll error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "iMessage poll error");
                 }
             }
         }

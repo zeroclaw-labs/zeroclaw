@@ -656,7 +656,7 @@ impl WeChatChannel {
                 && !token.is_empty()
             {
                 *self.bot_token.write().unwrap() = Some(token.clone());
-                tracing::info!("loaded persisted bot token");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "loaded persisted bot token");
             }
             if let Some(ref id) = account.account_id {
                 *self.account_id.write().unwrap() = Some(id.clone());
@@ -669,14 +669,14 @@ impl WeChatChannel {
             && !sync.get_updates_buf.is_empty()
         {
             *self.cursor.lock() = sync.get_updates_buf;
-            tracing::info!("loaded persisted sync cursor");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "loaded persisted sync cursor");
         }
     }
 
     /// Save account data to disk.
     fn save_account_data(&self, token: &str, account_id: &str, user_id: Option<&str>) {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
-            tracing::warn!(error = ?e, "failed to create state dir");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to create state dir");
             return;
         }
         let data = AccountData {
@@ -690,17 +690,17 @@ impl WeChatChannel {
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
-                    tracing::warn!(error = ?e, "failed to write account data");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to write account data");
                 }
             }
-            Err(e) => tracing::warn!(error = ?e, "failed to serialize account data"),
+            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to serialize account data"),
         }
     }
 
     /// Save sync cursor to disk.
     fn save_cursor(&self, cursor: &str) {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
-            tracing::warn!(error = ?e, "failed to create state dir");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to create state dir");
             return;
         }
         let data = SyncData {
@@ -710,10 +710,10 @@ impl WeChatChannel {
         match serde_json::to_string(&data) {
             Ok(json) => {
                 if let Err(e) = write_private(&path, json.as_bytes()) {
-                    tracing::warn!(error = ?e, "failed to write sync data");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to write sync data");
                 }
             }
-            Err(e) => tracing::warn!(error = ?e, "failed to serialize sync data"),
+            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to serialize sync data"),
         }
     }
 
@@ -745,9 +745,7 @@ impl WeChatChannel {
         use zeroclaw_config::providers::ChannelRef;
 
         let Some(config) = &self.persist else {
-            tracing::warn!(
-                "paired identity {identity} not persisted (no persistence handle wired)"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"identity": identity})), "paired identity not persisted (no persistence handle wired)");
             return Ok(());
         };
         let normalized = identity.trim().to_string();
@@ -768,7 +766,7 @@ impl WeChatChannel {
                 .peer_groups
                 .entry(group_name)
                 .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
+                    channel: channel_ref.to_string(),
                     ..PeerGroupConfig::default()
                 });
             if group
@@ -846,11 +844,7 @@ impl WeChatChannel {
                 (resolved.canonicalize(), workspace_dir.canonicalize())
             && !canonical.starts_with(&allowed)
         {
-            tracing::warn!(
-                "attachment path {} escapes workspace {}, rejected",
-                canonical.display(),
-                allowed.display()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("attachment path {} escapes workspace {}, rejected", canonical.display(), allowed.display()));
             return PathBuf::from(format!(
                 "/nonexistent/blocked_path_traversal_{}",
                 uuid::Uuid::new_v4()
@@ -1275,23 +1269,20 @@ impl WeChatChannel {
         let bytes = match self.download_inbound_attachment(&spec).await {
             Ok(bytes) => bytes,
             Err(err) => {
-                tracing::warn!(error = ?err, "attachment download skipped");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "attachment download skipped");
                 return None;
             }
         };
 
         let save_dir = workspace_dir.join("wechat_files");
         if let Err(err) = tokio::fs::create_dir_all(&save_dir).await {
-            tracing::warn!(error = ?err, "Failed to create WeChat attachment dir");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "Failed to create WeChat attachment dir");
             return None;
         }
 
         let local_path = save_dir.join(&spec.file_name);
         if let Err(err) = tokio::fs::write(&local_path, bytes).await {
-            tracing::warn!(
-                "Failed to save WeChat attachment to {}: {err}",
-                local_path.display()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to save WeChat attachment to {}: {err}", local_path.display()));
             return None;
         }
 
@@ -1376,7 +1367,7 @@ impl WeChatChannel {
             match render_login_qr(qr_payload) {
                 Ok(qr) => println!("{qr}"),
                 Err(err) => {
-                    tracing::warn!(error = ?err, "failed to render terminal QR code")
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "failed to render terminal QR code")
                 }
             }
             if !qrcode_img_url.is_empty() {
@@ -1412,7 +1403,7 @@ impl WeChatChannel {
                 let resp = match poll_result {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
-                        tracing::debug!(error = ?e, "QR poll error");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "QR poll error");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1425,7 +1416,7 @@ impl WeChatChannel {
                 let status: serde_json::Value = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::debug!(error = ?e, "QR poll parse error");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "QR poll parse error");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1481,7 +1472,7 @@ impl WeChatChannel {
                         return Ok((bot_token, account_id, user_id));
                     }
                     other => {
-                        tracing::debug!("QR status: {other}");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"other": other})), "QR status");
                     }
                 }
 
@@ -1498,7 +1489,7 @@ impl WeChatChannel {
             return Ok(());
         }
 
-        tracing::info!("no persisted token, starting QR login...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "no persisted token, starting QR login...");
         let (token, account_id, user_id) = self.qr_login().await?;
 
         // Save to memory
@@ -1513,7 +1504,7 @@ impl WeChatChannel {
         if let Some(ref uid) = user_id
             && let Err(e) = self.persist_allowed_identity(uid).await
         {
-            tracing::warn!(error = ?e, "failed to persist scanned identity {uid}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "uid": uid})), "failed to persist scanned identity");
         }
 
         // Persist to disk
@@ -1682,12 +1673,12 @@ impl WeChatChannel {
                 match pairing.try_pair(code, from_user_id).await {
                     Ok(Some(_token)) => {
                         if let Err(e) = self.persist_allowed_identity(from_user_id).await {
-                            tracing::warn!("failed to persist bound identity {from_user_id}: {e}");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_user_id": from_user_id, "e": e.to_string()})), "failed to persist bound identity");
                         }
                         let ctx = self.get_context_token(from_user_id);
                         let reply = wechat_cli_string("cli-wechat-bound-success");
                         let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
-                        tracing::info!("user {from_user_id} bound via pairing code");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from_user_id": from_user_id})), "user bound via pairing code");
                     }
                     Ok(None) => {
                         let ctx = self.get_context_token(from_user_id);
@@ -1695,13 +1686,22 @@ impl WeChatChannel {
                         let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "pairing error");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "pairing error");
                     }
                 }
             }
         } else {
-            tracing::debug!("ignoring unauthorized message from {from_user_id}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from_user_id": from_user_id})), "ignoring unauthorized message from");
         }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WeChatChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Wechat)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1717,7 +1717,7 @@ impl Channel for WeChatChannel {
         let context_token = self.get_context_token(recipient);
 
         if context_token.is_none() {
-            tracing::warn!("no context_token for {recipient}, message may fail to associate");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"recipient": recipient})), "no context_token for , message may fail to associate");
         }
 
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
@@ -1748,7 +1748,7 @@ impl Channel for WeChatChannel {
         // Ensure we're logged in (QR scan if needed)
         self.ensure_logged_in().await?;
 
-        tracing::info!("channel listening for messages...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel listening for messages...");
 
         let mut cursor = self.cursor.lock().clone();
         let mut long_poll_timeout_ms = LONG_POLL_TIMEOUT_MS;
@@ -1758,9 +1758,9 @@ impl Channel for WeChatChannel {
             let token = match self.get_token() {
                 Some(t) => t,
                 None => {
-                    tracing::error!("token lost, attempting re-login...");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), "token lost, attempting re-login...");
                     if let Err(e) = self.ensure_logged_in().await {
-                        tracing::error!(error = ?e, "re-login failed");
+                        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "re-login failed");
                         tokio::time::sleep(BACKOFF_DELAY).await;
                         continue;
                     }
@@ -1794,9 +1794,7 @@ impl Channel for WeChatChannel {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
                     consecutive_failures += 1;
-                    tracing::warn!(
-                        "getUpdates error ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"consecutive_failures": consecutive_failures, "MAX_CONSECUTIVE_FAILURES": MAX_CONSECUTIVE_FAILURES, "e": e.to_string()})), "getUpdates error (/)");
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         consecutive_failures = 0;
                         tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1807,7 +1805,7 @@ impl Channel for WeChatChannel {
                 }
                 Err(_) => {
                     // Client-side timeout — normal for long-poll, just retry
-                    tracing::debug!("getUpdates: client-side timeout, retrying");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "getUpdates: client-side timeout, retrying");
                     continue;
                 }
             };
@@ -1816,7 +1814,7 @@ impl Channel for WeChatChannel {
                 Ok(v) => v,
                 Err(e) => {
                     consecutive_failures += 1;
-                    tracing::warn!(error = ?e, "getUpdates parse error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "getUpdates parse error");
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         consecutive_failures = 0;
                         tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1834,10 +1832,7 @@ impl Channel for WeChatChannel {
 
             if is_error {
                 if errcode == SESSION_EXPIRED_ERRCODE || ret == SESSION_EXPIRED_ERRCODE {
-                    tracing::error!(
-                        "session expired (errcode {SESSION_EXPIRED_ERRCODE}), pausing for {} min",
-                        SESSION_PAUSE_DURATION.as_secs() / 60
-                    );
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("session expired (errcode {SESSION_EXPIRED_ERRCODE}), pausing for {} min", SESSION_PAUSE_DURATION.as_secs() / 60));
                     // Clear token so we re-login after pause
                     if let Ok(mut t) = self.bot_token.write() {
                         *t = None;
@@ -1845,7 +1840,7 @@ impl Channel for WeChatChannel {
                     tokio::time::sleep(SESSION_PAUSE_DURATION).await;
                     // Try to re-login
                     if let Err(e) = self.ensure_logged_in().await {
-                        tracing::error!(error = ?e, "re-login after session expiry failed");
+                        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "re-login after session expiry failed");
                     }
                     consecutive_failures = 0;
                     continue;
@@ -1853,9 +1848,7 @@ impl Channel for WeChatChannel {
 
                 consecutive_failures += 1;
                 let errmsg = data.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
-                tracing::warn!(
-                    "getUpdates failed: ret={ret} errcode={errcode} errmsg={errmsg} ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"ret": ret, "errcode": errcode, "errmsg": errmsg, "consecutive_failures": consecutive_failures, "MAX_CONSECUTIVE_FAILURES": MAX_CONSECUTIVE_FAILURES})), "getUpdates failed: ret= errcode= errmsg= (/)");
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     consecutive_failures = 0;
                     tokio::time::sleep(BACKOFF_DELAY).await;
@@ -1950,6 +1943,7 @@ impl Channel for WeChatChannel {
                     reply_target: from_user_id.to_string(),
                     content,
                     channel: "wechat".to_string(),
+                    channel_alias: Some(self.alias.clone()),
                     timestamp,
                     thread_ts: None,
                     interruption_scope_id: None,
@@ -1957,7 +1951,7 @@ impl Channel for WeChatChannel {
                 };
 
                 if tx.send(channel_msg).await.is_err() {
-                    tracing::info!("channel receiver dropped, stopping");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel receiver dropped, stopping");
                     return Ok(());
                 }
             }

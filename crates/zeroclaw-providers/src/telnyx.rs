@@ -33,10 +33,12 @@ pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 /// use zeroclaw::providers::telnyx::TelnyxModelProvider;
 /// use zeroclaw::providers::ModelProvider;
 ///
-/// let model_provider = TelnyxModelProvider::new(Some("your-api-key"));
+/// let model_provider = TelnyxModelProvider::new("test", Some("your-api-key"));
 /// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
 pub struct TelnyxModelProvider {
+    /// `[model_providers.telnyx.<alias>]` config-key alias.
+    alias: String,
     /// Telnyx API key
     api_key: Option<String>,
     /// HTTP client for API requests
@@ -45,13 +47,10 @@ pub struct TelnyxModelProvider {
 
 impl TelnyxModelProvider {
     /// Create a new Telnyx AI model_provider.
-    ///
-    /// The API key can be provided directly or will be resolved from:
-    /// 1. `TELNYX_API_KEY` environment variable
-    /// 2. `ZEROCLAW_API_KEY` environment variable (fallback)
-    pub fn new(api_key: Option<&str>) -> Self {
+    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
         let resolved_key = resolve_telnyx_api_key(api_key);
         Self {
+            alias: alias.to_string(),
             api_key: resolved_key,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
@@ -60,11 +59,10 @@ impl TelnyxModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-
     /// Create a model_provider with a custom base URL (for testing or proxies).
-    pub fn with_base_url(api_key: Option<&str>, _base_url: &str) -> Self {
+    pub fn with_base_url(alias: &str, api_key: Option<&str>, _base_url: &str) -> Self {
         // Note: custom base URL support for testing
-        Self::new(api_key)
+        Self::new(alias, api_key)
     }
 
     /// List available models from Telnyx AI.
@@ -292,19 +290,32 @@ pub mod models {
     pub const MISTRAL_SMALL: &str = "mistralai/mistral-small";
 }
 
+impl ::zeroclaw_api::attribution::Attributable for TelnyxModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Telnyx,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn creates_provider_with_key() {
-        let model_provider = TelnyxModelProvider::new(Some("test-key"));
+        let model_provider = TelnyxModelProvider::new("test", Some("test-key"));
         assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxModelProvider::new(None);
+        let _provider = TelnyxModelProvider::new("test", None);
         // Will be None if env vars not set
     }
 

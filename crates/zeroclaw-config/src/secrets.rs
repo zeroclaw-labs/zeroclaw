@@ -106,11 +106,9 @@ impl SecretStore {
             Ok((plaintext, None))
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             // Legacy XOR cipher — decrypt and re-encrypt with ChaCha20-Poly1305
-            tracing::warn!(
-                "Decrypting legacy XOR-encrypted secret (enc: prefix). \
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Decrypting legacy XOR-encrypted secret (enc: prefix). \
                  This format is insecure and will be removed in a future release. \
-                 The secret will be automatically migrated to enc2: (ChaCha20-Poly1305)."
-            );
+                 The secret will be automatically migrated to enc2: (ChaCha20-Poly1305).");
             let plaintext = self.decrypt_legacy_xor(hex_str)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
@@ -143,12 +141,9 @@ impl SecretStore {
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| {
-                tracing::error!(
-                    key_path = %self.key_path.display(),
-                    "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
                      Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
-                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw onboard`."
-                );
+                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw onboard`.");
                 anyhow::anyhow!("enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)")
             })?;
 
@@ -209,10 +204,8 @@ impl SecretStore {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
-                        "USERNAME environment variable is empty; \
-                         cannot restrict key file permissions via icacls"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "USERNAME environment variable is empty; \
+                         cannot restrict key file permissions via icacls");
                     return Ok(key);
                 };
 
@@ -225,16 +218,13 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to take ownership of key file via takeown (exit code {:?})",
-                            o.status.code()
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to take ownership of key file via takeown (exit code {:?})", o.status.code()));
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Could not take ownership of key file");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Could not take ownership of key file");
                     }
                     _ => {
-                        tracing::debug!("Key file ownership set to current user via takeown");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Key file ownership set to current user via takeown");
                     }
                 }
 
@@ -245,16 +235,13 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to set key file permissions via icacls (exit code {:?})", o.status.code()));
                     }
                     Err(e) => {
-                        tracing::warn!(error = ?e, "Could not set key file permissions");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Could not set key file permissions");
                     }
                     _ => {
-                        tracing::debug!("Key file permissions restricted via icacls");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Key file permissions restricted via icacls");
                     }
                 }
             }

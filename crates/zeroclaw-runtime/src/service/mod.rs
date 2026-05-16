@@ -274,7 +274,7 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 "❌ not loaded"
             }
         );
-        println!("Unit: {}", macos_service_file()?.display());
+        println!("Unit: {}", macos_service_file()?.display().to_string());
         return Ok(());
     }
 
@@ -321,7 +321,7 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             ]))
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: {}", linux_service_file(config)?.display());
+            println!("Unit: {}", linux_service_file(config)?.display().to_string());
         }
         InitSystem::Openrc => {
             let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
@@ -469,7 +469,7 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
                 "-Command",
                 &format!(
                     "Get-Content -Path '{}' -Tail {} -Wait",
-                    log_file.display(),
+                    log_file.display().to_string(),
                     lines
                 ),
             ])
@@ -482,7 +482,7 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
         let status = Command::new("powershell")
             .args([
                 "-Command",
-                &format!("Get-Content -Path '{}' -Tail {}", log_file.display(), lines),
+                &format!("Get-Content -Path '{}' -Tail {}", log_file.display().to_string(), lines),
             ])
             .status()
             .context("Failed to run PowerShell Get-Content")?;
@@ -517,9 +517,9 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
         let file = macos_service_file()?;
         if file.exists() {
             fs::remove_file(&file)
-                .with_context(|| format!("Failed to remove {}", file.display()))?;
+                .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
         }
-        println!("✅ Service uninstalled ({})", file.display());
+        println!("✅ Service uninstalled ({})", file.display().to_string());
         return Ok(());
     }
 
@@ -554,10 +554,10 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             let file = linux_service_file(config)?;
             if file.exists() {
                 fs::remove_file(&file)
-                    .with_context(|| format!("Failed to remove {}", file.display()))?;
+                    .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
             }
             let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-            println!("✅ Service uninstalled ({})", file.display());
+            println!("✅ Service uninstalled ({})", file.display().to_string());
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/zeroclaw");
@@ -570,7 +570,7 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                     );
                 }
                 fs::remove_file(init_script)
-                    .with_context(|| format!("Failed to remove {}", init_script.display()))?;
+                    .with_context(|| format!("Failed to remove {}", init_script.display().to_string()))?;
             }
             println!("✅ Service uninstalled (/etc/init.d/zeroclaw)");
         }
@@ -703,9 +703,9 @@ fn install_macos(config: &Config) -> Result<()> {
     );
 
     fs::write(&file, plist)?;
-    println!("✅ Installed launchd service: {}", file.display());
+    println!("✅ Installed launchd service: {}", file.display().to_string());
     if let Some(ref var_dir) = homebrew_var_dir {
-        println!("   Homebrew var: {}", var_dir.display());
+        println!("   Homebrew var: {}", var_dir.display().to_string());
     }
     println!("   Start with: zeroclaw service start");
     Ok(())
@@ -750,7 +750,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
-    println!("✅ Installed systemd user service: {}", file.display());
+    println!("✅ Installed systemd user service: {}", file.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
 }
@@ -903,7 +903,7 @@ fn chown_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -926,7 +926,7 @@ fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to recursively change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -941,17 +941,17 @@ fn chown_recursive_to_zeroclaw(_path: &Path) -> Result<()> {
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(target)
-        .with_context(|| format!("Failed to create directory {}", target.display()))?;
+        .with_context(|| format!("Failed to create directory {}", target.display().to_string()))?;
 
     for entry in fs::read_dir(source)
-        .with_context(|| format!("Failed to read directory {}", source.display()))?
+        .with_context(|| format!("Failed to read directory {}", source.display().to_string()))?
     {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry
             .file_type()
-            .with_context(|| format!("Failed to inspect {}", source_path.display()))?;
+            .with_context(|| format!("Failed to inspect {}", source_path.display().to_string()))?;
 
         if file_type.is_dir() {
             copy_dir_recursive(&source_path, &target_path)?;
@@ -962,7 +962,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             fs::copy(&source_path, &target_path).with_context(|| {
                 format!(
                     "Failed to copy file {} -> {}",
-                    source_path.display(),
+                    source_path.display().to_string(),
                     target_path.display()
                 )
             })?;
@@ -1017,7 +1017,7 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     copy_dir_recursive(&source_dir, config_dir)?;
     println!(
         "✅ Migrated runtime state from {} to {}",
-        source_dir.display(),
+        source_dir.display().to_string(),
         config_dir.display()
     );
     Ok(())
@@ -1081,7 +1081,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
         bail!(
             "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
              Re-run `sudo zeroclaw service install` and ensure ownership is zeroclaw:zeroclaw.",
-            path.display(),
+            path.display().to_string(),
         );
     }
 
@@ -1117,7 +1117,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
             "⚠️  Warning: Binary path '{}' appears to be in a user home directory.\n\
              For system-wide OpenRC service, consider installing to /usr/local/bin:\n\
              sudo cp '{}' /usr/local/bin/zeroclaw",
-            exe_path.display(),
+            exe_path.display().to_string(),
             exe_path.display()
         );
     }
@@ -1153,8 +1153,8 @@ start_pre() {{
     checkpath --directory --owner zeroclaw:zeroclaw --mode 0750 /var/lib/zeroclaw
 }}
 "#,
-        exe = exe_path.display(),
-        config_dir = config_dir.display(),
+        exe = exe_path.display().to_string(),
+        config_dir = config_dir.display().to_string(),
     )
 }
 
@@ -1187,27 +1187,27 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
-            .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", config_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(
-                || format!("Failed to set permissions on {}", config_dir.display()),
+                || format!("Failed to set permissions on {}", config_dir.display().to_string()),
             )?;
         }
-        println!("✅ Created directory: {}", config_dir.display());
+        println!("✅ Created directory: {}", config_dir.display().to_string());
     }
 
     migrate_openrc_runtime_state_if_needed(config_dir)?;
 
     if !workspace_dir.exists() {
         fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", workspace_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
-                || format!("Failed to set permissions on {}", workspace_dir.display()),
+                || format!("Failed to set permissions on {}", workspace_dir.display().to_string()),
             )?;
         }
         chown_to_zeroclaw(&workspace_dir)?;
@@ -1221,24 +1221,24 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
-            .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
+            .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display().to_string()))?;
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
+            .with_context(|| format!("Failed to set permissions on {}", config_dir.display().to_string()))?;
         let config_path = config_dir.join("config.toml");
         if config_path.exists() {
             fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", config_path.display()),
+                || format!("Failed to set permissions on {}", config_path.display().to_string()),
             )?;
         }
         let secret_key_path = config_dir.join(".secret_key");
         if secret_key_path.exists() {
             fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", secret_key_path.display()),
+                || format!("Failed to set permissions on {}", secret_key_path.display().to_string()),
             )?;
         }
     }
@@ -1248,12 +1248,12 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
         fs::create_dir_all(log_dir)
-            .with_context(|| format!("Failed to create {}", log_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", log_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750))
-                .with_context(|| format!("Failed to set permissions on {}", log_dir.display()))?;
+                .with_context(|| format!("Failed to set permissions on {}", log_dir.display().to_string()))?;
         }
     }
 
@@ -1271,13 +1271,13 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/zeroclaw");
     fs::write(init_path, init_script)
-        .with_context(|| format!("Failed to write {}", init_path.display()))?;
+        .with_context(|| format!("Failed to write {}", init_path.display().to_string()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(init_path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
+            .with_context(|| format!("Failed to set permissions on {}", init_path.display().to_string()))?;
     }
 
     run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
@@ -1304,8 +1304,8 @@ fn install_windows(config: &Config) -> Result<()> {
 
     let wrapper_content = format!(
         "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display(),
-        stdout_log.display(),
+        exe.display().to_string(),
+        stdout_log.display().to_string(),
         stderr_log.display()
     );
     fs::write(&wrapper, &wrapper_content)?;
@@ -1324,15 +1324,15 @@ fn install_windows(config: &Config) -> Result<()> {
         "/SC",
         "ONLOGON",
         "/TR",
-        &format!("\"{}\"", wrapper.display()),
+        &format!("\"{}\"", wrapper.display().to_string()),
         "/RL",
         "HIGHEST",
         "/F",
     ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
-    println!("   Wrapper: {}", wrapper.display());
-    println!("   Logs: {}", logs_dir.display());
+    println!("   Wrapper: {}", wrapper.display().to_string());
+    println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
 }

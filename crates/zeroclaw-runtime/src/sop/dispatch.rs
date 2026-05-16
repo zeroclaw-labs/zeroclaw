@@ -6,7 +6,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use tracing::{debug, info, warn};
 
 use super::audit::SopAuditLogger;
 use super::engine::{SopEngine, now_iso8601};
@@ -80,21 +79,17 @@ pub async fn dispatch_sop_event(
             .collect(),
         Err(e) => {
             crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
-            warn!(error = ?e, "SOP dispatch: engine lock poisoned during match phase");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "SOP dispatch: engine lock poisoned during match phase");
             return vec![];
         }
     };
 
     if matched_names.is_empty() {
-        debug!("SOP dispatch: no match for event");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "SOP dispatch: no match for event");
         return vec![DispatchResult::NoMatch];
     }
 
-    info!(
-        "SOP dispatch: {} SOP(s) matched: {:?}",
-        matched_names.len(),
-        matched_names
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP dispatch: {} SOP(s) matched: {:?}", matched_names.len(), matched_names));
 
     // Phase 2: start runs
     let mut results = Vec::new();
@@ -105,7 +100,7 @@ pub async fn dispatch_sop_event(
             Ok(e) => e,
             Err(e) => {
                 crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
-                warn!(error = ?e, "SOP dispatch: engine lock poisoned during start phase");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "SOP dispatch: engine lock poisoned during start phase");
                 return vec![];
             }
         };
@@ -119,11 +114,7 @@ pub async fn dispatch_sop_event(
                     if let Some(run) = eng.active_runs().get(&run_id) {
                         started_runs.push(run.clone());
                     }
-                    info!(
-                        "SOP dispatch: started '{}' run {run_id} (action: {})",
-                        sop_name,
-                        action_label(&action),
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP dispatch: started '{}' run {run_id} (action: {})", sop_name, action_label(&action)));
                     results.push(DispatchResult::Started {
                         run_id,
                         sop_name: sop_name.clone(),
@@ -131,7 +122,7 @@ pub async fn dispatch_sop_event(
                     });
                 }
                 Err(e) => {
-                    info!(error = ?e, "SOP dispatch: skipped '{}'", sop_name);
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), &format!("SOP dispatch: skipped '{}'", sop_name));
                     results.push(DispatchResult::Skipped {
                         sop_name: sop_name.clone(),
                         reason: e.to_string(),
@@ -142,9 +133,19 @@ pub async fn dispatch_sop_event(
     } // lock dropped
 
     // Phase 3: audit (async, no lock)
+    use zeroclaw_log::Instrument;
     for run in &started_runs {
-        if let Err(e) = audit.log_run_start(run).await {
-            warn!(error = ?e, "SOP dispatch: audit log failed for run {}", run.run_id);
+        let span = zeroclaw_log::attribution_span!(run);
+        let run_id = run.run_id.clone();
+        if let Err(e) = zeroclaw_log::scope!(
+            session_key: run_id,
+            =>
+            audit.log_run_start(run)
+        )
+        .instrument(span)
+        .await
+        {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), &format!("SOP dispatch: audit log failed for run {}", run.run_id));
         }
     }
 
@@ -170,48 +171,32 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                 action,
             } => match action.as_ref() {
                 SopRunAction::ExecuteStep { step, .. } => {
-                    warn!(
-                        "SOP headless dispatch: run {run_id} ('{sop_name}') ready for step {} \
-                         '{}' but no agent loop available to execute",
-                        step.number, step.title,
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') ready for step {} \
+                         '{}' but no agent loop available to execute", step.number, step.title));
                 }
                 SopRunAction::WaitApproval { step, .. } => {
-                    info!(
-                        "SOP headless dispatch: run {run_id} ('{sop_name}') waiting for approval \
-                         on step {} '{}'. Timeout polling will handle progression",
-                        step.number, step.title,
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') waiting for approval \
+                         on step {} '{}'. Timeout polling will handle progression", step.number, step.title));
                 }
                 SopRunAction::DeterministicStep { step, .. } => {
-                    info!(
-                        "SOP headless dispatch: run {run_id} ('{sop_name}') deterministic step {} \
-                         '{}'",
-                        step.number, step.title,
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') deterministic step {} \
+                         '{}'", step.number, step.title));
                 }
                 SopRunAction::CheckpointWait {
                     step, state_file, ..
                 } => {
-                    info!(
-                        "SOP headless dispatch: run {run_id} ('{sop_name}') checkpoint at step {} \
-                         '{}', state persisted to {}",
-                        step.number,
-                        step.title,
-                        state_file.display(),
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP headless dispatch: run {run_id} ('{sop_name}') checkpoint at step {} \
+                         '{}', state persisted to {}", step.number, step.title, state_file.display().to_string()));
                 }
                 SopRunAction::Completed { .. } => {
-                    info!(
-                        "SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name})), "SOP headless dispatch: run  ('') completed immediately");
                 }
                 SopRunAction::Failed { reason, .. } => {
-                    warn!("SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "sop_name": sop_name, "reason": reason.to_string()})), "SOP headless dispatch: run  ('') failed: ");
                 }
             },
             DispatchResult::Skipped { sop_name, reason } => {
-                info!("SOP headless dispatch: skipped '{sop_name}': {reason}");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), "SOP headless dispatch: skipped '': ");
             }
             DispatchResult::NoMatch => {}
         }
@@ -262,7 +247,7 @@ impl SopCronCache {
         let eng = match engine.lock() {
             Ok(e) => e,
             Err(e) => {
-                warn!(error = ?e, "SopCronCache: engine lock poisoned");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "SopCronCache: engine lock poisoned");
                 return Self { schedules };
             }
         };
@@ -274,10 +259,7 @@ impl SopCronCache {
                     let normalized = match crate::cron::normalize_expression(expression) {
                         Ok(n) => n,
                         Err(e) => {
-                            warn!(
-                                "SopCronCache: invalid cron expression '{}' in SOP '{}': {e}",
-                                expression, sop.name
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("SopCronCache: invalid cron expression '{}' in SOP '{}': {e}", expression, sop.name));
                             continue;
                         }
                     };
@@ -286,17 +268,14 @@ impl SopCronCache {
                             schedules.push((sop.name.clone(), expression.clone(), schedule));
                         }
                         Err(e) => {
-                            warn!(
-                                "SopCronCache: failed to parse cron schedule '{}' for SOP '{}': {e}",
-                                normalized, sop.name
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("SopCronCache: failed to parse cron schedule '{}' for SOP '{}': {e}", normalized, sop.name));
                         }
                     }
                 }
             }
         }
 
-        info!("SopCronCache: cached {} cron schedule(s)", schedules.len());
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SopCronCache: cached {} cron schedule(s)", schedules.len()));
         Self { schedules }
     }
 

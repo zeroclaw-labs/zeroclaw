@@ -68,7 +68,7 @@ fn memories_have_agent_id(conn: &Connection) -> bool {
 #[tokio::test]
 async fn fresh_install_creates_agents_table_and_default_agent() {
     let workspace = TempDir::new().expect("tempdir");
-    let _memory = SqliteMemory::new(workspace.path()).expect("init sqlite");
+    let _memory = SqliteMemory::new("test", workspace.path()).expect("init sqlite");
 
     let conn = open_raw(workspace.path());
     assert_eq!(
@@ -98,7 +98,7 @@ async fn idempotent_reinit_does_not_change_default_agent_uuid_or_agent_count() {
     let workspace = TempDir::new().expect("tempdir");
 
     // First init.
-    let _first = SqliteMemory::new(workspace.path()).expect("init sqlite first");
+    let _first = SqliteMemory::new("test", workspace.path()).expect("init sqlite first");
     let conn = open_raw(workspace.path());
     let first_uuid = fetch_default_agent_uuid(&conn).expect("default agent uuid #1");
     let first_count = agent_count(&conn);
@@ -109,7 +109,7 @@ async fn idempotent_reinit_does_not_change_default_agent_uuid_or_agent_count() {
 
     // Re-init. Migration must detect agent_id column already present
     // and skip every step.
-    let _second = SqliteMemory::new(workspace.path()).expect("init sqlite second");
+    let _second = SqliteMemory::new("test", workspace.path()).expect("init sqlite second");
     let conn = open_raw(workspace.path());
     let second_uuid = fetch_default_agent_uuid(&conn).expect("default agent uuid #2");
     let second_count = agent_count(&conn);
@@ -195,7 +195,7 @@ async fn pre_migration_rows_get_backfilled_to_default_agent_with_backup() {
     }
 
     // First open through the production code path triggers migration.
-    let _memory = SqliteMemory::new(workspace.path()).expect("init triggers migration");
+    let _memory = SqliteMemory::new("test", workspace.path()).expect("init triggers migration");
 
     let conn = open_raw(workspace.path());
     let default_uuid = fetch_default_agent_uuid(&conn).expect("default agent");
@@ -223,7 +223,7 @@ async fn store_after_migration_works_against_default_workspace() {
     // calls. This catches the case where the ALTER + backfill leaves
     // the schema in a state the rest of the code path can't write to.
     let workspace = TempDir::new().expect("tempdir");
-    let memory = SqliteMemory::new(workspace.path()).expect("init sqlite");
+    let memory = SqliteMemory::new("test", workspace.path()).expect("init sqlite");
     memory
         .store("post-migration", "hello", MemoryCategory::Core, None)
         .await

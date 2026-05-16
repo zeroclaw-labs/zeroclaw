@@ -475,10 +475,7 @@ impl ModelRoutingConfigTool {
             }
             // Retryable errors (e.g. transient network issues) — keep the
             // new config and let the resilient wrapper handle retries.
-            tracing::warn!(
-                model = %model_name,
-                "Model probe returned retryable error (keeping new config): {probe_err}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model": model_name, "probe_err": probe_err.to_string()})), "Model probe returned retryable error (keeping new config)");
         }
 
         Ok(ToolResult {

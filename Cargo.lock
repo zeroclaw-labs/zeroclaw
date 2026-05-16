@@ -13154,10 +13154,11 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -13209,8 +13210,6 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
  "urlencoding",
  "uuid",
  "wa-rs",
@@ -13263,12 +13262,11 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.11+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
  "webpki-roots 1.0.7",
  "zeroclaw-api",
+ "zeroclaw-log",
  "zeroclaw-macros",
 ]
 
@@ -13329,7 +13327,6 @@ dependencies = [
  "toml_edit 0.25.11+spec-1.1.0",
  "tower",
  "tower-http",
- "tracing",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-channels",
@@ -13367,10 +13364,10 @@ dependencies = [
  "tokio",
  "tokio-serial",
  "toml 1.1.2+spec-1.1.0",
- "tracing",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-log",
  "zeroclaw-tools",
 ]
 
@@ -13387,8 +13384,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "zeroclaw-api",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13401,13 +13398,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "zeroclaw-api",
- "zeroclaw-config",
 ]
 
 [[package]]
@@ -13436,10 +13434,10 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tracing",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13458,8 +13456,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
- "tracing",
  "zeroclaw-api",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13491,10 +13489,10 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tracing",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13516,7 +13514,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "toml 1.1.2+spec-1.1.0",
- "tracing",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13582,7 +13580,6 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tower",
  "tower-http",
- "tracing",
  "urlencoding",
  "uuid",
  "webpki-roots 1.0.7",
@@ -13607,7 +13604,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "tracing",
+ "zeroclaw-log",
 ]
 
 [[package]]
@@ -13641,7 +13638,6 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
- "tracing",
  "urlencoding",
  "uuid",
  "which",
@@ -13649,6 +13645,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
+ "zeroclaw-log",
  "zeroclaw-memory",
  "zeroclaw-providers",
 ]
@@ -13741,8 +13738,6 @@ dependencies = [
  "toml_edit 0.25.11+spec-1.1.0",
  "tower",
  "tower-http",
- "tracing",
- "tracing-subscriber",
  "urlencoding",
  "uuid",
  "webpki-roots 1.0.7",

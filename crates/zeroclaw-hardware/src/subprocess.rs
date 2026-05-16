@@ -128,7 +128,7 @@ impl Tool for SubprocessTool {
                 anyhow::anyhow!(
                     "failed to spawn plugin '{}' at {}: {}",
                     self.manifest.tool.name,
-                    self.binary_path.display(),
+                    self.binary_path.display().to_string(),
                     e
                 )
             })?;

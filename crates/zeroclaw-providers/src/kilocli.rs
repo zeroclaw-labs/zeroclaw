@@ -55,6 +55,8 @@ const TEMP_EPSILON: f64 = 1e-9;
 /// Each inference request spawns a fresh `kilo` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct KiloCliModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     /// Path to the `kilo` binary.
     binary_path: PathBuf,
 }
@@ -62,15 +64,17 @@ pub struct KiloCliModelProvider {
 impl KiloCliModelProvider {
     /// Create a new `KiloCliModelProvider`. Pass `None` to use the default
     /// `"kilo"` (PATH lookup); pass an explicit path to override.
-    pub fn new(binary_path: Option<&str>) -> Self {
+    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
         let binary_path = binary_path
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_KILO_CLI_BINARY));
-        Self { binary_path }
+        Self {
+            alias: alias.to_string(),
+            binary_path,
+        }
     }
-
     /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
@@ -177,12 +181,6 @@ impl KiloCliModelProvider {
     }
 }
 
-impl Default for KiloCliModelProvider {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
 #[async_trait]
 impl ModelProvider for KiloCliModelProvider {
     async fn chat_with_system(
@@ -224,25 +222,38 @@ impl ModelProvider for KiloCliModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for KiloCliModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::KiloCli,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = KiloCliModelProvider::new(Some("/usr/local/bin/kilo"));
+        let p = KiloCliModelProvider::new("test", Some("/usr/local/bin/kilo"));
         assert_eq!(p.binary_path, PathBuf::from("/usr/local/bin/kilo"));
     }
 
     #[test]
     fn new_defaults_to_kilo() {
-        let p = KiloCliModelProvider::new(None);
+        let p = KiloCliModelProvider::new("test", None);
         assert_eq!(p.binary_path, PathBuf::from("kilo"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = KiloCliModelProvider::new(Some("   "));
+        let p = KiloCliModelProvider::new("test", Some("   "));
         assert_eq!(p.binary_path, PathBuf::from("kilo"));
     }
 
@@ -279,6 +290,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_missing_binary_returns_error() {
         let model_provider = KiloCliModelProvider {
+            alias: "test".to_string(),
             binary_path: PathBuf::from("/nonexistent/path/to/kilo"),
         };
         let result = model_provider.invoke_cli("hello", "default").await;

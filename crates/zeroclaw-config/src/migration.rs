@@ -295,18 +295,18 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
 /// over the original so the operator never observes a partial write.
 pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read config at {}", path.display()))?;
+        .with_context(|| format!("failed to read config at {}", path.display().to_string()))?;
     let migrated = match migrate_file(&raw)? {
         Some(s) => s,
         None => return Ok(None),
     };
     let parent = path
         .parent()
-        .with_context(|| format!("config path {} has no parent directory", path.display()))?;
+        .with_context(|| format!("config path {} has no parent directory", path.display().to_string()))?;
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .with_context(|| format!("config path {} has no file name", path.display()))?;
+        .with_context(|| format!("config path {} has no file name", path.display().to_string()))?;
     let backup_path = parent.join(format!("{file_name}.backup"));
     let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
 
@@ -323,7 +323,7 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
                 )
             })?;
         std::io::Write::write_all(&mut temp, migrated.as_bytes()).with_context(|| {
-            format!("failed to write migrated config to {}", temp_path.display())
+            format!("failed to write migrated config to {}", temp_path.display().to_string())
         })?;
         temp.sync_all().with_context(|| {
             format!(
@@ -337,8 +337,8 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     std::fs::copy(path, &backup_path).with_context(|| {
         format!(
             "failed to write backup {} before migration (temp file intact at {})",
-            backup_path.display(),
-            temp_path.display(),
+            backup_path.display().to_string(),
+            temp_path.display().to_string(),
         )
     })?;
 
@@ -352,8 +352,8 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         return Err(anyhow::anyhow!(
             "failed to atomically replace {} with migrated config: {rename_err} \
              (backup retained at {})",
-            path.display(),
-            backup_path.display(),
+            path.display().to_string(),
+            backup_path.display().to_string(),
         ));
     }
 
@@ -378,9 +378,9 @@ fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let dir = std::fs::File::open(path)
-            .with_context(|| format!("failed to open directory for fsync: {}", path.display()))?;
+            .with_context(|| format!("failed to open directory for fsync: {}", path.display().to_string()))?;
         dir.sync_all()
-            .with_context(|| format!("failed to fsync directory: {}", path.display()))?;
+            .with_context(|| format!("failed to fsync directory: {}", path.display().to_string()))?;
     }
     #[cfg(not(unix))]
     {
@@ -465,13 +465,8 @@ pub fn migrate_legacy_workspace_to_default_agent(install_root: &Path) -> Result<
         .flatten()
         .is_some_and(|mut iter| iter.next().is_some());
     if data_populated && agent_populated {
-        tracing::info!(
-            data_target = %data_target.display(),
-            agent_target = %agent_default.display(),
-            legacy = %legacy.display(),
-            "filesystem migration: targets already populated; skipping split. \
-             Legacy dir can be removed manually after verifying."
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"data_target": data_target.display().to_string(), "agent_target": agent_default.display().to_string(), "legacy": legacy.display().to_string()})), "filesystem migration: targets already populated; skipping split. \
+             Legacy dir can be removed manually after verifying.");
         return Ok(false);
     }
 
@@ -490,14 +485,11 @@ pub fn migrate_legacy_workspace_to_default_agent(install_root: &Path) -> Result<
     copy_dir_recursive(&legacy, &backup_dir).with_context(|| {
         format!(
             "[system] failed to back up legacy workspace from {} to {}",
-            legacy.display(),
+            legacy.display().to_string(),
             backup_dir.display()
         )
     })?;
-    tracing::info!(
-        target = %backup_dir.display(),
-        "[system] filesystem migration: legacy workspace backed up"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"target": backup_dir.display().to_string()})), "[system] filesystem migration: legacy workspace backed up");
 
     std::fs::create_dir_all(&data_target).with_context(|| {
         format!(
@@ -548,13 +540,9 @@ pub fn migrate_legacy_workspace_to_default_agent(install_root: &Path) -> Result<
         };
 
         if dst.exists() {
-            tracing::warn!(
-                source = %src.display(),
-                target = %dst.display(),
-                "filesystem migration: target already exists; refusing to clobber. \
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"source": src.display().to_string(), "target": dst.display().to_string()})), "filesystem migration: target already exists; refusing to clobber. \
                  Resolve manually (the entry is still present in the legacy workspace and \
-                 in the timestamped backup); the rest of the split will continue."
-            );
+                 in the timestamped backup); the rest of the split will continue.");
             continue;
         }
 
@@ -565,23 +553,23 @@ pub fn migrate_legacy_workspace_to_default_agent(install_root: &Path) -> Result<
                 copy_dir_recursive(&src, &dst).with_context(|| {
                     format!(
                         "[system] failed to copy {} to {}",
-                        src.display(),
+                        src.display().to_string(),
                         dst.display()
                     )
                 })?;
                 std::fs::remove_dir_all(&src).with_context(|| {
-                    format!("[system] failed to remove {} after copy", src.display())
+                    format!("[system] failed to remove {} after copy", src.display().to_string())
                 })?;
             } else {
                 std::fs::copy(&src, &dst).with_context(|| {
                     format!(
                         "[system] failed to copy {} to {}",
-                        src.display(),
+                        src.display().to_string(),
                         dst.display()
                     )
                 })?;
                 std::fs::remove_file(&src).with_context(|| {
-                    format!("[system] failed to remove {} after copy", src.display())
+                    format!("[system] failed to remove {} after copy", src.display().to_string())
                 })?;
             }
         }
@@ -605,17 +593,7 @@ pub fn migrate_legacy_workspace_to_default_agent(install_root: &Path) -> Result<
         let _ = std::fs::remove_dir(&legacy);
     }
 
-    tracing::info!(
-        legacy = %legacy.display(),
-        data_target = %data_target.display(),
-        shared_target = %shared_target.display(),
-        agent_target = %agent_default.display(),
-        backup = %backup_dir.display(),
-        shared_db = shared_count,
-        shared_workspace = shared_workspace_count,
-        agent = agent_count,
-        "[system] filesystem migration: legacy workspace split into data + shared + default agent workspace"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"legacy": legacy.display().to_string(), "data_target": data_target.display().to_string(), "shared_target": shared_target.display().to_string(), "agent_target": agent_default.display().to_string(), "backup": backup_dir.display().to_string(), "shared_db": shared_count, "shared_workspace": shared_workspace_count, "agent": agent_count})), "[system] filesystem migration: legacy workspace split into data + shared + default agent workspace");
     Ok(true)
 }
 
@@ -654,18 +632,14 @@ pub fn relocate_default_agent_skills_to_shared(install_root: &Path) -> Result<bo
         copy_dir_recursive(&src, &dst).with_context(|| {
             format!(
                 "[system] failed to copy {} to {}",
-                src.display(),
+                src.display().to_string(),
                 dst.display()
             )
         })?;
         std::fs::remove_dir_all(&src)
-            .with_context(|| format!("[system] failed to remove {} after copy", src.display()))?;
+            .with_context(|| format!("[system] failed to remove {} after copy", src.display().to_string()))?;
     }
-    tracing::info!(
-        from = %src.display(),
-        to = %dst.display(),
-        "[system] filesystem migration: lifted default-agent skills into shared/"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": src.display().to_string(), "to": dst.display().to_string()})), "[system] filesystem migration: lifted default-agent skills into shared/");
     Ok(true)
 }
 
@@ -716,7 +690,7 @@ pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(anyhow::Error::from(e))
-                .with_context(|| format!("failed to read config at {}", path.display()));
+                .with_context(|| format!("failed to read config at {}", path.display().to_string()));
         }
     };
     let value: toml::Value =
@@ -728,13 +702,13 @@ pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
     if from > CURRENT_SCHEMA_VERSION {
         anyhow::bail!(
             "config at {} is schema_version {from}, newer than this binary supports ({})",
-            path.display(),
+            path.display().to_string(),
             CURRENT_SCHEMA_VERSION,
         );
     }
     anyhow::bail!(
         "config at {} is schema_version {from}; run `zeroclaw config migrate` to update before modifying",
-        path.display(),
+        path.display().to_string(),
     );
 }
 

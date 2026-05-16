@@ -317,7 +317,7 @@ impl Tool for WebFetchTool {
 
         // Build client: follow redirects, set timeout, set User-Agent
         let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "web_fetch: timeout_secs is 0, using safe default of 30s");
             30
         } else {
             self.timeout_secs
@@ -370,22 +370,17 @@ impl Tool for WebFetchTool {
         // If standard fetch succeeded well enough, return it directly.
         // Otherwise, try Firecrawl fallback if enabled.
         if self.should_fallback_to_firecrawl(&standard_result) {
-            tracing::info!(
-                "web_fetch: standard fetch insufficient for {url}, attempting Firecrawl fallback"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"url": url})), "web_fetch: standard fetch insufficient for , attempting Firecrawl fallback");
             match Box::pin(self.fetch_via_firecrawl(&url)).await {
                 Ok(firecrawl_result) if firecrawl_result.success => {
                     return Ok(firecrawl_result);
                 }
                 Ok(firecrawl_result) => {
-                    tracing::warn!(
-                        "web_fetch: Firecrawl fallback also failed: {:?}",
-                        firecrawl_result.error
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("web_fetch: Firecrawl fallback also failed: {:?}", firecrawl_result.error));
                     // Return original standard result if Firecrawl also failed
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "web_fetch: Firecrawl fallback error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "web_fetch: Firecrawl fallback error");
                 }
             }
         }
@@ -442,9 +437,7 @@ fn validate_target_url(
     }
 
     if private_host_allowed {
-        tracing::warn!(
-            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "host": host})), ": allowing private/local host '' via allowed_private_hosts");
     }
 
     if !private_host_allowed && !host_matches_allowlist(&host, allowed_domains) {

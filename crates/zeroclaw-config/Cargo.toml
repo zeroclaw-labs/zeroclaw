@@ -7,6 +7,7 @@ description = "Configuration schema, secrets, and related types for ZeroClaw."
 publish = false
 
 [dependencies]
+zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
 anyhow = "1.0"
@@ -37,13 +38,11 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 rustls-pki-types = "1.14.0"
 toml = "1.0"
 toml_edit = "0.25"
-tracing = { version = "0.1", default-features = false }
 url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 

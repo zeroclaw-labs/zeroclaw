@@ -31,6 +31,7 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 /// otherwise the backend falls back to keyword-only recall and logs a
 /// warning at construction.
 pub struct PostgresMemory {
+    alias: String,
     client: Arc<Mutex<Client>>,
     qualified_table: String,
     qualified_agents: String,
@@ -38,6 +39,7 @@ pub struct PostgresMemory {
 
 impl PostgresMemory {
     pub fn new(
+        alias: &str,
         db_url: &str,
         schema: &str,
         table: &str,
@@ -70,17 +72,17 @@ impl PostgresMemory {
                 Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
             };
             if !ext_ok {
-                tracing::warn!(
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "pgvector extension not available; falling back to keyword-only recall");
             }
             Ok(Self {
+                alias: alias.to_string(),
                 client: client_ref,
                 qualified_table,
                 qualified_agents,
             })
         } else {
             Ok(Self {
+                alias: alias.to_string(),
                 client: Arc::new(Mutex::new(client)),
                 qualified_table,
                 qualified_agents,
@@ -320,10 +322,7 @@ impl PostgresMemory {
             client.execute(&stmt, &[new, old])?;
         }
 
-        tracing::info!(
-            rewritten = rewrites.len(),
-            "Normalized session_id values in memories table to sanitized form"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"rewritten": rewrites.len()})), "Normalized session_id values in memories table to sanitized form");
 
         Ok(())
     }
@@ -493,6 +492,7 @@ impl Memory for PostgresMemory {
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
@@ -531,7 +531,6 @@ impl Memory for PostgresMemory {
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
                 ",
-                qualified_agents = self.qualified_agents,
             );
 
             #[allow(clippy::cast_possible_wrap)]
@@ -715,6 +714,7 @@ impl Memory for PostgresMemory {
 
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let q = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
@@ -761,7 +761,6 @@ impl Memory for PostgresMemory {
                 ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
                 ",
-                qualified_agents = self.qualified_agents,
             );
 
             #[allow(clippy::cast_possible_wrap)]
@@ -809,6 +808,17 @@ impl Memory for PostgresMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for PostgresMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::Postgres,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +857,7 @@ mod tests {
     async fn new_does_not_panic_inside_tokio_runtime() {
         let outcome = std::panic::catch_unwind(|| {
             PostgresMemory::new(
+               "test",
                 "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
                 "public",
                 "memories",

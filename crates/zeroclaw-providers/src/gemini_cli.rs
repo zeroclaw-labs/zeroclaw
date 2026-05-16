@@ -58,6 +58,8 @@ const TEMP_EPSILON: f64 = 1e-9;
 /// Each inference request spawns a fresh `gemini` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct GeminiCliModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     /// Path to the `gemini` binary.
     binary_path: PathBuf,
 }
@@ -65,15 +67,17 @@ pub struct GeminiCliModelProvider {
 impl GeminiCliModelProvider {
     /// Create a new `GeminiCliModelProvider`. Pass `None` to use the default
     /// `"gemini"` (PATH lookup); pass an explicit path to override.
-    pub fn new(binary_path: Option<&str>) -> Self {
+    pub fn new(alias: &str, binary_path: Option<&str>) -> Self {
         let binary_path = binary_path
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_GEMINI_CLI_BINARY));
-        Self { binary_path }
+        Self {
+            alias: alias.to_string(),
+            binary_path,
+        }
     }
-
     /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
@@ -186,12 +190,6 @@ impl GeminiCliModelProvider {
     }
 }
 
-impl Default for GeminiCliModelProvider {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
 #[async_trait]
 impl ModelProvider for GeminiCliModelProvider {
     async fn chat_with_system(
@@ -233,25 +231,38 @@ impl ModelProvider for GeminiCliModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for GeminiCliModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::GeminiCli,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_uses_explicit_binary_path() {
-        let p = GeminiCliModelProvider::new(Some("/usr/local/bin/gemini"));
+        let p = GeminiCliModelProvider::new("test", Some("/usr/local/bin/gemini"));
         assert_eq!(p.binary_path, PathBuf::from("/usr/local/bin/gemini"));
     }
 
     #[test]
     fn new_defaults_to_gemini() {
-        let p = GeminiCliModelProvider::new(None);
+        let p = GeminiCliModelProvider::new("test", None);
         assert_eq!(p.binary_path, PathBuf::from("gemini"));
     }
 
     #[test]
     fn new_ignores_blank_binary_path() {
-        let p = GeminiCliModelProvider::new(Some("   "));
+        let p = GeminiCliModelProvider::new("test", Some("   "));
         assert_eq!(p.binary_path, PathBuf::from("gemini"));
     }
 
@@ -319,6 +330,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_missing_binary_returns_error() {
         let model_provider = GeminiCliModelProvider {
+            alias: "test".to_string(),
             binary_path: PathBuf::from("/nonexistent/path/to/gemini"),
         };
         let result = model_provider.invoke_cli("hello", "default").await;

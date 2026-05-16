@@ -7,7 +7,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
-use tracing::{info, warn};
 use zeroclaw_config::schema::HeartbeatConfig;
 
 // ── Structured task types ────────────────────────────────────────
@@ -195,12 +194,12 @@ impl HeartbeatEngine {
     /// Start the heartbeat loop (runs until cancelled)
     pub async fn run(&self) -> Result<()> {
         if !self.config.enabled {
-            info!("Heartbeat disabled");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Heartbeat disabled");
             return Ok(());
         }
 
         let interval_mins = self.config.interval_minutes.max(1);
-        info!("💓 Heartbeat started: every {} minutes", interval_mins);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("💓 Heartbeat started: every {} minutes", interval_mins));
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
@@ -211,11 +210,11 @@ impl HeartbeatEngine {
             match self.tick().await {
                 Ok(tasks) => {
                     if tasks > 0 {
-                        info!("💓 Heartbeat: processed {} tasks", tasks);
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("💓 Heartbeat: processed {} tasks", tasks));
                     }
                 }
                 Err(e) => {
-                    warn!("💓 Heartbeat error: {}", e);
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("💓 Heartbeat error: {}", e));
                     self.observer.record_event(&ObserverEvent::Error {
                         component: "heartbeat".into(),
                         message: e.to_string(),

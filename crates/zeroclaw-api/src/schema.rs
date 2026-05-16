@@ -165,7 +165,7 @@ impl SchemaCleanr {
             && t == "object"
             && !obj.contains_key("properties")
         {
-            tracing::warn!("Object schema without 'properties' field may cause issues");
+            eprintln!("warn: Object schema without 'properties' field may cause issues");
         }
 
         Ok(())
@@ -298,7 +298,7 @@ impl SchemaCleanr {
     ) -> Value {
         // Prevent circular references
         if ref_stack.contains(ref_value) {
-            tracing::warn!("Circular $ref detected: {}", ref_value);
+            eprintln!("warn: Circular $ref detected: {}", ref_value);
             return Self::preserve_meta(obj, Value::Object(Map::new()));
         }
 
@@ -313,7 +313,7 @@ impl SchemaCleanr {
         }
 
         // Can't resolve: return empty object with metadata
-        tracing::warn!("Cannot resolve $ref: {}", ref_value);
+        eprintln!("warn: Cannot resolve $ref: {}", ref_value);
         Self::preserve_meta(obj, Value::Object(Map::new()))
     }
 

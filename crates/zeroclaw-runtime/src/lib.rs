@@ -1,3 +1,8 @@
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::manual_inspect,
+)]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;

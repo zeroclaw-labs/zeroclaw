@@ -7,10 +7,12 @@
 //! `pub(crate)` to keep external consumers off the typed surface.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use strum_macros::{EnumString, IntoStaticStr};
 
 /// OTel severity buckets. Stored alongside `severity_number` so consumers
 /// can range-compare numerically and pattern-match textually.
@@ -69,67 +71,36 @@ impl Severity {
     }
 }
 
-/// ECS-style event.category coarse axis. Drives the dashboard's "hide
-/// internal noise by default" filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ECS-style event.category coarse axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum EventCategory {
-    /// Agent loop activity: LLM requests, agent_start, agent_end.
     Agent,
-    /// Channel I/O: inbound messages, outbound sends, draft updates.
     Channel,
-    /// Cron scheduler activity: cron_run, cron_schedule.
     Cron,
-    /// Memory backend ops: store, recall, forget.
     Memory,
-    /// Tool execution: tool_call_start, tool_call_result.
     Tool,
-    /// Provider activity (transient retries, provider switches).
     Provider,
-    /// Session lifecycle: session_open, session_close.
     Session,
-    /// System-level events: daemon_start, reload, migration.
     System,
-    /// Ops noise that operators don't need on the dashboard by default:
-    /// heartbeats, sync retries, idle evictions. Hidden in the UI unless
-    /// explicitly opted into.
     Internal,
 }
 
 impl EventCategory {
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Channel => "channel",
-            Self::Cron => "cron",
-            Self::Memory => "memory",
-            Self::Tool => "tool",
-            Self::Provider => "provider",
-            Self::Session => "session",
-            Self::System => "system",
-            Self::Internal => "internal",
-        }
+        self.into()
     }
 
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "agent" => Some(Self::Agent),
-            "channel" => Some(Self::Channel),
-            "cron" => Some(Self::Cron),
-            "memory" => Some(Self::Memory),
-            "tool" => Some(Self::Tool),
-            "provider" => Some(Self::Provider),
-            "session" => Some(Self::Session),
-            "system" => Some(Self::System),
-            "internal" => Some(Self::Internal),
-            _ => None,
-        }
+        Self::from_str(raw).ok()
     }
 }
 
 /// ECS event.outcome. Default unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum EventOutcome {
     Success,
     Failure,
@@ -139,21 +110,12 @@ pub enum EventOutcome {
 impl EventOutcome {
     #[must_use]
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Failure => "failure",
-            Self::Unknown => "unknown",
-        }
+        self.into()
     }
 
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "success" => Some(Self::Success),
-            "failure" => Some(Self::Failure),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
-        }
+        Self::from_str(raw).ok()
     }
 }
 
@@ -201,6 +163,7 @@ pub const ATTRIBUTION_FIELDS: &[&str] = &[
     "knowledge_bundle",
     "mcp_bundle",
     "peer_group",
+    "sop_name",
     "model",
     "embedding_provider",
 ];
@@ -217,6 +180,20 @@ pub const COMPOSITE_PREFIXES: &[&str] = &[
     "tunnel_provider",
 ];
 
+/// Derive the `_type` decomposed key for a composite prefix. Single source
+/// of the `_type` suffix — every reader/writer routes through this.
+#[must_use]
+pub fn type_field(prefix: &str) -> String {
+    format!("{prefix}_type")
+}
+
+/// Derive the `_alias` decomposed key for a composite prefix. Single source
+/// of the `_alias` suffix.
+#[must_use]
+pub fn alias_field(prefix: &str) -> String {
+    format!("{prefix}_alias")
+}
+
 /// True when `name` matches a known plain attribution field, a composite
 /// prefix, or a composite's decomposed `_type` / `_alias` suffix.
 #[must_use]
@@ -228,9 +205,7 @@ pub fn is_attribution_field(name: &str) -> bool {
         if name == *prefix {
             return true;
         }
-        if let Some(suffix) = name.strip_prefix(prefix)
-            && (suffix == "_type" || suffix == "_alias")
-        {
+        if name == type_field(prefix) || name == alias_field(prefix) {
             return true;
         }
     }
@@ -273,10 +248,10 @@ impl ZeroclawAttribution {
     pub fn set_composite(&mut self, prefix: &str, composite: &str) {
         self.set(prefix.to_string(), composite.to_string());
         if let Some((ty, alias)) = composite.split_once('.') {
-            self.set(format!("{prefix}_type"), ty.to_string());
-            self.set(format!("{prefix}_alias"), alias.to_string());
+            self.set(type_field(prefix), ty.to_string());
+            self.set(alias_field(prefix), alias.to_string());
         } else {
-            self.set(format!("{prefix}_type"), composite.to_string());
+            self.set(type_field(prefix), composite.to_string());
         }
     }
 
@@ -415,6 +390,145 @@ pub fn severity_text_from_number(n: u8) -> &'static str {
 #[must_use]
 pub fn severity_text_from_tracing_level(level: tracing::Level) -> &'static str {
     Severity::from_tracing_level(level).text()
+}
+
+// ---------------------------------------------------------------------------
+// Call-site Event surface
+// ---------------------------------------------------------------------------
+
+/// Closed `event.action` taxonomy. Adding a verb requires extending
+/// this enum — no `Other(&str)` escape hatch on purpose. The snake_case
+/// form of each variant is the on-disk `event.action` string, derived
+/// via `strum::IntoStaticStr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum Action {
+    Start,
+    Complete,
+    Fail,
+    Cancel,
+    Skip,
+    Timeout,
+    Retry,
+    Inbound,
+    Outbound,
+    Send,
+    Receive,
+    Connect,
+    Disconnect,
+    Reconnect,
+    Spawn,
+    Kill,
+    Tick,
+    Trigger,
+    Schedule,
+    Approve,
+    Reject,
+    Defer,
+    Read,
+    Write,
+    Delete,
+    List,
+    Query,
+    Invoke,
+    Dispatch,
+    Resolve,
+    Register,
+    Unregister,
+    Load,
+    Save,
+    Migrate,
+    Validate,
+    Note,
+}
+
+impl Action {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// One emission's call-site descriptor. Built by the `record!` macro
+/// from the Event constructor + builder calls and consumed by the layer.
+/// Everything is by-value; the macro takes `&Event` to keep call sites
+/// non-moving.
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub name: &'static str,
+    pub action: Action,
+    pub category: Option<EventCategory>,
+    pub outcome: EventOutcome,
+    pub duration_ms: Option<u64>,
+    pub attrs: Option<Value>,
+}
+
+impl Event {
+    #[must_use]
+    pub fn new(name: &'static str, action: Action) -> Self {
+        Self {
+            name,
+            action,
+            category: None,
+            outcome: EventOutcome::Unknown,
+            duration_ms: None,
+            attrs: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_category(mut self, category: EventCategory) -> Self {
+        self.category = Some(category);
+        self
+    }
+
+    #[must_use]
+    pub fn with_outcome(mut self, outcome: EventOutcome) -> Self {
+        self.outcome = outcome;
+        self
+    }
+
+    #[must_use]
+    pub fn with_duration(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_attrs(mut self, attrs: Value) -> Self {
+        self.attrs = Some(attrs);
+        self
+    }
+
+    #[must_use]
+    pub fn category_str(&self) -> &'static str {
+        self.category.map_or("", EventCategory::as_str)
+    }
+
+    #[must_use]
+    pub fn outcome_str(&self) -> &'static str {
+        self.outcome.as_str()
+    }
+
+    /// JSON-encode the attrs payload as a string for tracing::event!
+    /// transport. Layer parses back to `Value`.
+    #[must_use]
+    pub fn attrs_str(&self) -> String {
+        match &self.attrs {
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn duration_ms_or_zero(&self) -> u64 {
+        self.duration_ms.unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn has_duration(&self) -> bool {
+        self.duration_ms.is_some()
+    }
 }
 
 #[cfg(test)]

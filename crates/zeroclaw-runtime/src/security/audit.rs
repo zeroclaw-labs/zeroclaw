@@ -387,12 +387,12 @@ impl AuditLogger {
     /// Rotate the log file
     fn rotate(&self) -> Result<()> {
         for i in (1..10).rev() {
-            let old_name = format!("{}.{}.log", self.log_path.display(), i);
-            let new_name = format!("{}.{}.log", self.log_path.display(), i + 1);
+            let old_name = format!("{}.{}.log", self.log_path.display().to_string(), i);
+            let new_name = format!("{}.{}.log", self.log_path.display().to_string(), i + 1);
             let _ = std::fs::rename(&old_name, &new_name);
         }
 
-        let rotated = format!("{}.1.log", self.log_path.display());
+        let rotated = format!("{}.1.log", self.log_path.display().to_string());
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
@@ -684,7 +684,7 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution);
         logger.log(&event)?;
 
-        let rotated = format!("{}.1.log", log_path.display());
+        let rotated = format!("{}.1.log", log_path.display().to_string());
         assert!(
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"

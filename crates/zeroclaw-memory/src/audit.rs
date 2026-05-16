@@ -42,6 +42,15 @@ pub struct AuditedMemory<M: Memory> {
     audit_conn: Arc<Mutex<Connection>>,
 }
 
+impl<M: Memory> ::zeroclaw_api::attribution::Attributable for AuditedMemory<M> {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+}
+
 impl<M: Memory> AuditedMemory<M> {
     pub fn new(inner: M, workspace_dir: &Path) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("audit.db");
@@ -280,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_logs_store_operation() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -294,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_logs_recall_operation() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         let _ = audited.recall("query", 10, None, None, None).await;
@@ -305,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_prune_works() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -323,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_delegates_correctly() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         assert_eq!(audited.name(), "none");

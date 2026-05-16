@@ -265,10 +265,7 @@ pub fn register_skill_tools(
         .collect();
     for tool in skill_tools {
         if existing_names.contains(tool.name()) {
-            tracing::warn!(
-                "Skill tool '{}' shadows built-in tool, skipping",
-                tool.name()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Skill tool '{}' shadows built-in tool, skipping", tool.name()));
         } else {
             tools_registry.push(tool);
         }
@@ -461,12 +458,12 @@ pub fn all_tools_with_runtime(
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {
-        match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
+        match zeroclaw_memory::SqliteMemory::new_named("sqlite", workspace_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "discord_search: failed to open discord.db");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord_search: failed to open discord.db");
             }
         }
     }
@@ -548,9 +545,7 @@ pub fn all_tools_with_runtime(
                 root_config.browser_delegate.clone(),
             )));
         } else {
-            tracing::warn!(
-                "browser_delegate: skipped registration because the current runtime does not allow shell access"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "browser_delegate: skipped registration because the current runtime does not allow shell access");
         }
     }
 
@@ -613,9 +608,7 @@ pub fn all_tools_with_runtime(
             root_config.notion.api_key.trim().to_string()
         };
         if notion_api_key.trim().is_empty() {
-            tracing::warn!(
-                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)");
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
         }
@@ -629,11 +622,9 @@ pub fn all_tools_with_runtime(
             root_config.jira.api_token.trim().to_string()
         };
         if api_token.trim().is_empty() {
-            tracing::warn!(
-                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)");
         } else if root_config.jira.base_url.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Jira tool enabled but jira.base_url is empty — skipping registration");
         } else {
             let email = root_config
                 .jira
@@ -643,9 +634,9 @@ pub fn all_tools_with_runtime(
                 .filter(|s| !s.is_empty())
                 .map(String::from);
             if email.is_some() {
-                tracing::info!("Jira tool: Cloud mode (API v3, Basic auth)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Jira tool: Cloud mode (API v3, Basic auth)");
             } else {
-                tracing::info!("Jira tool: Server/DC mode (API v2, Bearer auth)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Jira tool: Server/DC mode (API v2, Bearer auth)");
             }
             tool_arcs.push(Arc::new(JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
@@ -711,9 +702,7 @@ pub fn all_tools_with_runtime(
             root_config.google_workspace.audit_log,
         )));
     } else if root_config.google_workspace.enabled {
-        tracing::warn!(
-            "google_workspace: skipped registration because shell access is unavailable"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "google_workspace: skipped registration because shell access is unavailable");
     }
 
     // Claude Code delegation tool
@@ -895,9 +884,7 @@ pub fn all_tools_with_runtime(
                     .as_deref()
                     .is_none_or(|s| s.trim().is_empty())
             {
-                tracing::error!(
-                    "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
-                );
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), "microsoft365: client_credentials auth_flow requires a non-empty client_secret");
                 return (
                     boxed_registry_from_arcs(tool_arcs),
                     None,
@@ -924,13 +911,11 @@ pub fn all_tools_with_runtime(
             match Microsoft365Tool::new(resolved, security.clone(), cache_dir) {
                 Ok(tool) => tool_arcs.push(Arc::new(tool)),
                 Err(e) => {
-                    tracing::error!(error = ?e, "microsoft365: failed to initialize tool");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "microsoft365: failed to initialize tool");
                 }
             }
         } else {
-            tracing::warn!(
-                "microsoft365: skipped registration because tenant_id or client_id is empty"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "microsoft365: skipped registration because tenant_id or client_id is empty");
         }
     }
 
@@ -951,7 +936,7 @@ pub fn all_tools_with_runtime(
                 tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "knowledge graph disabled due to init error");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "knowledge graph disabled due to init error");
             }
         }
     }
@@ -1050,10 +1035,10 @@ pub fn all_tools_with_runtime(
                             manifest.description.clone().unwrap_or_default(),
                         )));
                     }
-                    tracing::info!("Loaded {count} WASM plugin tools");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": count})), "Loaded  WASM plugin tools");
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "Failed to load WASM plugins");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to load WASM plugins");
                 }
             }
         }

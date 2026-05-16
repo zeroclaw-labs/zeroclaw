@@ -51,6 +51,23 @@ pub fn subscribe() -> Option<broadcast::Receiver<Value>> {
     slot().read().as_ref().map(|s| s.subscribe())
 }
 
+/// Test-only convenience: ensure a broadcast hook is installed and
+/// return a receiver. If no hook is set yet, install one with a 1024-
+/// element ring buffer and subscribe. Idempotent.
+#[doc(hidden)]
+#[must_use]
+pub fn subscribe_or_install() -> broadcast::Receiver<Value> {
+    {
+        let read = slot().read();
+        if let Some(sender) = read.as_ref() {
+            return sender.subscribe();
+        }
+    }
+    let (tx, rx) = broadcast::channel(1024);
+    set_broadcast_hook(tx);
+    rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

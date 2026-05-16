@@ -17,7 +17,6 @@ pub use types::{
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use tracing::warn;
 
 use types::{SopManifest, SopMeta};
 
@@ -94,7 +93,7 @@ pub fn load_sops_from_directory(
         match load_sop(&path, default_execution_mode) {
             Ok(sop) => sops.push(sop),
             Err(e) => {
-                warn!(error = ?e, "Failed to load SOP from {}", path.display());
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), &format!("Failed to load SOP from {}", path.display().to_string()));
             }
         }
     }

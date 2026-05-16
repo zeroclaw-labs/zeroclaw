@@ -955,7 +955,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("see attached [IMAGE:{}]", image_path.display()),
+            "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
 
@@ -1008,7 +1008,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", image_path.display()),
+            "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
 
@@ -1096,7 +1096,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display()),
+            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
         })
         .to_string();
 
@@ -1106,7 +1106,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
             },
-            ChatMessage::user(format!("Now inspect this [IMAGE:{}]", fresh_path.display())),
+            ChatMessage::user(format!("Now inspect this [IMAGE:{}]", fresh_path.display().to_string())),
         ];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
@@ -1373,9 +1373,9 @@ mod tests {
         }
 
         let messages = vec![
-            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display().to_string())),
         ];
 
         let config = MultimodalConfig {

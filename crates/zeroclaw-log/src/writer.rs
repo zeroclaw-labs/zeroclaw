@@ -13,10 +13,8 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde_json::Value;
-use zeroclaw_config::schema::ObservabilityConfig;
-
 use crate::broadcast::current_broadcast_hook;
-use crate::config::{ResolvedPolicy, StoragePolicy};
+use crate::config::{LogConfig, ResolvedPolicy, StoragePolicy};
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
@@ -39,7 +37,7 @@ fn current_state() -> Option<Arc<WriterState>> {
 /// Initialize (or disable) the persistence writer from config. Idempotent.
 /// When enabled, runs a streaming in-place migration of any schema-1 rows
 /// in the existing file before resuming appends.
-pub fn init_from_config(config: &ObservabilityConfig, workspace_dir: &Path) {
+pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
     if policy.storage.is_enabled()
@@ -248,10 +246,10 @@ mod tests {
     use crate::event::{EventCategory, Severity};
 
     fn install_writer(dir: &Path, max_entries: usize) {
-        let cfg = ObservabilityConfig {
+        let cfg = LogConfig {
             log_persistence: "rolling".into(),
             log_persistence_max_entries: max_entries,
-            ..ObservabilityConfig::default()
+            ..LogConfig::default()
         };
         init_from_config(&cfg, dir);
     }
@@ -283,9 +281,9 @@ mod tests {
     fn disabled_storage_does_not_write_file() {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = ObservabilityConfig {
+        let cfg = LogConfig {
             log_persistence: "none".into(),
-            ..ObservabilityConfig::default()
+            ..LogConfig::default()
         };
         init_from_config(&cfg, tmp.path());
 

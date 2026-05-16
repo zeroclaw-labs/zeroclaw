@@ -1,5 +1,10 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::explicit_auto_deref,
+)]
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;

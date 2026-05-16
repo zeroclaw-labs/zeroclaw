@@ -11,9 +11,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::Instrument;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_log::scope;
 
 /// Spawn an ephemeral SubAgent that inherits the parent agent's
 /// identity and runs a focused prompt under the same alias.
@@ -98,12 +98,6 @@ impl Tool for SpawnSubagentTool {
         };
 
         let run_id = uuid::Uuid::new_v4().to_string();
-        let span = tracing::info_span!(
-            "subagent",
-            parent_alias = %subagent_ctx.parent_alias,
-            run_id = %run_id,
-            spawn_site = "tool",
-        );
 
         let temperature: Option<f64> = self
             .config
@@ -122,7 +116,11 @@ impl Tool for SpawnSubagentTool {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
         };
-        let run_result = Box::pin(
+        let parent_alias = subagent_ctx.parent_alias.clone();
+        let run_result = Box::pin(scope!(
+            agent_alias: parent_alias,
+            session_key: run_id,
+            =>
             crate::agent::run(
                 (*self.config).clone(),
                 &self.parent_alias,
@@ -136,8 +134,7 @@ impl Tool for SpawnSubagentTool {
                 None,
                 run_overrides,
             )
-            .instrument(span),
-        )
+        ))
         .await;
 
         match run_result {

@@ -145,7 +145,7 @@ mod tests {
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 
@@ -247,6 +247,15 @@ mod tests {
             self.recall(query, limit, session_id, since, until).await
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for QueryEchoMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str { "QueryEchoMemory" }
+    }
+
 
     #[tokio::test]
     async fn recall_empty() {

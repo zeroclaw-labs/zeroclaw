@@ -54,8 +54,8 @@ pub async fn migrate_openclaw_memory(
 
     if dry_run {
         println!("🔎 Dry run: OpenClaw migration preview");
-        println!("  Source: {}", source_workspace.display());
-        println!("  Target: {}", config.data_dir.display());
+        println!("  Source: {}", source_workspace.display().to_string());
+        println!("  Target: {}", config.data_dir.display().to_string());
         println!("  Candidates: {}", entries.len());
         println!("    - from sqlite:   {}", stats.from_sqlite);
         println!("    - from markdown: {}", stats.from_markdown);
@@ -65,7 +65,7 @@ pub async fn migrate_openclaw_memory(
     }
 
     if let Some(backup_dir) = backup_target_memory(&config.data_dir)? {
-        println!("🛟 Backup created: {}", backup_dir.display());
+        println!("🛟 Backup created: {}", backup_dir.display().to_string());
     }
 
     let memory = target_memory_backend(config)?;
@@ -94,8 +94,8 @@ pub async fn migrate_openclaw_memory(
     }
 
     println!("✅ OpenClaw memory migration complete");
-    println!("  Source: {}", source_workspace.display());
-    println!("  Target: {}", config.data_dir.display());
+    println!("  Source: {}", source_workspace.display().to_string());
+    println!("  Target: {}", config.data_dir.display().to_string());
     println!("  Imported:         {}", stats.imported);
     println!("  Skipped unchanged:{}", stats.skipped_unchanged);
     println!("  Renamed conflicts:{}", stats.renamed_conflicts);
@@ -140,7 +140,7 @@ fn read_openclaw_sqlite_entries(db_path: &Path) -> Result<Vec<SourceEntry>> {
     }
 
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open source db {}", db_path.display()))?;
+        .with_context(|| format!("Failed to open source db {}", db_path.display().to_string()))?;
 
     let table_exists: Option<String> = conn
         .query_row(
@@ -480,7 +480,7 @@ mod tests {
         let target = TempDir::new().unwrap();
 
         // Existing target memory
-        let target_mem = SqliteMemory::new(target.path()).unwrap();
+        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
         target_mem
             .store("k", "new value", MemoryCategory::Core, None)
             .await
@@ -534,7 +534,7 @@ mod tests {
             .await
             .unwrap();
 
-        let target_mem = SqliteMemory::new(target.path()).unwrap();
+        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
     }
 

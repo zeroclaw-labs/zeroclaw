@@ -246,7 +246,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         for row in rows {
             match row {
                 Ok(job) => jobs.push(job),
-                Err(e) => tracing::warn!(error = ?e, "Skipping cron job with unparseable row data"),
+                Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Skipping cron job with unparseable row data"),
             }
         }
         Ok(jobs)
@@ -280,7 +280,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         for row in rows {
             match row {
                 Ok(job) => jobs.push(job),
-                Err(e) => tracing::warn!(error = ?e, "Skipping cron job with unparseable row data"),
+                Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Skipping cron job with unparseable row data"),
             }
         }
         Ok(jobs)
@@ -782,10 +782,7 @@ pub fn sync_declarative_jobs(
                 .execute("DELETE FROM cron_jobs WHERE source = 'declarative'", [])
                 .context("Failed to remove stale declarative cron jobs")?;
             if deleted > 0 {
-                tracing::info!(
-                    count = deleted,
-                    "Removed declarative cron jobs no longer in config"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": deleted})), "Removed declarative cron jobs no longer in config");
             }
             Ok(())
         })?;
@@ -818,10 +815,7 @@ pub fn sync_declarative_jobs(
                         .with_context(|| {
                             format!("Failed to remove stale declarative cron job '{db_id}'")
                         })?;
-                    tracing::info!(
-                        job_id = %db_id,
-                        "Removed declarative cron job no longer in config"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"job_id": db_id})), "Removed declarative cron job no longer in config");
                 }
             }
         }
@@ -917,17 +911,14 @@ pub fn sync_declarative_jobs(
                     .with_context(|| format!("Failed to update declarative cron job '{id}'"))?;
                 }
 
-                tracing::debug!(job_id = %id, "Updated declarative cron job");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"job_id": id})), "Updated declarative cron job");
             } else {
                 // Reverse-resolve the owning agent from
                 // `[agents.<x>].cron_jobs` membership. Orphan declarative
                 // entries that no agent claims are skipped with a warning
                 // rather than silently bound to a magic alias.
                 let Some(agent_alias) = config.agent_for_cron_job(id) else {
-                    tracing::warn!(
-                        job_id = %id,
-                        "Skipping declarative cron job: no [agents.<x>].cron_jobs entry claims this id"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": id})), "Skipping declarative cron job: no [agents.<x>].cron_jobs entry claims this id");
                     continue;
                 };
                 let next_run = next_run_for_schedule(&schedule, now)?;
@@ -961,7 +952,7 @@ pub fn sync_declarative_jobs(
                     format!("Failed to insert declarative cron job '{id}'")
                 })?;
 
-                tracing::info!(job_id = %id, "Inserted declarative cron job from config");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"job_id": id})), "Inserted declarative cron job from config");
             }
         }
 
@@ -1056,7 +1047,7 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
         Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
             if msg.contains("duplicate column name") =>
         {
-            tracing::debug!(error = ?err, "Column cron_jobs.{name} already exists (concurrent migration)");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": err.to_string(), "name": name})), "Column cron_jobs. already exists (concurrent migration)");
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
@@ -1090,7 +1081,7 @@ fn with_existing_initialized_connection<T>(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display()))?;
+    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display().to_string()))?;
 
     initialize_schema(&conn)?;
 
@@ -1114,11 +1105,11 @@ fn with_initialized_connection<T>(
 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
+            .with_context(|| format!("Failed to create cron directory: {}", parent.display().to_string()))?;
     }
 
     let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
+        .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
 
     initialize_schema(&conn)?;
 

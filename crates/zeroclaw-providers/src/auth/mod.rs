@@ -490,13 +490,7 @@ async fn refresh_openai_access_token_with_retries(
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
                 let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
-                tracing::warn!(
-                    attempt,
-                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
-                    retry = should_retry,
-                    error = %err,
-                    "OpenAI token refresh failed"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "error": err.to_string()})), "OpenAI token refresh failed");
                 last_error = Some(err);
                 if should_retry {
                     tokio::time::sleep(Duration::from_millis(
@@ -526,13 +520,7 @@ async fn refresh_gemini_access_token_with_retries(
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
                 let should_retry = attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
-                tracing::warn!(
-                    attempt,
-                    max_attempts = OAUTH_REFRESH_MAX_ATTEMPTS,
-                    retry = should_retry,
-                    error = %err,
-                    "Gemini token refresh failed"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "error": err.to_string()})), "Gemini token refresh failed");
                 last_error = Some(err);
                 if should_retry {
                     tokio::time::sleep(Duration::from_millis(
@@ -821,7 +809,7 @@ impl AuthProviderFlow for OpenaiCodexFlow {
                 import_path,
             )
             .await?;
-            println!("Imported auth profile from {}", import_path.display());
+            println!("Imported auth profile from {}", import_path.display().to_string());
             println!("Active profile for openai-codex: {profile}");
             return Ok(());
         }

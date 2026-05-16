@@ -410,14 +410,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         if self.audit_log {
-            tracing::info!(
-                tool = "google_workspace",
-                service = service,
-                resource = resource,
-                sub_resource = sub_resource.unwrap_or(""),
-                method = method,
-                "gws audit: executing API call"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": "google_workspace", "service": service, "resource": resource, "sub_resource": sub_resource.unwrap_or(""), "method": method})), "gws audit: executing API call");
         }
 
         let result =

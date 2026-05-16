@@ -39,9 +39,7 @@ pub fn create_sandbox(
                     }
                 }
             }
-            tracing::warn!(
-                "Landlock requested but not available, falling back to application-layer"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Landlock requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Firejail => {
@@ -51,9 +49,7 @@ pub fn create_sandbox(
                     return Arc::new(sandbox);
                 }
             }
-            tracing::warn!(
-                "Firejail requested but not available, falling back to application-layer"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Firejail requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Bubblewrap => {
@@ -66,9 +62,7 @@ pub fn create_sandbox(
                     }
                 }
             }
-            tracing::warn!(
-                "Bubblewrap requested but not available, falling back to application-layer"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Bubblewrap requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
@@ -83,7 +77,7 @@ pub fn create_sandbox(
             if let Ok(sandbox) = result {
                 return Arc::new(sandbox);
             }
-            tracing::warn!("Docker requested but not available, falling back to application-layer");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Docker requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::SandboxExec => {
@@ -94,9 +88,7 @@ pub fn create_sandbox(
                     return Arc::new(sandbox);
                 }
             }
-            tracing::warn!(
-                "sandbox-exec requested but not available, falling back to application-layer"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "sandbox-exec requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Auto | SandboxBackend::None => {
@@ -122,14 +114,14 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
             if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
                 workspace_dir.map(Path::to_path_buf),
             ) {
-                tracing::info!("Landlock sandbox enabled (Linux kernel 5.13+)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Landlock sandbox enabled (Linux kernel 5.13+)");
                 return Arc::new(sandbox);
             }
         }
 
         // Try Firejail second (user-space tool)
         if let Ok(sandbox) = super::firejail::FirejailSandbox::probe() {
-            tracing::info!("Firejail sandbox enabled");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Firejail sandbox enabled");
             return Arc::new(sandbox);
         }
     }
@@ -140,14 +132,14 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
         #[cfg(feature = "sandbox-bubblewrap")]
         {
             if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::probe() {
-                tracing::info!("Bubblewrap sandbox enabled");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Bubblewrap sandbox enabled");
                 return Arc::new(sandbox);
             }
         }
 
         // Try sandbox-exec (Seatbelt) — built into macOS
         if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir) {
-            tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "macOS sandbox-exec (Seatbelt) enabled");
             return Arc::new(sandbox);
         }
     }
@@ -166,17 +158,15 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
             super::docker::DockerSandbox::probe()
         };
         if let Ok(sandbox) = docker_result {
-            tracing::info!("Docker sandbox enabled");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Docker sandbox enabled");
             return Arc::new(sandbox);
         }
     } else {
-        tracing::debug!(
-            "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection");
     }
 
     // Fallback: application-layer security only
-    tracing::info!("No sandbox backend available, using application-layer security");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "No sandbox backend available, using application-layer security");
     Arc::new(super::traits::NoopSandbox)
 }
 

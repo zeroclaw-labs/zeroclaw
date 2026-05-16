@@ -326,6 +326,15 @@ impl SignalChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for SignalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Signal)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
@@ -354,7 +363,7 @@ impl Channel for SignalChannel {
         let mut url = reqwest::Url::parse(&format!("{}/api/v1/events", self.http_url))?;
         url.query_pairs_mut().append_pair("account", &self.account);
 
-        tracing::info!("channel listening via SSE on {}...", self.http_url);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("channel listening via SSE on {}...", self.http_url));
 
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
@@ -372,13 +381,13 @@ impl Channel for SignalChannel {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    tracing::warn!("SSE returned {status}: {body}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})), "SSE returned");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "SSE connect error, retrying...");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "SSE connect error, retrying...");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;
@@ -395,7 +404,7 @@ impl Channel for SignalChannel {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!(error = ?e, "SSE chunk error, reconnecting");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "SSE chunk error, reconnecting");
                         break;
                     }
                 };
@@ -403,7 +412,7 @@ impl Channel for SignalChannel {
                 let text = match String::from_utf8(chunk.to_vec()) {
                     Ok(t) => t,
                     Err(e) => {
-                        tracing::debug!(error = ?e, "SSE invalid UTF-8, skipping chunk");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "SSE invalid UTF-8, skipping chunk");
                         continue;
                     }
                 };
@@ -443,7 +452,7 @@ impl Channel for SignalChannel {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::debug!(error = ?e, "SSE parse skip");
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "SSE parse skip");
                                 }
                             }
                             current_data.clear();
@@ -477,12 +486,12 @@ impl Channel for SignalChannel {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(error = ?e, "SSE trailing parse skip");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "SSE trailing parse skip");
                     }
                 }
             }
 
-            tracing::debug!("SSE stream ended, reconnecting...");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "SSE stream ended, reconnecting...");
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
     }

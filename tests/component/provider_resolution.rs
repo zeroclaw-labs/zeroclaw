@@ -143,6 +143,7 @@ fn factory_unknown_provider_rejected() {
 fn compatible_provider_bearer_auth_style() {
     // Construction with Bearer auth should succeed
     let _provider = OpenAiCompatibleModelProvider::new(
+        "test",
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -154,6 +155,7 @@ fn compatible_provider_bearer_auth_style() {
 fn compatible_provider_xapikey_auth_style() {
     // Construction with XApiKey auth should succeed
     let _provider = OpenAiCompatibleModelProvider::new(
+        "test",
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -165,6 +167,7 @@ fn compatible_provider_xapikey_auth_style() {
 fn compatible_provider_custom_auth_header() {
     // Construction with Custom auth should succeed
     let _provider = OpenAiCompatibleModelProvider::new(
+        "test",
         "TestProvider",
         "https://api.test.com",
         Some("sk-test-key-12345"),
@@ -176,6 +179,7 @@ fn compatible_provider_custom_auth_header() {
 fn compatible_provider_no_credential() {
     // Construction without credential should succeed (for local model_providers)
     let _provider = OpenAiCompatibleModelProvider::new(
+        "test",
         "TestLocal",
         "http://localhost:11434",
         None,
@@ -187,6 +191,7 @@ fn compatible_provider_no_credential() {
 fn compatible_provider_base_url_trailing_slash_normalized() {
     // Construction with trailing slash URL should succeed
     let _provider = OpenAiCompatibleModelProvider::new(
+        "test",
         "TestProvider",
         "https://api.test.com/v1/",
         Some("key"),

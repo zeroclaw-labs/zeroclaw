@@ -122,7 +122,7 @@ pub async fn consolidate_turn(
         )
         .await
         {
-            tracing::debug!(error = ?e, "conflict check skipped");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "conflict check skipped");
         }
 
         // Store with importance metadata.

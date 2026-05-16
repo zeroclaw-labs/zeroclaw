@@ -107,7 +107,7 @@ impl Tunnel for PinggyTunnel {
 
             match stream_line {
                 Ok(StreamLine::Stdout(Ok(Some(l))) | StreamLine::Stderr(Ok(Some(l)))) => {
-                    tracing::debug!("pinggy: {l}");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"l": l})), "pinggy: ");
                     // Pinggy prints tunnel URLs like: https://xxxxx.a.free.pinggy.link
                     // Skip non-tunnel URLs (e.g. dashboard.pinggy.io promo links).
                     if let Some(idx) = l.find("https://") {

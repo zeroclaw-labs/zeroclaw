@@ -1,228 +1,220 @@
 # Logging architecture
 
-ZeroClaw has one logging crate: `zeroclaw-log`. Every event the
-workspace emits — `tracing::info!`, `tracing::error!`, the
-crate-local `record!` macro, the runtime's legacy `runtime_trace`
-shim — converges on a single pipeline owned by this crate.
+ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace — agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors — flows through it. The macro feeds a single `LogCaptureLayer` that materializes structured `LogEvent` records and routes them to three sinks at once:
 
-This page describes the pipeline. For operator-facing config and
-query syntax see [Logs & observability](../ops/observability.md).
+1. The terminal (via the `tracing-subscriber` fmt layer that `zeroclaw-log` installs internally) so operators see colored, alias-prefixed lines on stderr.
+2. The persisted JSONL log at `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"` or `"full"`).
+3. The process-wide broadcast channel so the dashboard's SSE stream sees every event live.
 
-## The emission surface
+The `tracing` crate is `zeroclaw-log`'s implementation detail. No other workspace crate references `tracing`, `tracing-subscriber`, or `tracing-attributes`. Their Cargo.toml files do not depend on those crates, and no `.rs` file outside `crates/zeroclaw-log/` names a tracing type.
 
-There are three ways a call site can emit:
+## The `record!` macro
+
+The macro is locked-shape: it takes a level, a single `Event` expression, and a message literal.
 
 ```rust
-// 1. Vanilla tracing — the most common case.
-tracing::info!(channel = %composite, "connected and identified");
+use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
 
-// 2. `record!` — structured event with explicit action / category /
-//    outcome, mirroring `LogEvent` field names.
-zeroclaw_log::record!(
-    INFO,
-    action: "channel_message_inbound",
-    category: "channel",
-    channel: composite,
-    message: "inbound message",
-    sender: msg.sender,
-);
-
-// 3. `scope!` — open a span for a future. Every `tracing::*` /
-//    `record!` emission inside the future inherits the span fields.
-zeroclaw_log::scope!(
-    category: "channel",
-    agent_alias: ctx.agent_alias.as_str(),
-    channel: composite.as_str(),
-    => async move { /* per-message work */ }
-).await;
-
-// 4. `spawn!` — `tokio::spawn` that propagates the caller's current
-//    span into the spawned task.
-zeroclaw_log::spawn!(async move { /* child task */ });
+record!(INFO, Event::new(module_path!(), Action::Start), "starting step");
+record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), "tool failed");
 ```
 
-All four paths land at the same `LogCaptureLayer` (registered once in
-the daemon's `tracing-subscriber` chain). The Layer is the SOLE write
-path. Adding a new emission style is unnecessary — pick one of the
-four and use the registered field names.
+`module_path!()` is the canonical source of the event name — it's the Rust module path of the call site (e.g. `zeroclaw_channels::telegram`), so events are searchable, jump-to-source-able, and impossible to typo. The same convention is used at every `record!` site in the workspace.
 
-## The Layer
+The macro injects `file!()` and `line!()` automatically. The `LogCaptureLayer` attaches them to the event's `attributes` map as `_file` and `_line` so operators jump to source from a log viewer.
 
-`crates/zeroclaw-log/src/layer.rs` is the entire surface. The Layer
-hooks three `tracing-subscriber` callbacks:
+### Call-site contract
 
-- `on_new_span` / `on_record`: visit the span's fields. Known
-  attribution names (the `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES`
-  registry in `event.rs`) accumulate into a `ZeroclawAttribution`
-  marker stashed in span extensions. When a `category` field is set,
-  the parsed `EventCategory` lands in a separate `SpanCategory`
-  marker. Everything else is ignored at the span level (it'll surface
-  later when the event itself fires).
-- `on_event`: build a `LogEvent` from the event's fields. Walk the
-  span scope leaf→root and merge each ancestor's
-  `ZeroclawAttribution` into the event (child-wins, parent-fills).
-  When the event didn't carry `category`, pick the closest enclosing
-  `SpanCategory`. Fall back to `EventCategory::Internal` if no
-  ancestor stamped one. Call `record_event(event)`.
+Every `record!` call is a single line of code that says **what happened**, not **who did it or under what context**.
 
-The pipeline fans `record_event` out three ways:
+- The single positional argument after the level is an `Event` expression.
+- The next argument is a string literal for the human-readable message.
+- That is everything. Channel, agent_alias, provider, tool, session_key, cron_job_id, model — none of those are call-site arguments. They flow in from spans (see [Attribution](#attribution)).
 
-1. **JSONL writer** — when `[observability] log_persistence` is
-   `"rolling"` or `"full"`. Append a line, fsync, optionally trim.
-2. **Broadcast hook** — every event lands on a process-wide
-   `tokio::sync::broadcast::Sender<Value>` the gateway installs. The
-   dashboard's SSE stream subscribes there.
-3. **Observer bridge** — for actions that map to a typed
-   `ObserverEvent` (LLM request, tool call, channel message),
-   `observer_bridge::forward` projects the `LogEvent` onto the typed
-   variant. Prometheus / OTel collectors consume the typed surface.
+The shape is enforced by the `Event` struct: unknown fields are a compile error.
 
-The three fan-outs are independent. A `record!` call returns
-synchronously after all three have been invoked (the broadcast and
-observer paths are nonblocking sends; the JSONL append is sync but
-serialized behind a per-writer mutex).
+### When attrs are warranted
+
+`Event::with_attrs(serde_json::json!({...}))` is for per-event measurements and ad-hoc data that exist nowhere in the surrounding scope. Concretely:
+
+- Per-event measurements: `bytes_received`, `tokens_used`, `retry_count`, `status_code`, `queue_depth`.
+- Error payloads when the error is the event itself: anyhow chain text, HTTP error body, parse-error details.
+- External-system identifiers: a remote API's `request_id`, an upstream trace header.
+- Derived state captured at this instant: in-flight count, retry-after seconds.
+
+**Attrs are NOT for** anything that comes from the surrounding scope — channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Those belong in a wrapping `attribution_span!` or `scope!`.
+
+The serde rule: pass the **raw value**, never `format!("{}", v)` or `format!("{:?}", v)`. `serde_json::json!` serializes strings as strings, numbers as numbers, `Vec<T>` as arrays, `Option<T>` as null-or-value. Wrap with `.to_string()` only when the type doesn't `impl Serialize` (e.g. `anyhow::Error`, `reqwest::Error`, `std::io::Error`, `Path::Display`, `StatusCode`).
+
+### Placeholder rule
+
+Rust string-literal placeholders like `"raw error body: {body}"` are forbidden inside `record!` messages. Rust 2021's implicit format-string capture does not flow through `record!` — every `{var}` becomes a literal substring with no substitution. The conversion rule:
+
+```rust
+// BAD — {body} is a literal, never interpolated
+record!(WARN, Event::new(module_path!(), Action::Fail), "raw error body: {body}");
+
+// GOOD — body in attrs, message is plain prose
+record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), "raw error body");
+```
+
+## `Event`, `Action`, `EventOutcome`, `EventCategory`
+
+All four are closed enums defined in `crates/zeroclaw-log/src/event.rs`. Adding a value is the only point of change — call sites do not invent strings.
+
+- `Action` — closed verb set, snake-cased on disk via `strum::IntoStaticStr`: `Start`, `Complete`, `Fail`, `Cancel`, `Skip`, `Timeout`, `Retry`, `Inbound`, `Outbound`, `Send`, `Receive`, `Connect`, `Disconnect`, `Reconnect`, `Spawn`, `Kill`, `Tick`, `Trigger`, `Schedule`, `Approve`, `Reject`, `Defer`, `Read`, `Write`, `Delete`, `List`, `Query`, `Invoke`, `Dispatch`, `Resolve`, `Register`, `Unregister`, `Load`, `Save`, `Migrate`, `Validate`, `Note`.
+- `EventOutcome` — `Success`, `Failure`, `Unknown` (the default — terminal outcome correlated to the matching Start via `trace_id`).
+- `EventCategory` — `Agent`, `Channel`, `Cron`, `Memory`, `Tool`, `Provider`, `Session`, `System`, `Internal`. Derived from the innermost role span unless overridden via `Event::with_category(...)`.
 
 ## Attribution
 
-`ZeroclawAttribution` is a flat `BTreeMap<String, String>` (plus a
-numeric `duration_ms`). Adding a new alias-bound key requires
-extending one of two constants in `event.rs`:
+Alias-bound attribution (channel composite, agent_alias, model_provider, tool, cron_job_id, …) is never a call-site argument. It flows through tracing spans opened at entry points and walked by the layer.
+
+### The `Attributable` trait
+
+Lives in `crates/zeroclaw-api/src/attribution.rs` so every crate can implement it without depending on `zeroclaw-log`:
 
 ```rust
-pub const ATTRIBUTION_FIELDS: &[&str] = &[
-    "agent_alias",
-    "tool",
-    "session_key",
-    "cron_job_id",
-    "risk_profile",
-    "runtime_profile",
-    "memory_namespace",
-    "skill_bundle",
-    "knowledge_bundle",
-    "mcp_bundle",
-    "peer_group",
-    "model",
-    "embedding_provider",
-];
-
-pub const COMPOSITE_PREFIXES: &[&str] = &[
-    "channel",
-    "model_provider",
-    "tts_provider",
-    "transcription_provider",
-    "tunnel_provider",
-];
+pub trait Attributable {
+    fn role(&self) -> Role;
+    fn alias(&self) -> &str;
+}
 ```
 
-Each composite prefix emits three on-disk keys: `<prefix>`,
-`<prefix>_type`, `<prefix>_alias`. The Layer's `set_composite`
-splits a `<type>.<alias>` value on the first `.`.
+Each "thing" in the workspace (a `TelegramChannel`, an `AnthropicModelProvider`, an `Agent`, a cron job, a tool, a memory backend, a peer group, a skill bundle, an MCP bundle, a session) impls `Attributable` once next to its struct.
 
-The Layer is "smart" about bare values on composite-prefix fields: a
-caller passing `model_provider = "anthropic"` (no `.`) lands only in
-`model_provider_type`. The parent span's full composite (set once at
-agent loop entry) still wins on the leaf→root merge.
+### The `Role` taxonomy
 
-Adding a new field is one line. Every consumer reads the registry at
-runtime: the reader, the gateway's `/api/logs` validator, the dashboard
-(via `attribution_keys` in every response).
+Closed nested enum:
 
-## Span-carried category
-
-`EventCategory` (`agent` / `channel` / `cron` / `memory` / `tool` /
-`provider` / `session` / `system` / `internal`) is not derived from
-module paths. It travels via spans:
-
-- `agent::run` instruments with `category = "agent"`.
-- `spawn_supervised_listener` constructs the `channel_listener` span
-  with `category = "channel"`.
-- `process_channel_message` opens a `scope!` with `category = "channel"`.
-- Cron's `subagent` span carries `category = "cron"`.
-
-The Layer reads the closest ancestor `SpanCategory` when the event
-itself didn't set one. Adding a subsystem means stamping a category
-on its entry span — not editing a string-match function.
-
-## The on-disk file
-
-JSONL: one event per line, `0o600` on Unix, `sync_data` after every
-write. The writer (`writer.rs`):
-
-- Serializes `LogEvent` to a single line with `serde_json::to_writer`.
-- Appends, fsyncs, re-asserts `0o600`.
-- Runs a streaming rolling trim when `log_persistence = "rolling"`
-  exceeds `log_persistence_max_entries`. The trim never slurps; it
-  streams the file line-by-line into a temp file (keeping the last
-  N), fsyncs, and atomically renames.
-
-The reader (`reader.rs`) is a one-pass, single-allocation-bounded
-streamer: it reads forward through the file, applies the filter, and
-keeps the last `limit` matches in a `VecDeque`. Reversed in place for
-newest-first output. Cursor pagination is `(timestamp, id)` tuples;
-RFC 3339 with milliseconds sorts lexicographically, so the cursor is
-just a string compare. The caller pages older by passing the prior
-response's `next_cursor` back as `until_ts` / `until_id`.
-
-## Schema migration
-
-`migrate::migrate_legacy_jsonl_in_place` runs once on writer init.
-It detects schema-1 rows by shape, streams a temp file with v2 lines
-in place of v1, and atomic-renames. v2 rows in the same file are
-passed through. Pure streaming — RAM is bounded by one line.
-
-Failures are logged but don't block the daemon. The old v1 rows
-remain readable by external tools; they just won't pass the v2
-reader's deserializer.
-
-## Tool I/O capture
-
-`tool_io.rs` defines `capture_tool_input` / `capture_tool_output`.
-The runtime's `LeakDetector` scans the raw payload first (it owns the
-regex tables); the post-scan text is passed here for policy
-enforcement:
-
-- `log_tool_io = "off"` → returns `None`. Only tool name + outcome +
-  duration land in the event.
-- `log_tool_io = "redacted"` → text is truncated at
-  `log_tool_io_truncate_bytes` (char-boundary safe). The capture
-  carries `original_bytes` and `truncated: bool` so the dashboard can
-  render a "truncated" badge.
-- `log_tool_io = "full"` → text is kept as-is.
-
-`log_tool_io_denylist` short-circuits to `None` regardless of policy.
-Use it for tools whose I/O is intrinsically sensitive.
-
-## Terminal formatter
-
-`src/main.rs` registers a custom `FormatEvent` that prefixes every
-line with the closest enclosing alias-bound identity:
-
-- `agent_alias` from the span scope → `[<agent_alias>]`
-- otherwise `channel` (the composite) → `[<channel>]`
-- otherwise → `[system]`
-
-Followed by the timestamp, level, and the standard tracing-subscriber
-event body (target, span chain, message + fields). The formatter does
-not parse the JSONL — it reads the live `ZeroclawAttribution` marker
-straight from span extensions.
-
-## What lives where
-
-```
-crates/zeroclaw-log/src/
-  event.rs           — LogEvent, EventCategory, EventOutcome,
-                       ZeroclawAttribution, ATTRIBUTION_FIELDS,
-                       COMPOSITE_PREFIXES, is_attribution_field
-  layer.rs           — LogCaptureLayer (the sole write path)
-  macro.rs           — record!, scope!, spawn!
-  writer.rs          — JSONL append + rolling trim + init_from_config
-  reader.rs          — paginated cursor reader behind /api/logs
-  config.rs          — StoragePolicy, ToolIoPolicy, ResolvedPolicy
-  broadcast.rs       — process-wide broadcast::Sender<Value>
-  observer_bridge.rs — LogEvent → ObserverEvent projection
-  tool_io.rs         — leak-scan + truncation + denylist
-  migrate.rs         — schema-1 → schema-2 streaming migration
-  chain.rs           — display_chain helper for anyhow chains
+```rust
+pub enum Role {
+    Swarm,
+    Agent,
+    Channel(ChannelKind),       // Telegram, Discord, Slack, Matrix, Lark, ...
+    Tool(ToolKind),             // Shell, HttpRequest, FetchUrl, ...
+    Cron(CronKind),             // Interval, At, Cron, Once
+    Provider(ProviderKind),     // Model, Tts, Transcription, Tunnel
+    Memory(MemoryKind),         // Sqlite, Json, InMemory
+    PeerGroup,
+    Skill,
+    Mcp,
+    Session,
+    System,
+}
 ```
 
-Touch the source before you trust the prose on this page.
+`ChannelKind`, `ToolKind`, `CronKind`, `MemoryKind`, and the four `ProviderKind` sub-enums (`ModelProviderKind`, `TtsProviderKind`, `TranscriptionProviderKind`, `TunnelProviderKind`) are all closed. The variant's snake_case form via `strum::IntoStaticStr` is the canonical `<type>` portion of the `<type>.<alias>` composite. Adding a new implementation: extend the relevant `Kind` enum, that's it.
+
+### Opening a span
+
+Wrap an entry-point's work with `attribution_span!(thing)`. The macro returns a `Span` carrying the thing's role and alias as structured fields. `.instrument(span)` the future (or `let _g = span.entered()` in sync code).
+
+```rust
+use zeroclaw_log::Instrument;
+
+let span = zeroclaw_log::attribution_span!(self);  // self impls Attributable
+async move {
+    // every record! inside automatically carries the alias-bound fields
+    record!(INFO, Event::new(module_path!(), Action::Start), "channel online");
+    self.poll_loop().await
+}.instrument(span).await
+```
+
+The layer walks the span scope leaf→root when an event fires, merges every `Attributable`'s contribution into the event's `zeroclaw.*` attribution block, and emits the composite (`channel = "telegram.clamps"`, `channel_type = "telegram"`, `channel_alias = "clamps"`) without the call site naming any of those keys.
+
+### The `scope!` macro
+
+For per-scope identifiers that aren't tied to a role-bearing `Attributable` thing — sender id, message id, turn id, request id — use `scope!`:
+
+```rust
+zeroclaw_log::scope!(
+    sender: msg.sender.as_str(),
+    message_id: msg.id.as_str(),
+    => async move { process_message(msg).await }
+).await
+```
+
+Field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed attribution slot; everything else lands in the event `attributes` map for every descendant emission.
+
+## Tool input/output propagation
+
+The central tool executor (`crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool`) wraps every `Tool::execute(args)` call with start/complete/fail events:
+
+1. Emits `Event::new("tool.invoke.start", Action::Invoke)` with `args` in attrs.
+2. Runs `execute(args).await`.
+3. On success: `Event::new("tool.invoke.complete", Action::Complete)` with `Outcome::Success`, the duration, and the output in attrs.
+4. On failure: `Event::new("tool.invoke.fail", Action::Fail)` with `Outcome::Failure`, the duration, and the error/output in attrs.
+5. On panic / `Err`: same fail emission, error chain in attrs.
+
+Per-tool `Tool::execute` impls add zero logging code. The matching pair (start ↔ complete/fail) shares a `trace_id` via the surrounding span scope, so a dashboard query can correlate them.
+
+## `LogCaptureLayer` and the on-disk schema
+
+The layer in `crates/zeroclaw-log/src/layer.rs` is a `tracing-subscriber` Layer that:
+
+1. On span creation/record with target `"zeroclaw_log_internal_attribution"` (the target the `attribution_span!` macro opens with): parses the role + alias fields into a `ZeroclawAttribution` snapshot stored on the span's extensions.
+2. On span creation/record with target `"zeroclaw_log_internal_scope"` (`scope!`-opened): parses ad-hoc kvps and stashes them similarly.
+3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and writes the final event to:
+   - JSONL persistence (`writer.rs`).
+   - Broadcast hook (`broadcast.rs`) for SSE/dashboard subscribers.
+   - Observer bridge (`observer_bridge.rs`) for Prometheus / OTel typed metrics.
+
+The on-disk JSON shape (`LogEvent` in `event.rs`):
+
+```json
+{
+  "id": "<uuid>",
+  "@timestamp": "2026-05-16T10:08:59.002Z",
+  "severity_number": 9,
+  "severity_text": "INFO",
+  "event": { "category": "channel", "action": "inbound", "outcome": "success" },
+  "service": { "name": "zeroclaw", "version": "0.7.5" },
+  "trace_id": "<turn id>",
+  "span_id": "<sub-span id>",
+  "zeroclaw": {
+    "channel": "telegram.clamps",
+    "channel_type": "telegram",
+    "channel_alias": "clamps",
+    "agent_alias": "clamps",
+    "model_provider": "anthropic.clamps",
+    "model_provider_type": "anthropic",
+    "model_provider_alias": "clamps",
+    "model": "claude-sonnet-4-6"
+  },
+  "message": "inbound message",
+  "attributes": { "sender": "...", "_file": "...", "_line": 42 },
+  "schema_version": 2
+}
+```
+
+`@timestamp` is `chrono::DateTime<Utc>` serialized as RFC 3339 with `Z`. The schema version is `2`; older `version: 1` rows are migrated in place at daemon startup by `migrate::migrate_legacy_jsonl_in_place`.
+
+## `LogConfig` vs `ObservabilityConfig`
+
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`) — `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree.
+
+## Subscriber installation
+
+The daemon installs the global subscriber via:
+
+```rust
+zeroclaw_log::install_global_subscriber("info,matrix_sdk=warn,matrix_sdk_base=warn");
+```
+
+That single call sets up the agent-alias-prefixed terminal formatter + the `LogCaptureLayer` over a `tracing-subscriber::Registry`. `src/main.rs` is the only place that calls it. Tests use `zeroclaw_log::try_install_capture_subscriber()` + `zeroclaw_log::subscribe_or_install()` to drain emitted events through the broadcast hook without any tracing types named in the test crate.
+
+## When to extend the closed enums
+
+- **New channel impl**: add a variant to `ChannelKind`. The snake_case form is the on-disk `channel_type` string. Add `#[strum(serialize = "...")]` only when the variant name doesn't snake-case to the desired value (e.g. `OpenAi` → `"openai"`).
+- **New tool impl** (workspace built-in): add to `ToolKind`.
+- **New cron schedule shape**: add to `CronKind`.
+- **New model / TTS / transcription / tunnel provider**: add to the relevant `*ProviderKind` sub-enum under `ProviderKind`.
+- **New memory backend**: add to `MemoryKind`.
+- **New `Role` family altogether** (PeerGroup / Skill / Mcp gain sub-types): nest with its own `Kind` on the fly — the pattern is uniform.
+
+Then add `impl Attributable for X` next to the new struct (`fn role() -> Role::Family(Kind::Variant)`, `fn alias() -> &str { &self.alias }`) and wrap its entry point with `attribution_span!(self)`. The layer picks up everything else automatically.
+
+## Operator concerns
+
+For configuration knobs (`log_persistence`, `log_tool_io`, OTel export) and query syntax, see [Logs & observability](../ops/observability.md).

@@ -259,12 +259,14 @@ fn provider_construction_with_different_names() {
 
     // Construction with various names should succeed
     let _p1 = OpenAiCompatibleModelProvider::new(
+        "test",
         "DeepSeek",
         "https://api.deepseek.com",
         Some("test-key"),
         AuthStyle::Bearer,
     );
     let _p2 = OpenAiCompatibleModelProvider::new(
+        "test",
         "deepseek",
         "https://api.test.com",
         None,
@@ -277,18 +279,21 @@ fn provider_construction_with_different_auth_styles() {
     use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
     let _bearer = OpenAiCompatibleModelProvider::new(
+        "test",
         "Test",
         "https://api.test.com",
         Some("key"),
         AuthStyle::Bearer,
     );
     let _xapi = OpenAiCompatibleModelProvider::new(
+        "test",
         "Test",
         "https://api.test.com",
         Some("key"),
         AuthStyle::XApiKey,
     );
     let _custom = OpenAiCompatibleModelProvider::new(
+        "test",
         "Test",
         "https://api.test.com",
         Some("key"),

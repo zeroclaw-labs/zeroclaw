@@ -369,6 +369,8 @@ fn push_failure(
 /// passes a single primary. Per-model failover chains are also test-only —
 /// the schema no longer surfaces them.
 pub struct ReliableModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     max_retries: u32,
     base_backoff_ms: u64,
@@ -381,11 +383,13 @@ pub struct ReliableModelProvider {
 
 impl ReliableModelProvider {
     pub fn new(
+        alias: &str,
         model_providers: Vec<(String, Box<dyn ModelProvider>)>,
         max_retries: u32,
         base_backoff_ms: u64,
     ) -> Self {
         Self {
+            alias: alias.to_string(),
             model_providers,
             max_retries,
             base_backoff_ms: base_backoff_ms.max(50),
@@ -394,7 +398,6 @@ impl ReliableModelProvider {
             model_fallbacks: HashMap::new(),
         }
     }
-
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
@@ -442,12 +445,9 @@ impl ReliableModelProvider {
 impl ModelProvider for ReliableModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, model_provider) in &self.model_providers {
-            tracing::info!(
-                model_provider = name,
-                "Warming up model_provider connection pool"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": name})), "Warming up model_provider connection pool");
             if model_provider.warmup().await.is_err() {
-                tracing::warn!(model_provider = name, "Warmup failed (non-fatal)");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": name})), "Warmup failed (non-fatal)");
             }
         }
         Ok(())
@@ -482,13 +482,7 @@ impl ModelProvider for ReliableModelProvider {
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
-                                tracing::info!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt,
-                                    original_model = model,
-                                    "ModelProvider recovered (failover/retry)"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -545,37 +539,19 @@ impl ModelProvider for ReliableModelProvider {
                                 && !non_retryable_rate_limit
                                 && let Some(new_key) = self.rotate_key()
                             {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    error = %error_detail,
-                                    "Rate limited; key rotation selected key ending ...{} \
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
                                      but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.",
-                                    &new_key[new_key.len().saturating_sub(4)..]
-                                );
+                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "error": error_detail})), "Non-retryable error, moving on");
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "ModelProvider call failed, retrying"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
@@ -583,19 +559,11 @@ impl ModelProvider for ReliableModelProvider {
                     }
                 }
 
-                tracing::warn!(
-                    model_provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next model_provider/model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model})), "Exhausted retries, trying next model_provider/model");
             }
 
             if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all model_providers, trying next fallback model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"original_model": model, "fallback_model": *current_model})), "Model fallback exhausted all model_providers, trying next fallback model");
             }
         }
 
@@ -632,14 +600,7 @@ impl ModelProvider for ReliableModelProvider {
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
-                                tracing::info!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt,
-                                    original_model = model,
-                                    context_truncated,
-                                    "ModelProvider recovered (failover/retry)"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -660,13 +621,7 @@ impl ModelProvider for ReliableModelProvider {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
-                                    tracing::warn!(
-                                        model_provider = provider_name,
-                                        model = *current_model,
-                                        dropped,
-                                        remaining = effective_messages.len(),
-                                        "Context window exceeded; truncated history and retrying"
-                                    );
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // Nothing to truncate (system prompt alone exceeds
@@ -710,37 +665,19 @@ impl ModelProvider for ReliableModelProvider {
                                 && !non_retryable_rate_limit
                                 && let Some(new_key) = self.rotate_key()
                             {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    error = %error_detail,
-                                    "Rate limited; key rotation selected key ending ...{} \
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
                                      but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.",
-                                    &new_key[new_key.len().saturating_sub(4)..]
-                                );
+                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "error": error_detail})), "Non-retryable error, moving on");
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "ModelProvider call failed, retrying"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
@@ -748,11 +685,7 @@ impl ModelProvider for ReliableModelProvider {
                     }
                 }
 
-                tracing::warn!(
-                    model_provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next model_provider/model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model})), "Exhausted retries, trying next model_provider/model");
             }
         }
 
@@ -804,14 +737,7 @@ impl ModelProvider for ReliableModelProvider {
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
-                                tracing::info!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt,
-                                    original_model = model,
-                                    context_truncated,
-                                    "ModelProvider recovered (failover/retry)"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -832,13 +758,7 @@ impl ModelProvider for ReliableModelProvider {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
-                                    tracing::warn!(
-                                        model_provider = provider_name,
-                                        model = *current_model,
-                                        dropped,
-                                        remaining = effective_messages.len(),
-                                        "Context window exceeded; truncated history and retrying"
-                                    );
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // Nothing to truncate (system prompt alone exceeds
@@ -882,37 +802,19 @@ impl ModelProvider for ReliableModelProvider {
                                 && !non_retryable_rate_limit
                                 && let Some(new_key) = self.rotate_key()
                             {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    error = %error_detail,
-                                    "Rate limited; key rotation selected key ending ...{} \
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
                                      but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.",
-                                    &new_key[new_key.len().saturating_sub(4)..]
-                                );
+                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "error": error_detail})), "Non-retryable error, moving on");
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "ModelProvider call failed, retrying"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
@@ -920,11 +822,7 @@ impl ModelProvider for ReliableModelProvider {
                     }
                 }
 
-                tracing::warn!(
-                    model_provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next model_provider/model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model})), "Exhausted retries, trying next model_provider/model");
             }
         }
 
@@ -962,14 +860,7 @@ impl ModelProvider for ReliableModelProvider {
                                 || self.model_providers.first().map(|(n, _)| n.as_str())
                                     != Some(provider_name)
                             {
-                                tracing::info!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt,
-                                    original_model = model,
-                                    context_truncated,
-                                    "ModelProvider recovered (failover/retry)"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -990,13 +881,7 @@ impl ModelProvider for ReliableModelProvider {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
-                                    tracing::warn!(
-                                        model_provider = provider_name,
-                                        model = *current_model,
-                                        dropped,
-                                        remaining = effective_messages.len(),
-                                        "Context window exceeded; truncated history and retrying"
-                                    );
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // Nothing to truncate (system prompt alone exceeds
@@ -1040,37 +925,19 @@ impl ModelProvider for ReliableModelProvider {
                                 && !non_retryable_rate_limit
                                 && let Some(new_key) = self.rotate_key()
                             {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    error = %error_detail,
-                                    "Rate limited; key rotation selected key ending ...{} \
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "error": error_detail})), &format!("Rate limited; key rotation selected key ending ...{} \
                                      but cannot apply (ModelProvider trait has no set_api_key). \
-                                     Retrying with original key.",
-                                    &new_key[new_key.len().saturating_sub(4)..]
-                                );
+                                     Retrying with original key.", &new_key[new_key.len().saturating_sub(4)..]));
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "error": error_detail})), "Non-retryable error, moving on");
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    model_provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "ModelProvider call failed, retrying"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt + 1, "backoff_ms": wait, "reason": failure_reason, "error": error_detail})), "ModelProvider call failed, retrying");
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
@@ -1078,19 +945,11 @@ impl ModelProvider for ReliableModelProvider {
                     }
                 }
 
-                tracing::warn!(
-                    model_provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next model_provider/model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model})), "Exhausted retries, trying next model_provider/model");
             }
 
             if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all model_providers, trying next fallback model"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"original_model": model, "fallback_model": *current_model})), "Model fallback exhausted all model_providers, trying next fallback model");
             }
         }
 
@@ -1150,11 +1009,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut stream = stream;
                 while let Some(event) = stream.next().await {
                     if let Err(ref e) = event {
-                        tracing::warn!(
-                            model_provider = provider_clone,
-                            model = current_model,
-                            "Streaming error: {e}"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
                     }
                     if tx.send(event).await.is_err() {
                         break;
@@ -1217,11 +1072,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
-                        tracing::warn!(
-                            model_provider = provider_clone,
-                            model = current_model,
-                            "Streaming error: {e}"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
                     }
                     if tx.send(chunk).await.is_err() {
                         break; // Receiver dropped
@@ -1280,11 +1131,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
-                        tracing::warn!(
-                            model_provider = provider_clone,
-                            model = current_model,
-                            "Streaming error: {e}"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
                     }
                     if tx.send(chunk).await.is_err() {
                         break; // Receiver dropped
@@ -1305,6 +1152,19 @@ impl ModelProvider for ReliableModelProvider {
             ))
         })
         .boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Reliable,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1351,6 +1211,17 @@ mod tests {
             Ok(self.response.to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "MockModelProvider" }
+    }
+
 
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
@@ -1377,14 +1248,24 @@ mod tests {
             Ok(self.response.to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for ModelAwareMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "ModelAwareMock" }
+    }
+
 
     // ── Existing tests (preserved) ──
 
     #[tokio::test]
     async fn succeeds_without_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1408,8 +1289,7 @@ mod tests {
     #[tokio::test]
     async fn retries_then_recovers() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1435,8 +1315,7 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(MockModelProvider {
@@ -1471,8 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_aggregated_error_when_all_providers_fail() {
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "p1".into(),
                     Box::new(MockModelProvider {
@@ -1564,8 +1442,7 @@ mod tests {
             vec!["gpt-5.2-codex".to_string()],
         );
 
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "openai-codex".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1593,8 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "custom".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1624,8 +1500,7 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(MockModelProvider {
@@ -1662,8 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn chat_with_history_retries_then_recovers() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1690,8 +1564,7 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(MockModelProvider {
@@ -1740,8 +1613,7 @@ mod tests {
         let mut fallbacks = HashMap::new();
         fallbacks.insert("claude-opus".to_string(), vec!["claude-sonnet".to_string()]);
 
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "anthropic".into(),
                 Box::new(mock.clone()) as Box<dyn ModelProvider>,
             )],
@@ -1778,8 +1650,7 @@ mod tests {
             vec!["model-b".to_string(), "model-c".to_string()],
         );
 
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "p1".into(),
                 Box::new(mock.clone()) as Box<dyn ModelProvider>,
             )],
@@ -1804,8 +1675,7 @@ mod tests {
     #[tokio::test]
     async fn no_model_fallbacks_behaves_like_before() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -1830,8 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rotation_cycles_keys() {
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "p".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::new(AtomicUsize::new(0)),
@@ -1854,7 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rotation_returns_none_when_empty() {
-        let model_provider = ReliableModelProvider::new(vec![], 0, 1);
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 1);
         assert!(model_provider.rotate_key().is_none());
     }
 
@@ -1925,21 +1794,21 @@ mod tests {
 
     #[test]
     fn compute_backoff_uses_retry_after() {
-        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
         assert_eq!(model_provider.compute_backoff(500, &err), 3_000);
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
-        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 120");
         assert_eq!(model_provider.compute_backoff(500, &err), 30_000);
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
-        let model_provider = ReliableModelProvider::new(vec![], 0, 500);
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
         assert_eq!(model_provider.compute_backoff(500, &err), 500);
     }
@@ -2055,8 +1924,7 @@ mod tests {
     #[tokio::test]
     async fn non_retryable_skips_retries_for_401() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -2081,8 +1949,7 @@ mod tests {
     #[tokio::test]
     async fn non_retryable_rate_limit_skips_retries_for_plan_errors() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(MockModelProvider {
                     calls: Arc::clone(&calls),
@@ -2152,6 +2019,17 @@ mod tests {
             })
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for NativeToolMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "NativeToolMock" }
+    }
+
 
     #[tokio::test]
     async fn chat_delegates_to_inner_provider() {
@@ -2162,8 +2040,7 @@ mod tests {
             arguments: r#"{"command":"date"}"#.to_string(),
             extra_content: None,
         };
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
                     calls: Arc::clone(&calls),
@@ -2202,8 +2079,7 @@ mod tests {
             arguments: r#"{"command":"date"}"#.to_string(),
             extra_content: None,
         };
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
                     calls: Arc::clone(&calls),
@@ -2237,8 +2113,7 @@ mod tests {
     #[tokio::test]
     async fn chat_preserves_native_tools_support() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(NativeToolMock {
                     calls: Arc::clone(&calls),
@@ -2264,8 +2139,7 @@ mod tests {
     /// matching behavior of `returns_aggregated_error_when_all_providers_fail`.
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "p1".into(),
                     Box::new(NativeToolMock {
@@ -2353,6 +2227,17 @@ mod tests {
             })
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for NativeModelAwareMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "NativeModelAwareMock" }
+    }
+
 
     // Arc<NativeModelAwareMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
@@ -2371,8 +2256,7 @@ mod tests {
         let mut fallbacks = HashMap::new();
         fallbacks.insert("claude-opus".to_string(), vec!["claude-sonnet".to_string()]);
 
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "anthropic".into(),
                 Box::new(mock.clone()) as Box<dyn ModelProvider>,
             )],
@@ -2405,8 +2289,7 @@ mod tests {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
 
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(NativeToolMock {
@@ -2545,6 +2428,17 @@ mod tests {
             Ok("recovered after truncation".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for ContextOverflowMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "ContextOverflowMock" }
+    }
+
 
     #[tokio::test]
     async fn chat_with_history_truncates_on_context_overflow() {
@@ -2555,8 +2449,7 @@ mod tests {
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
-        let model_provider = ReliableModelProvider::new(
-            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+        let model_provider = ReliableModelProvider::new("test", vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
             3,
             1,
         );
@@ -2588,8 +2481,7 @@ mod tests {
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
-        let model_provider = ReliableModelProvider::new(
-            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+        let model_provider = ReliableModelProvider::new("test", vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
             3,
             1,
         );
@@ -2722,6 +2614,17 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingToolEventMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamingToolEventMock" }
+    }
+
 
     // Arc<StreamingToolEventMock> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
@@ -2729,8 +2632,7 @@ mod tests {
     async fn stream_chat_prefers_provider_with_tool_event_support() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
         let fallback = Arc::new(StreamingToolEventMock::new(true));
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(Arc::clone(&primary)) as Box<dyn ModelProvider>,
@@ -2781,8 +2683,7 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_errors_when_no_provider_supports_tool_events() {
         let primary = Arc::new(StreamingToolEventMock::new(false));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(Arc::clone(&primary)) as Box<dyn ModelProvider>,
             )],
@@ -2858,12 +2759,22 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingHistoryMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamingHistoryMock" }
+    }
+
 
     #[tokio::test]
     async fn stream_chat_with_history_delegates_to_streaming_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "primary".into(),
                 Box::new(StreamingHistoryMock {
                     stream_calls: Arc::clone(&calls),
@@ -2903,8 +2814,7 @@ mod tests {
         let non_streaming_calls = Arc::new(AtomicUsize::new(0));
         let streaming_calls = Arc::new(AtomicUsize::new(0));
 
-        let model_provider = ReliableModelProvider::new(
-            vec![
+        let model_provider = ReliableModelProvider::new("test", vec![
                 (
                     "non-streaming".into(),
                     Box::new(StreamingHistoryMock {
@@ -2948,8 +2858,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
-        let model_provider = ReliableModelProvider::new(
-            vec![(
+        let model_provider = ReliableModelProvider::new("test", vec![(
                 "non-streaming".into(),
                 Box::new(StreamingHistoryMock {
                     stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -2981,8 +2890,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_records_provider_fallback_info() {
         scope_provider_fallback(async {
-            let model_provider = ReliableModelProvider::new(
-                vec![
+            let model_provider = ReliableModelProvider::new("test", vec![
                     (
                         "broken".into(),
                         Box::new(MockModelProvider {
@@ -3048,9 +2956,19 @@ mod tests {
                 self.0
             }
         }
+        impl ::zeroclaw_api::attribution::Attributable for VisionMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str { "VisionMock" }
+        }
 
-        let provider = ReliableModelProvider::new(
-            vec![
+
+        let provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(VisionMock(false)) as Box<dyn ModelProvider>,
@@ -3069,8 +2987,7 @@ mod tests {
             "ReliableModelProvider with non-vision primary must report supports_vision()=false even when a fallback supports vision"
         );
 
-        let provider = ReliableModelProvider::new(
-            vec![
+        let provider = ReliableModelProvider::new("test", vec![
                 (
                     "primary".into(),
                     Box::new(VisionMock(true)) as Box<dyn ModelProvider>,

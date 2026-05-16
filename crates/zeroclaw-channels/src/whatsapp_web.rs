@@ -140,11 +140,9 @@ impl WhatsAppWebChannel {
             .filter(|digits| !digits.is_empty());
 
         if mention_only && bot_phone.is_none() {
-            tracing::warn!(
-                "mention_only enabled but pair_phone not set. \
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "mention_only enabled but pair_phone not set. \
                 Bot identity will be resolved after connection. Group messages \
-                will be skipped until identity is known."
-            );
+                will be skipped until identity is known.");
         }
 
         Self {
@@ -194,9 +192,7 @@ impl WhatsAppWebChannel {
                 self.transcription = Some(config);
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "transcription manager init failed, voice transcription disabled");
             }
         }
         self
@@ -212,7 +208,7 @@ impl WhatsAppWebChannel {
         if config.tts.enabled {
             match super::tts::TtsManager::from_config(config) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
-                Err(e) => tracing::warn!(error = ?e, "TTS disabled"),
+                Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "TTS disabled"),
             }
         }
         self
@@ -469,11 +465,7 @@ impl WhatsAppWebChannel {
         if let Some(seconds) = audio.seconds
             && u64::from(seconds) > config.max_duration_secs
         {
-            tracing::info!(
-                "skipping voice note ({}s exceeds {}s limit)",
-                seconds,
-                config.max_duration_secs
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("skipping voice note ({}s exceeds {}s limit)", seconds, config.max_duration_secs));
             return None;
         }
 
@@ -482,7 +474,7 @@ impl WhatsAppWebChannel {
         let audio_data = match client.download(audio as &dyn Downloadable).await {
             Ok(data) => data,
             Err(e) => {
-                tracing::warn!(error = ?e, "failed to download voice note");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to download voice note");
                 return None;
             }
         };
@@ -496,23 +488,19 @@ impl WhatsAppWebChannel {
             _ => "voice.ogg", // WhatsApp default
         };
 
-        tracing::info!(
-            "transcribing voice note ({} bytes, file={})",
-            audio_data.len(),
-            file_name
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("transcribing voice note ({} bytes, file={})", audio_data.len(), file_name));
 
         match manager.transcribe(&audio_data, file_name).await {
             Ok(text) if text.trim().is_empty() => {
-                tracing::info!("voice transcription returned empty text, skipping");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "voice transcription returned empty text, skipping");
                 None
             }
             Ok(text) => {
-                tracing::info!("voice note transcribed ({} chars)", text.len());
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("voice note transcribed ({} chars)", text.len()));
                 Some(text)
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "voice transcription failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "voice transcription failed");
                 None
             }
         }
@@ -528,7 +516,7 @@ impl WhatsAppWebChannel {
     ) -> Result<()> {
         let audio_bytes = tts_manager.synthesize(text).await?;
         let audio_len = audio_bytes.len();
-        tracing::info!("TTS: synthesized {} bytes of audio", audio_len);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("TTS: synthesized {} bytes of audio", audio_len));
 
         if audio_bytes.is_empty() {
             anyhow::bail!("TTS returned empty audio");
@@ -540,11 +528,7 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to upload TTS audio: {e}"))?;
 
-        tracing::info!(
-            "TTS: uploaded audio (url_len={}, file_length={})",
-            upload.url.len(),
-            upload.file_length
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("TTS: uploaded audio (url_len={}, file_length={})", upload.url.len(), upload.file_length));
 
         // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]
@@ -569,11 +553,7 @@ impl WhatsAppWebChannel {
         Box::pin(client.send_message(to.clone(), voice_msg))
             .await
             .map_err(|e| anyhow!("Failed to send voice note: {e}"))?;
-        tracing::info!(
-            "TTS: sent voice note ({} bytes, ~{}s)",
-            audio_len,
-            estimated_seconds
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("TTS: sent voice note ({} bytes, ~{}s)", audio_len, estimated_seconds));
         Ok(())
     }
 
@@ -680,6 +660,18 @@ fn fromme_outside_self_chat_is_operator_trigger(
 }
 
 #[cfg(feature = "whatsapp-web")]
+impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::WhatsappWeb,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
@@ -696,7 +688,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(&message.recipient) {
             let normalized = self.normalize_phone(&message.recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!("recipient {} not in allowed list", message.recipient);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("recipient {} not in allowed list", message.recipient));
                 return Ok(());
             }
         }
@@ -768,10 +760,10 @@ impl Channel for WhatsAppWebChannel {
                         .await
                         {
                             Ok(()) => {
-                                tracing::info!("voice reply sent ({} chars)", text.len());
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("voice reply sent ({} chars)", text.len()));
                             }
                             Err(e) => {
-                                tracing::warn!(error = ?e, "TTS voice reply failed");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "TTS voice reply failed");
                             }
                         }
                     }
@@ -787,7 +779,7 @@ impl Channel for WhatsAppWebChannel {
         };
 
         let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!("sent text to {} (id: {})", message.recipient, message_id);
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("sent text to {} (id: {})", message.recipient, message_id));
         Ok(())
     }
 
@@ -814,7 +806,7 @@ impl Channel for WhatsAppWebChannel {
         loop {
             let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
 
-            tracing::info!("channel starting (session: {})", expanded_session_path);
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("channel starting (session: {})", expanded_session_path));
 
             // Initialize storage backend
             let storage = RusqliteStore::new(&expanded_session_path)?;
@@ -823,14 +815,14 @@ impl Channel for WhatsAppWebChannel {
             // Check if we have a saved device to load
             let mut device = Device::new(backend.clone());
             if backend.exists().await? {
-                tracing::info!("found existing session, loading device");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "found existing session, loading device");
                 if let Some(core_device) = backend.load().await? {
                     device.load_from_serializable(core_device);
                 } else {
                     anyhow::bail!("Device exists but failed to load");
                 }
             } else {
-                tracing::info!("no existing session, new device will be created during pairing");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "no existing session, new device will be created during pairing");
             };
 
             // Create transport factory. WebSocket URL override comes from
@@ -944,9 +936,7 @@ impl Channel for WhatsAppWebChannel {
 
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
-                                            tracing::debug!(
-                                                "ignoring self-chat message (self_chat_mode=false)"
-                                            );
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring self-chat message (self_chat_mode=false)");
                                             return;
                                         }
                                         // self_chat_mode=true: always process, skip further policy checks.
@@ -961,9 +951,7 @@ impl Channel for WhatsAppWebChannel {
                                                 .filter(|d| !d.is_empty());
                                             if let Some(digits) = phone_digits {
                                                 reply_target = format!("{digits}@s.whatsapp.net");
-                                                tracing::debug!(
-                                                    "self-chat LID→phone reply target: {reply_target}"
-                                                );
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"reply_target": reply_target})), "self-chat LID→phone reply target");
                                             }
                                         }
                                     } else if info.source.is_from_me
@@ -982,16 +970,12 @@ impl Channel for WhatsAppWebChannel {
                                         // with `TinyBot ...` triggers), in which case the helper
                                         // returns true and we fall through to the policy branches
                                         // below to treat the message like an inbound trigger.
-                                        tracing::debug!(
-                                            "ignoring fromMe message outside self-chat thread (chat={chat}, sender={sender})"
-                                        );
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chat": chat, "sender": sender})), "ignoring fromMe message outside self-chat thread (chat=, sender=)");
                                         return;
                                     } else if is_group {
                                         match wa_group_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                                                tracing::debug!(
-                                                    "ignoring group message (group_policy=ignore)"
-                                                );
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message (group_policy=ignore)");
                                                 return;
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::All => {
@@ -1003,11 +987,7 @@ impl Channel for WhatsAppWebChannel {
                                                         &sender_jid,
                                                         mapped_phone.as_deref(),
                                                     );
-                                                    tracing::warn!(
-                                                        "message from unrecognized sender not in allowed list (candidates_count={}){}",
-                                                        sender_candidates.len(),
-                                                        lid_diag,
-                                                    );
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
                                                     return;
                                                 }
                                             }
@@ -1016,9 +996,7 @@ impl Channel for WhatsAppWebChannel {
                                         // DM (non-self)
                                         match wa_dm_policy {
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                                                tracing::debug!(
-                                                    "ignoring DM (dm_policy=ignore)"
-                                                );
+                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring DM (dm_policy=ignore)");
                                                 return;
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::All => {
@@ -1030,11 +1008,7 @@ impl Channel for WhatsAppWebChannel {
                                                         &sender_jid,
                                                         mapped_phone.as_deref(),
                                                     );
-                                                    tracing::warn!(
-                                                        "message from unrecognized sender not in allowed list (candidates_count={}){}",
-                                                        sender_candidates.len(),
-                                                        lid_diag,
-                                                    );
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
                                                     return;
                                                 }
                                             }
@@ -1061,10 +1035,7 @@ impl Channel for WhatsAppWebChannel {
                                         )
                                         .await
                                     } else {
-                                        tracing::debug!(
-                                            "ignoring non-PTT audio message from {}",
-                                            normalized
-                                        );
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring non-PTT audio message from {}", normalized));
                                         None
                                     }
                                 } else {
@@ -1087,22 +1058,11 @@ impl Channel for WhatsAppWebChannel {
                                     text.trim().to_string()
                                 };
 
-                                tracing::info!(
-                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
-                                    sender.len(),
-                                    chat.len(),
-                                    content.len()
-                                );
-                                tracing::debug!(
-                                    "WhatsApp Web message content: {}",
-                                    content
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
 
                                 if content.is_empty() {
-                                    tracing::debug!(
-                                        "ignoring empty or non-text message from {}",
-                                        normalized
-                                    );
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty or non-text message from {}", normalized));
                                     return;
                                 }
 
@@ -1117,15 +1077,11 @@ impl Channel for WhatsAppWebChannel {
                                             &mentioned_jids,
                                             bp,
                                         ) {
-                                            tracing::debug!(
-                                                "ignoring group message without bot mention"
-                                            );
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message without bot mention");
                                             return;
                                         }
                                     } else {
-                                        tracing::debug!(
-                                            "mention_only active but bot identity unknown, skipping group msg"
-                                        );
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
                                         return;
                                     }
                                 }
@@ -1145,9 +1101,7 @@ impl Channel for WhatsAppWebChannel {
                                     ) {
                                         Some(c) => c,
                                         None => {
-                                            tracing::debug!(
-                                                "message from {normalized} did not match mention patterns, dropping"
-                                            );
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"normalized": normalized})), "message from did not match mention patterns, dropping");
                                             return;
                                         }
                                     };
@@ -1170,11 +1124,11 @@ impl Channel for WhatsAppWebChannel {
                                     })
                                     .await
                                 {
-                                    tracing::error!(error = ?e, "failed to send message to channel");
+                                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to send message to channel");
                                 }
                             }
                             Event::Connected(_) => {
-                                tracing::info!("connected successfully");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
                                 // Resolve bot identity from the device store
                                 if mention_only {
@@ -1190,37 +1144,28 @@ impl Channel for WhatsAppWebChannel {
                                             .collect();
                                         if !digits.is_empty() {
                                             *bot_phone_inner.lock() = Some(digits.clone());
-                                            tracing::info!(
-                                                "resolved bot identity from device: +{}",
-                                                digits
-                                            );
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot identity from device: +{}", digits));
                                         }
                                     }
                                 }
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(
-                                    "WhatsApp Web was logged out — will clear session and reconnect"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WhatsApp Web was logged out — will clear session and reconnect");
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
-                                tracing::error!("stream error: {:?}", stream_error);
+                                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("stream error: {:?}", stream_error));
                             }
                             Event::PairingCode { code, .. } => {
-                                tracing::info!("pair code received");
-                                tracing::info!(
-                                    "Link your phone by entering this code in WhatsApp > Linked Devices"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair code received");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Link your phone by entering this code in WhatsApp > Linked Devices");
                                 eprintln!();
                                 eprintln!("pair code: {code}");
                                 eprintln!();
                             }
                             Event::PairingQrCode { code, .. } => {
-                                tracing::info!(
-                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
-                                );
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
                                 match Self::render_pairing_qr(&code) {
                                     Ok(rendered) => {
                                         eprintln!();
@@ -1231,10 +1176,7 @@ impl Channel for WhatsAppWebChannel {
                                         eprintln!();
                                     }
                                     Err(err) => {
-                                        tracing::warn!(
-                                            "failed to render pairing QR in terminal: {}",
-                                            err
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to render pairing QR in terminal: {}", err));
                                         eprintln!();
                                         eprintln!("WhatsApp Web QR payload: {code}");
                                         eprintln!();
@@ -1248,16 +1190,14 @@ impl Channel for WhatsAppWebChannel {
 
             // Configure pair-code flow when a phone number is provided.
             if let Some(ref phone) = self.pair_phone {
-                tracing::info!("pair-code flow enabled for configured phone number");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "pair-code flow enabled for configured phone number");
                 builder = builder.with_pair_code(PairCodeOptions {
                     phone_number: phone.clone(),
                     custom_code: self.pair_code.clone(),
                     ..Default::default()
                 });
             } else if self.pair_code.is_some() {
-                tracing::warn!(
-                    "pair_code is set but pair_phone is missing; pair code config is ignored"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "pair_code is set but pair_phone is missing; pair code config is ignored");
             }
 
             let mut bot = builder.build().await?;
@@ -1281,7 +1221,7 @@ impl Channel for WhatsAppWebChannel {
                     true
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("channel received Ctrl+C");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received Ctrl+C");
                     false
                 }
             };
@@ -1318,23 +1258,16 @@ impl Channel for WhatsAppWebChannel {
                         match tokio::fs::remove_file(&path).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => tracing::warn!("failed to remove session file {}: {e}", path),
+                            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to remove session file {}: {e}", path)),
                         }
                     }
-                    tracing::info!("session files removed, restarting for QR pairing");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "session files removed, restarting for QR pairing");
                 } else {
-                    tracing::warn!(
-                        "bot stopped without LoggedOut; reconnecting with existing session"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "bot stopped without LoggedOut; reconnecting with existing session");
                 }
 
                 let delay = Self::compute_retry_delay(attempts);
-                tracing::info!(
-                    "reconnecting in {}s (attempt {}/{})",
-                    delay,
-                    attempts,
-                    Self::MAX_RETRIES
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("reconnecting in {}s (attempt {}/{})", delay, attempts, Self::MAX_RETRIES));
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
@@ -1359,7 +1292,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!("typing target {} not in allowed list", recipient);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("typing target {} not in allowed list", recipient));
                 return Ok(());
             }
         }
@@ -1371,7 +1304,7 @@ impl Channel for WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to send typing state (composing): {e}"))?;
 
-        tracing::debug!("start typing for {}", recipient);
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("start typing for {}", recipient));
         Ok(())
     }
 
@@ -1384,7 +1317,7 @@ impl Channel for WhatsAppWebChannel {
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
             if !self.is_number_allowed(&normalized) {
-                tracing::warn!("typing target {} not in allowed list", recipient);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("typing target {} not in allowed list", recipient));
                 return Ok(());
             }
         }
@@ -1396,7 +1329,7 @@ impl Channel for WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
 
-        tracing::debug!("stop typing for {}", recipient);
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("stop typing for {}", recipient));
         Ok(())
     }
 }
@@ -1431,6 +1364,18 @@ impl WhatsAppWebChannel {
 
     pub fn with_tts(self, _config: zeroclaw_config::schema::TtsConfig) -> Self {
         self
+    }
+}
+
+#[cfg(not(feature = "whatsapp-web"))]
+impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::WhatsappWeb,
+        )
+    }
+    fn alias(&self) -> &str {
+        "whatsapp"
     }
 }
 

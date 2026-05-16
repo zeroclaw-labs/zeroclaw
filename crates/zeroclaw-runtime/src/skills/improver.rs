@@ -60,13 +60,13 @@ impl SkillImprover {
         let toml_path = skill_dir.join("SKILL.toml");
 
         if !toml_path.exists() {
-            bail!("Skill file not found: {}", toml_path.display());
+            bail!("Skill file not found: {}", toml_path.display().to_string());
         }
 
         // Read existing content to preserve audit trail.
         let existing = tokio::fs::read_to_string(&toml_path)
             .await
-            .with_context(|| format!("Failed to read {}", toml_path.display()))?;
+            .with_context(|| format!("Failed to read {}", toml_path.display().to_string()))?;
 
         // Build the updated content with audit metadata appended.
         let now = chrono::Utc::now().to_rfc3339();
@@ -89,7 +89,7 @@ impl SkillImprover {
         let temp_path = skill_dir.join(".SKILL.toml.tmp");
         tokio::fs::write(&temp_path, final_content.as_bytes())
             .await
-            .with_context(|| format!("Failed to write temp file: {}", temp_path.display()))?;
+            .with_context(|| format!("Failed to write temp file: {}", temp_path.display().to_string()))?;
 
         // Validate the temp file is readable and valid.
         let written = tokio::fs::read_to_string(&temp_path).await?;
@@ -105,7 +105,7 @@ impl SkillImprover {
             .with_context(|| {
                 format!(
                     "Failed to rename {} to {}",
-                    temp_path.display(),
+                    temp_path.display().to_string(),
                     toml_path.display()
                 )
             })?;

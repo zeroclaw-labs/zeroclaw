@@ -7157,11 +7157,7 @@ impl ProxyConfig {
                     builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid all_proxy URL: {error}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"proxy_url": url, "service_key": service_key, "error": error.to_string()})), "Ignoring invalid all_proxy URL: ");
                 }
             }
         }
@@ -7172,11 +7168,7 @@ impl ProxyConfig {
                     builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid http_proxy URL: {error}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"proxy_url": url, "service_key": service_key, "error": error.to_string()})), "Ignoring invalid http_proxy URL: ");
                 }
             }
         }
@@ -7187,11 +7179,7 @@ impl ProxyConfig {
                     builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        proxy_url = %url,
-                        service_key,
-                        "Ignoring invalid https_proxy URL: {error}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"proxy_url": url, "service_key": service_key, "error": error.to_string()})), "Ignoring invalid https_proxy URL: ");
                 }
             }
         }
@@ -7495,7 +7483,7 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
 
     let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
     let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(service_key, "Failed to build proxied client: {error}");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "error": error.to_string()})), "Failed to build proxied client: ");
         reqwest::Client::new()
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
@@ -7518,10 +7506,7 @@ pub fn build_runtime_proxy_client_with_timeouts(
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
     let builder = apply_runtime_proxy_to_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(
-            service_key,
-            "Failed to build proxied timeout client: {error}"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "error": error.to_string()})), "Failed to build proxied timeout client: ");
         reqwest::Client::new()
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
@@ -7606,11 +7591,7 @@ fn build_explicit_proxy_client(
     }
     builder = apply_explicit_proxy_to_builder(builder, service_key, proxy_url);
     let client = builder.build().unwrap_or_else(|error| {
-        tracing::warn!(
-            service_key,
-            proxy_url,
-            "Failed to build channel proxy client: {error}"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "proxy_url": proxy_url, "error": error.to_string()})), "Failed to build channel proxy client: ");
         reqwest::Client::new()
     });
     set_runtime_proxy_cached_client(cache_key, client.clone());
@@ -7628,11 +7609,7 @@ fn apply_explicit_proxy_to_builder(
             builder = builder.proxy(proxy);
         }
         Err(error) => {
-            tracing::warn!(
-                proxy_url,
-                service_key,
-                "Ignoring invalid channel proxy_url: {error}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"proxy_url": proxy_url, "service_key": service_key, "error": error.to_string()})), "Ignoring invalid channel proxy_url: ");
         }
     }
     builder
@@ -12780,11 +12757,8 @@ fn expand_tilde_path(path: &str) -> PathBuf {
             }
         }
         // If UserDirs also fails, log a warning and use the literal path
-        tracing::warn!(
-            path = path,
-            "Failed to expand tilde: HOME environment variable is not set and UserDirs failed. \
-             In cron/non-TTY environments, use absolute paths or set HOME explicitly."
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": path})), "Failed to expand tilde: HOME environment variable is not set and UserDirs failed. \
+             In cron/non-TTY environments, use absolute paths or set HOME explicitly.");
     }
 
     PathBuf::from(expanded_str)
@@ -12805,22 +12779,18 @@ async fn resolve_runtime_config_dirs(
                 .filter(|v| !v.trim().is_empty())
                 .is_some()
             {
-                tracing::warn!(
-                    "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_DATA_DIR is ignored \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_DATA_DIR is ignored \
                      (CONFIG_DIR pins both the config directory and the data \
-                     directory under it)."
-                );
+                     directory under it).");
             }
             if std::env::var("ZEROCLAW_WORKSPACE")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .is_some()
             {
-                tracing::warn!(
-                    "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_WORKSPACE (deprecated) \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_WORKSPACE (deprecated) \
                      is ignored. ZEROCLAW_WORKSPACE will be removed in a future \
-                     release; switch any remaining references to ZEROCLAW_DATA_DIR."
-                );
+                     release; switch any remaining references to ZEROCLAW_DATA_DIR.");
             }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
             return Ok((
@@ -12839,11 +12809,9 @@ async fn resolve_runtime_config_dirs(
             .filter(|v| !v.is_empty())
             .is_some()
         {
-            tracing::warn!(
-                "ZEROCLAW_DATA_DIR and ZEROCLAW_WORKSPACE are both set; \
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ZEROCLAW_DATA_DIR and ZEROCLAW_WORKSPACE are both set; \
                  ZEROCLAW_WORKSPACE (deprecated) is ignored. \
-                 ZEROCLAW_WORKSPACE will be removed in a future release."
-            );
+                 ZEROCLAW_WORKSPACE will be removed in a future release.");
         }
         let expanded = expand_tilde_path(&custom_data);
         let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
@@ -12853,10 +12821,8 @@ async fn resolve_runtime_config_dirs(
     if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE")
         && !custom_workspace.is_empty()
     {
-        tracing::warn!(
-            "ZEROCLAW_WORKSPACE is deprecated; use ZEROCLAW_DATA_DIR instead. \
-             ZEROCLAW_WORKSPACE will be removed in a future release."
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ZEROCLAW_WORKSPACE is deprecated; use ZEROCLAW_DATA_DIR instead. \
+             ZEROCLAW_WORKSPACE will be removed in a future release.");
         let expanded = expand_tilde_path(&custom_workspace);
         let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
         return Ok((
@@ -13141,16 +13107,12 @@ impl Config {
             && let Err(e) =
                 crate::migration::migrate_legacy_workspace_to_default_agent(&zeroclaw_dir)
         {
-            tracing::warn!(
-                "[system] filesystem migration failed (continuing with legacy layout): {e}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "[system] filesystem migration failed (continuing with legacy layout): ");
         }
         // Heal pre-shared-workspace V3 installs whose skills landed in
         // `agents/default/workspace/skills/`. Idempotent.
         if let Err(e) = crate::migration::relocate_default_agent_skills_to_shared(&zeroclaw_dir) {
-            tracing::warn!(
-                "[system] skills relocation to shared workspace failed (continuing): {e}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "[system] skills relocation to shared workspace failed (continuing): ");
         }
 
         let config_path = zeroclaw_dir.join("config.toml");
@@ -13175,7 +13137,7 @@ impl Config {
         let data_dir = zeroclaw_dir.join("data");
         fs::create_dir_all(&data_dir)
             .await
-            .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
+            .with_context(|| format!("Failed to create data directory: {}", data_dir.display().to_string()))?;
         // Legacy alias retained for clarity in the struct initializer
         // and existing field assignments below.
         let workspace_dir = data_dir;
@@ -13204,13 +13166,8 @@ impl Config {
                 if let Ok(meta) = fs::metadata(&config_path).await
                     && meta.permissions().mode() & 0o004 != 0
                 {
-                    tracing::warn!(
-                        "Config file {:?} is world-readable (mode {:o}). \
-                             Consider restricting with: chmod 600 {:?}",
-                        config_path,
-                        meta.permissions().mode() & 0o777,
-                        config_path,
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Config file {:?} is world-readable (mode {:o}). \
+                             Consider restricting with: chmod 600 {:?}", config_path, meta.permissions().mode() & 0o777, config_path));
                 }
             }
 
@@ -13255,15 +13212,11 @@ impl Config {
                 }
             }
             if let Some(from_version) = stale_version {
-                tracing::warn!(
-                    "Config at {} is schema_version {from_version}; auto-migrated to {} in memory. \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Config at {} is schema_version {from_version}; auto-migrated to {} in memory. \
                      Run `zeroclaw config migrate` to commit the migration to disk. \
                      V0.8.0 also replaced the env-var override grammar; see \
                      https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/reference/env-vars.md \
-                     for the migration recipes.",
-                    config_path.display(),
-                    crate::migration::CURRENT_SCHEMA_VERSION,
-                );
+                     for the migration recipes.", config_path.display().to_string(), crate::migration::CURRENT_SCHEMA_VERSION));
             }
 
             // Ensure the built-in default auto_approve entries are always
@@ -13294,9 +13247,7 @@ impl Config {
             // This replaces the previous serde_ignored-based approach which
             // had false-positive issues with #[serde(default)] nested structs.
             for key in Self::unknown_keys(&contents) {
-                tracing::warn!(
-                    "Unknown config key ignored: \"{key}\". Check config.toml for typos or deprecated options.",
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"key": key})), "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options.");
             }
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
@@ -13311,10 +13262,7 @@ impl Config {
                     crate::skill_bundles::resolve_directory(&config, &install_root, &alias)
                     && let Err(e) = std::fs::create_dir_all(&dir)
                 {
-                    tracing::warn!(
-                        "skill-bundle '{alias}' directory creation failed at {}: {e}",
-                        dir.display(),
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("skill-bundle '{alias}' directory creation failed at {}: {e}", dir.display().to_string()));
                 }
             }
 
@@ -13337,19 +13285,10 @@ impl Config {
             // still come up so the user can navigate to the bad section
             // and repair it.
             if let Err(e) = config.validate() {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "[system] config has validation errors — booting anyway so you \
-                     can fix them via /config or `zeroclaw config set`"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{e:#}")})), "[system] config has validation errors — booting anyway so you \
+                     can fix them via /config or `zeroclaw config set`");
             }
-            tracing::info!(
-                path = %config.config_path.display(),
-                workspace = %config.data_dir.display(),
-                source = resolution_source.as_str(),
-                initialized = true,
-                "Config loaded"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         } else {
             let mut config = Config {
@@ -13377,19 +13316,10 @@ impl Config {
             // a fresh-init config can't realistically fail validation,
             // but if it does we still want the daemon up.
             if let Err(e) = config.validate() {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "[system] freshly-initialized config has validation errors — \
-                     booting anyway so you can fix them via /config"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{e:#}")})), "[system] freshly-initialized config has validation errors — \
+                     booting anyway so you can fix them via /config");
             }
-            tracing::info!(
-                path = %config.config_path.display(),
-                workspace = %config.data_dir.display(),
-                source = resolution_source.as_str(),
-                initialized = true,
-                "Config loaded"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
     }
@@ -13698,12 +13628,9 @@ impl Config {
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_uri && !has_api_key && !has_model {
-                tracing::warn!(
-                    model_provider = %profile_name,
-                    "providers.models.{profile_name} is empty (no uri / api_key / model). \
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
                      Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
-                     to make this model_provider usable.",
-                );
+                     to make this model_provider usable.");
                 continue;
             }
 
@@ -13744,7 +13671,7 @@ impl Config {
         // collect_warnings; emit each one to tracing here so the existing
         // log behavior is preserved.
         for w in self.collect_warnings() {
-            tracing::warn!(path = %w.path, code = %w.code, "{}", w.message);
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": w.path, "code": w.code})), &format!("{}", w.message));
         }
 
         // Ollama cloud-routing safety checks
@@ -14485,12 +14412,7 @@ impl Config {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
         let resolved = zeroclaw_dir.join(file_name);
-        tracing::warn!(
-            path = %self.config_path.display(),
-            resolved = %resolved.display(),
-            source = source.as_str(),
-            "Config path missing parent directory; resolving from runtime environment"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": self.config_path.display().to_string(), "resolved": resolved.display().to_string(), "source": source.as_str()})), "Config path missing parent directory; resolving from runtime environment");
         Ok(resolved)
     }
 
@@ -14691,11 +14613,7 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
     {
         use std::{fs::Permissions, os::unix::fs::PermissionsExt};
         if let Err(err) = fs::set_permissions(config_path, Permissions::from_mode(0o600)).await {
-            tracing::warn!(
-                "Failed to harden config permissions to 0600 at {}: {}",
-                config_path.display(),
-                err
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to harden config permissions to 0600 at {}: {}", config_path.display().to_string(), err));
         }
     }
 
@@ -14856,10 +14774,10 @@ async fn sync_directory(path: &Path) -> Result<()> {
     {
         let dir = File::open(path)
             .await
-            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
+            .with_context(|| format!("Failed to open directory for fsync: {}", path.display().to_string()))?;
         dir.sync_all()
             .await
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display().to_string()))?;
         Ok(())
     }
 
@@ -14871,20 +14789,17 @@ async fn sync_directory(path: &Path) -> Result<()> {
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
-            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
+            .with_context(|| format!("Failed to open directory for fsync: {}", path.display().to_string()))?;
         // FlushFileBuffers on directory handles returns ERROR_ACCESS_DENIED on
         // Windows (OS Error 5). This is expected — NTFS does not support
         // flushing directory metadata the same way Unix does. The individual
         // files have already been synced, so it is safe to ignore this error.
         if let Err(e) = dir.sync_all() {
             if e.raw_os_error() == Some(5) {
-                tracing::trace!(
-                    "Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}",
-                    path.display()
-                );
+                ::zeroclaw_log::record!(TRACE, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}", path.display().to_string()));
             } else {
                 return Err(e).with_context(|| {
-                    format!("Failed to fsync directory metadata: {}", path.display())
+                    format!("Failed to fsync directory metadata: {}", path.display().to_string())
                 });
             }
         }
@@ -15081,11 +14996,9 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
     use tokio::sync::MutexGuard;
     use tokio::test;
@@ -15189,34 +15102,18 @@ mod tests {
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
 
-    #[derive(Clone, Default)]
-    struct SharedLogBuffer(Arc<StdMutex<Vec<u8>>>);
-
-    struct SharedLogWriter(Arc<StdMutex<Vec<u8>>>);
-
-    impl SharedLogBuffer {
-        fn captured(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
+    fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+        ::zeroclaw_log::try_install_capture_subscriber();
+        ::zeroclaw_log::subscribe_or_install()
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
-        type Writer = SharedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedLogWriter(self.0.clone())
+    fn drain_captured(rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>) -> String {
+        let mut buf = String::new();
+        while let Ok(value) = rx.try_recv() {
+            buf.push_str(&serde_json::to_string(&value).unwrap_or_default());
+            buf.push('\n');
         }
-    }
-
-    impl io::Write for SharedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+        buf
     }
 
     #[test]
@@ -18246,20 +18143,11 @@ default_model = "persisted-profile"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
 
-        let capture = SharedLogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(capture.clone())
-            .finish();
-        let dispatch = tracing::Dispatch::new(subscriber);
-        let guard = tracing::dispatcher::set_default(&dispatch);
+        let mut rx = capture_log_events();
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
-        drop(guard);
-        let logs = capture.captured();
+        let logs = drain_captured(&mut rx);
 
         // V3: shared databases live at `<install>/data/`, per-agent
         // identity at `<install>/agents/<alias>/workspace/`. The
@@ -18275,8 +18163,8 @@ default_model = "persisted-profile"
             Some("persisted-profile")
         );
         assert!(logs.contains("Config loaded"), "{logs}");
-        assert!(logs.contains("initialized=true"), "{logs}");
-        assert!(!logs.contains("initialized=false"), "{logs}");
+        assert!(logs.contains("\"initialized\":true"), "{logs}");
+        assert!(!logs.contains("\"initialized\":false"), "{logs}");
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };

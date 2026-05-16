@@ -27,6 +27,8 @@ const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
 
 #[derive(Clone)]
 pub struct OpenAiCodexModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     auth: AuthService,
     auth_profile_override: Option<String>,
     responses_url: String,
@@ -111,6 +113,7 @@ struct ResponsesTurnResult {
 
 impl OpenAiCodexModelProvider {
     pub fn new(
+        alias: &str,
         options: &ModelProviderRuntimeOptions,
         gateway_api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
@@ -122,6 +125,7 @@ impl OpenAiCodexModelProvider {
         let responses_url = resolve_responses_url(options)?;
 
         Ok(Self {
+            alias: alias.to_string(),
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
@@ -134,8 +138,7 @@ impl OpenAiCodexModelProvider {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         })
-    }
-}
+    }}
 
 fn default_zeroclaw_dir() -> PathBuf {
     directories::UserDirs::new().map_or_else(
@@ -1033,10 +1036,7 @@ impl OpenAiCodexModelProvider {
         {
             Ok(profile) => profile,
             Err(err) if use_gateway_api_key_auth => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode");
                 None
             }
             Err(err) => return Err(err),
@@ -1048,10 +1048,7 @@ impl OpenAiCodexModelProvider {
         {
             Ok(token) => token,
             Err(err) if use_gateway_api_key_auth => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": err.to_string()})), "failed to refresh OpenAI token; continuing with custom endpoint API key mode");
                 None
             }
             Err(err) => return Err(err),
@@ -1309,6 +1306,19 @@ impl ModelProvider for OpenAiCodexModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiCodexModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenAiCodex,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1393,7 +1403,7 @@ mod tests {
             ..ModelProviderRuntimeOptions::default()
         };
 
-        let provider = OpenAiCodexModelProvider::new(&options, Some("test-key")).unwrap();
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
         assert!(provider.custom_endpoint);
         assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
     }
@@ -1802,7 +1812,7 @@ data: [DONE]
             ..ModelProviderRuntimeOptions::default()
         };
         let provider =
-            OpenAiCodexModelProvider::new(&options, None).expect("provider should initialize");
+            OpenAiCodexModelProvider::new("test", &options, None).expect("provider should initialize");
         let caps = provider.capabilities();
 
         assert!(caps.native_tool_calling);
@@ -1811,7 +1821,7 @@ data: [DONE]
 
     #[test]
     fn provider_does_not_advertise_streaming_until_live_sse_is_wired() {
-        let provider = OpenAiCodexModelProvider::new(&ModelProviderRuntimeOptions::default(), None)
+        let provider = OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
             .expect("provider should initialize");
 
         assert!(!provider.supports_streaming());

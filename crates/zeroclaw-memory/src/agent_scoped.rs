@@ -412,6 +412,17 @@ impl Memory for AgentScopedMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::AgentScoped,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.agent_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,7 +431,7 @@ mod tests {
 
     fn fresh_sqlite() -> (TempDir, Arc<SqliteMemory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 

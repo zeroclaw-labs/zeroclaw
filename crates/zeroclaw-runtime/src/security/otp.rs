@@ -28,7 +28,7 @@ impl OtpValidator {
         let secret_path = secret_file_path(zeroclaw_dir);
         let (secret, generated) = if secret_path.exists() {
             let encoded = fs::read_to_string(&secret_path).with_context(|| {
-                format!("Failed to read OTP secret file {}", secret_path.display())
+                format!("Failed to read OTP secret file {}", secret_path.display().to_string())
             })?;
             let decrypted = store
                 .decrypt(encoded.trim())
@@ -128,7 +128,7 @@ pub fn secret_file_path(zeroclaw_dir: &Path) -> PathBuf {
 fn write_secret_file(path: &Path, value: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            .with_context(|| format!("Failed to create directory {}", parent.display().to_string()))?;
     }
 
     let temp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));

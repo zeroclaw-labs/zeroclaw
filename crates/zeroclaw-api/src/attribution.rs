@@ -2,38 +2,52 @@
 //! workspace. Each "thing" that participates in an event (channel,
 //! agent, tool, cron job, model provider, memory backend, peer group,
 //! skill bundle, MCP bundle, session) implements [`Attributable`].
-//! Entry points open `attribution_span()` once at the start of their
-//! work; the `LogCaptureLayer` in `zeroclaw-log` walks the span scope
-//! and fills the typed attribution slots automatically.
+//! Entry points open `attribution_span!(thing)` once at the start of
+//! their work; the `LogCaptureLayer` in `zeroclaw-log` walks the span
+//! scope and fills the typed attribution slots automatically.
 //!
-//! The trait does not own a `Span` constructor here — that lives in
-//! `zeroclaw-log::attribution_span` to keep the tracing dependency
-//! contained. Each `Attributable` only exposes its role + alias; the
-//! emission crate turns those into the right span shape.
-//!
-//! Adding a new variant: extend the relevant `Kind` enum and add the
-//! mapping in the [`Role::composite_prefix`] / [`Role::composite_type`]
-//! / [`Role::attribution_field`] methods. No call-site changes.
+//! Adding a new variant: extend the relevant `Kind` enum (the variant
+//! name's snake_case form is the canonical `<type>` string via
+//! `strum::IntoStaticStr`), and — only if a new role family is needed —
+//! update the [`Role::composite_prefix`] / [`Role::attribution_field`]
+//! / [`Role::default_category`] match arms. No call-site changes.
+
+use strum_macros::IntoStaticStr;
 
 /// Trait every alias-bound "thing" implements once next to its struct.
-///
-/// The two methods are the contract. The default span construction
-/// happens in `zeroclaw-log::attribution_span(thing)` and uses these
-/// two to populate the typed slots — no per-impl span code needed.
 pub trait Attributable {
-    /// The role this thing fills (Channel/Agent/Tool/Cron/Provider/...).
     fn role(&self) -> Role;
-
-    /// The alias portion of the `<type>.<alias>` composite (or the
-    /// plain attribution value for non-composite roles). For an Agent
-    /// this is `agent_alias`; for a Telegram channel it is the
-    /// `[channels.telegram.<alias>]` config key suffix.
     fn alias(&self) -> &str;
 }
 
-/// Closed taxonomy of every role a thing can fill. Adding a new family
-/// here is the single point of change for new attribution coverage —
-/// the layer reads the typed slots through the methods below.
+impl<T: Attributable + ?Sized> Attributable for std::sync::Arc<T> {
+    fn role(&self) -> Role {
+        (**self).role()
+    }
+    fn alias(&self) -> &str {
+        (**self).alias()
+    }
+}
+
+impl<T: Attributable + ?Sized> Attributable for Box<T> {
+    fn role(&self) -> Role {
+        (**self).role()
+    }
+    fn alias(&self) -> &str {
+        (**self).alias()
+    }
+}
+
+impl<T: Attributable + ?Sized> Attributable for &T {
+    fn role(&self) -> Role {
+        (**self).role()
+    }
+    fn alias(&self) -> &str {
+        (**self).alias()
+    }
+}
+
+/// Closed taxonomy of every role a thing can fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Swarm,
@@ -46,48 +60,60 @@ pub enum Role {
     PeerGroup,
     Skill,
     Mcp,
+    Sop,
     Session,
     System,
 }
 
-/// Channel implementations. The string returned by [`ChannelKind::type_str`]
-/// is the canonical `channel_type` value in every event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Channel implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ChannelKind {
+    #[strum(serialize = "acp")]
+    AcpChannel,
+    Bluesky,
+    #[strum(serialize = "clawdtalk")]
+    ClawdTalk,
     Cli,
+    #[strum(serialize = "dingtalk")]
+    DingTalk,
     Discord,
+    Email,
+    GmailPush,
+    #[strum(serialize = "imessage")]
+    IMessage,
+    Irc,
     Lark,
+    Line,
+    Linq,
     Matrix,
+    Mattermost,
+    #[strum(serialize = "mochat")]
+    MoChat,
+    NextcloudTalk,
+    Nostr,
+    Notion,
+    Qq,
+    Reddit,
+    Signal,
     Slack,
     Telegram,
+    Twitter,
+    VoiceCall,
+    VoiceWake,
+    Wati,
+    #[strum(serialize = "wecom")]
+    WeCom,
     Webhook,
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
 }
 
-impl ChannelKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Cli => "cli",
-            Self::Discord => "discord",
-            Self::Lark => "lark",
-            Self::Matrix => "matrix",
-            Self::Slack => "slack",
-            Self::Telegram => "telegram",
-            Self::Webhook => "webhook",
-            Self::Wechat => "wechat",
-            Self::WhatsappBusiness => "whatsapp_business",
-            Self::WhatsappWeb => "whatsapp_web",
-        }
-    }
-}
-
-/// Tool implementations. Open-ended in practice (plugins register at
-/// runtime) so the catch-all `Other(&'static str)` variant carries the
-/// canonical tool name for tools not in the built-in set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Built-in tool implementations. Closed set — plugins that need their
+/// own attribution add a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ToolKind {
     Shell,
     HttpRequest,
@@ -103,35 +129,12 @@ pub enum ToolKind {
     SopStatus,
     SopHistory,
     Wait,
-    Other(&'static str),
+    Plugin,
 }
 
-impl ToolKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::HttpRequest => "http_request",
-            Self::HttpServer => "http_server",
-            Self::FetchUrl => "fetch_url",
-            Self::Search => "search",
-            Self::Memory => "memory",
-            Self::SpawnSubagent => "spawn_subagent",
-            Self::SopList => "sop_list",
-            Self::SopExecute => "sop_execute",
-            Self::SopApprove => "sop_approve",
-            Self::SopAdvance => "sop_advance",
-            Self::SopStatus => "sop_status",
-            Self::SopHistory => "sop_history",
-            Self::Wait => "wait",
-            Self::Other(name) => name,
-        }
-    }
-}
-
-/// Cron job shapes. Currently a flat schedule taxonomy; nested if a
-/// shape acquires its own sub-kinds later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Cron schedule shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum CronKind {
     Interval,
     At,
@@ -139,21 +142,9 @@ pub enum CronKind {
     Once,
 }
 
-impl CronKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Interval => "interval",
-            Self::At => "at",
-            Self::Cron => "cron",
-            Self::Once => "once",
-        }
-    }
-}
-
-/// Provider family. The inner enum carries the specific provider
-/// implementation; the outer family drives which composite prefix
-/// (`model_provider` / `tts_provider` / …) the layer populates.
+/// Provider family. The inner enum carries the specific implementation;
+/// the outer family drives which composite prefix (`model_provider` /
+/// `tts_provider` / …) the layer populates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Model(ModelProviderKind),
@@ -166,134 +157,150 @@ impl ProviderKind {
     #[must_use]
     pub fn type_str(self) -> &'static str {
         match self {
-            Self::Model(k) => k.type_str(),
-            Self::Tts(k) => k.type_str(),
-            Self::Transcription(k) => k.type_str(),
-            Self::Tunnel(k) => k.type_str(),
+            Self::Model(k) => k.into(),
+            Self::Tts(k) => k.into(),
+            Self::Transcription(k) => k.into(),
+            Self::Tunnel(k) => k.into(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ModelProviderKind {
     Anthropic,
+    #[strum(serialize = "openai")]
     OpenAi,
+    #[strum(serialize = "openai_codex")]
+    OpenAiCodex,
+    Azure,
     Together,
     Bedrock,
     Ollama,
     Gemini,
+    GeminiCli,
     GoogleAi,
     Mistral,
     Groq,
-    Other(&'static str),
+    OpenRouter,
+    Telnyx,
+    Copilot,
+    Glm,
+    KiloCli,
+    Router,
+    Reliable,
+    Moonshot,
+    Qwen,
+    Minimax,
+    Zai,
+    Doubao,
+    Yi,
+    Hunyuan,
+    Qianfan,
+    Baichuan,
+    Fireworks,
+    Deepseek,
+    AtomicChat,
+    Cohere,
+    Perplexity,
+    Xai,
+    Cerebras,
+    Sambanova,
+    Hyperbolic,
+    Deepinfra,
+    Huggingface,
+    Ai21,
+    Reka,
+    Baseten,
+    Nscale,
+    Anyscale,
+    Nebius,
+    Friendli,
+    Stepfun,
+    Aihubmix,
+    Siliconflow,
+    Astrai,
+    Avian,
+    Deepmyst,
+    Venice,
+    Novita,
+    Nvidia,
+    Vercel,
+    Cloudflare,
+    Ovh,
+    Lmstudio,
+    Llamacpp,
+    Sglang,
+    Vllm,
+    Osaurus,
+    Litellm,
+    Lepton,
+    Synthetic,
+    Opencode,
+    Custom,
+    Plugin,
 }
 
-impl ModelProviderKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
-            Self::Together => "together",
-            Self::Bedrock => "bedrock",
-            Self::Ollama => "ollama",
-            Self::Gemini => "gemini",
-            Self::GoogleAi => "google_ai",
-            Self::Mistral => "mistral",
-            Self::Groq => "groq",
-            Self::Other(name) => name,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum TtsProviderKind {
+    #[strum(serialize = "openai")]
     OpenAi,
+    #[strum(serialize = "elevenlabs")]
     ElevenLabs,
     Cartesia,
+    Google,
+    Edge,
     Piper,
-    Other(&'static str),
+    Plugin,
 }
 
-impl TtsProviderKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::OpenAi => "openai",
-            Self::ElevenLabs => "elevenlabs",
-            Self::Cartesia => "cartesia",
-            Self::Piper => "piper",
-            Self::Other(name) => name,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum TranscriptionProviderKind {
     Whisper,
+    #[strum(serialize = "openai")]
     OpenAi,
     Deepgram,
-    Other(&'static str),
+    Groq,
+    AssemblyAi,
+    Google,
+    Plugin,
 }
 
-impl TranscriptionProviderKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Whisper => "whisper",
-            Self::OpenAi => "openai",
-            Self::Deepgram => "deepgram",
-            Self::Other(name) => name,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum TunnelProviderKind {
     Ngrok,
     Cloudflared,
     OpenVpn,
-    Other(&'static str),
+    Pinggy,
+    Tailscale,
+    None,
+    Custom,
+    Plugin,
 }
 
-impl TunnelProviderKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Ngrok => "ngrok",
-            Self::Cloudflared => "cloudflared",
-            Self::OpenVpn => "openvpn",
-            Self::Other(name) => name,
-        }
-    }
-}
-
-/// Memory backend implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum MemoryKind {
     Sqlite,
     Json,
     InMemory,
-    Other(&'static str),
-}
-
-impl MemoryKind {
-    #[must_use]
-    pub fn type_str(self) -> &'static str {
-        match self {
-            Self::Sqlite => "sqlite",
-            Self::Json => "json",
-            Self::InMemory => "in_memory",
-            Self::Other(name) => name,
-        }
-    }
+    Markdown,
+    AgentScopedMarkdown,
+    AgentScoped,
+    Qdrant,
+    Postgres,
+    Lucid,
+    None,
+    Plugin,
 }
 
 impl Role {
-    /// The composite prefix this role populates (`channel`,
-    /// `model_provider`, `tts_provider`, `transcription_provider`,
-    /// `tunnel_provider`, `memory_namespace`-derivative), or `None`
-    /// for roles that are plain attribution fields.
+    /// Composite prefix this role populates (`channel`, `model_provider`,
+    /// `tts_provider`, `transcription_provider`, `tunnel_provider`),
+    /// or `None` for roles that use a plain attribution field.
     #[must_use]
     pub fn composite_prefix(self) -> Option<&'static str> {
         match self {
@@ -302,16 +309,7 @@ impl Role {
             Self::Provider(ProviderKind::Tts(_)) => Some("tts_provider"),
             Self::Provider(ProviderKind::Transcription(_)) => Some("transcription_provider"),
             Self::Provider(ProviderKind::Tunnel(_)) => Some("tunnel_provider"),
-            Self::Swarm
-            | Self::Agent
-            | Self::Tool(_)
-            | Self::Cron(_)
-            | Self::Memory(_)
-            | Self::PeerGroup
-            | Self::Skill
-            | Self::Mcp
-            | Self::Session
-            | Self::System => None,
+            _ => None,
         }
     }
 
@@ -320,15 +318,15 @@ impl Role {
     #[must_use]
     pub fn composite_type(self) -> Option<&'static str> {
         match self {
-            Self::Channel(k) => Some(k.type_str()),
+            Self::Channel(k) => Some(k.into()),
             Self::Provider(p) => Some(p.type_str()),
             _ => None,
         }
     }
 
-    /// The plain attribution key this role populates for non-composite
-    /// roles. `Tool` writes `tool`; `Agent` writes `agent_alias`; `Cron`
-    /// writes `cron_job_id`; etc.
+    /// Plain-attribution-field key this role populates for roles that
+    /// don't use a composite. `Tool` writes `tool`; `Agent` writes
+    /// `agent_alias`; `Cron` writes `cron_job_id`; …
     #[must_use]
     pub fn attribution_field(self) -> Option<&'static str> {
         match self {
@@ -339,14 +337,15 @@ impl Role {
             Self::PeerGroup => Some("peer_group"),
             Self::Skill => Some("skill_bundle"),
             Self::Mcp => Some("mcp_bundle"),
+            Self::Sop => Some("sop_name"),
             Self::Session => Some("session_key"),
             _ => None,
         }
     }
 
-    /// Stable string tag used by the span layer to deserialize the role
-    /// back from the span field. One-to-one with the enum variant; the
-    /// inner Kind is rendered alongside in [`Role::variant_str`].
+    /// Stable string tag used by the span layer to identify the role's
+    /// family. The inner Kind (when applicable) is rendered alongside in
+    /// [`Role::composite_type`].
     #[must_use]
     pub fn family_str(self) -> &'static str {
         match self {
@@ -363,15 +362,16 @@ impl Role {
             Self::PeerGroup => "peer_group",
             Self::Skill => "skill",
             Self::Mcp => "mcp",
+            Self::Sop => "sop",
             Self::Session => "session",
             Self::System => "system",
         }
     }
 
-    /// The closest equivalent [`zeroclaw_log::event::EventCategory`] for
-    /// this role, used by the layer to default `event.category` when
-    /// the call site doesn't override it. Returned as a `&'static str`
-    /// to keep `zeroclaw-api` free of a back-dep on `zeroclaw-log`.
+    /// Closest [`zeroclaw_log::EventCategory`] for this role, used by
+    /// the layer to default `event.category` when the call site doesn't
+    /// override. Returned as a `&'static str` to keep `zeroclaw-api`
+    /// free of a back-dep on `zeroclaw-log`.
     #[must_use]
     pub fn default_category(self) -> &'static str {
         match self {
@@ -379,10 +379,57 @@ impl Role {
             Self::Channel(_) => "channel",
             Self::Tool(_) => "tool",
             Self::Cron(_) => "cron",
-            Self::Provider(_) => "provider",
+            Self::Provider(ProviderKind::Model(_)) => "model_provider",
+            Self::Provider(ProviderKind::Tts(_)) => "tts_provider",
+            Self::Provider(ProviderKind::Transcription(_)) => "transcription_provider",
+            Self::Provider(ProviderKind::Tunnel(_)) => "tunnel_provider",
             Self::Memory(_) => "memory",
             Self::Session => "session",
+            Self::Sop => "sop",
             Self::PeerGroup | Self::Skill | Self::Mcp | Self::System => "system",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_kind_snake_case() {
+        assert_eq!(<&'static str>::from(ChannelKind::Telegram), "telegram");
+        assert_eq!(
+            <&'static str>::from(ChannelKind::WhatsappBusiness),
+            "whatsapp_business"
+        );
+    }
+
+    #[test]
+    fn provider_kind_delegates_to_inner() {
+        assert_eq!(
+            ProviderKind::Model(ModelProviderKind::Anthropic).type_str(),
+            "anthropic"
+        );
+        assert_eq!(
+            ProviderKind::Tts(TtsProviderKind::ElevenLabs).type_str(),
+            "elevenlabs"
+        );
+    }
+
+    #[test]
+    fn role_composite_prefix() {
+        assert_eq!(Role::Channel(ChannelKind::Discord).composite_prefix(), Some("channel"));
+        assert_eq!(
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic)).composite_prefix(),
+            Some("model_provider"),
+        );
+        assert!(Role::Agent.composite_prefix().is_none());
+    }
+
+    #[test]
+    fn role_attribution_field() {
+        assert_eq!(Role::Agent.attribution_field(), Some("agent_alias"));
+        assert_eq!(Role::Tool(ToolKind::Shell).attribution_field(), Some("tool"));
+        assert!(Role::Channel(ChannelKind::Telegram).attribution_field().is_none());
     }
 }

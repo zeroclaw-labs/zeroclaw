@@ -151,10 +151,7 @@ impl V1Config {
                     toml::Value::Table(entry_table),
                 );
 
-                tracing::info!(
-                    target: "migration",
-                    "V1 top-level provider globals folded into [providers.models.{default_provider_key}]"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"default_provider_key": default_provider_key})), "V1 top-level provider globals folded into [providers.models.]");
             }
 
             let mut providers = toml::Table::new();
@@ -184,7 +181,7 @@ impl V1Config {
                 apply_v1_to_v2_channel_folds(channels_table);
             }
             passthrough.insert("channels".to_string(), channels_value);
-            tracing::info!(target: "migration", "channels_config → channels");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels_config → channels");
         }
 
         let mut v2 = V2Config {
@@ -249,17 +246,11 @@ fn apply_v1_to_v2_channel_folds(channels: &mut toml::Table) {
     if let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
         && fold_string_into_array(matrix, "room_id", "allowed_rooms")
     {
-        tracing::info!(
-            target: "migration",
-            "channels.matrix.room_id folded into channels.matrix.allowed_rooms[]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.matrix.room_id folded into channels.matrix.allowed_rooms[]");
     }
     if let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
         && fold_string_into_array(slack, "channel_id", "channel_ids")
     {
-        tracing::info!(
-            target: "migration",
-            "channels.slack.channel_id folded into channels.slack.channel_ids[]"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channels.slack.channel_id folded into channels.slack.channel_ids[]");
     }
 }

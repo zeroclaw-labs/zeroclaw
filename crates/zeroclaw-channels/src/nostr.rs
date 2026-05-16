@@ -90,6 +90,15 @@ impl NostrChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for NostrChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Nostr)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for NostrChannel {
     fn name(&self) -> &str {
@@ -113,10 +122,7 @@ impl Channel for NostrChannel {
                     .send_private_msg(recipient, &message.content, None)
                     .await
                     .context("Failed to send NIP-17 message")?;
-                tracing::debug!(
-                    "Sent NIP-17 message to {}",
-                    recipient.to_bech32().unwrap_or_default()
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Sent NIP-17 message to {}", recipient.to_bech32().unwrap_or_default()));
             }
             NostrProtocol::Nip04 => {
                 // NIP-04: legacy encrypted DM (kind 4)
@@ -131,10 +137,7 @@ impl Channel for NostrChannel {
                     .send_event_builder(builder)
                     .await
                     .context("Failed to send NIP-04 message")?;
-                tracing::debug!(
-                    "Sent NIP-04 message to {}",
-                    recipient.to_bech32().unwrap_or_default()
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Sent NIP-04 message to {}", recipient.to_bech32().unwrap_or_default()));
             }
         }
 
@@ -158,10 +161,7 @@ impl Channel for NostrChannel {
             .await
             .context("Failed to subscribe to Nostr events")?;
 
-        tracing::info!(
-            "channel listening as {}",
-            self.public_key.to_bech32().unwrap_or_default()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("channel listening as {}", self.public_key.to_bech32().unwrap_or_default()));
 
         let sender_protocols = Arc::clone(&self.sender_protocols);
         let signer = self.client.signer().await.context("No signer on client")?;
@@ -183,10 +183,7 @@ impl Channel for NostrChannel {
                                 continue;
                             }
                             if !self.is_pubkey_allowed(&event.pubkey) {
-                                tracing::warn!(
-                                    "Nostr: ignoring NIP-04 message from unauthorized pubkey: {}",
-                                    event.pubkey.to_hex()
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Nostr: ignoring NIP-04 message from unauthorized pubkey: {}", event.pubkey.to_hex()));
                                 continue;
                             }
                             match signer.nip04_decrypt(&event.pubkey, &event.content).await {
@@ -204,7 +201,7 @@ impl Channel for NostrChannel {
                                     ))
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = ?e, "Failed to decrypt NIP-04 message");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to decrypt NIP-04 message");
                                     None
                                 }
                             }
@@ -220,10 +217,7 @@ impl Channel for NostrChannel {
                                     }
                                     let sender = rumor.pubkey;
                                     if !self.is_pubkey_allowed(&sender) {
-                                        tracing::warn!(
-                                            "Nostr: ignoring NIP-17 message from unauthorized pubkey: {}",
-                                            sender.to_hex()
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Nostr: ignoring NIP-17 message from unauthorized pubkey: {}", sender.to_hex()));
                                         continue;
                                     }
                                     sender_protocols
@@ -238,7 +232,7 @@ impl Channel for NostrChannel {
                                     ))
                                 }
                                 Err(e) => {
-                                    tracing::warn!(error = ?e, "Failed to unwrap NIP-17 gift wrap");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to unwrap NIP-17 gift wrap");
                                     None
                                 }
                             }
@@ -260,13 +254,13 @@ impl Channel for NostrChannel {
                             attachments: vec![],
                         };
                         if tx.send(msg).await.is_err() {
-                            tracing::info!("listener: message bus closed, stopping");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "listener: message bus closed, stopping");
                             break;
                         }
                     }
                 }
                 RelayPoolNotification::Shutdown => {
-                    tracing::info!("relay pool shut down");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "relay pool shut down");
                     break;
                 }
                 RelayPoolNotification::Message { .. } => {}

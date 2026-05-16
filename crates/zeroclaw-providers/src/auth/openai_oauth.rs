@@ -406,9 +406,9 @@ pub async fn import_codex_auth_profile(
     }
 
     let raw = std::fs::read_to_string(import_path)
-        .with_context(|| format!("Failed to read import file {}", import_path.display()))?;
+        .with_context(|| format!("Failed to read import file {}", import_path.display().to_string()))?;
     let imported: CodexAuthFile = serde_json::from_str(&raw)
-        .with_context(|| format!("Failed to parse import file {}", import_path.display()))?;
+        .with_context(|| format!("Failed to parse import file {}", import_path.display().to_string()))?;
     let expires_at = extract_expiry_from_jwt(&imported.tokens.access_token);
 
     let token_set = crate::auth::profiles::TokenSet {
@@ -425,10 +425,8 @@ pub async fn import_codex_auth_profile(
         .account_id
         .or_else(|| extract_account_id_from_jwt(&token_set.access_token));
     if account_id.is_none() {
-        tracing::warn!(
-            "Could not extract OpenAI account id from imported access token; \
-             requests may fail until re-authentication.",
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Could not extract OpenAI account id from imported access token; \
+             requests may fail until re-authentication.");
     }
 
     auth_service

@@ -1,3 +1,4 @@
+#![allow(clippy::to_string_in_format_args)]
 //! ModelProvider subsystem for model inference backends.
 //!
 //! This module implements the factory pattern for AI model model_providers. Each model_provider
@@ -499,7 +500,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
                 cached = Some(refreshed);
             }
             Err(error) => {
-                tracing::warn!(error = %error, "OAuth refresh failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": error.to_string()})), "OAuth refresh failed");
             }
         }
     }
@@ -661,10 +662,7 @@ pub fn provider_runtime_options_for_agent(
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
     let entry = config.model_provider_for_agent(agent_alias).or_else(|| {
-        tracing::debug!(
-            agent = agent_alias,
-            "model_provider_for_agent returned None; falling back to model_providers.first_model_provider()"
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": agent_alias})), "model_provider_for_agent returned None; falling back to model_providers.first_model_provider()");
         config.first_model_provider()
     });
     let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
@@ -1065,8 +1063,7 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(name, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(
-            options, api_key,
+        return Ok(Box::new(openai_codex::OpenAiCodexModelProvider::new(alias, options, api_key,
         )?));
     }
     // Resolve credential and break static-analysis taint chain from the
@@ -1160,7 +1157,7 @@ pub fn create_resilient_model_provider_with_options(
     let primary_model_provider =
         create_model_provider_inner(None, primary_name, "default", api_key, api_url, options)?;
 
-    let reliable = ReliableModelProvider::new(
+    let reliable = ReliableModelProvider::new(primary_name,
         vec![(primary_name.to_string(), primary_model_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
@@ -1186,7 +1183,7 @@ pub fn create_resilient_model_provider_for_alias(
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
-    let reliable = ReliableModelProvider::new(
+    let reliable = ReliableModelProvider::new(alias,
         vec![(family.to_string(), primary_model_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
@@ -1267,10 +1264,7 @@ pub fn create_routed_model_provider_with_options(
                 if name == primary_name {
                     return Err(e);
                 }
-                tracing::warn!(
-                    model_provider = name.as_str(),
-                    "Ignoring routed model_provider that failed to initialize"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": name.as_str()})), "Ignoring routed model_provider that failed to initialize");
             }
         }
     }
@@ -1289,7 +1283,7 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    Ok(Box::new(router::RouterModelProvider::new(primary_name,
         model_providers,
         routes,
         default_model.to_string(),
@@ -2775,7 +2769,7 @@ mod tests {
         assert_eq!(tuning.num_predict, 4096);
         assert_eq!(tuning.temperature_override, Some(0.5));
 
-        let provider = ollama::OllamaModelProvider::new(None, None).with_tuning(tuning);
+        let provider = ollama::OllamaModelProvider::new("test", None, None).with_tuning(tuning);
         assert_eq!(provider.tuning(), tuning);
     }
 

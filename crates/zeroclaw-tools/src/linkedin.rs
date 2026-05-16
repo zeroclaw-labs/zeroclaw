@@ -277,7 +277,7 @@ impl Tool for LinkedInTool {
                         }
                         Err(e) => {
                             // Image generation failed entirely — post without image
-                            tracing::warn!(error = ?e, "Image generation failed, posting without image");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Image generation failed, posting without image");
                         }
                     }
                 }

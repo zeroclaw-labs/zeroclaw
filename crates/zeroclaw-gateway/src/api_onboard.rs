@@ -111,7 +111,7 @@ pub async fn handle_catalog_models(
     let (models, live) = match handle.list_models().await {
         Ok(m) => (m, true),
         Err(e) => {
-            tracing::debug!(model_provider = %q.model_provider, error = ?e, "model catalog fetch failed");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": q.model_provider, "error": e.to_string()})), "model catalog fetch failed");
             (Vec::new(), false)
         }
     };
@@ -971,12 +971,7 @@ pub async fn handle_section_select(
             if created {
                 let enabled_path = format!("channels.{key}.{alias}.enabled");
                 if let Err(e) = working.set_prop_persistent(&enabled_path, "true") {
-                    tracing::warn!(
-                        target: "config",
-                        path = %enabled_path,
-                        error = %e,
-                        "failed to default-enable newly created channel; operator must toggle manually"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": enabled_path, "error": e.to_string()})), "failed to default-enable newly created channel; operator must toggle manually");
                 }
             }
             (format!("channels.{key}.{alias}"), created)
@@ -1028,11 +1023,7 @@ pub async fn handle_section_select(
                 if let Err(err) =
                     zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
                 {
-                    tracing::warn!(
-                        agent = %key,
-                        workspace = %workspace_dir.display(),
-                        "agent workspace scaffolded but bootstrap files seed failed (continuing): {err}",
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but bootstrap files seed failed (continuing)");
                 }
             }
             (format!("{section_key}.{key}"), created)

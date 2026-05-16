@@ -389,16 +389,12 @@ impl QQChannel {
             match self.fetch_access_token().await {
                 Ok(result) => {
                     if attempt > 1 {
-                        tracing::info!(
-                            "getAppAccessToken succeeded on attempt {attempt}/{AUTH_RETRY_MAX_ATTEMPTS}"
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"attempt": attempt, "AUTH_RETRY_MAX_ATTEMPTS": AUTH_RETRY_MAX_ATTEMPTS})), "getAppAccessToken succeeded on attempt /");
                     }
                     return Ok(result);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "getAppAccessToken failed (attempt {attempt}/{AUTH_RETRY_MAX_ATTEMPTS}): {e}"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "AUTH_RETRY_MAX_ATTEMPTS": AUTH_RETRY_MAX_ATTEMPTS, "e": e.to_string()})), "getAppAccessToken failed (attempt /)");
                     last_err = Some(e);
 
                     if attempt < AUTH_RETRY_MAX_ATTEMPTS {
@@ -703,7 +699,7 @@ impl QQChannel {
 
             // Check upload cache
             if let Some(cached_file_info) = self.get_cached_upload(&cache_key).await {
-                tracing::debug!("using cached upload for {target}");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"target": target})), "using cached upload for");
                 self.send_media_message(recipient, &cached_file_info)
                     .await?;
                 return Ok(());
@@ -800,7 +796,7 @@ impl QQChannel {
                     {
                         Ok(local_path) => local_path.display().to_string(),
                         Err(e) => {
-                            tracing::warn!(error = ?e, "failed to download attachment");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "failed to download attachment");
                             url.clone()
                         }
                     }
@@ -936,6 +932,15 @@ impl QQChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for QQChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Qq)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for QQChannel {
     fn name(&self) -> &str {
@@ -961,11 +966,7 @@ impl Channel for QQChannel {
         // Send each media attachment
         for attachment in &attachments {
             if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
-                tracing::warn!(
-                    target = attachment.target,
-                    error = %e,
-                    "failed to send media attachment; falling back to text"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": e.to_string()})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
                     "{}: {}",
@@ -987,13 +988,13 @@ impl Channel for QQChannel {
 
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("authenticating...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "authenticating...");
         let token = self.get_token().await?;
 
-        tracing::info!("fetching gateway URL...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "fetching gateway URL...");
         let gw_url = self.get_gateway_url(&token).await?;
 
-        tracing::info!("connecting to gateway WebSocket...");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connecting to gateway WebSocket...");
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &gw_url,
             "channel.qq",
@@ -1020,7 +1021,7 @@ impl Channel for QQChannel {
 
         if let (Some(sid), Some(seq)) = (&stored_session, stored_seq) {
             // Attempt Resume (opcode 6)
-            tracing::info!("attempting session resume (session_id={sid}, seq={seq})");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sid": sid, "seq": seq})), "attempting session resume (session_id=, seq=)");
             let resume = json!({
                 "op": 6,
                 "d": {
@@ -1049,7 +1050,7 @@ impl Channel for QQChannel {
             write
                 .send(Message::Text(identify.to_string().into()))
                 .await?;
-            tracing::info!("connected and sent Identify");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected and sent Identify");
         }
 
         let mut sequence: i64 = stored_seq.unwrap_or(-1);
@@ -1105,18 +1106,11 @@ impl Channel for QQChannel {
                     // heartbeats go un-acknowledged.
                     if missed_ack_count > 0 {
                         if missed_ack_count >= MAX_MISSED_ACKS {
-                            tracing::warn!(
-                                "{missed_ack_count} consecutive heartbeat ACKs missed \
-                                 (interval {hb_interval}ms + {grace_ms}ms grace); \
-                                 connection appears zombied"
-                            );
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"missed_ack_count": missed_ack_count, "hb_interval": hb_interval, "grace_ms": grace_ms})), "consecutive heartbeat ACKs missed (interval ms + ms grace); connection appears zombied");
                             exit_reason = ExitReason::HeartbeatTimeout;
                             break;
                         }
-                        tracing::info!(
-                            "heartbeat ACK missed ({missed_ack_count}/{MAX_MISSED_ACKS}); \
-                             tolerating transient delay"
-                        );
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"missed_ack_count": missed_ack_count, "MAX_MISSED_ACKS": MAX_MISSED_ACKS})), "heartbeat ACK missed (/); tolerating transient delay");
                     }
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
@@ -1181,13 +1175,13 @@ impl Channel for QQChannel {
                         }
                         // Reconnect
                         7 => {
-                            tracing::warn!("received Reconnect (op 7); will resume");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Reconnect (op 7); will resume");
                             exit_reason = ExitReason::Reconnect;
                             break;
                         }
                         // Invalid Session
                         9 => {
-                            tracing::warn!("received Invalid Session (op 9); clearing session for fresh auth");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Invalid Session (op 9); clearing session for fresh auth");
                             exit_reason = ExitReason::InvalidSession;
                             break;
                         }
@@ -1214,12 +1208,12 @@ impl Channel for QQChannel {
                     if event_type == "READY" || event_type == "RESUMED" {
                         if let Some(sid) = d.get("session_id").and_then(|s| s.as_str()) {
                             *self.session_id.write().await = Some(sid.to_string());
-                            tracing::info!("session established (session_id={sid}, event={event_type})");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sid": sid, "event_type": event_type})), "session established (session_id=, event=)");
                         }
                         continue;
                     }
 
-                    tracing::debug!("event_type={event_type} payload={d}");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"event_type": event_type, "d": d})), "event_type= payload=");
 
                     match event_type {
                         "C2C_MESSAGE_CREATE" => {
@@ -1237,7 +1231,7 @@ impl Channel for QQChannel {
                             let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
 
                             if !self.is_user_allowed(user_openid) {
-                                tracing::warn!("ignoring C2C message from unauthorized user: {user_openid}");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_openid": user_openid})), "ignoring C2C message from unauthorized user");
                                 continue;
                             }
 
@@ -1260,7 +1254,7 @@ impl Channel for QQChannel {
                             };
 
                             if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("message channel closed");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
                                 exit_reason = ExitReason::ChannelClosed;
                                 break 'outer;
                             }
@@ -1278,7 +1272,7 @@ impl Channel for QQChannel {
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
                             if !self.is_user_allowed(author_id) {
-                                tracing::warn!("ignoring group message from unauthorized user: {author_id}");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"author_id": author_id})), "ignoring group message from unauthorized user");
                                 continue;
                             }
 
@@ -1302,7 +1296,7 @@ impl Channel for QQChannel {
                             };
 
                             if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("message channel closed");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "message channel closed");
                                 exit_reason = ExitReason::ChannelClosed;
                                 break 'outer;
                             }
@@ -1336,32 +1330,24 @@ impl Channel for QQChannel {
                     .as_ref()
                     .map(|f| (f.code.to_string(), f.reason.to_string()))
                     .unwrap_or_else(|| ("unknown".into(), "none".into()));
-                tracing::warn!(
-                    "WebSocket closed with code={code}, reason=\"{reason}\"; \
-                     resume will be attempted on reconnect"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code.to_string(), "reason": reason.to_string()})), "WebSocket closed with code=, reason=\"\"; resume will be attempted on reconnect");
                 anyhow::bail!(
                     "QQ WebSocket connection closed: close_code={code}, reason=\"{reason}\""
                 )
             }
             ExitReason::StreamEnded => {
-                tracing::warn!(
-                    "WebSocket stream ended unexpectedly; resume will be attempted on reconnect"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WebSocket stream ended unexpectedly; resume will be attempted on reconnect");
                 anyhow::bail!("QQ WebSocket connection closed: stream ended unexpectedly")
             }
             ExitReason::HeartbeatTimeout => {
-                tracing::warn!(
-                    "heartbeat timeout after {MAX_MISSED_ACKS} consecutive missed ACKs; \
-                     resume will be attempted on reconnect"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"MAX_MISSED_ACKS": MAX_MISSED_ACKS})), "heartbeat timeout after consecutive missed ACKs; resume will be attempted on reconnect");
                 anyhow::bail!(
                     "QQ WebSocket connection closed: heartbeat ACK timeout \
                      ({MAX_MISSED_ACKS} consecutive missed ACKs)"
                 )
             }
             ExitReason::WriteFailed => {
-                tracing::warn!("WebSocket write failed; resume will be attempted on reconnect");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "WebSocket write failed; resume will be attempted on reconnect");
                 anyhow::bail!("QQ WebSocket connection closed: write failed")
             }
             ExitReason::ChannelClosed => {

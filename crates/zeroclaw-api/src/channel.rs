@@ -118,9 +118,13 @@ impl SendMessage {
     }
 }
 
-/// Core channel trait — implement for any messaging platform
+/// Core channel trait — implement for any messaging platform.
+///
+/// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
+/// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
+/// inherit `channel = <type>.<alias>` from the trait object's role + alias.
 #[async_trait]
-pub trait Channel: Send + Sync {
+pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
@@ -345,6 +349,15 @@ mod tests {
     /// `drop_self_messages` implementation can be exercised.
     struct StubChannel {
         handle: Option<String>,
+    }
+
+    impl crate::attribution::Attributable for StubChannel {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Channel(crate::attribution::ChannelKind::Webhook)
+        }
+        fn alias(&self) -> &str {
+            "stub"
+        }
     }
 
     #[async_trait]

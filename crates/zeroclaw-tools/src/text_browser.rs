@@ -115,9 +115,7 @@ impl TextBrowserTool {
                 if installed {
                     return Ok(preferred);
                 }
-                tracing::warn!(
-                    "Configured preferred text browser '{preferred}' is not installed, falling back to auto-detect"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"preferred": preferred})), "Configured preferred text browser '' is not installed, falling back to auto-detect");
             }
         }
 
@@ -216,7 +214,7 @@ impl Tool for TextBrowserTool {
         let dump_args = Self::build_dump_args(&browser, &url);
 
         let timeout = Duration::from_secs(if self.timeout_secs == 0 {
-            tracing::warn!("text_browser: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "text_browser: timeout_secs is 0, using safe default of 30s");
             30
         } else {
             self.timeout_secs

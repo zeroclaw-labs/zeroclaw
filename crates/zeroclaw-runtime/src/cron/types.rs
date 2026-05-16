@@ -205,6 +205,20 @@ pub struct CronJobPatch {
     pub uses_memory: Option<bool>,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for CronJob {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        let kind = match self.schedule {
+            Schedule::Cron { .. } => ::zeroclaw_api::attribution::CronKind::Cron,
+            Schedule::At { .. } => ::zeroclaw_api::attribution::CronKind::At,
+            Schedule::Every { .. } => ::zeroclaw_api::attribution::CronKind::Interval,
+        };
+        ::zeroclaw_api::attribution::Role::Cron(kind)
+    }
+    fn alias(&self) -> &str {
+        &self.id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

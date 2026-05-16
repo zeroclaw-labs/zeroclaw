@@ -76,7 +76,21 @@ pub async fn execute_one_tool(
         });
     };
 
-    let tool_future = tool.execute(call_arguments.clone());
+    use ::zeroclaw_log::Instrument;
+    let tool_span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        tool = %call_name,
+    );
+
+    // Auto tool I/O propagation: emit Start with full input, run the
+    // tool, then emit Complete or Fail with full output. Per-tool
+    // execute() impls add zero logging.
+    let _start_guard = tool_span.clone().entered();
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"input": call_arguments})), "tool invocation start");
+    drop(_start_guard);
+
+    let tool_future = tool.execute(call_arguments.clone()).instrument(tool_span.clone());
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -86,9 +100,15 @@ pub async fn execute_one_tool(
         tool_future.await
     };
 
+    let _result_guard = tool_span.entered();
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+            if r.success {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Success).with_duration(duration.as_millis() as u64).with_attrs(::serde_json::json!({"output": r.output})), "tool invocation complete");
+            } else {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_duration(duration.as_millis() as u64).with_attrs(::serde_json::json!({"error": r.error.clone().unwrap_or_default(), "output": r.output})), "tool invocation failed");
+            }
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
@@ -124,6 +144,7 @@ pub async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_duration(duration.as_millis() as u64).with_attrs(::serde_json::json!({"error": format!("{e:?}")})), "tool invocation errored");
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,

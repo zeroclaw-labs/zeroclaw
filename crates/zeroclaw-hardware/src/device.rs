@@ -503,10 +503,7 @@ impl DeviceRegistry {
             let probe_transport = if !is_known_vid {
                 let probe = HardwareSerialTransport::new(&info.port_path, DEFAULT_BAUD);
                 if !probe.ping_handshake().await {
-                    tracing::debug!(
-                        port = %info.port_path,
-                        "skipping unknown device: no ZeroClaw firmware response"
-                    );
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"port": info.port_path})), "skipping unknown device: no ZeroClaw firmware response");
                     continue;
                 }
                 Some(probe)
@@ -538,14 +535,9 @@ impl DeviceRegistry {
                 ..DeviceCapabilities::default()
             };
             registry.attach_transport(&alias, transport, caps)
-                .unwrap_or_else(|e| tracing::warn!(alias = %alias, err = %e, "attach_transport: unexpected unknown alias"));
+                .unwrap_or_else(|e| ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"alias": alias, "err": e.to_string()})), "attach_transport: unexpected unknown alias"));
 
-            tracing::info!(
-                alias = %alias,
-                port  = %info.port_path,
-                vid   = %info.vid,
-                "device registered"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": info.port_path, "vid": info.vid})), "device registered");
         }
 
         registry
@@ -601,7 +593,7 @@ impl DeviceRegistry {
         entry.transport = Some(Arc::new(transport) as Arc<dyn super::transport::Transport>);
         entry.capabilities.gpio = true;
 
-        tracing::info!(alias = %alias, port = %port_path, "device reconnected");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port_path})), "device reconnected");
         Ok(())
     }
 }

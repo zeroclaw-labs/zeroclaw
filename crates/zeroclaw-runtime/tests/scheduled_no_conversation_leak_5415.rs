@@ -85,7 +85,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     // With a session_id set, SQLite's recall filter scopes it out before
     // build_context runs — the bug manifests precisely when scoping fails.
     {
-        let mem = SqliteMemory::new(&workspace_dir).unwrap();
+        let mem = SqliteMemory::new("sqlite", &workspace_dir).unwrap();
         mem.store(
             "discord:guild:chan:msg-42",
             // Includes overlap words ("reminder", "today") so the keyword

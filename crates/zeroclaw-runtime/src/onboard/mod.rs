@@ -1195,17 +1195,13 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
             match handle.list_models().await {
                 Ok(models) => Some(models),
                 Err(e) => {
-                    tracing::debug!(model_provider, error = ?e, "models.dev catalog fetch failed");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "error": e.to_string()})), "models.dev catalog fetch failed");
                     None
                 }
             }
         }
         Err(e) => {
-            tracing::debug!(
-                model_provider,
-                error = ?e,
-                "model_provider construction failed for model-list probe"
-            );
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "error": e.to_string()})), "model_provider construction failed for model-list probe");
             None
         }
     };
@@ -1217,12 +1213,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, prefix: &str) ->
                 match discover_openai_compat_models(base_url, api_key).await {
                     Ok(models) => Some(models),
                     Err(e) => {
-                        tracing::debug!(
-                            model_provider,
-                            base_url,
-                            error = ?e,
-                            "OpenAI-compatible model discovery failed"
-                        );
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "base_url": base_url, "error": e.to_string()})), "OpenAI-compatible model discovery failed");
                         None
                     }
                 }
@@ -1574,11 +1565,7 @@ async fn agents(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Res
         } else if let Err(err) =
             zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
         {
-            tracing::warn!(
-                agent = %alias,
-                workspace = %workspace_dir.display(),
-                "bootstrap file seed failed (continuing): {err}",
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": alias, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "bootstrap file seed failed (continuing): ");
         }
         ui.heading(2, &alias);
         let _ = prompt_agent_fields(cfg, ui, &alias).await?;
@@ -1764,7 +1751,7 @@ async fn prompt_agent_system_prompt(
                         )
                     })?;
                 tokio::fs::write(&agents_md, &new).await.with_context(|| {
-                    format!("Failed to write AGENTS.md at {}", agents_md.display())
+                    format!("Failed to write AGENTS.md at {}", agents_md.display().to_string())
                 })?;
             }
             Ok(Nav::Done)

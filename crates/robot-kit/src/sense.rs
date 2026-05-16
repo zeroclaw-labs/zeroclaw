@@ -132,7 +132,7 @@ impl SenseTool {
             }
             _ => {
                 // Fallback to mock if hardware unavailable
-                tracing::warn!("RPLidar unavailable, using mock data");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "RPLidar unavailable, using mock data");
                 self.scan_mock().await
             }
         }

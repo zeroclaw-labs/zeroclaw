@@ -39,6 +39,17 @@ mod tests {
             Ok("ok".into())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for CapabilityMockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "CapabilityMockModelProvider" }
+    }
+
 
     #[test]
     fn chat_message_constructors() {
@@ -261,6 +272,17 @@ mod tests {
             Ok("response".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "MockModelProvider" }
+    }
+
 
     #[test]
     fn provider_convert_tools_default() {
@@ -345,6 +367,17 @@ mod tests {
             Ok(system.unwrap_or_default().to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for EchoSystemModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "EchoSystemModelProvider" }
+    }
+
 
     struct CustomConvertModelProvider;
 
@@ -370,6 +403,17 @@ mod tests {
             Ok(system.unwrap_or_default().to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for CustomConvertModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "CustomConvertModelProvider" }
+    }
+
 
     struct InvalidConvertModelProvider;
 
@@ -395,6 +439,17 @@ mod tests {
             Ok("should_not_reach".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for InvalidConvertModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "InvalidConvertModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn provider_chat_prompt_guided_preserves_existing_system_not_first() {
@@ -507,6 +562,17 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingChunkOnlyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "StreamingChunkOnlyModelProvider" }
+    }
+
 
     #[tokio::test]
     async fn provider_stream_chat_default_maps_legacy_chunks_to_events() {

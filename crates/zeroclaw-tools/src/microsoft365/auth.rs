@@ -112,7 +112,7 @@ impl TokenCache {
                 match self.refresh_token(client, &refresh_tok).await {
                     Ok(new_state) => return Ok(new_state),
                     Err(e) => {
-                        tracing::debug!(error = ?e, "ms365: refresh token failed, re-authenticating");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "ms365: refresh token failed, re-authenticating");
                     }
                 }
             }
@@ -157,7 +157,7 @@ impl TokenCache {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::debug!("ms365: client_credentials raw OAuth error: {body}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"body": body})), "ms365: client_credentials raw OAuth error");
             anyhow::bail!("ms365: client_credentials token request failed ({status})");
         }
 
@@ -193,7 +193,7 @@ impl TokenCache {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::debug!("ms365: device_code initiation raw error: {body}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"body": body})), "ms365: device_code initiation raw error");
             anyhow::bail!("ms365: device code request failed ({status})");
         }
 
@@ -204,9 +204,7 @@ impl TokenCache {
 
         // Log only a generic prompt; the full device_resp.message may contain
         // sensitive verification URIs or codes that should not appear in logs.
-        tracing::info!(
-            "ms365: device code auth required — follow the instructions shown to the user"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ms365: device code auth required — follow the instructions shown to the user");
         // Print the user-facing message to stderr so the operator can act on it
         // without it being captured in structured log sinks.
         eprintln!("ms365: {}", device_resp.message);
@@ -256,7 +254,7 @@ impl TokenCache {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
-            tracing::debug!("ms365: device code polling raw error: {body}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"body": body})), "ms365: device code polling raw error");
             anyhow::bail!("ms365: device code polling failed");
         }
 
@@ -295,7 +293,7 @@ impl TokenCache {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            tracing::debug!("ms365: token refresh raw error: {body}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"body": body})), "ms365: token refresh raw error");
             anyhow::bail!("ms365: token refresh failed ({status})");
         }
 
@@ -322,7 +320,7 @@ impl TokenCache {
         if let Ok(json) = serde_json::to_string_pretty(state)
             && let Err(e) = std::fs::write(&self.cache_path, json)
         {
-            tracing::warn!(error = ?e, "ms365: failed to persist token cache");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "ms365: failed to persist token cache");
         }
     }
 }

@@ -145,7 +145,7 @@ impl WhatsAppChannel {
                 {
                     Ok(re) => Some(re),
                     Err(e) => {
-                        tracing::warn!("ignoring invalid mention_pattern {trimmed:?}: {e}");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"trimmed": trimmed, "e": e.to_string()})), "ignoring invalid mention_pattern");
                         None
                     }
                 }
@@ -252,11 +252,7 @@ impl WhatsAppChannel {
                     };
 
                     if !self.is_number_allowed(&normalized_from) {
-                        tracing::warn!(
-                            "ignoring message from unauthorized number: {normalized_from}. \
-                            Add to channels.whatsapp.allowed_numbers in config.toml, \
-                            or run `zeroclaw onboard --channels-only` to configure interactively."
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"normalized_from": normalized_from})), "ignoring message from unauthorized number: . Add to channels.whatsapp.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively.");
                         continue;
                     }
 
@@ -269,7 +265,7 @@ impl WhatsAppChannel {
                             .to_string()
                     } else {
                         // Could be image, audio, etc. — skip for now
-                        tracing::debug!("skipping non-text message from {from}");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from})), "skipping non-text message from");
                         continue;
                     };
 
@@ -290,9 +286,7 @@ impl WhatsAppChannel {
                     ) {
                         Some(c) => c,
                         None => {
-                            tracing::debug!(
-                                "message from {from} did not match mention patterns, dropping"
-                            );
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from})), "message from did not match mention patterns, dropping");
                             continue;
                         }
                     };
@@ -326,6 +320,17 @@ impl WhatsAppChannel {
         }
 
         messages
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WhatsAppChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::WhatsappBusiness,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -373,7 +378,7 @@ impl Channel for WhatsAppChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("send failed: {status} — {error_body}");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "send failed:");
             anyhow::bail!("WhatsApp API error: {status}");
         }
 
@@ -414,10 +419,8 @@ impl Channel for WhatsAppChannel {
         // WhatsApp uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /whatsapp endpoint.
         // This method keeps the channel "alive" but doesn't actively poll.
-        tracing::info!(
-            "WhatsApp channel active (webhook mode). \
-            Configure Meta webhook to POST to your gateway's /whatsapp endpoint."
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp channel active (webhook mode). \
+            Configure Meta webhook to POST to your gateway's /whatsapp endpoint.");
 
         // Keep the task alive — it will be cancelled when the channel shuts down
         loop {

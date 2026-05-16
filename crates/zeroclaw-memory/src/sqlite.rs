@@ -33,6 +33,7 @@ const CURRENT_SCHEMA_VERSION: i64 = 1;
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
 pub struct SqliteMemory {
+    alias: String,
     conn: Arc<Mutex<Connection>>,
     embedder: Arc<dyn EmbeddingProvider>,
     vector_weight: f32,
@@ -42,8 +43,9 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
+    pub fn new(alias: &str, workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
+            alias,
             workspace_dir,
             Arc::new(super::embeddings::NoopEmbedding),
             0.7,
@@ -55,7 +57,7 @@ impl SqliteMemory {
     }
 
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
-    pub fn new_named(workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
+    pub fn new_named(alias: &str, workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -76,6 +78,7 @@ impl SqliteMemory {
         Self::init_schema(&conn)?;
         Self::migrate_multi_agent(&db_path, &conn)?;
         Ok(Self {
+            alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
             embedder: Arc::new(super::embeddings::NoopEmbedding),
             vector_weight: 0.7,
@@ -91,6 +94,7 @@ impl SqliteMemory {
     /// (capped at 300). Useful when the DB file may be locked or on slow storage.
     /// `None` = wait indefinitely (default).
     pub fn with_embedder(
+        alias: &str,
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
@@ -129,6 +133,7 @@ impl SqliteMemory {
         Self::migrate_multi_agent(&db_path, &conn)?;
 
         Ok(Self {
+            alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
             embedder,
             vector_weight,
@@ -279,10 +284,7 @@ impl SqliteMemory {
         }
 
         if rewritten > 0 {
-            tracing::info!(
-                rewritten,
-                "Normalized session_id values in memories table to sanitized form"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"rewritten": rewritten})), "Normalized session_id values in memories table to sanitized form");
         }
 
         Ok(())
@@ -562,14 +564,11 @@ impl SqliteMemory {
         std::fs::copy(db_path, &backup_path).with_context(|| {
             format!(
                 "failed to copy {} to {} before multi-agent migration",
-                db_path.display(),
-                backup_path.display(),
+                db_path.display().to_string(),
+                backup_path.display().to_string(),
             )
         })?;
-        tracing::info!(
-            backup = %backup_path.display(),
-            "multi-agent migration: backed up SQLite memory DB before adding agents table and agent_id column"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"backup": backup_path.display().to_string()})), "multi-agent migration: backed up SQLite memory DB before adding agents table and agent_id column");
         Ok(())
     }
 
@@ -1680,6 +1679,17 @@ impl Memory for SqliteMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for SqliteMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::Sqlite,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1687,7 +1697,7 @@ mod tests {
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
     }
 
@@ -1863,14 +1873,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("persist", "I survive restarts", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
 
         // Reopen
-        let mem2 = SqliteMemory::new(tmp.path()).unwrap();
+        let mem2 = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem2.get("persist").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "I survive restarts");
@@ -2147,8 +2157,7 @@ mod tests {
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             embedder,
             0.7,
             0.3,
@@ -2166,8 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn open_with_timeout_store_recall_unchanged() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
@@ -2194,8 +2202,7 @@ mod tests {
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             embedder,
             0.7,
             0.3,
@@ -2298,8 +2305,7 @@ mod tests {
     #[tokio::test]
     async fn recall_prefix_wildcard_like_fallback_keeps_token_prefix() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
@@ -2323,8 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn recall_prefix_wildcard_like_fallback_overfetches_filtered_rows() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
@@ -2532,13 +2537,13 @@ mod tests {
     async fn schema_idempotent_reopen() {
         let tmp = TempDir::new().unwrap();
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("k1", "v1", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
         // Open again — init_schema runs again on existing DB
-        let mem2 = SqliteMemory::new(tmp.path()).unwrap();
+        let mem2 = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem2.get("k1").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "v1");
@@ -2552,9 +2557,9 @@ mod tests {
     #[tokio::test]
     async fn schema_triple_open() {
         let tmp = TempDir::new().unwrap();
-        let _m1 = SqliteMemory::new(tmp.path()).unwrap();
-        let _m2 = SqliteMemory::new(tmp.path()).unwrap();
-        let m3 = SqliteMemory::new(tmp.path()).unwrap();
+        let _m1 = SqliteMemory::new("test", tmp.path()).unwrap();
+        let _m2 = SqliteMemory::new("test", tmp.path()).unwrap();
+        let m3 = SqliteMemory::new("test", tmp.path()).unwrap();
         assert!(m3.health_check().await);
     }
 
@@ -2965,7 +2970,7 @@ mod tests {
 
         // First open: creates schema + migration
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("k1", "before reopen", MemoryCategory::Core, Some("sess-x"))
                 .await
                 .unwrap();
@@ -2973,7 +2978,7 @@ mod tests {
 
         // Second open: migration runs again but is idempotent
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let results = mem
                 .recall("reopen", 10, Some("sess-x"), None, None)
                 .await
@@ -3323,8 +3328,7 @@ mod tests {
     #[tokio::test]
     async fn search_mode_bm25_only() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
@@ -3357,8 +3361,7 @@ mod tests {
     async fn search_mode_embedding_only() {
         let tmp = TempDir::new().unwrap();
         // NoopEmbedding returns None, so embedding-only mode will fall back to LIKE
-        let mem = SqliteMemory::with_embedder(
-            tmp.path(),
+        let mem = SqliteMemory::with_embedder("test", tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
             0.3,
@@ -3389,7 +3392,7 @@ mod tests {
     #[tokio::test]
     async fn search_mode_hybrid_default() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         // Default search mode should be Hybrid
         assert_eq!(mem.search_mode, SearchMode::Hybrid);
 
@@ -3489,7 +3492,7 @@ mod tests {
         );
 
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store(
                 "legacy_key",
                 "stored before sanitize fix",
@@ -3502,7 +3505,7 @@ mod tests {
             assert_eq!(pre.len(), 1, "raw session_id should match before migration");
         }
 
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
         let by_sanitized = mem.list(None, Some(&sanitized)).await.unwrap();
         assert_eq!(
@@ -3525,14 +3528,14 @@ mod tests {
         let sanitized = sanitize_session_key("slack_C123_1.2_user");
 
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("k", "v", MemoryCategory::Core, Some(&sanitized))
                 .await
                 .unwrap();
         }
 
         for _ in 0..3 {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let entries = mem.list(None, Some(&sanitized)).await.unwrap();
             assert_eq!(entries.len(), 1);
         }
@@ -3543,13 +3546,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("global", "no session", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
 
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem.get("global").await.unwrap().expect("row should exist");
         assert!(entry.session_id.is_none());
     }

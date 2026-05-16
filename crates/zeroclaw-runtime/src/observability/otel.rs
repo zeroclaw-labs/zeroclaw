@@ -384,10 +384,10 @@ impl Observer for OtelObserver {
 
     fn flush(&self) {
         if let Err(e) = self.tracer_provider.force_flush() {
-            tracing::warn!(error = ?e, "OTel trace flush failed");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "OTel trace flush failed");
         }
         if let Err(e) = self.meter_provider.force_flush() {
-            tracing::warn!(error = ?e, "OTel metric flush failed");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "OTel metric flush failed");
         }
     }
 

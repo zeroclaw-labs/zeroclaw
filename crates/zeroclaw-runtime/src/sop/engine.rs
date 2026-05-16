@@ -3,7 +3,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use tracing::{info, warn};
 
 use super::condition::evaluate_condition;
 use super::load_sops;
@@ -46,7 +45,7 @@ impl SopEngine {
             self.config.sops_dir.as_deref(),
             super::parse_execution_mode(&self.config.default_execution_mode),
         );
-        info!("SOP engine loaded {} SOPs", self.sops.len());
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP engine loaded {} SOPs", self.sops.len()));
     }
 
     /// Return all loaded SOP definitions.
@@ -170,7 +169,7 @@ impl SopEngine {
 
         self.active_runs.insert(run_id.clone(), run);
 
-        info!("SOP run {} started for '{}'", run_id, sop_name);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP run {} started for '{}'", run_id, sop_name));
 
         // Determine first action based on execution mode
         let step = sop.steps[0].clone();
@@ -209,7 +208,7 @@ impl SopEngine {
         // Check if step failed
         if result.status == SopStepStatus::Failed {
             let reason = format!("Step {} failed: {}", result.step_number, result.output);
-            warn!("SOP run {run_id}: {reason}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"run_id": run_id, "reason": reason.to_string()})), "SOP run : ");
             return Ok(self.finish_run(run_id, SopRunStatus::Failed, Some(reason)));
         }
 
@@ -217,7 +216,7 @@ impl SopEngine {
         let next_step_num = run.current_step + 1;
         if next_step_num > run.total_steps {
             // All steps completed
-            info!("SOP run {run_id} completed successfully");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"run_id": run_id})), "SOP run  completed successfully");
             return Ok(self.finish_run(run_id, SopRunStatus::Completed, None));
         }
 
@@ -248,7 +247,7 @@ impl SopEngine {
             bail!("Active run not found: {run_id}");
         }
         self.finish_run(run_id, SopRunStatus::Cancelled, None);
-        info!("SOP run {run_id} cancelled");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"run_id": run_id})), "SOP run  cancelled");
         Ok(())
     }
 
@@ -357,10 +356,7 @@ impl SopEngine {
         };
 
         self.active_runs.insert(run_id.clone(), run);
-        info!(
-            "Deterministic SOP run {} started for '{}'",
-            run_id, sop_name
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Deterministic SOP run {} started for '{}'", run_id, sop_name));
 
         // Produce first step action
         let step = sop.steps[0].clone();
@@ -404,10 +400,7 @@ impl SopEngine {
         // Advance to next step
         let next_step_num = run.current_step + 1;
         if next_step_num > run.total_steps {
-            info!(
-                "Deterministic SOP run {run_id} completed ({} LLM calls saved)",
-                run.llm_calls_saved
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Deterministic SOP run {run_id} completed ({} LLM calls saved)", run.llm_calls_saved));
             let saved = run.llm_calls_saved;
             self.deterministic_savings.total_llm_calls_saved += saved;
             self.deterministic_savings.total_runs += 1;
@@ -456,10 +449,7 @@ impl SopEngine {
         // Resume from the step after the last completed one
         let next_step_num = state.last_completed_step + 1;
         if next_step_num > state.total_steps {
-            info!(
-                "Deterministic SOP run {} completed on resume ({} LLM calls saved)",
-                state.run_id, state.llm_calls_saved
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Deterministic SOP run {} completed on resume ({} LLM calls saved)", state.run_id, state.llm_calls_saved));
             self.deterministic_savings.total_llm_calls_saved += state.llm_calls_saved;
             self.deterministic_savings.total_runs += 1;
             return Ok(self.finish_run(&state.run_id, SopRunStatus::Completed, None));
@@ -499,12 +489,7 @@ impl SopEngine {
 
             let state_file = self.persist_deterministic_state(run_id, sop)?;
 
-            info!(
-                "Deterministic SOP run {run_id}: checkpoint at step {} '{}', state persisted to {}",
-                step.number,
-                step.title,
-                state_file.display()
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Deterministic SOP run {run_id}: checkpoint at step {} '{}', state persisted to {}", step.number, step.title, state_file.display().to_string()));
 
             Ok(SopRunAction::CheckpointWait {
                 run_id: run_id.to_string(),
@@ -601,15 +586,13 @@ impl SopEngine {
         for (run_id, is_critical) in timed_out {
             if is_critical {
                 // Auto-approve: Critical/High priority SOPs fall back to Auto on timeout
-                info!(
-                    "SOP run {run_id}: approval timeout — auto-approving (critical/high priority)"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"run_id": run_id})), "SOP run : approval timeout — auto-approving (critical/high priority)");
                 match self.approve_step(&run_id) {
                     Ok(action) => actions.push(action),
-                    Err(e) => warn!(error = ?e, "SOP run {run_id}: auto-approve failed"),
+                    Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "run_id": run_id})), "SOP run : auto-approve failed"),
                 }
             } else {
-                info!("SOP run {run_id}: approval timeout — waiting indefinitely (non-critical)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"run_id": run_id})), "SOP run : approval timeout — waiting indefinitely (non-critical)");
             }
         }
 

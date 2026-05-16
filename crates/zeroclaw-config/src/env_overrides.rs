@@ -90,14 +90,14 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             .set_prop(&path, &value)
             .with_context(|| format!("{env_name} → {path}"))?;
         if Config::prop_is_secret(&path) {
-            tracing::warn!(path = %path, env_var = %env_name, "Secret applied from env override");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": path, "env_var": env_name})), "Secret applied from env override");
         } else {
-            tracing::debug!(path = %path, env_var = %env_name, "Env override applied");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": path, "env_var": env_name})), "Env override applied");
         }
         paths.insert(path);
     }
     if !paths.is_empty() {
-        tracing::info!(count = paths.len(), "Applied env-var config overrides");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": paths.len()})), "Applied env-var config overrides");
     }
     Ok(AppliedOverrides { paths, snapshots })
 }
@@ -189,7 +189,7 @@ pub fn mask_env_overrides_for_save(
 ) -> Result<()> {
     for (path, value) in snapshots {
         if let Err(err) = config_to_save.set_prop(path, value) {
-            tracing::warn!(path = %path, error = %err, "Save-mask reset failed; field retains default");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": path, "error": err.to_string()})), "Save-mask reset failed; field retains default");
         }
     }
     Ok(())

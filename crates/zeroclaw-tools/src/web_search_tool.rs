@@ -603,15 +603,11 @@ impl Tool for WebSearchTool {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        tracing::info!("Searching web for: {}", query);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Searching web for: {}", query));
 
         let resolution = resolve_web_search_provider(&self.model_provider);
         if resolution.used_fallback {
-            tracing::warn!(
-                "Unknown web search model_provider '{}'; falling back to '{}'",
-                self.model_provider,
-                resolution.canonical_provider
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Unknown web search model_provider '{}'; falling back to '{}'", self.model_provider, resolution.canonical_provider));
         }
 
         let result = match resolution.route {

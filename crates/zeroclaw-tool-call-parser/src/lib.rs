@@ -1117,9 +1117,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!(
-                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)");
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -1260,11 +1258,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             let json_values = extract_json_values(inner);
             if json_values.is_empty() {
                 // Log a warning if we found a tool block but couldn't parse arguments
-                tracing::warn!(
-                    tool_name = %tool_name,
-                    inner = %inner.chars().take(100).collect::<String>(),
-                    "Found ```tool <name> block but could not parse JSON arguments"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
             } else {
                 for value in json_values {
                     let arguments = if value.is_object() {

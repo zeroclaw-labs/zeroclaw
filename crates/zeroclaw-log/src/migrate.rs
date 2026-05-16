@@ -154,29 +154,30 @@ fn convert_legacy_to_current(legacy: Value) -> Value {
     if let Some(agent) = get_str("agent_alias") {
         zeroclaw.insert("agent_alias".into(), Value::String(agent));
     }
+    use crate::event::{alias_field, type_field};
     if let Some(channel) = get_str("channel") {
         // Legacy "channel" might be bare type or composite. If it
         // contains `.`, treat as composite and split.
         if let Some((ty, alias)) = channel.split_once('.') {
             zeroclaw.insert("channel".into(), Value::String(channel.clone()));
-            zeroclaw.insert("channel_type".into(), Value::String(ty.to_string()));
-            zeroclaw.insert("channel_alias".into(), Value::String(alias.to_string()));
+            zeroclaw.insert(type_field("channel"), Value::String(ty.to_string()));
+            zeroclaw.insert(alias_field("channel"), Value::String(alias.to_string()));
         } else {
             zeroclaw.insert("channel".into(), Value::String(channel.clone()));
-            zeroclaw.insert("channel_type".into(), Value::String(channel));
+            zeroclaw.insert(type_field("channel"), Value::String(channel));
         }
     }
     if let Some(mp) = get_str("model_provider") {
         if let Some((ty, alias)) = mp.split_once('.') {
             zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
-            zeroclaw.insert("model_provider_type".into(), Value::String(ty.to_string()));
+            zeroclaw.insert(type_field("model_provider"), Value::String(ty.to_string()));
             zeroclaw.insert(
-                "model_provider_alias".into(),
+                alias_field("model_provider"),
                 Value::String(alias.to_string()),
             );
         } else {
             zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
-            zeroclaw.insert("model_provider_type".into(), Value::String(mp));
+            zeroclaw.insert(type_field("model_provider"), Value::String(mp));
         }
     }
     if let Some(model) = get_str("model") {

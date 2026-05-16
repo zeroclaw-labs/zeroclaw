@@ -68,14 +68,14 @@ impl SkillCreator {
         tokio::fs::create_dir_all(&skill_dir)
             .await
             .with_context(|| {
-                format!("Failed to create skill directory: {}", skill_dir.display())
+                format!("Failed to create skill directory: {}", skill_dir.display().to_string())
             })?;
 
         let toml_content = Self::generate_skill_toml(&slug, task_description, tool_calls);
         let toml_path = skill_dir.join("SKILL.toml");
         tokio::fs::write(&toml_path, toml_content.as_bytes())
             .await
-            .with_context(|| format!("Failed to write {}", toml_path.display()))?;
+            .with_context(|| format!("Failed to write {}", toml_path.display().to_string()))?;
 
         Ok(Some(slug))
     }

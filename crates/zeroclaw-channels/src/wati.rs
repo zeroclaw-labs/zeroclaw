@@ -91,9 +91,7 @@ impl WatiChannel {
                 self.transcription_manager = Some(std::sync::Arc::new(m));
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "transcription manager init failed, voice transcription disabled");
             }
         }
         self
@@ -130,11 +128,7 @@ impl WatiChannel {
 
         // Check allowlist
         if !self.is_number_allowed(&normalized_phone) {
-            tracing::warn!(
-                "ignoring message from unauthorized sender: {normalized_phone}. \
-                Add to channels.wati.allowed_numbers in config.toml, \
-                or run `zeroclaw onboard --channels-only` to configure interactively."
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"normalized_phone": normalized_phone})), "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively.");
             return None;
         }
 
@@ -229,7 +223,7 @@ impl WatiChannel {
             .unwrap_or(false);
 
         if from_me {
-            tracing::debug!("skipping fromMe message");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "skipping fromMe message");
             return messages;
         }
 
@@ -281,7 +275,7 @@ impl WatiChannel {
         match (api_host, media_host) {
             (Some(ref expected), Some(ref actual)) if actual == expected => {}
             _ => {
-                tracing::warn!("blocked media URL with unexpected host: {media_url}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"media_url": media_url})), "blocked media URL with unexpected host");
                 return None;
             }
         }
@@ -294,7 +288,7 @@ impl WatiChannel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if from_me {
-            tracing::debug!("skipping fromMe audio before download");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "skipping fromMe audio before download");
             return None;
         }
 
@@ -317,13 +311,13 @@ impl WatiChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = ?e, "media download request failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "media download request failed");
                 return None;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::warn!("media download failed: {}", resp.status());
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("media download failed: {}", resp.status()));
             return None;
         }
 
@@ -331,7 +325,7 @@ impl WatiChannel {
         while let Some(chunk) = resp.chunk().await.ok().flatten() {
             audio_bytes.extend_from_slice(&chunk);
             if audio_bytes.len() as u64 > MAX_WATI_AUDIO_BYTES {
-                tracing::warn!("audio download exceeds {} byte limit", MAX_WATI_AUDIO_BYTES);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("audio download exceeds {} byte limit", MAX_WATI_AUDIO_BYTES));
                 return None;
             }
         }
@@ -339,7 +333,7 @@ impl WatiChannel {
         match manager.transcribe(&audio_bytes, file_name).await {
             Ok(transcript) => Some(transcript),
             Err(e) => {
-                tracing::warn!(error = ?e, "transcription failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "transcription failed");
                 None
             }
         }
@@ -365,12 +359,12 @@ impl WatiChannel {
             .unwrap_or(false);
 
         if from_me {
-            tracing::debug!("skipping fromMe audio message");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "skipping fromMe audio message");
             return messages;
         }
 
         if transcript.trim().is_empty() {
-            tracing::debug!("skipping empty audio transcript");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "skipping empty audio transcript");
             return messages;
         }
 
@@ -394,6 +388,15 @@ impl WatiChannel {
         });
 
         messages
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WatiChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Wati)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -425,7 +428,7 @@ impl Channel for WatiChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("send failed: {status} — {error_body}");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "send failed:");
             anyhow::bail!("WATI API error: {status}");
         }
 
@@ -435,10 +438,8 @@ impl Channel for WatiChannel {
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // WATI uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /wati endpoint.
-        tracing::info!(
-            "WATI channel active (webhook mode). \
-            Configure WATI webhook to POST to your gateway's /wati endpoint."
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WATI channel active (webhook mode). \
+            Configure WATI webhook to POST to your gateway's /wati endpoint.");
 
         // Keep the task alive — it will be cancelled when the channel shuts down
         loop {

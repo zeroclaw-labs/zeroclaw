@@ -106,6 +106,17 @@ impl MatrixTestChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for MatrixTestChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "test"
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixTestChannel {
     fn name(&self) -> &str {
@@ -1330,6 +1341,17 @@ async fn capability_matrix_spec() {
 
 /// Minimal channel with ONLY required methods — validates all defaults work.
 struct MinimalChannel;
+
+impl ::zeroclaw_api::attribution::Attributable for MinimalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "minimal"
+    }
+}
 
 #[async_trait]
 impl Channel for MinimalChannel {

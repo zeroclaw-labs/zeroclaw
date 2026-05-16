@@ -114,9 +114,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             }
             #[cfg(not(feature = "observability-prometheus"))]
             {
-                tracing::warn!(
-                    "Prometheus backend requested but this build was compiled without `observability-prometheus`; falling back to noop."
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Prometheus backend requested but this build was compiled without `observability-prometheus`; falling back to noop.");
                 Box::new(NoopObserver)
             }
         }
@@ -128,34 +126,26 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 config.otel_headers.clone(),
             ) {
                 Ok(obs) => {
-                    tracing::info!(
-                        endpoint = config
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"endpoint": config
                             .otel_endpoint
                             .as_deref()
-                            .unwrap_or("http://localhost:4318"),
-                        "OpenTelemetry observer initialized"
-                    );
+                            .unwrap_or("http://localhost:4318")})), "OpenTelemetry observer initialized");
                     Box::new(obs)
                 }
                 Err(e) => {
-                    tracing::error!(error = ?e, "Failed to create OTel observer. Falling back to noop.");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to create OTel observer. Falling back to noop.");
                     Box::new(NoopObserver)
                 }
             }
             #[cfg(not(feature = "observability-otel"))]
             {
-                tracing::warn!(
-                    "OpenTelemetry backend requested but this build was compiled without `observability-otel`; falling back to noop."
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "OpenTelemetry backend requested but this build was compiled without `observability-otel`; falling back to noop.");
                 Box::new(NoopObserver)
             }
         }
         "none" | "noop" => Box::new(NoopObserver),
         _ => {
-            tracing::warn!(
-                "Unknown observability backend '{}', falling back to noop",
-                config.backend
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Unknown observability backend '{}', falling back to noop", config.backend));
             Box::new(NoopObserver)
         }
     }

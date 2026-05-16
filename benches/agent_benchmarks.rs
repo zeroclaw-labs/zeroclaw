@@ -70,6 +70,19 @@ impl BenchModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for BenchModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "BenchModelProvider"
+    }
+}
+
 #[async_trait]
 impl ModelProvider for BenchModelProvider {
     async fn chat_with_system(

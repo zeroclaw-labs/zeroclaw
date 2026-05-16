@@ -11,6 +11,8 @@ use zeroclaw_api::tool::ToolSpec;
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 pub struct OpenAiModelProvider {
+    /// `[model_providers.openai.<alias>]` config-key alias.
+    alias: String,
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
@@ -179,14 +181,15 @@ impl NativeResponseMessage {
 }
 
 impl OpenAiModelProvider {
-    pub fn new(credential: Option<&str>) -> Self {
-        Self::with_base_url(None, credential)
+    pub fn new(alias: &str, credential: Option<&str>) -> Self {
+        Self::with_base_url(alias, None, credential)
     }
 
     /// Create a model_provider with an optional custom base URL.
-    /// Defaults to `https://api.openai.com/v1` when `base_url` is `None`.
-    pub fn with_base_url(base_url: Option<&str>, credential: Option<&str>) -> Self {
+    /// Falls back to `https://api.openai.com/v1` when `base_url` is `None`.
+    pub fn with_base_url(alias: &str, base_url: Option<&str>, credential: Option<&str>) -> Self {
         Self {
+            alias: alias.to_string(),
             base_url: base_url
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| BASE_URL.to_string()),
@@ -553,31 +556,44 @@ impl ModelProvider for OpenAiModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn creates_with_key() {
-        let p = OpenAiModelProvider::new(Some("openai-test-credential"));
+        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
         assert_eq!(p.credential.as_deref(), Some("openai-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
-        let p = OpenAiModelProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = OpenAiModelProvider::new(Some(""));
+        let p = OpenAiModelProvider::new("test", Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = OpenAiModelProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -585,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = OpenAiModelProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -677,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = OpenAiModelProvider::new(None);
+        let model_provider = OpenAiModelProvider::new("test", None);
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
@@ -728,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = OpenAiModelProvider::new(None);
+        let p = OpenAiModelProvider::new("test", None);
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -753,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_rejects_invalid_tool_shape() {
-        let p = OpenAiModelProvider::new(Some("openai-test-credential"));
+        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1047,3 +1063,4 @@ mod tests {
         );
     }
 }
+

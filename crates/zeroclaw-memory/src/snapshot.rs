@@ -28,7 +28,7 @@ const SNAPSHOT_HEADER: &str = "# 🧠 ZeroClaw Memory Snapshot\n\n\
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let db_path = workspace_dir.join("memory").join("brain.db");
     if !db_path.exists() {
-        tracing::debug!("snapshot export skipped: brain.db does not exist");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "snapshot export skipped: brain.db does not exist");
         return Ok(0);
     }
 
@@ -56,7 +56,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         .collect();
 
     if rows.is_empty() {
-        tracing::debug!("snapshot export: no core memories to export");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "snapshot export: no core memories to export");
         return Ok(0);
     }
 
@@ -80,11 +80,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let snapshot_path = snapshot_path(workspace_dir);
     fs::write(&snapshot_path, output)?;
 
-    tracing::info!(
-        "📸 Memory snapshot exported: {} core memories → {}",
-        rows.len(),
-        snapshot_path.display()
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("📸 Memory snapshot exported: {} core memories → {}", rows.len(), snapshot_path.display().to_string()));
 
     Ok(rows.len())
 }
@@ -160,19 +156,15 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
                 hydrated += 1;
             }
             Ok(_) => {
-                tracing::debug!("hydrate: key '{key}' already exists, skipping");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"key": key})), "hydrate: key '' already exists, skipping");
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "hydrate: failed to insert key '{key}'");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "key": key})), "hydrate: failed to insert key ''");
             }
         }
     }
 
-    tracing::info!(
-        "🧬 Memory hydration complete: {} entries restored from {}",
-        hydrated,
-        snapshot.display()
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("🧬 Memory hydration complete: {} entries restored from {}", hydrated, snapshot.display().to_string()));
 
     Ok(hydrated)
 }

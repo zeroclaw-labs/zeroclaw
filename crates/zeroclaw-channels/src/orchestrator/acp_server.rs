@@ -27,7 +27,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tracing::{debug, error, warn};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
@@ -154,7 +153,7 @@ impl RpcOutbound {
         if let Ok(s) = serde_json::to_string(&n)
             && self.writer_tx.send(s).await.is_err()
         {
-            warn!("ACP writer task closed; dropping outbound notification");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "ACP writer task closed; dropping outbound notification");
         }
     }
 
@@ -228,7 +227,7 @@ impl RpcOutbound {
             };
             let _ = tx.send(payload);
         } else {
-            debug!("No pending outbound RPC matched response id={id_str}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"id_str": id_str})), "No pending outbound RPC matched response id=");
         }
     }
 }
@@ -322,10 +321,7 @@ impl AcpServer {
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
     /// responses/notifications to stdout.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        debug!(
-            "ACP server starting (max_sessions={}, timeout={}s)",
-            self.acp_config.max_sessions, self.acp_config.session_timeout_secs
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ACP server starting (max_sessions={}, timeout={}s)", self.acp_config.max_sessions, self.acp_config.session_timeout_secs));
 
         // Pull the writer-rx out of self so we can move it into the writer
         // task. Subsequent `run()` calls would have nothing to drive — but
@@ -358,7 +354,7 @@ impl AcpServer {
                         Ok(session) => {
                             let expired = session.last_active.elapsed() > timeout;
                             if expired {
-                                debug!("Session {id} expired after inactivity");
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"id": id})), "Session expired after inactivity");
                             }
                             !expired
                         }
@@ -367,7 +363,7 @@ impl AcpServer {
                 });
                 let reaped = before - sessions.len();
                 if reaped > 0 {
-                    debug!("Reaped {reaped} expired session(s)");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"reaped": reaped})), "Reaped expired session(s)");
                 }
             }
         });
@@ -376,7 +372,7 @@ impl AcpServer {
             line.clear();
             let bytes_read = reader.read_line(&mut line).await?;
             if bytes_read == 0 {
-                debug!("ACP server: stdin closed, shutting down");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ACP server: stdin closed, shutting down");
                 break;
             }
 
@@ -448,7 +444,7 @@ impl AcpServer {
                 });
             }
             Err(e) => {
-                warn!(error = ?e, "Failed to parse JSON-RPC request");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to parse JSON-RPC request");
                 self.write_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
                     .await;
             }
@@ -622,7 +618,7 @@ impl AcpServer {
             })),
         );
 
-        debug!("Created session {session_id} (workspace: {workspace_dir})");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": session_id, "workspace_dir": workspace_dir})), "Created session (workspace: )");
 
         Ok(serde_json::json!({
             "sessionId": session_id,
@@ -848,7 +844,7 @@ impl AcpServer {
         // Drop the ACP back-channel from each tool's channel map so the
         // session's RpcOutbound clone isn't kept alive by stale entries.
         session.agent.channel_handles().unregister_channel("acp");
-        debug!("Stopped session {session_id}");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": session_id})), "Stopped session");
         Ok(serde_json::json!({
             "sessionId": session_id,
             "stopped": true,
@@ -887,7 +883,7 @@ impl AcpServer {
 
         if let Some(token) = token {
             token.cancel();
-            debug!("Cancelled active turn for session {session_id}");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": session_id})), "Cancelled active turn for session");
         }
 
         Ok(serde_json::json!({}))
@@ -918,7 +914,7 @@ impl AcpServer {
             .unwrap_or("unknown")
             .to_string();
 
-        debug!("Received session update (type={event_type}) for session {session_id}");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"event_type": event_type, "session_id": session_id})), "Received session update (type=) for session");
 
         let session_arc = {
             let sessions = self.sessions.lock().await;
@@ -979,11 +975,11 @@ impl AcpServer {
         match serde_json::to_string(value) {
             Ok(json) => {
                 if self.rpc.writer_tx.send(json).await.is_err() {
-                    error!("ACP writer task closed; dropping outbound message");
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), "ACP writer task closed; dropping outbound message");
                 }
             }
             Err(e) => {
-                error!(error = ?e, "Failed to serialize JSON-RPC message");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to serialize JSON-RPC message");
             }
         }
     }
@@ -996,15 +992,15 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     let mut stdout = tokio::io::stdout();
     while let Some(line) = rx.recv().await {
         if let Err(e) = stdout.write_all(line.as_bytes()).await {
-            error!(error = ?e, "Failed to write to stdout");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to write to stdout");
             continue;
         }
         if let Err(e) = stdout.write_all(b"\n").await {
-            error!(error = ?e, "Failed to write newline to stdout");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to write newline to stdout");
             continue;
         }
         if let Err(e) = stdout.flush().await {
-            error!(error = ?e, "Failed to flush stdout");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to flush stdout");
         }
     }
 }

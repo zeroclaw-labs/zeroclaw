@@ -163,11 +163,7 @@ pub fn record_tool_loop_cost_usage(
         .tracker
         .record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
     {
-        tracing::warn!(
-            model_provider = model_provider_name,
-            model,
-            "Failed to record cost tracking usage: {error}"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": error.to_string()})), "Failed to record cost tracking usage: ");
     }
 
     {
@@ -206,22 +202,14 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
     static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     if missing_pricing_first_sighting(seen, model_provider, model) {
-        tracing::warn!(
-            model_provider,
-            model,
-            "Cost tracking: no pricing entry found for {model_provider}/{model} — \
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model})), "Cost tracking: no pricing entry found for {model_provider}/{model} — \
              token usage will be recorded with zero cost and budget enforcement \
              is inert for this model. Add a `pricing` table to the model provider \
              entry in config.toml (under `[model_providers.\"{model_provider}\"]`) \
              with `\"{model}.input\"` and `\"{model}.output\"` keys (USD per 1M tokens). \
-             This warning fires once per (model_provider, model) pair per process.",
-        );
+             This warning fires once per (model_provider, model) pair per process.");
     } else {
-        tracing::debug!(
-            model_provider,
-            model,
-            "Cost tracking recorded token usage with zero pricing (no pricing entry found)",
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model})), "Cost tracking recorded token usage with zero pricing (no pricing entry found)");
     }
 }
 

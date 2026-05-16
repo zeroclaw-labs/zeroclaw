@@ -15,6 +15,7 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Uses Qdrant's REST API for vector storage and semantic search.
 /// Requires an embedding model_provider for converting text to vectors.
 pub struct QdrantMemory {
+    alias: String,
     client: reqwest::Client,
     base_url: String,
     collection: String,
@@ -33,12 +34,13 @@ impl QdrantMemory {
     /// * `api_key` - Optional API key for Qdrant Cloud
     /// * `embedder` - Embedding model_provider for vector conversion
     pub async fn new(
+        alias: &str,
         url: &str,
         collection: &str,
         api_key: Option<String>,
         embedder: Arc<dyn EmbeddingProvider>,
     ) -> Result<Self> {
-        let mem = Self::new_lazy(url, collection, api_key, embedder);
+        let mem = Self::new_lazy(alias, url, collection, api_key, embedder);
 
         // Ensure collection exists with correct schema
         mem.ensure_collection().await?;
@@ -55,6 +57,7 @@ impl QdrantMemory {
     /// Collection will be created on first operation. Use this when calling
     /// from a synchronous context (e.g., the memory factory).
     pub fn new_lazy(
+        alias: &str,
         url: &str,
         collection: &str,
         api_key: Option<String>,
@@ -64,6 +67,7 @@ impl QdrantMemory {
         let client = zeroclaw_config::schema::build_runtime_proxy_client("memory.qdrant");
 
         Self {
+            alias: alias.to_string(),
             client,
             base_url,
             collection: collection.to_string(),
@@ -189,9 +193,7 @@ impl QdrantMemory {
         let dims = self.embedder.dimensions();
         if dims == 0 {
             // Noop embedder — skip vector collection setup
-            tracing::warn!(
-                "Qdrant memory using noop embedder (0 dimensions); vector search disabled"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Qdrant memory using noop embedder (0 dimensions); vector search disabled");
             return Ok(());
         }
 
@@ -246,11 +248,7 @@ impl QdrantMemory {
             anyhow::bail!("Qdrant collection creation failed ({status}): {text}");
         }
 
-        tracing::info!(
-            "Created Qdrant collection '{}' with {} dimensions",
-            self.collection,
-            dims
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Created Qdrant collection '{}' with {} dimensions", self.collection, dims));
 
         Ok(())
     }
@@ -346,11 +344,7 @@ impl QdrantMemory {
         }
 
         if rewritten > 0 {
-            tracing::info!(
-                rewritten,
-                collection = %self.collection,
-                "Normalized session_id payload values in Qdrant collection to sanitized form"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"rewritten": rewritten, "collection": self.collection})), "Normalized session_id payload values in Qdrant collection to sanitized form");
         }
 
         Ok(())
@@ -944,6 +938,17 @@ impl Memory for QdrantMemory {
             entries.retain(|e| e.timestamp.as_str() <= u);
         }
         Ok(entries)
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::Qdrant,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 

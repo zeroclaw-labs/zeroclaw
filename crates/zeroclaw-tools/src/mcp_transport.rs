@@ -168,9 +168,7 @@ impl McpTransportConn for StdioTransport {
             if resp.id.is_none() {
                 // Server-sent notification (e.g. `notifications/initialized`) — skip and
                 // keep waiting for the actual response to our request.
-                tracing::debug!(
-                    "MCP stdio: skipping server notification while waiting for response"
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "MCP stdio: skipping server notification while waiting for response");
                 continue;
             }
             return Ok(resp);
@@ -596,11 +594,7 @@ async fn handle_sse_event(
     if let Some(tx) = tx {
         let _ = tx.send(resp);
     } else {
-        tracing::debug!(
-            "MCP SSE `{}` received response for unknown id {}",
-            server_name,
-            id
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("MCP SSE `{}` received response for unknown id {}", server_name, id));
     }
 }
 

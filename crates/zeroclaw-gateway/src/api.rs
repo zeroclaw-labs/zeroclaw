@@ -460,17 +460,9 @@ pub async fn handle_api_cron_run(
         .await
     {
         if job.delivery.best_effort {
-            tracing::warn!(
-                job_id = %job.id,
-                error = %e,
-                "manual cron trigger delivery failed (best_effort)"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "manual cron trigger delivery failed (best_effort)");
         } else {
-            tracing::warn!(
-                job_id = %job.id,
-                error = %e,
-                "manual cron trigger delivery failed"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "manual cron trigger delivery failed");
             success = false;
         }
     }
@@ -485,20 +477,12 @@ pub async fn handle_api_cron_run(
         Some(&output),
         duration_ms,
     ) {
-        tracing::warn!(
-            job_id = %job.id,
-            error = %e,
-            "manual cron trigger: failed to persist run history",
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "manual cron trigger: failed to persist run history");
     }
     if let Err(e) =
         zeroclaw_runtime::cron::record_last_run(&config, &job.id, finished_at, success, &output)
     {
-        tracing::warn!(
-            job_id = %job.id,
-            error = %e,
-            "manual cron trigger: failed to update last_run state",
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": e.to_string()})), "manual cron trigger: failed to update last_run state");
     }
 
     // Broadcast the result so dashboard/SSE clients refresh in real time,
@@ -1220,7 +1204,7 @@ pub async fn handle_api_session_delete(
         .remove(&session_key);
     if let Some(token) = token {
         token.cancel();
-        tracing::info!(session_key, "cancelled in-flight turn for deleted session");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_key": session_key})), "cancelled in-flight turn for deleted session");
     }
 
     match backend.delete_session(&session_key) {
@@ -1403,7 +1387,7 @@ pub async fn handle_api_session_abort(
 
     if let Some(token) = token {
         token.cancel();
-        tracing::info!(session_key, "session abort requested");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_key": session_key})), "session abort requested");
         Json(serde_json::json!({ "status": "aborted" })).into_response()
     } else {
         Json(serde_json::json!({ "status": "no_active_response" })).into_response()
@@ -1427,13 +1411,7 @@ pub async fn handle_claude_code_hook(
     // back to a session we spawned.
     let _ = &state; // retained for future Slack update wiring
 
-    tracing::info!(
-        session_id = %payload.session_id,
-        event_type = %payload.event_type,
-        tool_name = ?payload.tool_name,
-        summary = ?payload.summary,
-        "Claude Code hook event received"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": payload.session_id, "event_type": payload.event_type, "tool_name": payload.tool_name, "summary": payload.summary})), "Claude Code hook event received");
 
     Json(serde_json::json!({ "ok": true }))
 }
@@ -1530,6 +1508,15 @@ mod tests {
             Ok(Vec::new())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str { "MockMemory" }
+    }
+
 
     struct MockModelProvider;
 
@@ -1545,6 +1532,17 @@ mod tests {
             Ok("ok".to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str { "MockModelProvider" }
+    }
+
 
     /// Wire a minimal agent + model_provider + risk_profile into a test config
     /// so cron-add API tests have an `agent` reference to bind to.

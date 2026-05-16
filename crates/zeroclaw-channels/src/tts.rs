@@ -23,7 +23,7 @@ const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 
 /// Trait for pluggable TTS backends.
 #[async_trait::async_trait]
-pub trait TtsProvider: Send + Sync {
+pub trait TtsProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
     /// ModelProvider identifier (e.g. `"openai"`, `"elevenlabs"`).
     fn name(&self) -> &str;
 
@@ -41,6 +41,7 @@ pub trait TtsProvider: Send + Sync {
 
 /// OpenAI TTS model_provider (`POST /v1/audio/speech`).
 pub struct OpenAiTtsProvider {
+    alias: String,
     api_key: String,
     model: String,
     speed: f64,
@@ -52,7 +53,7 @@ impl OpenAiTtsProvider {
     /// `[tts_providers.openai.<alias>].api_key` (or via the schema-mirror
     /// env grammar). Legacy `OPENAI_API_KEY` env-var fallback eradicated
     /// in V0.8.0.
-    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
+    pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -65,6 +66,7 @@ impl OpenAiTtsProvider {
             )?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             model: config
                 .model
@@ -142,6 +144,7 @@ impl TtsProvider for OpenAiTtsProvider {
 
 /// ElevenLabs TTS model_provider (`POST /v1/text-to-speech/{voice_id}`).
 pub struct ElevenLabsTtsProvider {
+    alias: String,
     api_key: String,
     model_id: String,
     stability: f64,
@@ -153,7 +156,7 @@ impl ElevenLabsTtsProvider {
     /// Create a new ElevenLabs TTS model_provider from config. Reads
     /// `[tts_providers.elevenlabs.<alias>].api_key`. Legacy
     /// `ELEVENLABS_API_KEY` env-var fallback eradicated in V0.8.0.
-    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
+    pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -166,6 +169,7 @@ impl ElevenLabsTtsProvider {
             )?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             model_id: config
                 .model
@@ -251,6 +255,7 @@ impl TtsProvider for ElevenLabsTtsProvider {
 
 /// Google Cloud TTS model_provider (`POST /v1/text:synthesize`).
 pub struct GoogleTtsProvider {
+    alias: String,
     api_key: String,
     language_code: String,
     client: reqwest::Client,
@@ -260,7 +265,7 @@ impl GoogleTtsProvider {
     /// Create a new Google Cloud TTS model_provider from config, resolving the API key
     /// from `[tts_providers.google.<alias>].api_key`. Legacy
     /// `GOOGLE_TTS_API_KEY` env-var fallback eradicated in V0.8.0.
-    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
+    pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -273,6 +278,7 @@ impl GoogleTtsProvider {
             )?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             language_code: config
                 .language_code
@@ -364,6 +370,7 @@ impl TtsProvider for GoogleTtsProvider {
 
 /// Edge TTS model_provider — free, uses the `edge-tts` CLI subprocess.
 pub struct EdgeTtsProvider {
+    alias: String,
     binary_path: String,
 }
 
@@ -376,7 +383,7 @@ impl EdgeTtsProvider {
     /// `binary_path` must be a bare command name (no path separators) matching
     /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
     /// paths like `/tmp/malicious/edge-tts` from passing the basename check.
-    pub fn new(config: &TtsProviderConfig) -> Result<Self> {
+    pub fn new(alias: &str, config: &TtsProviderConfig) -> Result<Self> {
         let raw_path = config
             .binary_path
             .clone()
@@ -394,9 +401,11 @@ impl EdgeTtsProvider {
             );
         }
         Ok(Self {
+            alias: alias.to_string(),
             binary_path: raw_path,
         })
     }
+
 }
 
 #[async_trait::async_trait]
@@ -466,6 +475,7 @@ impl TtsProvider for EdgeTtsProvider {
 
 /// Piper TTS model_provider — local GPU-accelerated server with an OpenAI-compatible endpoint.
 pub struct PiperTtsProvider {
+    alias: String,
     client: reqwest::Client,
     api_url: String,
 }
@@ -473,13 +483,14 @@ pub struct PiperTtsProvider {
 impl PiperTtsProvider {
     /// Create a new Piper TTS model_provider from config. Falls back to
     /// `http://127.0.0.1:5000/v1/audio/speech` when no `api_url` is supplied.
-    pub fn new(config: &TtsProviderConfig) -> Self {
+    pub fn new(alias: &str, config: &TtsProviderConfig) -> Self {
         let api_url = config
             .uri
             .clone()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:5000/v1/audio/speech".to_string());
         Self {
+            alias: alias.to_string(),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -487,6 +498,7 @@ impl PiperTtsProvider {
             api_url,
         }
     }
+
 }
 
 #[async_trait::async_trait]
@@ -582,11 +594,13 @@ impl TtsManager {
         for (family, alias, instance) in config.providers.tts.iter_entries() {
             let dotted = format!("{family}.{alias}");
             let result: Result<Box<dyn TtsProvider>> = match family {
-                "openai" => OpenAiTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                "elevenlabs" => ElevenLabsTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                "google" => GoogleTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                "edge" => EdgeTtsProvider::new(instance).map(|p| Box::new(p) as _),
-                "piper" => Ok(Box::new(PiperTtsProvider::new(instance)) as _),
+                "openai" => OpenAiTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                "elevenlabs" => {
+                    ElevenLabsTtsProvider::new(alias, instance).map(|p| Box::new(p) as _)
+                }
+                "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
+                "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
                 _ => unreachable!("TtsProviders typed slots cover all 5 families"),
             };
             match result {
@@ -602,7 +616,7 @@ impl TtsManager {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?e, "Skipping TTS provider {dotted}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "dotted": dotted})), "Skipping TTS provider");
                 }
             }
         }
@@ -682,7 +696,11 @@ impl TtsManager {
             )
         })?;
 
-        tts.synthesize(text, voice).await
+        use ::zeroclaw_log::Instrument;
+        let span = ::zeroclaw_log::attribution_span!(tts.as_ref());
+        ::zeroclaw_log::scope!(voice: voice, => tts.synthesize(text, voice))
+            .instrument(span)
+            .await
     }
 
     /// List dotted aliases of all initialized tts_providers.
@@ -694,6 +712,71 @@ impl TtsManager {
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+impl ::zeroclaw_api::attribution::Attributable for OpenAiTtsProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Tts(
+                ::zeroclaw_api::attribution::TtsProviderKind::OpenAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ElevenLabsTtsProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Tts(
+                ::zeroclaw_api::attribution::TtsProviderKind::ElevenLabs,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for GoogleTtsProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Tts(
+                ::zeroclaw_api::attribution::TtsProviderKind::Google,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for EdgeTtsProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Tts(
+                ::zeroclaw_api::attribution::TtsProviderKind::Edge,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for PiperTtsProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Tts(
+                ::zeroclaw_api::attribution::TtsProviderKind::Piper,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -801,7 +884,7 @@ mod tests {
 
     #[test]
     fn piper_provider_creation_uses_default_url_when_unset() {
-        let model_provider = PiperTtsProvider::new(&TtsProviderConfig::default());
+        let model_provider = PiperTtsProvider::new("test", &TtsProviderConfig::default());
         assert_eq!(model_provider.name(), "piper");
         assert_eq!(
             model_provider.api_url,

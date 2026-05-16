@@ -146,7 +146,7 @@ pub fn normalize_recent_recall_query(query: &str) -> &str {
 
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
-pub trait Memory: Send + Sync {
+pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
 

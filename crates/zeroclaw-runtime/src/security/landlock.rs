@@ -34,7 +34,7 @@ impl LandlockSandbox {
         match test_ruleset {
             Ok(_) => Ok(Self { workspace_dir }),
             Err(e) => {
-                tracing::debug!(error = ?e, "Landlock not available");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), "Landlock not available");
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "Landlock not available",
@@ -113,11 +113,11 @@ impl LandlockSandbox {
         // Apply the ruleset
         match ruleset.restrict_self() {
             Ok(_) => {
-                tracing::debug!("Landlock restrictions applied successfully");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Landlock restrictions applied successfully");
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "Failed to apply Landlock restrictions");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to apply Landlock restrictions");
                 Err(std::io::Error::other(e.to_string()))
             }
         }

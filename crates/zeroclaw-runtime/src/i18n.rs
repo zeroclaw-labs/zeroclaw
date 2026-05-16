@@ -63,11 +63,7 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
 }
 
 fn missing_cli_string(key: &str) -> String {
-    tracing::warn!(
-        error_key = "i18n.missing_cli_string",
-        key,
-        "missing CLI Fluent string"
-    );
+    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})), "missing CLI Fluent string");
     format!("{{{key}}}")
 }
 
@@ -193,7 +189,7 @@ fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
     let search_paths = [workspace_path];
     for path in search_paths.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            tracing::debug!(path = %path.display(), "loaded locale FTL from disk");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": path.display().to_string()})), "loaded locale FTL from disk");
             return Some(content);
         }
     }

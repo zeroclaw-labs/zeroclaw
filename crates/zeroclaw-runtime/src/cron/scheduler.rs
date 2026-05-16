@@ -1,3 +1,4 @@
+use zeroclaw_log::Instrument;
 use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
@@ -49,23 +50,17 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             session_target: None,
             delivery: None,
         };
-        tracing::debug!(
-            schedule = %schedule_cron,
-            "Synthesizing builtin backup cron job from config.backup.schedule_cron"
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"schedule": schedule_cron})), "Synthesizing builtin backup cron job from config.backup.schedule_cron");
         jobs_with_builtin.insert("__builtin_backup".to_string(), backup_job);
     }
 
     match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
             if !jobs_with_builtin.is_empty() {
-                tracing::info!(
-                    count = jobs_with_builtin.len(),
-                    "Synced declarative cron jobs from config"
-                );
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": jobs_with_builtin.len()})), "Synced declarative cron jobs from config");
             }
         }
-        Err(e) => tracing::warn!(error = ?e, "Failed to sync declarative cron jobs"),
+        Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Failed to sync declarative cron jobs"),
     }
 
     // ── Startup catch-up: run ALL overdue jobs before entering the
@@ -77,7 +72,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
-        tracing::info!("Scheduler startup: catch-up disabled by config");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Scheduler startup: catch-up disabled by config");
     }
 
     loop {
@@ -89,7 +84,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             Ok(jobs) => jobs,
             Err(e) => {
                 crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                tracing::warn!(error = ?e, "Scheduler query failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Scheduler query failed");
                 continue;
             }
         };
@@ -129,27 +124,25 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
         Err(e) => {
-            tracing::warn!(error = ?e, "Startup catch-up query failed");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Startup catch-up query failed");
             return;
         }
     };
 
     if jobs.is_empty() {
-        tracing::info!("Scheduler startup: no overdue jobs to catch up");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Scheduler startup: no overdue jobs to catch up");
         return;
     }
 
-    tracing::info!(
-        count = jobs.len(),
-        "Scheduler startup: catching up overdue jobs"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": jobs.len()})), "Scheduler startup: catching up overdue jobs");
 
     process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
 
-    tracing::info!("Scheduler startup: catch-up complete");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Scheduler startup: catch-up complete");
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+    use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
             false,
@@ -164,7 +157,10 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
         Ok(s) => s,
         Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
     };
-    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job)).await
+    let span = zeroclaw_log::attribution_span!(job);
+    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
+        .instrument(span)
+        .await
 }
 
 async fn execute_job_with_retry(
@@ -217,22 +213,14 @@ async fn process_due_jobs(
         // Resolve owning agent per-job. Skip orphans with a warning so a
         // mis-configured job can't take down the scheduler loop.
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            tracing::warn!(
-                job_id = %job.id,
-                "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
             return None;
         };
         let agent_alias = agent_alias.to_owned();
         let security = match SecurityPolicy::for_agent(config, &agent_alias) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                tracing::warn!(
-                    job_id = %job.id,
-                    agent = %agent_alias,
-                    error = %e,
-                    "Cron job: failed to build SecurityPolicy for owning agent"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": e.to_string()})), "Cron job: failed to build SecurityPolicy for owning agent");
                 return None;
             }
         };
@@ -253,7 +241,7 @@ async fn process_due_jobs(
 
     while let Some((job_id, success, output)) = in_flight.next().await {
         if !success {
-            tracing::warn!("Scheduler job '{job_id}' failed: {output}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job_id, "output": output})), "Scheduler job '' failed: ");
         }
         // Broadcast cron result to dashboard/SSE clients.
         if let Some(tx) = event_tx {
@@ -279,8 +267,10 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) =
-        Box::pin(execute_job_with_retry(config, security, agent_alias, job)).await;
+    let span = zeroclaw_log::attribution_span!(job);
+    let (success, output) = Box::pin(execute_job_with_retry(config, security, agent_alias, job))
+        .instrument(span)
+        .await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -392,7 +382,7 @@ async fn run_agent_job(
     let run_session_id = uuid::Uuid::new_v4().to_string();
     let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
 
-    let subagent_span = tracing::info_span!(
+    let subagent_span = zeroclaw_log::info_span!(
         "subagent",
         category = "cron",
         agent_alias = %agent_alias,
@@ -412,7 +402,6 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            use tracing::Instrument;
             Box::pin(
                 crate::agent::run(
                     cron_config,
@@ -492,27 +481,13 @@ async fn persist_job_result(
         let channel = job.delivery.channel.as_deref().unwrap_or("");
         let target = job.delivery.to.as_deref().unwrap_or("");
         if job.delivery.best_effort {
-            tracing::warn!(
-                job_id = %job.id,
-                agent_alias = %job.agent_alias,
-                channel = %channel,
-                target = %target,
-                error = ?e,
-                "Cron delivery failed (best_effort)"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": e.to_string()})), "Cron delivery failed (best_effort)");
             if success {
                 persisted_status = "degraded".to_string();
             }
         } else {
             success = false;
-            tracing::warn!(
-                job_id = %job.id,
-                agent_alias = %job.agent_alias,
-                channel = %channel,
-                target = %target,
-                error = ?e,
-                "Cron delivery failed"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": e.to_string()})), "Cron delivery failed");
             persisted_status = "error".to_string();
         }
 
@@ -544,7 +519,7 @@ async fn persist_job_result(
         duration_ms,
         action,
     ) {
-        tracing::warn!("Failed to persist scheduler run result: {e}");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "Failed to persist scheduler run result: ");
 
         if action == RunCompletionAction::Delete {
             // Best-effort fallback for the legacy behavior: a successful
@@ -559,9 +534,7 @@ async fn persist_job_result(
                 Some(&persisted_output),
                 RunCompletionAction::Disable,
             ) {
-                tracing::warn!(
-                    "Failed to disable one-shot cron job after history persistence failure: {disable_err}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"disable_err": disable_err.to_string()})), "Failed to disable one-shot cron job after history persistence failure: ");
             }
         } else {
             // For recurring jobs and non-delete one-shots, keep the scheduler
@@ -574,9 +547,7 @@ async fn persist_job_result(
                 Some(&persisted_output),
                 action,
             ) {
-                tracing::warn!(
-                    "Failed to update cron job state after history persistence failure: {state_err}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"state_err": state_err.to_string()})), "Failed to update cron job state after history persistence failure: ");
             }
         }
     }
@@ -607,10 +578,7 @@ fn is_high_frequency_agent_job(job: &CronJob) -> bool {
 
 fn warn_if_high_frequency_agent_job(job: &CronJob) {
     if is_high_frequency_agent_job(job) {
-        tracing::warn!(
-            "Cron agent job '{}' is scheduled more frequently than every 5 minutes",
-            job.id
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Cron agent job '{}' is scheduled more frequently than every 5 minutes", job.id));
     }
 }
 
@@ -691,12 +659,8 @@ pub async fn deliver_announcement(
         // records the job execution itself as successful. Operators that
         // actively rely on delivery wire a handler at startup; absence is a
         // configuration signal, not a delivery error.
-        tracing::warn!(
-            channel = %channel,
-            target = %target,
-            "Cron delivery skipped: no delivery handler registered \
-             (register_delivery_fn was not called by the binary)"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel": channel, "target": target})), "Cron delivery skipped: no delivery handler registered \
+             (register_delivery_fn was not called by the binary)");
         Ok(())
     }
 }

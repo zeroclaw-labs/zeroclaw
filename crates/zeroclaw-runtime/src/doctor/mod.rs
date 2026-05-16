@@ -409,7 +409,7 @@ pub fn run_traces(
     }
 
     println!("Runtime traces (newest first)");
-    println!("Path: {}", path.display());
+    println!("Path: {}", path.display().to_string());
     println!(
         "Filters: event={} contains={} limit={}",
         event_filter.unwrap_or("*"),
@@ -446,12 +446,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     if config.config_path.exists() {
         items.push(DiagItem::ok(
             cat,
-            format!("config file: {}", config.config_path.display()),
+            format!("config file: {}", config.config_path.display().to_string()),
         ));
     } else {
         items.push(DiagItem::error(
             cat,
-            format!("config file not found: {}", config.config_path.display()),
+            format!("config file not found: {}", config.config_path.display().to_string()),
         ));
     }
 
@@ -688,12 +688,12 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
     if ws.exists() {
         items.push(DiagItem::ok(
             cat,
-            format!("directory exists: {}", ws.display()),
+            format!("directory exists: {}", ws.display().to_string()),
         ));
     } else {
         items.push(DiagItem::error(
             cat,
-            format!("directory missing: {}", ws.display()),
+            format!("directory missing: {}", ws.display().to_string()),
         ));
         return;
     }

@@ -4,7 +4,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // ScoutSource
@@ -26,7 +25,7 @@ impl std::str::FromStr for ScoutSource {
             "clawhub" => Self::ClawHub,
             "huggingface" | "hf" => Self::HuggingFace,
             _ => {
-                warn!(source = s, "Unknown scout source, defaulting to GitHub");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"source": s})), "Unknown scout source, defaulting to GitHub");
                 Self::GitHub
             }
         })
@@ -166,43 +165,31 @@ impl Scout for GitHubScout {
                 "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=30",
                 urlencoding(query)
             );
-            debug!(query = query.as_str(), "Searching GitHub");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"query": query.as_str()})), "Searching GitHub");
 
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(
-                        query = query.as_str(),
-                        error = %e,
-                        "GitHub API request failed, skipping query"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"query": query.as_str(), "error": e.to_string()})), "GitHub API request failed, skipping query");
                     continue;
                 }
             };
 
             if !resp.status().is_success() {
-                warn!(
-                    status = %resp.status(),
-                    query = query.as_str(),
-                    "GitHub search returned non-200"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"status": resp.status().to_string(), "query": query.as_str()})), "GitHub search returned non-200");
                 continue;
             }
 
             let body: serde_json::Value = match resp.json().await {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(
-                        query = query.as_str(),
-                        error = %e,
-                        "Failed to parse GitHub response, skipping query"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"query": query.as_str(), "error": e.to_string()})), "Failed to parse GitHub response, skipping query");
                     continue;
                 }
             };
 
             let mut items = Self::parse_items(&body);
-            debug!(count = items.len(), query = query.as_str(), "Parsed items");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": items.len(), "query": query.as_str()})), "Parsed items");
             all.append(&mut items);
         }
 

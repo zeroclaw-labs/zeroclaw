@@ -768,6 +768,17 @@ mod tests {
                 Ok(guard.remove(0))
             }
         }
+        impl ::zeroclaw_api::attribution::Attributable for RecordingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str { "RecordingModelProvider" }
+        }
+
 
         pub fn make_memory() -> Arc<dyn Memory> {
             let cfg = MemoryConfig {
@@ -1008,7 +1019,7 @@ mod tests {
 
         // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
         let model_provider =
-            OpenAiCodexModelProvider::new(&ModelProviderRuntimeOptions::default(), None)
+            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
                 .expect("model_provider should initialize");
 
         let mut agent = Agent::builder()

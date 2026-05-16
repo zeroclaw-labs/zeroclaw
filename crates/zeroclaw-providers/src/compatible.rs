@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
 #[allow(clippy::struct_excessive_bools)]
 pub struct OpenAiCompatibleModelProvider {
+    /// `[providers.models.<alias>]` key this provider was constructed
+    /// under. Used by the `Attributable` impl so log emissions carry the
+    /// real composite (`<type>.<alias>`) instead of the bare type.
+    pub alias: String,
     pub name: String,
     pub base_url: String,
     pub credential: Option<String>,
@@ -150,15 +154,26 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
 
 impl OpenAiCompatibleModelProvider {
     pub fn new(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, false, None, false)
+        Self::new_with_options(
+            alias,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            None,
+            false,
+        )
     }
 
     pub fn new_with_vision(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -166,6 +181,7 @@ impl OpenAiCompatibleModelProvider {
         supports_vision: bool,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
@@ -181,6 +197,7 @@ impl OpenAiCompatibleModelProvider {
     /// Some model_providers (for example Kimi Code) require a specific User-Agent
     /// for request routing and policy enforcement.
     pub fn new_with_user_agent(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -188,6 +205,7 @@ impl OpenAiCompatibleModelProvider {
         user_agent: &str,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
@@ -199,6 +217,7 @@ impl OpenAiCompatibleModelProvider {
     }
 
     pub fn new_with_user_agent_and_vision(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -207,6 +226,7 @@ impl OpenAiCompatibleModelProvider {
         supports_vision: bool,
     ) -> Self {
         Self::new_with_options(
+            alias,
             name,
             base_url,
             credential,
@@ -220,15 +240,26 @@ impl OpenAiCompatibleModelProvider {
     /// For model_providers that do not support `role: system` (e.g. MiniMax).
     /// System prompt content is prepended to the first user message instead.
     pub fn new_merge_system_into_user(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
     ) -> Self {
-        Self::new_with_options(name, base_url, credential, auth_style, false, None, true)
+        Self::new_with_options(
+            alias,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            false,
+            None,
+            true,
+        )
     }
 
     fn new_with_options(
+        alias: &str,
         name: &str,
         base_url: &str,
         credential: Option<&str>,
@@ -238,6 +269,7 @@ impl OpenAiCompatibleModelProvider {
         merge_system_into_user: bool,
     ) -> Self {
         Self {
+            alias: alias.to_string(),
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
@@ -255,7 +287,6 @@ impl OpenAiCompatibleModelProvider {
             local_model_tool_sanitize: false,
         }
     }
-
     /// Opt this provider into per-model conservative tool-schema sanitization.
     /// Today the only trigger is the gemma-4 family on llama.cpp, where the
     /// upstream tool-call parser rejects empty-properties / non-string
@@ -389,7 +420,7 @@ impl OpenAiCompatibleModelProvider {
                         headers.insert(name, val);
                     }
                     _ => {
-                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"header": key})), "Skipping invalid extra header name or value");
                     }
                 }
             }
@@ -404,9 +435,7 @@ impl OpenAiCompatibleModelProvider {
             );
 
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!(
-                    "Failed to build proxied timeout client with custom headers: {error}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": error.to_string()})), "Failed to build proxied timeout client with custom headers: ");
                 Client::new()
             });
         }
@@ -441,7 +470,7 @@ impl OpenAiCompatibleModelProvider {
                         headers.insert(name, val);
                     }
                     _ => {
-                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"header": key})), "Skipping invalid extra header name or value");
                     }
                 }
             }
@@ -454,9 +483,7 @@ impl OpenAiCompatibleModelProvider {
                 "provider.compatible",
             );
             return builder.build().unwrap_or_else(|error| {
-                tracing::warn!(
-                    "Failed to build proxied streaming client with custom headers: {error}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": error.to_string()})), "Failed to build proxied streaming client with custom headers: ");
                 Client::new()
             });
         }
@@ -465,7 +492,7 @@ impl OpenAiCompatibleModelProvider {
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
-            tracing::warn!("Failed to build proxied streaming client: {error}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": error.to_string()})), "Failed to build proxied streaming client: ");
             Client::new()
         })
     }
@@ -994,11 +1021,7 @@ impl StreamToolCallAccumulator {
         {
             arguments
         } else {
-            tracing::warn!(
-                function = %name,
-                arguments = %arguments,
-                "Invalid JSON in streamed native tool-call arguments, using empty object"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"function": name, "arguments": arguments})), "Invalid JSON in streamed native tool-call arguments, using empty object");
             "{}".to_string()
         };
 
@@ -1045,7 +1068,7 @@ fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
 
     if let Some(ts) = obj.get("x_tool_start") {
         let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
-            tracing::debug!("proxy x_tool_start event missing required 'name' field");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "proxy x_tool_start event missing required 'name' field");
             return None;
         };
         let name = name.to_string();
@@ -1808,11 +1831,7 @@ impl OpenAiCompatibleModelProvider {
                     if serde_json::from_str::<serde_json::Value>(&arguments).is_ok() {
                         arguments
                     } else {
-                        tracing::warn!(
-                            function = %name,
-                            arguments = %arguments,
-                            "Invalid JSON in native tool-call arguments, using empty object"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"function": name, "arguments": arguments})), "Invalid JSON in native tool-call arguments, using empty object");
                         "{}".to_string()
                     };
                 Some(ProviderToolCall {
@@ -2106,10 +2125,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(
-                    "{} native tool call transport failed: {error}; falling back to history path",
-                    self.name
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("{} native tool call transport failed: {error}; falling back to history path", self.name));
                 let text = self
                     .chat_with_history(messages, model, Some(temperature))
                     .await?;
@@ -2603,6 +2619,19 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Plugin,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2612,7 +2641,9 @@ mod tests {
         url: &str,
         key: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
-        OpenAiCompatibleModelProvider::new(name, url, key, AuthStyle::Bearer)
+        OpenAiCompatibleModelProvider::new(
+"test",
+name, url, key, AuthStyle::Bearer)
     }
 
     #[test]
@@ -2793,6 +2824,7 @@ mod tests {
     #[test]
     fn x_api_key_auth_style() {
         let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "moonshot",
             "https://api.moonshot.cn",
             Some("ms-key"),
@@ -2804,6 +2836,7 @@ mod tests {
     #[test]
     fn custom_auth_style() {
         let p = OpenAiCompatibleModelProvider::new(
+            "test",
             "custom",
             "https://api.example.com",
             Some("key"),
@@ -2877,7 +2910,8 @@ mod tests {
     #[test]
     fn zhipu_jwt_auth_style_applies_correctly() {
         let p = OpenAiCompatibleModelProvider::new(
-            "Z.AI",
+"test",
+"Z.AI",
             "https://api.z.ai/api/coding/paas/v4",
             Some("testid.testsecret"),
             AuthStyle::ZhipuJwt,
@@ -3499,6 +3533,7 @@ mod tests {
     #[test]
     fn capabilities_reports_vision_for_qwen_compatible_provider() {
         let p = OpenAiCompatibleModelProvider::new_with_vision(
+            "test",
             "Qwen",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Some("k"),
@@ -3513,7 +3548,8 @@ mod tests {
     #[test]
     fn minimax_provider_supports_native_tool_calling_with_system_merge() {
         let p = OpenAiCompatibleModelProvider::new(
-            "MiniMax",
+"test",
+"MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
@@ -3544,6 +3580,7 @@ mod tests {
             ChatMessage::user("thanks"),
         ];
         let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3590,6 +3627,7 @@ mod tests {
             ChatMessage::assistant("Done"),
         ];
         let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3613,6 +3651,7 @@ mod tests {
             ChatMessage::user("bye"),
         ];
         let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -3643,7 +3682,8 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
         ];
         let p = OpenAiCompatibleModelProvider::new(
-            "NativeToolProvider",
+"test",
+"NativeToolProvider",
             "https://api.example.com/v1",
             Some("k"),
             AuthStyle::Bearer,
@@ -3663,6 +3703,7 @@ mod tests {
     #[test]
     fn user_agent_constructor_keeps_native_tool_calling_enabled() {
         let p = OpenAiCompatibleModelProvider::new_with_user_agent(
+            "test",
             "TestProvider",
             "https://example.com",
             Some("k"),
@@ -3678,6 +3719,7 @@ mod tests {
     #[test]
     fn user_agent_and_vision_constructor_preserves_capability_flags() {
         let p = OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+            "test",
             "VisionModelProvider",
             "https://example.com",
             Some("k"),
@@ -4566,6 +4608,7 @@ mod tests {
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
         let p = OpenAiCompatibleModelProvider::new_with_user_agent(
             "test",
+            "test",
             "https://example.com",
             None,
             AuthStyle::Bearer,
@@ -4719,6 +4762,7 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
         ];
         let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
@@ -4759,6 +4803,7 @@ mod tests {
             ChatMessage::assistant("Here are the results"),
         ];
         let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),

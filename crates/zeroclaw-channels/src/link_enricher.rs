@@ -233,7 +233,7 @@ pub async fn enrich_message(content: &str, config: &LinkEnricherConfig) -> Strin
                 enrichments.push(format!("[Link: {} — {}]", summary.title, summary.snippet));
             }
             None => {
-                tracing::debug!(url, "Link enricher: failed to fetch or extract summary");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"url": url})), "Link enricher: failed to fetch or extract summary");
             }
         }
     }

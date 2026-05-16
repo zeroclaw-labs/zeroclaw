@@ -21,18 +21,22 @@ pub struct ClawdTalkChannel {
     from_number: String,
     /// Allowed destination numbers/patterns
     allowed_destinations: Vec<String>,
+    /// The alias key under `[channels.clawdtalk.<alias>]` this handle is
+    /// bound to. Used for attribution.
+    alias: String,
     /// HTTP client for Telnyx API
     client: Client,
 }
 
 impl ClawdTalkChannel {
     /// Create a new ClawdTalk channel
-    pub fn new(config: ClawdTalkConfig) -> Self {
+    pub fn new(alias: impl Into<String>, config: ClawdTalkConfig) -> Self {
         Self {
             api_key: config.api_key,
             connection_id: config.connection_id,
             from_number: config.from_number,
             allowed_destinations: config.allowed_destinations,
+            alias: alias.into(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -144,7 +148,7 @@ impl ClawdTalkChannel {
 
         if !response.status().is_success() {
             let error = response.text().await?;
-            tracing::warn!("Failed to hangup call: {}", error);
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Failed to hangup call: {}", error));
         }
 
         Ok(())
@@ -247,6 +251,17 @@ struct VoiceSettings {
     speed: f32,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for ClawdTalkChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::ClawdTalk,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for ClawdTalkChannel {
     fn name(&self) -> &str {
@@ -275,7 +290,7 @@ impl Channel for ClawdTalkChannel {
         // ClawdTalk listens for incoming calls via webhooks
         // This would typically be handled by the gateway module
         // For now, we signal that this channel is ready and wait indefinitely
-        tracing::info!("channel listening for incoming calls");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel listening for incoming calls");
 
         // Keep the listener alive
         loop {
@@ -302,7 +317,7 @@ impl Channel for ClawdTalkChannel {
         match response {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
-                tracing::warn!(error = ?e, "health check failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "health check failed");
                 false
             }
         }
@@ -350,13 +365,13 @@ mod tests {
 
     #[test]
     fn creates_channel() {
-        let channel = ClawdTalkChannel::new(test_config());
+        let channel = ClawdTalkChannel::new("testbot", test_config());
         assert_eq!(channel.name(), "ClawdTalk");
     }
 
     #[test]
     fn destination_allowed_exact_match() {
-        let channel = ClawdTalkChannel::new(test_config());
+        let channel = ClawdTalkChannel::new("testbot", test_config());
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(!channel.is_destination_allowed("+14449876543"));
     }
@@ -365,7 +380,7 @@ mod tests {
     fn destination_allowed_wildcard() {
         let mut config = test_config();
         config.allowed_destinations = vec!["*".to_string()];
-        let channel = ClawdTalkChannel::new(config);
+        let channel = ClawdTalkChannel::new("testbot", config);
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(channel.is_destination_allowed("+14449876543"));
     }
@@ -374,7 +389,7 @@ mod tests {
     fn destination_allowed_empty_means_all() {
         let mut config = test_config();
         config.allowed_destinations = vec![];
-        let channel = ClawdTalkChannel::new(config);
+        let channel = ClawdTalkChannel::new("testbot", config);
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(channel.is_destination_allowed("+14449876543"));
     }

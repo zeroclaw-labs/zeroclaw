@@ -282,10 +282,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 .args(["kill-session", "-t", &cleanup_session])
                 .output()
                 .await;
-            tracing::info!(
-                session = cleanup_session,
-                "Claude Code runner session TTL expired, cleaned up"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session": cleanup_session})), "Claude Code runner session TTL expired, cleaned up");
         });
 
         // Build response

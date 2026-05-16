@@ -10,7 +10,6 @@ pub mod scout;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 
 use self::evaluate::{EvalResult, Evaluator, Recommendation};
 use self::integrate::Integrator;
@@ -122,7 +121,7 @@ impl SkillForge {
     /// Run the full pipeline: Scout → Evaluate → Integrate.
     pub async fn forge(&self) -> Result<ForgeReport> {
         if !self.config.enabled {
-            warn!("SkillForge is disabled — skipping");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "SkillForge is disabled — skipping");
             return Ok(ForgeReport {
                 discovered: 0,
                 evaluated: 0,
@@ -143,19 +142,16 @@ impl SkillForge {
                     let scout = GitHubScout::new(self.config.github_token.clone());
                     match scout.discover().await {
                         Ok(mut found) => {
-                            info!(count = found.len(), "GitHub scout returned candidates");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": found.len()})), "GitHub scout returned candidates");
                             candidates.append(&mut found);
                         }
                         Err(e) => {
-                            warn!(error = %e, "GitHub scout failed, continuing with other sources");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "GitHub scout failed, continuing with other sources");
                         }
                     }
                 }
                 ScoutSource::ClawHub | ScoutSource::HuggingFace => {
-                    info!(
-                        source = src.as_str(),
-                        "Source not yet implemented — skipping"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"source": src.as_str()})), "Source not yet implemented — skipping");
                 }
             }
         }
@@ -163,7 +159,7 @@ impl SkillForge {
         // Deduplicate by URL
         scout::dedup(&mut candidates);
         let discovered = candidates.len();
-        info!(discovered, "Total unique candidates after dedup");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"discovered": discovered})), "Total unique candidates after dedup");
 
         // --- Evaluate -------------------------------------------------------
         let results: Vec<EvalResult> = candidates
@@ -186,11 +182,7 @@ impl SkillForge {
                                 auto_integrated += 1;
                             }
                             Err(e) => {
-                                warn!(
-                                    skill = res.candidate.name.as_str(),
-                                    error = %e,
-                                    "Integration failed for candidate, continuing"
-                                );
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"skill": res.candidate.name.as_str(), "error": e.to_string()})), "Integration failed for candidate, continuing");
                             }
                         }
                     } else {
@@ -207,10 +199,7 @@ impl SkillForge {
             }
         }
 
-        info!(
-            auto_integrated,
-            manual_review, skipped, "Forge pipeline complete"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"auto_integrated": auto_integrated, "manual_review": manual_review, "skipped": skipped})), "Forge pipeline complete");
 
         Ok(ForgeReport {
             discovered,

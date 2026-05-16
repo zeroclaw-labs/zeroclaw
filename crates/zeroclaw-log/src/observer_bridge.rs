@@ -52,10 +52,11 @@ pub(crate) fn forward(event: &LogEvent) {
 }
 
 fn project(event: &LogEvent) -> Option<ObserverEvent> {
+    use crate::event::type_field;
     let action = event.event.action.as_str();
     let attribution = &event.zeroclaw;
     let model_provider = attribution
-        .get("model_provider_type")
+        .get(&type_field("model_provider"))
         .or_else(|| attribution.get("model_provider"))
         .unwrap_or_default()
         .to_string();
@@ -135,7 +136,7 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
         "heartbeat_tick" => Some(ObserverEvent::HeartbeatTick),
         "error" => Some(ObserverEvent::Error {
             component: attribution
-                .get("channel_type")
+                .get(&type_field("channel"))
                 .unwrap_or("system")
                 .to_string(),
             message: event.message.clone().unwrap_or_default(),

@@ -1,3 +1,4 @@
+#![allow(clippy::to_string_in_format_args)]
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
 //!
 //! ## Reserved Key Prefixes
@@ -93,6 +94,7 @@ fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<
         .as_deref()
         .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
     let memory = PostgresMemory::new(
+        "postgres",
         db_url,
         &storage.schema,
         &storage.table,
@@ -124,7 +126,7 @@ where
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new(workspace_dir, local)))
+            Ok(Box::new(LucidMemory::new("lucid", workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => {
             // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
@@ -138,14 +140,12 @@ where
             )
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
         }
-        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
+        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new("none"))),
         MemoryBackendKind::Unknown => {
-            tracing::warn!(
-                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
-            );
-            Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
+            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
         }
     }
 }
@@ -245,10 +245,7 @@ fn resolve_embedding_config(
         .iter()
         .find(|route| route.hint.trim() == hint)
     else {
-        tracing::warn!(
-            hint,
-            "Unknown embedding route hint; falling back to [memory] embedding settings"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"hint": hint})), "Unknown embedding route hint; falling back to [memory] embedding settings");
         return fallback;
     };
 
@@ -256,10 +253,7 @@ fn resolve_embedding_config(
     let model = route.model.trim();
     let dimensions = route.dimensions.unwrap_or(config.embedding_dimensions);
     if model_provider.is_empty() || model.is_empty() || dimensions == 0 {
-        tracing::warn!(
-            hint,
-            "Invalid embedding route configuration; falling back to [memory] embedding settings"
-        );
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"hint": hint})), "Invalid embedding route configuration; falling back to [memory] embedding settings");
         return fallback;
     }
 
@@ -306,7 +300,7 @@ pub fn create_memory_with_storage_and_routes(
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!(error = ?e, "memory hygiene skipped");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "memory hygiene skipped");
     }
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
@@ -318,7 +312,7 @@ pub fn create_memory_with_storage_and_routes(
         )
         && let Err(e) = snapshot::export_snapshot(workspace_dir)
     {
-        tracing::warn!(error = ?e, "memory snapshot skipped");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "memory snapshot skipped");
     }
 
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
@@ -330,15 +324,15 @@ pub fn create_memory_with_storage_and_routes(
         )
         && snapshot::should_hydrate(workspace_dir)
     {
-        tracing::info!("cold boot detected; hydrating from MEMORY_SNAPSHOT.md");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "cold boot detected; hydrating from MEMORY_SNAPSHOT.md");
         match snapshot::hydrate_from_snapshot(workspace_dir) {
             Ok(count) => {
                 if count > 0 {
-                    tracing::info!(count, "hydrated core memories from snapshot");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"count": count})), "hydrated core memories from snapshot");
                 }
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "memory hydration failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "memory hydration failed");
             }
         }
     }
@@ -359,6 +353,7 @@ pub fn create_memory_with_storage_and_routes(
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(
+            "sqlite",
             workspace_dir,
             embedder,
             config.vector_weight as f32,
@@ -399,12 +394,9 @@ pub fn create_memory_with_storage_and_routes(
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
             ));
-        tracing::info!(
-            "📦 Qdrant memory backend configured (url: {}, collection: {})",
-            url,
-            collection
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("📦 Qdrant memory backend configured (url: {}, collection: {})", url, collection));
         return Ok(Box::new(QdrantMemory::new_lazy(
+            "qdrant",
             &url,
             &collection,
             qdrant_api_key,
@@ -451,7 +443,7 @@ pub fn create_memory_for_migration(
     create_memory_with_builders(
         backend,
         workspace_dir,
-        || SqliteMemory::new(workspace_dir),
+        || SqliteMemory::new("sqlite", workspace_dir),
         " during migration",
     )
 }
@@ -485,14 +477,14 @@ pub async fn create_memory_for_agent(
     // shared backend. Skip the inner-backend factory entirely.
     if matches!(backend_kind, ConfigBackend::Markdown) {
         let own_workspace = config.agent_workspace_dir(agent_alias);
-        let own = MarkdownMemory::new(&own_workspace);
+        let own = MarkdownMemory::new("markdown", &own_workspace);
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
         for peer in &agent_cfg.workspace.read_memory_from {
             let peer_alias = peer.as_str();
             let peer_workspace = config.agent_workspace_dir(peer_alias);
             peers.push(agent_scoped_markdown::MarkdownPeer {
                 alias: peer_alias.to_string(),
-                memory: MarkdownMemory::new(&peer_workspace),
+                memory: MarkdownMemory::new("markdown", &peer_workspace),
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
@@ -501,7 +493,7 @@ pub async fn create_memory_for_agent(
 
     // None branch: nothing to scope, no agents-table lookup needed.
     if matches!(backend_kind, ConfigBackend::None) {
-        return Ok(Arc::new(NoneMemory::new()));
+        return Ok(Arc::new(NoneMemory::new("none")));
     }
 
     // SQL / Qdrant / Lucid: single install-wide backend; the
@@ -549,15 +541,11 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
         config.response_cache_max_entries,
     ) {
         Ok(cache) => {
-            tracing::info!(
-                "💾 Response cache enabled (TTL: {}min, max: {} entries)",
-                config.response_cache_ttl_minutes,
-                config.response_cache_max_entries
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("💾 Response cache enabled (TTL: {}min, max: {} entries)", config.response_cache_ttl_minutes, config.response_cache_max_entries));
             Some(cache)
         }
         Err(e) => {
-            tracing::warn!(error = ?e, "Response cache disabled due to error");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "Response cache disabled due to error");
             None
         }
     }

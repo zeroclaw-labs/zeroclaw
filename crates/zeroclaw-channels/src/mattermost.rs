@@ -130,7 +130,7 @@ impl MattermostChannel {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow::anyhow!("login succeeded but the response had no Token header"))?
             .to_string();
-        tracing::info!("login succeeded; session token cached");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "login succeeded; session token cached");
         Ok(token)
     }
 
@@ -165,9 +165,7 @@ impl MattermostChannel {
                 self.transcription = Some(config);
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"e": e.to_string()})), "transcription manager init failed, voice transcription disabled");
             }
         }
         self
@@ -195,7 +193,7 @@ impl MattermostChannel {
         let token = match self.token().await {
             Ok(t) => t.to_string(),
             Err(e) => {
-                tracing::warn!(error = ?e, "auth failed in get_bot_identity");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "auth failed in get_bot_identity");
                 return (String::new(), String::new());
             }
         };
@@ -241,11 +239,7 @@ impl MattermostChannel {
         if let Some(duration_ms) = audio_file.get("duration").and_then(|d| d.as_u64()) {
             let duration_secs = duration_ms / 1000;
             if duration_secs > config.max_duration_secs {
-                tracing::debug!(
-                    duration_secs,
-                    max = config.max_duration_secs,
-                    "audio attachment exceeds max duration, skipping"
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"duration_secs": duration_secs, "max": config.max_duration_secs})), "audio attachment exceeds max duration, skipping");
                 return None;
             }
         }
@@ -259,7 +253,7 @@ impl MattermostChannel {
         let token = match self.token().await {
             Ok(t) => t.to_string(),
             Err(e) => {
-                tracing::warn!(error = ?e, "audio download auth failed for {file_id}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "file_id": file_id})), "audio download auth failed for");
                 return None;
             }
         };
@@ -272,27 +266,27 @@ impl MattermostChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = ?e, "audio download failed for {file_id}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "file_id": file_id})), "audio download failed for");
                 return None;
             }
         };
 
         if !response.status().is_success() {
-            tracing::warn!("audio download returned {}: {file_id}", response.status());
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("audio download returned {}: {file_id}", response.status()));
             return None;
         }
 
         if let Some(content_length) = response.content_length()
             && content_length > MAX_MATTERMOST_AUDIO_BYTES
         {
-            tracing::warn!("audio file too large ({content_length} bytes): {file_id}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"content_length": content_length, "file_id": file_id})), "audio file too large ( bytes)");
             return None;
         }
 
         let bytes = match response.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = ?e, "failed to read audio bytes for {file_id}");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "file_id": file_id})), "failed to read audio bytes for");
                 return None;
             }
         };
@@ -301,17 +295,28 @@ impl MattermostChannel {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    tracing::info!("transcription returned empty text, skipping");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "transcription returned empty text, skipping");
                     None
                 } else {
                     Some(format!("[Voice] {trimmed}"))
                 }
             }
             Err(e) => {
-                tracing::warn!(error = ?e, "audio transcription failed");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "audio transcription failed");
                 None
             }
         }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MattermostChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Mattermost,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -368,10 +373,7 @@ impl Channel for MattermostChannel {
             anyhow::anyhow!("channel_ids must contain at least one entry for listening")
         })?;
         if self.channel_ids.len() > 1 {
-            tracing::warn!(
-                "channel_ids has {} entries; only the first ({channel_id}) is currently used for listening",
-                self.channel_ids.len()
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("channel_ids has {} entries; only the first ({channel_id}) is currently used for listening", self.channel_ids.len()));
         }
 
         // Resolve auth up front so misconfiguration fails fast at listen-time.
@@ -384,7 +386,7 @@ impl Channel for MattermostChannel {
             .unwrap_or_default()
             .as_millis()) as i64;
 
-        tracing::info!("channel listening on {}...", channel_id);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("channel listening on {}...", channel_id));
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -402,7 +404,7 @@ impl Channel for MattermostChannel {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "poll error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "poll error");
                     continue;
                 }
             };
@@ -410,7 +412,7 @@ impl Channel for MattermostChannel {
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "parse error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "parse error");
                     continue;
                 }
             };
@@ -502,7 +504,7 @@ impl Channel for MattermostChannel {
                     .await
                     && !r.status().is_success()
                 {
-                    tracing::debug!(status = %r.status(), "typing indicator failed");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"status": r.status().to_string()})), "typing indicator failed");
                 }
 
                 // Mattermost typing events expire after ~6s; re-fire every 4s.
@@ -552,7 +554,7 @@ impl MattermostChannel {
         };
 
         if !self.is_user_allowed(user_id) {
-            tracing::warn!("ignoring message from unauthorized user: {user_id}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id})), "ignoring message from unauthorized user");
             return None;
         }
 

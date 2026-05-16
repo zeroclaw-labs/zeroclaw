@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
 
 use super::event_matcher::{EventPattern, RoutineEvent, matches_any};
 
@@ -141,7 +140,7 @@ impl RoutinesEngine {
             }
 
             if !routine.enabled {
-                debug!(routine = %routine.name, "routine matched but disabled");
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"routine": routine.name})), "routine matched but disabled");
                 results.push(RoutineDispatchResult::Disabled {
                     routine_name: routine.name.clone(),
                 });
@@ -156,11 +155,7 @@ impl RoutinesEngine {
                 let cooldown = Duration::from_secs(routine.cooldown_secs);
                 if elapsed < cooldown {
                     let remaining = cooldown.saturating_sub(elapsed).as_secs();
-                    debug!(
-                        routine = %routine.name,
-                        remaining_secs = remaining,
-                        "routine in cooldown"
-                    );
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"routine": routine.name, "remaining_secs": remaining})), "routine in cooldown");
                     results.push(RoutineDispatchResult::Cooldown {
                         routine_name: routine.name.clone(),
                         remaining_secs: remaining,
@@ -169,7 +164,7 @@ impl RoutinesEngine {
                 }
             }
 
-            info!(routine = %routine.name, source = %event.source, topic = %event.topic, "routine fired");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"routine": routine.name, "source": event.source, "topic": event.topic})), "routine fired");
             self.cooldowns.insert(routine.name.clone(), now);
             results.push(RoutineDispatchResult::Fired {
                 routine_name: routine.name.clone(),
@@ -196,12 +191,12 @@ pub fn load_routines_from_file(path: &std::path::Path) -> Vec<Routine> {
         Ok(content) => match toml::from_str::<RoutinesManifest>(&content) {
             Ok(manifest) => manifest.routines,
             Err(e) => {
-                warn!(error = ?e, "Failed to parse routines file {}", path.display());
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), &format!("Failed to parse routines file {}", path.display().to_string()));
                 Vec::new()
             }
         },
         Err(e) => {
-            debug!(error = ?e, "Routines file not found at {}", path.display());
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string()})), &format!("Routines file not found at {}", path.display().to_string()));
             Vec::new()
         }
     }

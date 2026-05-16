@@ -13,6 +13,9 @@ pub struct RedditChannel {
     username: String,
     /// Empty = accept items from any subreddit the bot has access to.
     subreddits: Vec<String>,
+    /// The alias key under `[channels.reddit.<alias>]` this handle is
+    /// bound to. Used for attribution.
+    alias: String,
     auth: Mutex<RedditAuth>,
 }
 
@@ -67,6 +70,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl RedditChannel {
     pub fn new(
+        alias: impl Into<String>,
         client_id: String,
         client_secret: String,
         refresh_token: String,
@@ -79,6 +83,7 @@ impl RedditChannel {
             refresh_token,
             username,
             subreddits,
+            alias: alias.into(),
             auth: Mutex::new(RedditAuth {
                 access_token: String::new(),
                 expires_at: Instant::now(),
@@ -153,7 +158,7 @@ impl RedditChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            tracing::warn!("inbox fetch failed ({status}): {body}");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})), "inbox fetch failed");
             return Ok(Vec::new());
         }
 
@@ -179,7 +184,7 @@ impl RedditChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::warn!("mark_read failed: {}", resp.status());
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("mark_read failed: {}", resp.status()));
         }
         Ok(())
     }
@@ -233,6 +238,15 @@ impl RedditChannel {
             interruption_scope_id: None,
             attachments: vec![],
         })
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RedditChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Reddit)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -319,7 +333,7 @@ impl Channel for RedditChannel {
                     .join(", ")
             )
         };
-        tracing::info!("channel listening as u/{} {}...", self.username, scope);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("channel listening as u/{} {}...", self.username, scope));
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -327,7 +341,7 @@ impl Channel for RedditChannel {
             let items = match self.fetch_inbox().await {
                 Ok(items) => items,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "poll error");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "poll error");
                     continue;
                 }
             };
@@ -345,7 +359,7 @@ impl Channel for RedditChannel {
             }
 
             if let Err(e) = self.mark_read(&read_ids).await {
-                tracing::warn!(error = ?e, "mark_read error");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "mark_read error");
             }
         }
     }
@@ -361,6 +375,7 @@ mod tests {
 
     fn make_channel() -> RedditChannel {
         RedditChannel::new(
+            "testbot",
             "client_id".into(),
             "client_secret".into(),
             "refresh_token".into(),
@@ -371,6 +386,7 @@ mod tests {
 
     fn make_channel_with_sub(sub: &str) -> RedditChannel {
         RedditChannel::new(
+            "testbot",
             "client_id".into(),
             "client_secret".into(),
             "refresh_token".into(),

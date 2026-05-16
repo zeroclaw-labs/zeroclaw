@@ -37,6 +37,7 @@ use anyhow::{Result, anyhow};
 pub trait FamilyProviderFactory {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -69,10 +70,12 @@ pub trait CompatFamilySpec {
     /// variant.
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         let mut p = OpenAiCompatibleModelProvider::new(
+            alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
@@ -88,11 +91,12 @@ pub trait CompatFamilySpec {
 impl<T: CompatFamilySpec> FamilyProviderFactory for T {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(apply_compat_options(self.build_compat(key, api_url), opts))
+        Ok(apply_compat_options(self.build_compat(alias, key, api_url), opts))
     }
 }
 
@@ -158,7 +162,7 @@ pub fn dispatch_family_factory(
                                 &default_cfg
                             }
                         };
-                        cfg.create_provider(key, api_url, opts)
+                        cfg.create_provider(alias, key, api_url, opts)
                     }
                 )+
                 _ => Err(anyhow!(
@@ -422,10 +426,12 @@ impl CompatFamilySpec for VeniceModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::new(
+            alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
@@ -443,10 +449,12 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::new(
+            alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
@@ -466,6 +474,7 @@ impl CompatFamilySpec for XaiModelProviderConfig {
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -493,6 +502,7 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
             .transpose()?;
         let resolved_key = refreshed_key.as_deref().or(key);
         let p = OpenAiCompatibleModelProvider::new(
+            alias,
             "MiniMax",
             api_url.unwrap_or(crate::MINIMAX_INTL_BASE_URL),
             resolved_key,
@@ -515,11 +525,13 @@ impl CompatFamilySpec for GlmModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::ZhipuJwt;
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         // GLM exposes vision-capable models (e.g. `glm-4.5v`).
         OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
@@ -535,10 +547,12 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::new(
+            alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
@@ -556,11 +570,12 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     fn build_compat(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         let base_url = crate::qianfan_base_url(api_url);
-        OpenAiCompatibleModelProvider::new(Self::DISPLAY, &base_url, key, Self::AUTH)
+        OpenAiCompatibleModelProvider::new(alias, Self::DISPLAY, &base_url, key, Self::AUTH)
     }
 }
 
@@ -572,12 +587,13 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
 impl FamilyProviderFactory for OpenRouterModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut p =
-            crate::openrouter::OpenRouterModelProvider::new(key, opts.provider_timeout_secs)
+            crate::openrouter::OpenRouterModelProvider::new(alias, key, opts.provider_timeout_secs)
                 .with_max_tokens(opts.provider_max_tokens);
         if let Some(extra) = opts.provider_extra.clone() {
             p = p.with_extra_body(extra);
@@ -589,11 +605,12 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
 impl FamilyProviderFactory for AnthropicModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(key, api_url);
+        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(alias, key, api_url);
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
         }
@@ -604,6 +621,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
 impl FamilyProviderFactory for OpenAIModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -613,11 +631,10 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         // the typed alias — operators set it via the schema-mirror grammar
         // alongside any other OpenAI alias field.
         if self.base.requires_openai_auth {
-            return Ok(Box::new(
-                crate::openai_codex::OpenAiCodexModelProvider::new(opts, key)?,
-            ));
+            return Ok(Box::new(crate::openai_codex::OpenAiCodexModelProvider::new(alias, opts, key,
+            )?));
         }
-        let mut p = crate::openai::OpenAiModelProvider::with_base_url(api_url, key);
+        let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
@@ -628,6 +645,7 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
 impl FamilyProviderFactory for OllamaModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -644,7 +662,7 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
             self.temperature_override,
         );
         Ok(Box::new(
-            crate::ollama::OllamaModelProvider::new_with_reasoning(
+            crate::ollama::OllamaModelProvider::new_with_reasoning(alias,
                 api_url,
                 key,
                 opts.reasoning_enabled,
@@ -657,6 +675,7 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
 impl FamilyProviderFactory for GeminiModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -668,7 +687,7 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(crate::gemini::GeminiModelProvider::new_with_auth(
+        Ok(Box::new(crate::gemini::GeminiModelProvider::new_with_auth(alias,
             key,
             auth_service,
             opts.auth_profile_override.clone(),
@@ -682,17 +701,19 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
 impl FamilyProviderFactory for TelnyxModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::telnyx::TelnyxModelProvider::new(key)))
+        Ok(Box::new(crate::telnyx::TelnyxModelProvider::new(alias, key)))
     }
 }
 
 impl FamilyProviderFactory for AzureModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
@@ -713,28 +734,27 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             )
         })?;
         let api_version = self.api_version.as_deref();
-        Ok(Box::new(
-            crate::azure_openai::AzureOpenAiModelProvider::new(
-                key,
-                resource,
-                deployment,
-                api_version,
-            ),
-        ))
+        Ok(Box::new(crate::azure_openai::AzureOpenAiModelProvider::new(alias,
+            key,
+            resource,
+            deployment,
+            api_version,
+        )))
     }
 }
 
 impl FamilyProviderFactory for BedrockModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut p = if let Some(api_key) = key {
-            crate::bedrock::BedrockModelProvider::with_bearer_token(api_key)
+            crate::bedrock::BedrockModelProvider::with_bearer_token(alias, api_key)
         } else {
-            crate::bedrock::BedrockModelProvider::new()
+            crate::bedrock::BedrockModelProvider::new(alias)
         };
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
@@ -746,6 +766,7 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
 impl FamilyProviderFactory for QwenModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -796,6 +817,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
             .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
         let p = if oauth_context.credential.is_some() {
             OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+                alias,
                 "Qwen Code",
                 &base_url,
                 resolved_key,
@@ -805,6 +827,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
             )
         } else {
             OpenAiCompatibleModelProvider::new_with_vision(
+                alias,
                 "Qwen",
                 &base_url,
                 resolved_key,
@@ -819,11 +842,13 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
 impl FamilyProviderFactory for GroqModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut p = OpenAiCompatibleModelProvider::new(
+            alias,
             "Groq",
             "https://api.groq.com/openai/v1",
             key,
@@ -842,43 +867,49 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
 impl FamilyProviderFactory for CopilotModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::copilot::CopilotModelProvider::new(key)))
+        Ok(Box::new(
+            crate::copilot::CopilotModelProvider::new(alias, key),
+        ))
     }
 }
 
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         _key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::gemini_cli::GeminiCliModelProvider::new(
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::gemini_cli::GeminiCliModelProvider::new(alias, self.binary_path.as_deref()),
+        ))
     }
 }
 
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         _key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::kilocli::KiloCliModelProvider::new(
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::kilocli::KiloCliModelProvider::new(alias, self.binary_path.as_deref()),
+        ))
     }
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -888,6 +919,7 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or("lm-studio");
         let p = OpenAiCompatibleModelProvider::new(
+            alias,
             "LM Studio",
             api_url.unwrap_or("http://localhost:1234/v1"),
             Some(lm_studio_key),
@@ -900,6 +932,7 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
 impl FamilyProviderFactory for LlamacppModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -910,6 +943,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or("llama.cpp");
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
             "llama.cpp",
             base_url,
             Some(llama_cpp_key),
@@ -927,6 +961,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
 impl FamilyProviderFactory for OsaurusModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -936,6 +971,7 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             .filter(|value| !value.is_empty())
             .unwrap_or("osaurus");
         let p = OpenAiCompatibleModelProvider::new(
+            alias,
             "Osaurus",
             api_url.unwrap_or("http://localhost:1337/v1"),
             Some(osaurus_key),
@@ -948,11 +984,13 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
 impl FamilyProviderFactory for OvhModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         Ok(Box::new(crate::openai::OpenAiModelProvider::with_base_url(
+            alias,
             Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
             key,
         )))
@@ -962,6 +1000,7 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
 impl FamilyProviderFactory for CustomModelProviderConfig {
     fn create_provider(
         &self,
+        alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
@@ -973,6 +1012,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             )
         })?;
         let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
             "Custom",
             base_url,
             key,

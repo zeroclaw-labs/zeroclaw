@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 /// Gemini model_provider supporting multiple authentication methods.
 pub struct GeminiModelProvider {
+    /// `[model_providers.gemini.<alias>]` config-key alias.
+    alias: String,
     auth: Option<GeminiAuth>,
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Per-alias seed for the GCP project ID resolved against the
@@ -481,7 +483,7 @@ impl GeminiModelProvider {
     /// 1. Explicit API key passed in (from `[model_providers.gemini.<alias>]
     ///    api_key`, reachable via the schema-mirror env grammar)
     /// 2. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
-    pub fn new(api_key: Option<&str>) -> Self {
+    pub fn new(alias: &str, api_key: Option<&str>) -> Self {
         let oauth_cred_paths = Self::discover_oauth_cred_paths();
         let resolved_auth = api_key
             .and_then(Self::normalize_non_empty)
@@ -492,6 +494,7 @@ impl GeminiModelProvider {
             });
 
         Self {
+            alias: alias.to_string(),
             auth: resolved_auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: None,
@@ -503,7 +506,6 @@ impl GeminiModelProvider {
             oauth_client_secret: None,
         }
     }
-
     /// Create a new Gemini model_provider with managed OAuth from auth-profiles.json.
     ///
     /// Authentication priority:
@@ -511,6 +513,7 @@ impl GeminiModelProvider {
     /// 2. Managed OAuth from auth-profiles.json (if auth_service provided)
     /// 3. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new_with_auth(
+        alias: &str,
         api_key: Option<&str>,
         auth_service: AuthService,
         profile_override: Option<String>,
@@ -563,6 +566,7 @@ impl GeminiModelProvider {
         };
 
         Self {
+            alias: alias.to_string(),
             auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed,
@@ -737,7 +741,7 @@ impl GeminiModelProvider {
                     guard.client_secret.as_deref(),
                 )
                 .await?;
-                tracing::info!("Gemini CLI OAuth token refreshed successfully (runtime)");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Gemini CLI OAuth token refreshed successfully (runtime)");
                 guard.access_token = refreshed.access_token;
                 guard.expiry_millis = refreshed.expiry_millis;
             } else {
@@ -782,10 +786,7 @@ impl GeminiModelProvider {
                     let mut cached_project = self.oauth_project.lock().await;
                     *cached_project = None;
                 }
-                tracing::warn!(
-                    "Gemini OAuth: rotated credential to {}",
-                    self.oauth_cred_paths[next].display()
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Gemini OAuth: rotated credential to {}", self.oauth_cred_paths[next].display().to_string()));
                 return true;
             }
         }
@@ -876,9 +877,7 @@ impl GeminiModelProvider {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if let Some(seed) = project_seed {
-                tracing::warn!(
-                    "loadCodeAssist failed (HTTP {status}); using oauth_project seed fallback"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"status": status.to_string()})), "loadCodeAssist failed (HTTP ); using oauth_project seed fallback");
                 return Ok(seed);
             }
             anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
@@ -1167,9 +1166,7 @@ impl GeminiModelProvider {
             } else if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
             {
-                tracing::warn!(
-                    "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig");
                 response = self
                     .build_generate_content_request(
                         auth,
@@ -1193,9 +1190,7 @@ impl GeminiModelProvider {
             if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
             {
-                tracing::warn!(
-                    "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig");
                 response = self
                     .build_generate_content_request(
                         auth,
@@ -1391,6 +1386,19 @@ impl ModelProvider for GeminiModelProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for GeminiModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Gemini,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,6 +1417,7 @@ mod tests {
 
     fn test_model_provider(auth: Option<GeminiAuth>) -> GeminiModelProvider {
         GeminiModelProvider {
+            alias: "test".to_string(),
             auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: None,
@@ -1511,14 +1520,14 @@ mod tests {
 
     #[test]
     fn provider_creates_without_key() {
-        let model_provider = GeminiModelProvider::new(None);
+        let model_provider = GeminiModelProvider::new("test", None);
         // May pick up env vars; just verify it doesn't panic
         let _ = model_provider.auth_source();
     }
 
     #[test]
     fn provider_creates_with_key() {
-        let model_provider = GeminiModelProvider::new(Some("test-api-key"));
+        let model_provider = GeminiModelProvider::new("test", Some("test-api-key"));
         assert!(matches!(
             model_provider.auth,
             Some(GeminiAuth::ExplicitKey(ref key)) if key == "test-api-key"
@@ -1527,7 +1536,7 @@ mod tests {
 
     #[test]
     fn provider_rejects_empty_key() {
-        let model_provider = GeminiModelProvider::new(Some(""));
+        let model_provider = GeminiModelProvider::new("test", Some(""));
         assert!(!matches!(
             model_provider.auth,
             Some(GeminiAuth::ExplicitKey(_))
@@ -2193,6 +2202,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_managed_oauth_requires_auth_service() {
         let model_provider = GeminiModelProvider {
+            alias: "test".to_string(),
             auth: Some(GeminiAuth::ManagedOAuth),
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
             oauth_project_seed: None,

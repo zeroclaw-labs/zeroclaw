@@ -200,12 +200,7 @@ impl Tool for SendMessageToPeerTool {
                 if let Err(e) =
                     crate::agent::loop_::process_message(cfg, &recipient_alias, &body, None).await
                 {
-                    tracing::warn!(
-                        sender = %sender,
-                        recipient = %recipient_alias,
-                        error = %e,
-                        "peer-message in-process delivery failed",
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": e.to_string()})), "peer-message in-process delivery failed");
                 }
             });
 

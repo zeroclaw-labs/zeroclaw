@@ -165,11 +165,7 @@ impl Memory for AgentScopedMarkdownMemory {
                 .await
             {
                 Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
-                Err(error) => tracing::warn!(
-                    peer = %peer.alias,
-                    error = %error,
-                    "AgentScopedMarkdownMemory peer recall failed; continuing with other peers"
-                ),
+                Err(error) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"peer": peer.alias, "error": error.to_string()})), "AgentScopedMarkdownMemory peer recall failed; continuing with other peers"),
             }
         }
         merged.truncate(limit);
@@ -214,11 +210,7 @@ impl Memory for AgentScopedMarkdownMemory {
                 .await
             {
                 Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
-                Err(error) => tracing::warn!(
-                    peer = %peer.alias,
-                    error = %error,
-                    "AgentScopedMarkdownMemory peer recall failed; continuing with other peers"
-                ),
+                Err(error) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"peer": peer.alias, "error": error.to_string()})), "AgentScopedMarkdownMemory peer recall failed; continuing with other peers"),
             }
         }
         merged.truncate(limit);
@@ -252,6 +244,17 @@ impl Memory for AgentScopedMarkdownMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for AgentScopedMarkdownMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::AgentScopedMarkdown,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.own_alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,7 +264,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let mem = MarkdownMemory::new(&dir);
+        let mem = MarkdownMemory::new("markdown", &dir);
         (tmp, mem)
     }
 
@@ -270,7 +273,7 @@ mod tests {
         let (_tmp_a, own) = make_md("alpha-ws");
         let (_tmp_b, peer_mem) = make_md("beta-ws");
         let scoped = AgentScopedMarkdownMemory::new(
-            "alpha",
+"alpha",
             own,
             vec![MarkdownPeer {
                 alias: "beta".into(),
@@ -309,7 +312,7 @@ mod tests {
             .unwrap();
 
         let scoped = AgentScopedMarkdownMemory::new(
-            "alpha",
+"alpha",
             own,
             vec![MarkdownPeer {
                 alias: "beta".into(),
@@ -347,7 +350,7 @@ mod tests {
             .unwrap();
 
         let scoped = AgentScopedMarkdownMemory::new(
-            "alpha",
+"alpha",
             own,
             vec![MarkdownPeer {
                 alias: "beta".into(),
@@ -387,7 +390,8 @@ mod tests {
     #[tokio::test]
     async fn list_and_get_stamp_agent_alias_for_dashboard_parity() {
         let (_tmp, own) = make_md("alpha-ws");
-        let scoped = AgentScopedMarkdownMemory::new("alpha", own, vec![]);
+        let scoped = AgentScopedMarkdownMemory::new(
+"alpha", own, vec![]);
 
         scoped
             .store("note", "preferences", MemoryCategory::Core, None)
@@ -431,7 +435,7 @@ mod tests {
             .await
             .unwrap();
         let scoped = AgentScopedMarkdownMemory::new(
-            "alpha",
+"alpha",
             own,
             vec![MarkdownPeer {
                 alias: "beta".into(),

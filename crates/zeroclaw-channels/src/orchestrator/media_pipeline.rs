@@ -114,11 +114,7 @@ impl<'a> MediaPipeline<'a> {
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    file = %attachment.file_name,
-                    error = %err,
-                    "Media pipeline: audio transcription failed"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file": attachment.file_name, "error": err.to_string()})), "Media pipeline: audio transcription failed");
                 "[Audio: transcription failed]".to_string()
             }
         }

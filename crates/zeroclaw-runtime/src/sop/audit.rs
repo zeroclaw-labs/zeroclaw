@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tracing::{info, warn};
 
 use super::types::{SopRun, SopStepResult};
 use zeroclaw_memory::traits::{Memory, MemoryCategory};
@@ -27,10 +26,7 @@ impl SopAuditLogger {
         let key = run_key(&run.run_id);
         let content = serde_json::to_string_pretty(run)?;
         self.memory.store(&key, &content, category(), None).await?;
-        info!(
-            "SOP audit: run {} started for '{}'",
-            run.run_id, run.sop_name
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP audit: run {} started for '{}'", run.run_id, run.sop_name));
         Ok(())
     }
 
@@ -47,10 +43,7 @@ impl SopAuditLogger {
         let key = run_key(&run.run_id);
         let content = serde_json::to_string_pretty(run)?;
         self.memory.store(&key, &content, category(), None).await?;
-        info!(
-            "SOP audit: run {} finished with status {}",
-            run.run_id, run.status
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP audit: run {} finished with status {}", run.run_id, run.status));
         Ok(())
     }
 
@@ -59,10 +52,7 @@ impl SopAuditLogger {
         let key = format!("sop_approval_{}_{step_number}", run.run_id);
         let content = serde_json::to_string_pretty(run)?;
         self.memory.store(&key, &content, category(), None).await?;
-        info!(
-            "SOP audit: run {} step {step_number} approved by operator",
-            run.run_id
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP audit: run {} step {step_number} approved by operator", run.run_id));
         Ok(())
     }
 
@@ -71,10 +61,7 @@ impl SopAuditLogger {
         let key = format!("sop_timeout_approve_{}_{step_number}", run.run_id);
         let content = serde_json::to_string_pretty(run)?;
         self.memory.store(&key, &content, category(), None).await?;
-        info!(
-            "SOP audit: run {} step {step_number} auto-approved after timeout",
-            run.run_id
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("SOP audit: run {} step {step_number} auto-approved after timeout", run.run_id));
         Ok(())
     }
 
@@ -84,7 +71,7 @@ impl SopAuditLogger {
         match self.memory.get(&key).await? {
             Some(entry) => {
                 let run: SopRun = serde_json::from_str(&entry.content).map_err(|e| {
-                    warn!(error = ?e, "SOP audit: failed to parse run {run_id}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string(), "run_id": run_id})), "SOP audit: failed to parse run ");
                     e
                 })?;
                 Ok(Some(run))

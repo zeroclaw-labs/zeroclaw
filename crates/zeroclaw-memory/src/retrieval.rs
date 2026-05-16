@@ -126,7 +126,7 @@ impl RetrievalPipeline {
             match stage.as_str() {
                 "cache" => {
                     if let Some(cached) = self.check_cache(&ck) {
-                        tracing::debug!("retrieval pipeline: cache hit for '{query}'");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"query": query})), "retrieval pipeline: cache hit for ''");
                         return Ok(cached);
                     }
                 }
@@ -150,9 +150,7 @@ impl RetrievalPipeline {
                             && let Some(top_score) = results.first().and_then(|e| e.score)
                             && top_score >= self.config.fts_early_return_score
                         {
-                            tracing::debug!(
-                                "retrieval pipeline: FTS early return (score={top_score:.3})"
-                            );
+                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"top_score": top_score})), "retrieval pipeline: FTS early return (score=)");
                             self.store_in_cache(ck, results.clone());
                             return Ok(results);
                         }
@@ -162,7 +160,7 @@ impl RetrievalPipeline {
                     }
                 }
                 other => {
-                    tracing::warn!("retrieval pipeline: unknown stage '{other}', skipping");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"other": other})), "retrieval pipeline: unknown stage '', skipping");
                 }
             }
         }
@@ -189,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_returns_empty_from_none_backend() {
-        let memory = Arc::new(NoneMemory::new());
+        let memory = Arc::new(NoneMemory::new("none"));
         let pipeline = RetrievalPipeline::new(memory, RetrievalConfig::default());
 
         let results = pipeline
@@ -201,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_cache_invalidation() {
-        let memory = Arc::new(NoneMemory::new());
+        let memory = Arc::new(NoneMemory::new("none"));
         let pipeline = RetrievalPipeline::new(memory, RetrievalConfig::default());
 
         // Force a cache entry
@@ -225,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_caches_results() {
-        let memory = Arc::new(NoneMemory::new());
+        let memory = Arc::new(NoneMemory::new("none"));
         let config = RetrievalConfig {
             stages: vec!["cache".into()],
             ..Default::default()

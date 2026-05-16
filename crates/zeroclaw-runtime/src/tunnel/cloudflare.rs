@@ -89,7 +89,7 @@ impl Tunnel for CloudflareTunnel {
 
             match line {
                 Ok(Ok(Some(l))) => {
-                    tracing::debug!("cloudflared: {l}");
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"l": l})), "cloudflared: ");
                     if let Some(url) = extract_tunnel_url(&l) {
                         public_url = url;
                         break;

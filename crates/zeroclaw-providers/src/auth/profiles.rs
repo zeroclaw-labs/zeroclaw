@@ -469,7 +469,7 @@ impl AuthProfilesStore {
     async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create lock directory at {}", parent.display())
+                format!("Failed to create lock directory at {}", parent.display().to_string())
             })?;
         }
 
@@ -488,7 +488,7 @@ impl AuthProfilesStore {
                         fs::remove_file(&self.lock_path)
                             .await
                             .inspect(|e| {
-                                tracing::error!("Failed to remove auth profile lock file: {e:?}");
+                                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"e": format!("{:?}", e)})), "Failed to remove auth profile lock file: ");
                             })
                             .ok();
                         return Err(e).with_context(|| {

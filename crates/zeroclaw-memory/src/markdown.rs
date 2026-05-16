@@ -10,12 +10,14 @@ use tokio::fs;
 ///   workspace/MEMORY.md          — curated long-term memory (core)
 ///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
 pub struct MarkdownMemory {
+    alias: String,
     workspace_dir: PathBuf,
 }
 
 impl MarkdownMemory {
-    pub fn new(workspace_dir: &Path) -> Self {
+    pub fn new(alias: &str, workspace_dir: &Path) -> Self {
         Self {
+            alias: alias.to_string(),
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }
@@ -312,6 +314,17 @@ impl Memory for MarkdownMemory {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for MarkdownMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(
+            ::zeroclaw_api::attribution::MemoryKind::Markdown,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +332,7 @@ mod tests {
 
     fn temp_workspace() -> (TempDir, MarkdownMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = MarkdownMemory::new(tmp.path());
+        let mem = MarkdownMemory::new("markdown", tmp.path());
         (tmp, mem)
     }
 

@@ -38,15 +38,15 @@ pub fn audit_skill_directory_with_options(
     options: SkillAuditOptions,
 ) -> Result<SkillAuditReport> {
     if !skill_dir.exists() {
-        bail!("Skill source does not exist: {}", skill_dir.display());
+        bail!("Skill source does not exist: {}", skill_dir.display().to_string());
     }
     if !skill_dir.is_dir() {
-        bail!("Skill source must be a directory: {}", skill_dir.display());
+        bail!("Skill source must be a directory: {}", skill_dir.display().to_string());
     }
 
     let canonical_root = skill_dir
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", skill_dir.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", skill_dir.display().to_string()))?;
     let mut report = SkillAuditReport::default();
 
     let has_canonical = canonical_root.join(SKILL_MANIFEST_FILENAME).is_file();
@@ -69,14 +69,14 @@ pub fn audit_skill_directory_with_options(
 
 pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillAuditReport> {
     if !path.exists() {
-        bail!("Open-skill markdown not found: {}", path.display());
+        bail!("Open-skill markdown not found: {}", path.display().to_string());
     }
     let canonical_repo = repo_root
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", repo_root.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", repo_root.display().to_string()))?;
     let canonical_path = path
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", path.display().to_string()))?;
     if !canonical_path.starts_with(&canonical_repo) {
         bail!(
             "Open-skill markdown escapes repository root: {}",
@@ -105,7 +105,7 @@ fn collect_paths_depth_first(root: &Path) -> Result<Vec<PathBuf>> {
 
         let mut children = Vec::new();
         for entry in fs::read_dir(&current)
-            .with_context(|| format!("failed to read directory {}", current.display()))?
+            .with_context(|| format!("failed to read directory {}", current.display().to_string()))?
         {
             let entry = entry?;
             children.push(entry.path());
@@ -127,7 +127,7 @@ fn audit_path(
     options: SkillAuditOptions,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        .with_context(|| format!("failed to read metadata for {}", path.display().to_string()))?;
     let rel = relative_display(root, path);
 
     if metadata.file_type().is_symlink() {
@@ -165,7 +165,7 @@ fn audit_path(
 
 fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
     let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read markdown file {}", path.display()))?;
+        .with_context(|| format!("failed to read markdown file {}", path.display().to_string()))?;
 
     for raw_target in extract_markdown_links(&content) {
         audit_markdown_link_target(root, path, &raw_target, report);
@@ -176,7 +176,7 @@ fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
 
 fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
     let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read TOML manifest {}", path.display()))?;
+        .with_context(|| format!("failed to read TOML manifest {}", path.display().to_string()))?;
     let rel = relative_display(root, path);
     let parsed: toml::Value = match toml::from_str(&content) {
         Ok(value) => value,

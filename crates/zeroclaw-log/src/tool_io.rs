@@ -114,15 +114,14 @@ fn empty_unused_marker() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::ObservabilityConfig;
+    use crate::config::LogConfig;
 
     fn make_policy(io: &str, cap: usize, denylist: Vec<String>) -> ResolvedPolicy {
-        let cfg = ObservabilityConfig {
-            log_persistence: "rolling".into(),
+        let cfg = LogConfig {
             log_tool_io: io.into(),
             log_tool_io_truncate_bytes: cap,
             log_tool_io_denylist: denylist,
-            ..ObservabilityConfig::default()
+            ..LogConfig::default()
         };
         ResolvedPolicy::from_config(&cfg, std::path::Path::new("/"))
     }

@@ -89,7 +89,7 @@ impl DatasheetManager {
         let bytes = response.bytes().await?;
         std::fs::write(&dest, &bytes)?;
 
-        tracing::info!(device = %device_name, path = %dest.display(), "datasheet downloaded");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"device": device_name, "path": dest.display().to_string()})), "datasheet downloaded");
         Ok(dest)
     }
 

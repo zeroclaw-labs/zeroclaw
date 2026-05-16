@@ -13,13 +13,25 @@ use zeroclaw_log::{EventCategory, EventOutcome, LogEvent, Severity};
 
 pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
-/// Initialize log persistence from the observability config. Forwards to
-/// [`zeroclaw_log::init_from_config`].
+fn to_log_config(
+    config: &zeroclaw_config::schema::ObservabilityConfig,
+) -> zeroclaw_log::LogConfig {
+    zeroclaw_log::LogConfig {
+        log_persistence: config.log_persistence.clone(),
+        log_persistence_path: config.log_persistence_path.clone(),
+        log_persistence_max_entries: config.log_persistence_max_entries,
+        log_tool_io: config.log_tool_io.clone(),
+        log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
+        log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+    }
+}
+
+/// Initialize log persistence from the observability config.
 pub fn init_from_config(
     config: &zeroclaw_config::schema::ObservabilityConfig,
     workspace_dir: &Path,
 ) {
-    zeroclaw_log::init_from_config(config, workspace_dir);
+    zeroclaw_log::init_from_config(&to_log_config(config), workspace_dir);
 }
 
 /// Resolve the configured log path (used by the doctor command).
@@ -27,7 +39,7 @@ pub fn resolve_trace_path(
     config: &zeroclaw_config::schema::ObservabilityConfig,
     workspace_dir: &Path,
 ) -> std::path::PathBuf {
-    let policy = zeroclaw_log::ResolvedPolicy::from_config(config, workspace_dir);
+    let policy = zeroclaw_log::ResolvedPolicy::from_config(&to_log_config(config), workspace_dir);
     policy.path
 }
 

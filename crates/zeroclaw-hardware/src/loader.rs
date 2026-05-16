@@ -44,7 +44,7 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
     let tools_dir = match plugin_tools_dir() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = ?e, "cannot resolve plugin tools dir");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "cannot resolve plugin tools dir");
             return Vec::new();
         }
     };
@@ -52,17 +52,10 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
     // Create the directory tree if it is missing.
     if !tools_dir.exists() {
         if let Err(e) = fs::create_dir_all(&tools_dir) {
-            tracing::warn!(
-                "[registry] could not create {:?}: {}",
-                tools_dir.display(),
-                e
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("[registry] could not create {:?}: {}", tools_dir.display().to_string(), e));
             return Vec::new();
         }
-        tracing::info!(
-            "[registry] created plugin directory: {}",
-            tools_dir.display()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("[registry] created plugin directory: {}", tools_dir.display().to_string()));
     }
 
     println!(
@@ -84,7 +77,7 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
     let entries = match fs::read_dir(&tools_dir) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(error = ?e, "cannot read tools dir");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "cannot read tools dir");
             return Vec::new();
         }
     };
@@ -93,7 +86,7 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = ?e, "skipping unreadable dir entry");
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skipping unreadable dir entry");
                 continue;
             }
         };
@@ -108,21 +101,14 @@ pub fn scan_plugin_dir() -> Vec<LoadedPlugin> {
         let manifest_path = plugin_dir.join("tool.toml");
 
         if !manifest_path.exists() {
-            tracing::debug!(
-                "[registry] no tool.toml in {:?} — skipping",
-                plugin_dir.file_name().unwrap_or_default()
-            );
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("[registry] no tool.toml in {:?} — skipping", plugin_dir.file_name().unwrap_or_default()));
             continue;
         }
 
         match load_one_plugin(&plugin_dir, &manifest_path) {
             Ok(plugin) => plugins.push(plugin),
             Err(e) => {
-                tracing::warn!(
-                    "[registry] skipping plugin in {:?}: {}",
-                    plugin_dir.file_name().unwrap_or_default(),
-                    e
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("[registry] skipping plugin in {:?}: {}", plugin_dir.file_name().unwrap_or_default(), e));
             }
         }
     }
@@ -155,7 +141,7 @@ fn load_one_plugin(plugin_dir: &Path, manifest_path: &Path) -> Result<LoadedPlug
     let canonical_plugin_dir = plugin_dir.canonicalize().map_err(|e| {
         anyhow::anyhow!(
             "cannot canonicalize plugin dir {}: {}",
-            plugin_dir.display(),
+            plugin_dir.display().to_string(),
             e
         )
     })?;
@@ -169,14 +155,14 @@ fn load_one_plugin(plugin_dir: &Path, manifest_path: &Path) -> Result<LoadedPlug
     let binary_path = raw_binary_path.canonicalize().map_err(|e| {
         anyhow::anyhow!(
             "cannot canonicalize binary path {}: {}",
-            raw_binary_path.display(),
+            raw_binary_path.display().to_string(),
             e
         )
     })?;
     if !binary_path.starts_with(&canonical_plugin_dir) {
         anyhow::bail!(
             "manifest exec binary escapes plugin directory: {} is not under {}",
-            binary_path.display(),
+            binary_path.display().to_string(),
             canonical_plugin_dir.display()
         );
     }

@@ -27,7 +27,7 @@ async fn memory_persists_across_instances() {
 
     // Instance 1: store
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "project_deadline",
             "The deadline is March 30th 2026",
@@ -40,7 +40,7 @@ async fn memory_persists_across_instances() {
 
     // Instance 2: recall (simulates restart)
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let results = mem.recall("deadline", 5, None, None, None).await.unwrap();
         assert!(
             !results.is_empty(),
@@ -58,7 +58,7 @@ async fn memory_persists_across_instances() {
 #[tokio::test]
 async fn memory_recall_returns_relevant_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store(
         "user_name",
@@ -182,7 +182,7 @@ async fn agent_auto_saves_and_recalls_memory() {
 
     // Pre-seed memory with a fact
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "project_tech",
             "The project uses Rust and Tokio for async runtime",
@@ -217,7 +217,7 @@ async fn compressor_with_memory_saves_summary() {
     use zeroclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
     let config = ContextCompressionConfig {
         enabled: true,
@@ -460,7 +460,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 #[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
     let model_provider = MockModelProvider::new(vec![text_response(
         r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
@@ -490,7 +490,7 @@ async fn consolidation_extracts_facts_to_memory() {
 #[tokio::test]
 async fn memory_survives_rapid_consolidation() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
     // Simulate 10 rapid consolidation rounds
     for i in 0..10 {

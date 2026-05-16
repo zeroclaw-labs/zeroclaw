@@ -26,7 +26,6 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, error, info, warn};
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -243,10 +242,7 @@ impl GmailPushChannel {
         if *last_id == 0 {
             *last_id = watch.history_id;
         }
-        info!(
-            "Gmail watch registered — historyId={}, expiration={}",
-            watch.history_id, watch.expiration
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Gmail watch registered — historyId={}, expiration={}", watch.history_id, watch.expiration));
         Ok(watch)
     }
 
@@ -368,10 +364,7 @@ impl GmailPushChannel {
     /// Process a Pub/Sub push notification and dispatch new messages to the agent.
     pub async fn handle_notification(&self, envelope: &PubSubEnvelope) -> Result<()> {
         let notification = parse_notification(&envelope.message)?;
-        debug!(
-            "Gmail push notification: email={}, historyId={}",
-            notification.email_address, notification.history_id
-        );
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Gmail push notification: email={}, historyId={}", notification.email_address, notification.history_id));
 
         // Hold the lock across read-fetch-update to prevent duplicate
         // processing when concurrent webhook notifications arrive.
@@ -380,10 +373,7 @@ impl GmailPushChannel {
         if *last_id == 0 {
             // First notification — just record the history ID.
             *last_id = notification.history_id;
-            info!(
-                "Gmail push: first notification, seeding historyId={}",
-                notification.history_id
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Gmail push: first notification, seeding historyId={}", notification.history_id));
             return Ok(());
         }
 
@@ -393,14 +383,11 @@ impl GmailPushChannel {
         drop(last_id);
 
         if message_ids.is_empty() {
-            debug!("Gmail push: no new messages in history");
+            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Gmail push: no new messages in history");
             return Ok(());
         }
 
-        info!(
-            "Gmail push: {} new message(s) to process",
-            message_ids.len()
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Gmail push: {} new message(s) to process", message_ids.len()));
 
         // Clone the sender and drop the mutex immediately to avoid holding it
         // across network calls.
@@ -409,7 +396,7 @@ impl GmailPushChannel {
             match tx_guard.clone() {
                 Some(tx) => tx,
                 None => {
-                    warn!("Gmail push: no listener registered, dropping messages");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Gmail push: no listener registered, dropping messages");
                     return Ok(());
                 }
             }
@@ -422,7 +409,7 @@ impl GmailPushChannel {
                     let sender_email = extract_email_from_header(&sender);
 
                     if !self.is_sender_allowed(&sender_email) {
-                        warn!("Gmail push: blocked message from {}", sender_email);
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("Gmail push: blocked message from {}", sender_email));
                         continue;
                     }
 
@@ -455,17 +442,28 @@ impl GmailPushChannel {
                     };
 
                     if tx.send(channel_msg).await.is_err() {
-                        debug!("Gmail push: listener channel closed");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Gmail push: listener channel closed");
                         return Ok(());
                     }
                 }
                 Err(e) => {
-                    error!("Gmail push: failed to fetch message {}: {}", msg_id, e);
+                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure), &format!("Gmail push: failed to fetch message {}: {}", msg_id, e));
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for GmailPushChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::GmailPush,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -512,7 +510,7 @@ impl Channel for GmailPushChannel {
             return Err(anyhow!("Gmail send failed ({}): {}", status, text));
         }
 
-        info!("Gmail message sent to {}", message.recipient);
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("Gmail message sent to {}", message.recipient));
         Ok(())
     }
 
@@ -523,13 +521,13 @@ impl Channel for GmailPushChannel {
             *tx_guard = Some(tx);
         }
 
-        info!("Gmail push channel started — registering watch subscription");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Gmail push channel started — registering watch subscription");
 
         // Register initial watch
         if !self.config.webhook_url.is_empty()
             && let Err(e) = self.register_watch().await
         {
-            error!("Gmail watch registration failed: {e:#}");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"e": e.to_string()})), "Gmail watch registration failed");
             // Non-fatal — external subscription management may be in use
         }
 
@@ -538,9 +536,9 @@ impl Channel for GmailPushChannel {
         let renewal_interval = Duration::from_secs(6 * 24 * 60 * 60); // 6 days
         loop {
             tokio::time::sleep(renewal_interval).await;
-            info!("Gmail push: renewing watch subscription");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Gmail push: renewing watch subscription");
             if let Err(e) = self.register_watch().await {
-                error!("Gmail watch renewal failed: {e:#}");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"e": e.to_string()})), "Gmail watch renewal failed");
             }
         }
     }

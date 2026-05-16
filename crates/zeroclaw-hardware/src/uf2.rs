@@ -82,7 +82,7 @@ pub fn ensure_firmware_dir() -> Result<PathBuf> {
             );
         }
         std::fs::write(&uf2_path, PICO_UF2)?;
-        tracing::info!(path = %uf2_path.display(), "extracted bundled UF2");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": uf2_path.display().to_string()})), "extracted bundled UF2");
     }
 
     Ok(firmware_dir)
@@ -106,11 +106,7 @@ pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
     let src_str = uf2_src.to_string_lossy().into_owned();
     let dst_str = uf2_dst.to_string_lossy().into_owned();
 
-    tracing::info!(
-        src = %src_str,
-        dst = %dst_str,
-        "flashing UF2"
-    );
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"src": src_str, "dst": dst_str})), "flashing UF2");
 
     // Validate UF2 magic before any copy attempt — prevents flashing a stub.
     let data = std::fs::read(&uf2_src)?;
@@ -133,11 +129,11 @@ pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
 
         match result {
             Ok(Ok(_)) => {
-                tracing::info!("UF2 copy complete (std::fs::copy) — Pico will reboot");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "UF2 copy complete (std::fs::copy) — Pico will reboot");
                 return Ok(());
             }
-            Ok(Err(e)) => tracing::warn!("std::fs::copy failed ({}), trying cp", e),
-            Err(e) => tracing::warn!("std::fs::copy task failed ({}), trying cp", e),
+            Ok(Err(e)) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("std::fs::copy failed ({}), trying cp", e)),
+            Err(e) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("std::fs::copy task failed ({}), trying cp", e)),
         }
     }
 
@@ -157,17 +153,17 @@ pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
 
         match out {
             Err(_elapsed) => {
-                tracing::warn!("cp timed out after {}s, trying sudo cp", CP_TIMEOUT_SECS);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("cp timed out after {}s, trying sudo cp", CP_TIMEOUT_SECS));
             }
             Ok(Ok(o)) if o.status.success() => {
-                tracing::info!("UF2 copy complete (cp) — Pico will reboot");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "UF2 copy complete (cp) — Pico will reboot");
                 return Ok(());
             }
             Ok(Ok(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!("cp failed ({}), trying sudo cp", stderr.trim());
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("cp failed ({}), trying sudo cp", stderr.trim()));
             }
-            Ok(Err(e)) => tracing::warn!("cp spawn failed ({}), trying sudo cp", e),
+            Ok(Err(e)) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("cp spawn failed ({}), trying sudo cp", e)),
         }
     }
 
@@ -185,17 +181,17 @@ pub async fn flash_uf2(mount_point: &Path, firmware_dir: &Path) -> Result<()> {
 
         match out {
             Err(_elapsed) => {
-                tracing::warn!("sudo cp timed out after {}s", SUDO_CP_TIMEOUT_SECS);
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("sudo cp timed out after {}s", SUDO_CP_TIMEOUT_SECS));
             }
             Ok(Ok(o)) if o.status.success() => {
-                tracing::info!("UF2 copy complete (sudo cp) — Pico will reboot");
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "UF2 copy complete (sudo cp) — Pico will reboot");
                 return Ok(());
             }
             Ok(Ok(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::warn!("sudo cp failed: {}", stderr.trim());
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("sudo cp failed: {}", stderr.trim()));
             }
-            Ok(Err(e)) => tracing::warn!(error = ?e, "sudo cp spawn failed"),
+            Ok(Err(e)) => ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "sudo cp spawn failed"),
         }
     }
 
