@@ -114,8 +114,36 @@ impl RusqliteStore {
 
     /// Initialize all database tables
     fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        to_store_err!(conn.execute_batch(
+        let mut conn = self.conn.lock();
+
+        // Decide whether the `raw_id` ALTER is needed BEFORE opening the tx.
+        // PRAGMA table_info is read-only and may target a not-yet-created
+        // table (returns no rows) — in that case the CREATE TABLE inside the
+        // transaction will produce the column anyway, so `needs_raw_id` stays
+        // false and we correctly skip the ALTER.
+        let needs_raw_id = {
+            let mut stmt = conn.prepare("PRAGMA table_info(device_registry)")?;
+            let mut has_raw_id = false;
+            let mut table_exists = false;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for r in rows {
+                table_exists = true;
+                if r? == "raw_id" {
+                    has_raw_id = true;
+                    break;
+                }
+            }
+            table_exists && !has_raw_id
+        };
+
+        // Wrap CREATEs + the conditional ALTER in a single transaction so a
+        // crash between them can't leave the DB with new tables but no
+        // `raw_id` column — that state survives reboots because the PRAGMA
+        // probe sees the column as missing yet the ALTER may have already
+        // been recorded as run.
+        let tx = to_store_err!(conn.transaction())?;
+
+        to_store_err!(tx.execute_batch(
             "-- Main device table
             CREATE TABLE IF NOT EXISTS device (
                 id INTEGER PRIMARY KEY,
@@ -306,24 +334,18 @@ impl RusqliteStore {
 
         // Migration: ensure `raw_id` column exists on legacy device_registry
         // rows (added in wacore 0.6 for ADV identity-change detection).
-        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so we probe pragma
-        // table_info first and skip the ALTER if it has already been applied.
-        let needs_raw_id = {
-            let mut stmt = conn.prepare("PRAGMA table_info(device_registry)")?;
-            let mut has_raw_id = false;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            for r in rows {
-                if r? == "raw_id" {
-                    has_raw_id = true;
-                    break;
-                }
-            }
-            !has_raw_id
-        };
+        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so we use the pragma
+        // probe performed above to skip the ALTER if it is already applied.
+        // Runs inside the same transaction as the CREATEs so a crash between
+        // them rolls everything back.
         if needs_raw_id {
-            conn.execute("ALTER TABLE device_registry ADD COLUMN raw_id INTEGER", [])?;
+            to_store_err!(execute: tx.execute(
+                "ALTER TABLE device_registry ADD COLUMN raw_id INTEGER",
+                [],
+            ))?;
         }
 
+        to_store_err!(tx.commit())?;
         Ok(())
     }
 }
