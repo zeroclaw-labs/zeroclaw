@@ -3,6 +3,7 @@ pub use zeroclaw_runtime::skills::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 pub mod creator {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::creator::*;
@@ -106,7 +107,13 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             source,
             no_tier_banner,
         } => {
-            println!("Installing skill from: {source}");
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-install-start",
+                    &[("source", &source)]
+                )
+            );
 
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
@@ -118,7 +125,13 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install git skill source: {source}"))?
             } else if is_registry_source(&source) {
-                println!("  Resolving '{source}' from skills registry...");
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-registry",
+                        &[("source", &source)]
+                    )
+                );
                 install_registry_skill_source(
                     &source,
                     &skills_path,
@@ -132,14 +145,25 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install local skill source: {source}"))?
             };
+            let status = console::style("✓").green().bold().to_string();
+            let installed_path = installed_dir.display().to_string();
+            let files_scanned = files_scanned.to_string();
             println!(
-                "  {} Skill installed and audited: {} ({} files scanned)",
-                console::style("✓").green().bold(),
-                installed_dir.display(),
-                files_scanned
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-install-installed-audited",
+                    &[
+                        ("status", &status),
+                        ("path", &installed_path),
+                        ("files", &files_scanned)
+                    ]
+                )
             );
 
-            println!("  Security audit completed successfully.");
+            println!(
+                "{}",
+                get_required_cli_string("cli-skills-install-security-audit-completed")
+            );
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
