@@ -1811,7 +1811,7 @@ impl Default for PacingConfig {
 /// defaults, the observer is attached on each channel turn but every
 /// event short-circuits — no `StatusUpdate` is produced until the user
 /// explicitly enables a sub-toggle.
-#[derive(Debug, Clone, Deserialize, Serialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "progress_observer"]
 #[serde(default)]
@@ -19638,7 +19638,10 @@ allowed_users = ["@u:m"]
         let cfg: ProgressObserverConfig = toml::from_str(toml_input).unwrap();
         assert!(cfg.enabled);
         assert!(cfg.agent_start);
+        assert!(!cfg.agent_end);
+        assert!(!cfg.tool_call_start);
         assert!(!cfg.tool_call);
+        assert!(!cfg.llm_thinking);
         assert!(!cfg.error);
     }
 
