@@ -524,6 +524,52 @@ impl WuKongIMChannel {
         let _: serde_json::Value = self.send_rpc("send", params).await?;
         Ok(())
     }
+
+    /// Send a structured "application command" message (JSON-shaped payload
+    /// distinct from the base64-encoded text payload used by
+    /// [`send_text_message`]).
+    ///
+    /// Payload format decision (see spec OQ-2 / P-1): we send the JSON
+    /// object verbatim as `SendParams.payload`. The receive path
+    /// (`la_init_helloworld` parsing) treats `payload` as a JSON object
+    /// already, so the symmetric send shape is also JSON object. If WK
+    /// rejects this shape in the field, change the body of this helper
+    /// to base64-encode the serialized JSON into a `Value::String`.
+    async fn send_cmd_message(
+        &self,
+        channel_id: &str,
+        channel_type: u8,
+        cmd_payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id: channel_id.to_string(),
+            channel_type,
+            payload: cmd_payload,
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        Ok(())
+    }
+}
+
+fn phase_to_content(phase: &zeroclaw_api::channel::StatusPhase) -> &'static str {
+    use zeroclaw_api::channel::StatusPhase;
+    match phase {
+        StatusPhase::AgentStart => "Agent 启动",
+        StatusPhase::LlmThinking => "正在思考",
+        StatusPhase::ToolStart => "工具启动",
+        StatusPhase::ToolDone { success: true, .. } => "工具完成",
+        StatusPhase::ToolDone { success: false, .. } => "工具失败",
+        StatusPhase::Error => "错误",
+        StatusPhase::AgentEnd => "处理完成",
+    }
 }
 
 #[async_trait]
@@ -554,6 +600,28 @@ impl Channel for WuKongIMChannel {
         };
         let _: serde_json::Value = self.send_rpc("send", params).await?;
         Ok(())
+    }
+
+    async fn send_status_update(
+        &self,
+        recipient: &str,
+        _thread_ts: Option<&str>,
+        update: zeroclaw_api::channel::StatusUpdate,
+    ) -> anyhow::Result<()> {
+        if !self.progress_streaming {
+            return Ok(());
+        }
+        let (channel_id, channel_type) = parse_recipient(recipient);
+        let payload = serde_json::json!({
+            "cmd": "la_status_update",
+            "content": phase_to_content(&update.phase),
+            "param": {
+                "mid": update.execution_id,
+                "name": update.name,
+                "desc": update.desc,
+            }
+        });
+        self.send_cmd_message(&channel_id, channel_type, payload).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -769,5 +837,63 @@ mod tests {
         let memory = Arc::new(MockMemory);
         let ch = WuKongIMChannel::from_config(&make_config(vec![], false), &workspace, memory);
         assert_eq!(ch.name(), "wukongim");
+    }
+
+    fn make_test_channel(progress_streaming: bool) -> WuKongIMChannel {
+        let workspace = std::path::PathBuf::from("/tmp/test");
+        let memory = Arc::new(MockMemory);
+        let mut config = make_config(vec!["*".to_string()], false);
+        config.progress_streaming = progress_streaming;
+        WuKongIMChannel::from_config(&config, &workspace, memory)
+    }
+
+    #[test]
+    fn cmd_payload_serializes_with_known_shape() {
+        let payload = serde_json::json!({
+            "cmd": "la_status_update",
+            "content": "执行状态",
+            "param": {
+                "mid": "exec-9c4f",
+                "name": "shell",
+                "desc": "执行命令：ls",
+            }
+        });
+
+        let s = serde_json::to_string(&payload).unwrap();
+        assert!(s.contains("\"cmd\":\"la_status_update\""));
+        assert!(s.contains("\"mid\":\"exec-9c4f\""));
+        assert!(s.contains("\"desc\":\"执行命令：ls\""));
+    }
+
+    use zeroclaw_api::channel::StatusPhase;
+
+    #[test]
+    fn phase_to_content_covers_all_variants() {
+        assert_eq!(phase_to_content(&StatusPhase::AgentStart), "Agent 启动");
+        assert_eq!(phase_to_content(&StatusPhase::LlmThinking), "正在思考");
+        assert_eq!(phase_to_content(&StatusPhase::ToolStart), "工具启动");
+        assert_eq!(
+            phase_to_content(&StatusPhase::ToolDone { success: true, elapsed_ms: 0 }),
+            "工具完成",
+        );
+        assert_eq!(
+            phase_to_content(&StatusPhase::ToolDone { success: false, elapsed_ms: 0 }),
+            "工具失败",
+        );
+        assert_eq!(phase_to_content(&StatusPhase::Error), "错误");
+        assert_eq!(phase_to_content(&StatusPhase::AgentEnd), "处理完成");
+    }
+
+    #[tokio::test]
+    async fn send_status_update_returns_ok_when_opt_in_disabled() {
+        use zeroclaw_api::channel::{Channel, StatusUpdate};
+        let ch = make_test_channel(false);
+        let update = StatusUpdate {
+            execution_id: "e".into(),
+            phase: StatusPhase::AgentStart,
+            name: "agent".into(),
+            desc: "x".into(),
+        };
+        assert!(ch.send_status_update("P:u1", None, update).await.is_ok());
     }
 }
