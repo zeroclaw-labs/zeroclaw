@@ -112,7 +112,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN size=$(stat -c%s /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
-# Prepare runtime directory structure and default config inline (no extra stage)
+# Prepare runtime directory structure and default config inline (no extra stage).
+# Dashboard assets live at /usr/share/zeroclawlabs/web/dist (outside the documented
+# /zeroclaw-data mount point) so a bind mount on /zeroclaw-data cannot shadow them.
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
     printf '%s\n' \
         'workspace_dir = "/zeroclaw-data/workspace"' \
@@ -127,7 +129,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'host = "[::]"' \
         'allow_public_bind = true' \
         'require_pairing = false' \
-        'web_dist_dir = "/zeroclaw-data/web/dist"' \
+        'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
         '' \
         '[autonomy]' \
         'level = "supervised"' \
@@ -146,7 +148,9 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
-COPY --from=web-builder /app/web/dist /zeroclaw-data/web/dist
+# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
+# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
+COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
 COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
@@ -179,7 +183,9 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc7564
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
-COPY --from=web-builder /app/web/dist /zeroclaw-data/web/dist
+# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
+# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
+COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly

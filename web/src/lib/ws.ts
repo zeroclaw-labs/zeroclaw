@@ -1,4 +1,4 @@
-import type { WsMessage } from '../types/api';
+import type { ApprovalDecision, WsMessage } from '../types/api';
 import { getToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
@@ -113,6 +113,19 @@ export class WebSocketClient {
       throw new Error('WebSocket is not connected');
     }
     this.ws.send(JSON.stringify({ type: 'message', content }));
+  }
+
+  /**
+   * Reply to a supervised-mode tool `approval_request`. The backend matches
+   * the response by `request_id` and resolves the parked approval oneshot.
+   * If the socket is closed the request will auto-deny on the server side
+   * after the timeout, so we silently no-op rather than throwing.
+   */
+  sendApprovalResponse(requestId: string, decision: ApprovalDecision): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(
+      JSON.stringify({ type: 'approval_response', request_id: requestId, decision }),
+    );
   }
 
   /** Close the connection without auto-reconnecting. */
