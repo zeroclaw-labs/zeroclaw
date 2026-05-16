@@ -747,11 +747,16 @@ impl ProtocolStore for RusqliteStore {
         if entries.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
+        // Wrap the per-entry upserts in a transaction so a panic or connection
+        // drop mid-batch can't leave some (group, device) pairs flipped and
+        // others not — partial state would silently break SKDM resend logic.
+        let tx = to_store_err!(conn.transaction())?;
+
         for (device_jid, has_key) in entries {
-            to_store_err!(execute: conn.execute(
+            to_store_err!(execute: tx.execute(
                 "INSERT INTO sender_key_devices
                  (group_jid, device_jid, has_key, device_id, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -768,6 +773,7 @@ impl ProtocolStore for RusqliteStore {
             ))?;
         }
 
+        to_store_err!(tx.commit())?;
         Ok(())
     }
 
