@@ -47,12 +47,16 @@ pub struct WuKongIMChannel {
     pub(crate) mention_only: bool,
     pub(crate) dawn_url: String,
     pub(crate) dawn_token: String,
+    pub(crate) ack_reactions: bool,
+    pub(crate) ack_reactions_message: String,
+    pub(crate) ack_reactions_delay_secs: u64,
     pub(crate) memory: Arc<dyn Memory>,
     pub(crate) pending_responses:
         Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     pub(crate) pending_approvals: Arc<PendingApprovals>,
     pub(crate) ws_sink: Arc<RwLock<Option<WsSink>>>,
     pub(crate) downloads_dir: PathBuf,
+    pub(crate) last_message_time: Arc<RwLock<HashMap<String, Instant>>>,
     pub(crate) workspace_dir: PathBuf,
 }
 
@@ -74,11 +78,15 @@ impl WuKongIMChannel {
             mention_only: config.mention_only,
             dawn_url: config.dawn_url.clone(),
             dawn_token: config.dawn_token.clone(),
+            ack_reactions: config.ack_reactions,
+            ack_reactions_message: if config.ack_reactions_message.is_empty() { "👋 收到".to_string() } else { config.ack_reactions_message.clone() },
+            ack_reactions_delay_secs: config.ack_reactions_delay,
             memory,
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
             downloads_dir,
+            last_message_time: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }
@@ -421,6 +429,31 @@ impl WuKongIMChannel {
             }
         }
 
+        // Send quick acknowledgment message only if:
+        // 1. ack_reactions is enabled AND
+        // 2. More than 60 seconds have passed since the last message from this sender
+        if self.ack_reactions {
+            let sender_key = format!("{}:{}", params.channel_id, params.from_uid);
+            let now = Instant::now();
+            let should_send = {
+                let last_time = self.last_message_time.read().await;
+                match last_time.get(&sender_key) {
+                    Some(last) if now.duration_since(*last) < Duration::from_secs(self.ack_reactions_delay_secs) => false,
+                    _ => true,
+                }
+            };
+            if should_send {
+                let ack_msg = self.ack_reactions_message.clone();
+                let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
+                let _ = self.send_text_message(target_id, params.channel_type, &ack_msg).await;
+            }
+            // Update last message time
+            {
+                let mut last_time = self.last_message_time.write().await;
+                last_time.insert(sender_key, now);
+            }
+        }
+
         let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
         // Decode content by message type
@@ -463,6 +496,30 @@ impl WuKongIMChannel {
             tracing::info!("WuKongIM: message sent to orchestrator, updating sync state: seq={}, ts={}", params.message_seq, params.timestamp);
             self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
         }
+        Ok(())
+    }
+
+    async fn send_text_message(
+        &self,
+        channel_id: &str,
+        channel_type: u8,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let payload_b64 = encode_text_payload(text)?;
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id: channel_id.to_string(),
+            channel_type,
+            payload: payload_b64,
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
         Ok(())
     }
 }
