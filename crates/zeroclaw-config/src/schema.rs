@@ -7451,6 +7451,12 @@ pub struct SlackConfig {
     /// Enable this only if your Slack workspace supports the `markdown` block type.
     #[serde(default)]
     pub use_markdown_blocks: bool,
+    /// Whether Slack should auto-generate URL preview cards (unfurls) for
+    /// outbound messages. Defaults to true (Slack's native behavior). Set to
+    /// false when the bot frequently posts mrkdwn link references
+    /// (`<url|text>`) and the preview cards add noise.
+    #[serde(default = "default_true")]
+    pub unfurl: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]

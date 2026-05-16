@@ -38,6 +38,9 @@ pub struct SlackChannel {
     active_assistant_thread: Mutex<HashMap<String, String>>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
+    /// Whether Slack should auto-generate URL preview cards (unfurls) on
+    /// outbound messages. Defaults to true (Slack's native behavior).
+    unfurl: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     /// Voice transcription config — when set, audio file attachments are
@@ -180,6 +183,7 @@ impl SlackChannel {
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
             use_markdown_blocks: false,
+            unfurl: true,
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
@@ -230,6 +234,12 @@ impl SlackChannel {
     /// Only use this if your Slack workspace supports it.
     pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
         self.use_markdown_blocks = enabled;
+        self
+    }
+
+    /// Configure whether Slack should auto-generate URL preview cards (unfurls).
+    pub fn with_unfurl(mut self, enabled: bool) -> Self {
+        self.unfurl = enabled;
         self
     }
 
@@ -3396,6 +3406,12 @@ impl Channel for SlackChannel {
             }
             body
         };
+
+        let mut body = body;
+        if !self.unfurl {
+            body["unfurl_links"] = serde_json::Value::Bool(false);
+            body["unfurl_media"] = serde_json::Value::Bool(false);
+        }
 
         let resp = self
             .http_client()
