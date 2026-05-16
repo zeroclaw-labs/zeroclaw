@@ -76,9 +76,10 @@ pub async fn handle_sse_events(
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
             match result {
-                Ok(value) => Some(Ok::<_, Infallible>(
+                Ok(value) if is_public_sse_event(&value) => Some(Ok::<_, Infallible>(
                     Event::default().data(value.to_string()),
                 )),
+                Ok(_) => None,
                 Err(_) => None, // Skip lagged messages
             }
         },
@@ -97,8 +98,24 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    let events = state.event_buffer.snapshot();
+    let events: Vec<_> = state
+        .event_buffer
+        .snapshot()
+        .into_iter()
+        .filter(is_public_sse_event)
+        .collect();
     Json(serde_json::json!({ "events": events })).into_response()
+}
+
+/// Returns true for events that should be visible on the global SSE stream.
+///
+/// Contract: broadcast events must not include `session_id` unless they are
+/// intentionally scoped to that session and hidden from global `/api/events`.
+fn is_public_sse_event(event: &serde_json::Value) -> bool {
+    event
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
 }
 
 /// Broadcast observer that fans events out to SSE subscribers.
@@ -267,6 +284,22 @@ mod tests {
 
         assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
         assert!(buffer.snapshot().is_empty());
+    }
+
+    #[test]
+    fn session_scoped_events_are_not_public_sse_events() {
+        let session_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private session notification"
+        });
+        let global_event = serde_json::json!({
+            "type": "tool_call",
+            "tool": "shell"
+        });
+
+        assert!(!is_public_sse_event(&session_event));
+        assert!(is_public_sse_event(&global_event));
     }
 
     /// End-to-end coverage of the wiring `run_gateway` performs at startup:
