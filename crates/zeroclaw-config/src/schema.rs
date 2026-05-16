@@ -8423,10 +8423,24 @@ pub struct WuKongIMConfig {
     #[serde(default)]
     #[secret]
     pub dawn_token: String,
+    /// Whether to send quick acknowledgment message on message receipt. Default: true.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
+    /// Quick acknowledgment message sent on message receipt. Default: "👋 收到".
+    #[serde(default)]
+    pub ack_reactions_message: String,
+    /// Minimum interval (seconds) between acknowledgment messages for the same sender.
+    /// Messages received within this window will not trigger a quick reply. Default: 60.
+    #[serde(default = "default_ack_reactions_delay")]
+    pub ack_reactions_delay: u64,
 }
 
 fn default_wukongim_downloads_dir() -> String {
     "downloads".to_string()
+}
+
+fn default_ack_reactions_delay() -> u64 {
+    300
 }
 
 impl ChannelConfig for WuKongIMConfig {
