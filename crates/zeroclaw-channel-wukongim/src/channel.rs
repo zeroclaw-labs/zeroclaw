@@ -58,6 +58,7 @@ pub struct WuKongIMChannel {
     pub(crate) downloads_dir: PathBuf,
     pub(crate) last_message_time: Arc<RwLock<HashMap<String, Instant>>>,
     pub(crate) workspace_dir: PathBuf,
+    pub(crate) progress_streaming: bool,
 }
 
 impl WuKongIMChannel {
@@ -88,6 +89,7 @@ impl WuKongIMChannel {
             downloads_dir,
             last_message_time: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: workspace_dir.to_path_buf(),
+            progress_streaming: config.progress_streaming,
         }
     }
 
@@ -738,6 +740,10 @@ mod tests {
             downloads_dir: "downloads".to_string(),
             dawn_url: "".to_string(),
             dawn_token: "".to_string(),
+            ack_reactions: true,
+            ack_reactions_message: String::new(),
+            ack_reactions_delay: 60,
+            progress_streaming: false,
         }
     }
 

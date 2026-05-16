@@ -8512,6 +8512,14 @@ pub struct WuKongIMConfig {
     /// Messages received within this window will not trigger a quick reply. Default: 60.
     #[serde(default = "default_ack_reactions_delay")]
     pub ack_reactions_delay: u64,
+    /// Whether to opt in to receiving real-time agent-progress updates
+    /// via the `la_status_update` application command. Default: false.
+    ///
+    /// Independent of the global `[progress_observer]` master switch —
+    /// even when the runtime is producing StatusUpdates, they're silently
+    /// dropped here unless this channel opts in.
+    #[serde(default)]
+    pub progress_streaming: bool,
 }
 
 fn default_wukongim_downloads_dir() -> String {
