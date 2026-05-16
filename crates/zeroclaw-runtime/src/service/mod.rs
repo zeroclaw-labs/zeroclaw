@@ -673,9 +673,9 @@ fn install_macos(config: &Config) -> Result<()> {
     };
 
     let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>Label</key>
   <string>{label}</string>
@@ -1393,6 +1393,25 @@ mod tests {
     fn xml_escape_escapes_reserved_chars() {
         let escaped = xml_escape("<&>\"' and text");
         assert_eq!(escaped, "&lt;&amp;&gt;&quot;&apos; and text");
+    }
+
+    #[test]
+    fn macos_plist_template_uses_plain_xml_quotes() {
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+</dict>
+</plist>
+"#,
+            label = SERVICE_LABEL,
+        );
+
+        assert!(!plist.contains(r#"\""#));
+        assert!(plist.contains(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
     }
 
     #[cfg(not(target_os = "windows"))]
