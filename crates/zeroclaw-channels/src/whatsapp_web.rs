@@ -1452,7 +1452,7 @@ impl Channel for WhatsAppWebChannel {
                                     let bot_phone = bot_phone_inner.lock();
                                     if let Some(ref bp) = *bot_phone {
                                         let mentioned_jids =
-                                            Self::extract_mentioned_jids(&msg);
+                                            Self::extract_mentioned_jids(msg);
                                         if !Self::contains_bot_mention(
                                             &content,
                                             &mentioned_jids,
@@ -1574,7 +1574,7 @@ impl Channel for WhatsAppWebChannel {
                                 tracing::info!(
                                     "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)"
                                 );
-                                match Self::render_pairing_qr(&code) {
+                                match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();
                                         eprintln!(
