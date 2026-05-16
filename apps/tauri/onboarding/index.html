@@ -217,7 +217,7 @@
     <script>
       async function detectPlatform() {
         try {
-          return await callInvoke("get_runtime_platform");
+          return await tauriInvoke("get_runtime_platform");
         } catch (_) {
           // Fallback for browser-only preview without Tauri IPC.
           const ua = navigator.userAgent.toLowerCase();
@@ -418,7 +418,7 @@
         return window.__TAURI__?.core?.invoke ?? null;
       }
 
-      async function callInvoke(cmd, args) {
+      async function tauriInvoke(cmd, args) {
         const invoke = resolveInvoke();
         if (!invoke) {
           throw new Error(
@@ -561,7 +561,7 @@
 
       async function refresh() {
         try {
-          const list = await callInvoke("get_permissions_status");
+          const list = await tauriInvoke("get_permissions_status");
           const map = {};
           for (const p of list) map[p.name] = p.status;
           statusMap = map;
@@ -574,7 +574,7 @@
 
       async function grant(name) {
         try {
-          await callInvoke("request_permission", { name });
+          await tauriInvoke("request_permission", { name });
         } catch (err) {
           console.error("request_permission failed:", err);
           footerStatus.textContent = `Grant ${name}: ${String(err.message ?? err)}`;
@@ -589,7 +589,7 @@
           renderStep();
         } else {
           // Final step CTA → close wizard.
-          callInvoke("complete_onboarding").catch((err) => {
+          tauriInvoke("complete_onboarding").catch((err) => {
             footerStatus.textContent = String(err.message ?? err);
             footerStatus.style.color = "var(--bad)";
           });

@@ -109,7 +109,8 @@ fn snapshot() -> WindowsPrivacySnapshot {
 }
 
 fn open_settings(uri: &str) -> Result<(), String> {
-    // Empty string is the "window title" placeholder required by `start`.
+    // Empty string is the console-window title parameter required by `start`
+    // before URL arguments.
     let status = Command::new("cmd")
         .args(["/C", "start", "", uri])
         .status()

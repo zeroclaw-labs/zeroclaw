@@ -222,6 +222,6 @@ pub fn open_privacy_settings(pane: String) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = pane;
-        Err("Platform-specific privacy settings are unavailable on this OS".into())
+        Err("Privacy settings integration is only available on macOS and Windows".into())
     }
 }
