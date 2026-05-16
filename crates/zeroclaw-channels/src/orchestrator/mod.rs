@@ -3411,13 +3411,13 @@ async fn process_channel_message(
     };
 
     // Build progress-reporting observer (fire-and-forget per-message streaming)
-    let execution_id = uuid::Uuid::new_v4().to_string();
     let progress_cfg = &ctx.prompt_config.progress_observer;
     let progress_inner: Arc<dyn Observer> = if progress_cfg.enabled {
         if let Some(ref ch) = target_channel {
+            let execution_id = uuid::Uuid::new_v4().to_string();
             let toggles = progress_toggles_from_config(progress_cfg);
             Arc::new(ProgressReportingObserver::new(
-                execution_id.clone(),
+                execution_id,
                 Arc::clone(ch),
                 msg.reply_target.clone(),
                 followup_thread_id(&msg),
