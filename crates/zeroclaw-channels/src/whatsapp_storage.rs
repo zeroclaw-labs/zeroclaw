@@ -22,9 +22,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "whatsapp-web")]
-use prost::Message;
+use bytes::Bytes;
 #[cfg(feature = "whatsapp-web")]
-use wacore_binary::jid::Jid;
+use prost::Message;
 #[cfg(feature = "whatsapp-web")]
 use wacore::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
@@ -56,16 +56,23 @@ pub struct RusqliteStore {
 
 /// Helper macro to convert rusqlite errors to StoreError
 /// For execute statements that return usize, maps to ()
+///
+/// Wraps the underlying error in a `Box<dyn std::error::Error + Send + Sync>`
+/// to match the `StoreError::Database` variant signature in wacore 0.6.
 macro_rules! to_store_err {
     // For expressions returning Result<usize, E>
     (execute: $expr:expr) => {
-        $expr
-            .map(|_| ())
-            .map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))
+        $expr.map(|_| ()).map_err(|e| {
+            wacore::store::error::StoreError::Database(Box::new(e)
+                as Box<dyn std::error::Error + Send + Sync>)
+        })
     };
     // For other expressions
     ($expr:expr) => {
-        $expr.map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))
+        $expr.map_err(|e| {
+            wacore::store::error::StoreError::Database(Box::new(e)
+                as Box<dyn std::error::Error + Send + Sync>)
+        })
     };
 }
 
@@ -217,14 +224,43 @@ impl RusqliteStore {
             );
 
             -- Device registry for multi-device
+            -- `raw_id` (NULL on legacy rows) is the ADV identity index added
+            -- in wacore 0.6 — used to detect identity changes that require
+            -- full session/sender-key invalidation per WA Web parity.
             CREATE TABLE IF NOT EXISTS device_registry (
                 user_id TEXT NOT NULL,
                 devices_json TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 phash TEXT,
+                raw_id INTEGER,
                 device_id INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (user_id, device_id)
+            );
+
+            -- Per-device sender-key tracking (wacore 0.6: replaces the
+            -- skdm_recipients / sender_key_status pair). Each row records
+            -- whether a known group device has a valid sender key (1) or
+            -- needs a fresh SKDM (0).
+            CREATE TABLE IF NOT EXISTS sender_key_devices (
+                group_jid TEXT NOT NULL,
+                device_jid TEXT NOT NULL,
+                has_key INTEGER NOT NULL,
+                device_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (group_jid, device_jid, device_id)
+            );
+
+            -- Sent message retry store (wacore 0.6: WA Web getMessageTable
+            -- parity). Stores serialized payloads keyed by (chat, message_id)
+            -- so retry-receipts can re-encrypt + resend the original message.
+            CREATE TABLE IF NOT EXISTS sent_messages (
+                chat_jid TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                device_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_jid, message_id, device_id)
             );
 
             -- Base keys for collision detection
@@ -257,6 +293,27 @@ impl RusqliteStore {
                 PRIMARY KEY (jid, device_id)
             );",
         ))?;
+
+        // Migration: ensure `raw_id` column exists on legacy device_registry
+        // rows (added in wacore 0.6 for ADV identity-change detection).
+        // SQLite has no `IF NOT EXISTS` for ADD COLUMN, so we probe pragma
+        // table_info first and skip the ALTER if it has already been applied.
+        let needs_raw_id = {
+            let mut stmt = conn.prepare("PRAGMA table_info(device_registry)")?;
+            let mut has_raw_id = false;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for r in rows {
+                if r? == "raw_id" {
+                    has_raw_id = true;
+                    break;
+                }
+            }
+            !has_raw_id
+        };
+        if needs_raw_id {
+            conn.execute("ALTER TABLE device_registry ADD COLUMN raw_id INTEGER", [])?;
+        }
+
         Ok(())
     }
 }
@@ -282,7 +339,7 @@ impl SignalStore for RusqliteStore {
     async fn load_identity(
         &self,
         address: &str,
-    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<[u8; 32]>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key FROM identities WHERE address = ?1 AND device_id = ?2",
@@ -291,11 +348,19 @@ impl SignalStore for RusqliteStore {
         );
 
         match result {
-            Ok(key) => Ok(Some(key)),
+            Ok(key) => {
+                if key.len() != 32 {
+                    return Err(wacore::store::error::StoreError::Validation(format!(
+                        "identity key has invalid length {}, expected 32",
+                        key.len()
+                    )));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&key);
+                Ok(Some(arr))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -312,7 +377,7 @@ impl SignalStore for RusqliteStore {
     async fn get_session(
         &self,
         address: &str,
-    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Bytes>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM sessions WHERE address = ?1 AND device_id = ?2",
@@ -321,11 +386,9 @@ impl SignalStore for RusqliteStore {
         );
 
         match result {
-            Ok(record) => Ok(Some(record)),
+            Ok(record) => Ok(Some(Bytes::from(record))),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -366,7 +429,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn load_prekey(&self, id: u32) -> wacore::store::error::Result<Option<Vec<u8>>> {
+    async fn load_prekey(&self, id: u32) -> wacore::store::error::Result<Option<Bytes>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key FROM prekeys WHERE id = ?1 AND device_id = ?2",
@@ -375,11 +438,29 @@ impl SignalStore for RusqliteStore {
         );
 
         match result {
-            Ok(key) => Ok(Some(key)),
+            Ok(key) => Ok(Some(Bytes::from(key))),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
+        }
+    }
+
+    /// Get the maximum pre-key ID currently stored, or 0 if none exist.
+    /// Added in wacore 0.6: used for migrating `next_pre_key_id` counter when
+    /// initializing fresh devices that share storage with the legacy schema.
+    async fn get_max_prekey_id(&self) -> wacore::store::error::Result<u32> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT MAX(id) FROM prekeys WHERE device_id = ?1",
+            params![self.device_id],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+
+        match result {
+            // MAX returns NULL on empty table → Some(None); on non-empty → Some(Some(n))
+            Ok(Some(id)) => Ok(u32::try_from(id).unwrap_or(0)),
+            Ok(None) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -420,9 +501,7 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -483,9 +562,7 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -519,9 +596,7 @@ impl AppSyncStore for RusqliteStore {
         match result {
             Ok(key) => Ok(Some(key)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -607,9 +682,7 @@ impl AppSyncStore for RusqliteStore {
         match result {
             Ok(mac) => Ok(Some(mac)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -632,61 +705,130 @@ impl AppSyncStore for RusqliteStore {
 
         Ok(())
     }
+
+    /// Get the most recently stored app state sync key ID.
+    /// Added in wacore 0.6: used to seed app-state sync requests with the
+    /// freshest key identifier we hold rather than scanning the table on each
+    /// request.
+    async fn get_latest_sync_key_id(&self) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT key_id FROM app_state_keys
+             WHERE device_id = ?1
+             ORDER BY key_id DESC
+             LIMIT 1",
+            params![self.device_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+
+        match result {
+            Ok(key_id) => Ok(Some(key_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
+        }
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
-    // --- SKDM Tracking ---
+    // --- Per-Device Sender Key Tracking ---
+    //
+    // Replaces the wacore 0.2 SKDM-recipients model with WA Web's
+    // `participant.senderKey` map. Tracks per-device `(has_key)` status:
+    // `true` = SKDM already distributed, `false` = needs fresh SKDM.
+    // The legacy `skdm_recipients` table is kept around (no migration drops it)
+    // but is no longer read or written.
 
-    async fn get_skdm_recipients(
+    async fn get_sender_key_devices(
         &self,
         group_jid: &str,
-    ) -> wacore::store::error::Result<Vec<Jid>> {
+    ) -> wacore::store::error::Result<Vec<(String, bool)>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(conn.prepare(
-            "SELECT device_jid FROM skdm_recipients WHERE group_jid = ?1 AND device_id = ?2"
+            "SELECT device_jid, has_key FROM sender_key_devices
+             WHERE group_jid = ?1 AND device_id = ?2"
         ))?;
 
         let rows = to_store_err!(stmt.query_map(params![group_jid, self.device_id], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         }))?;
 
         let mut result = Vec::new();
         for row in rows {
-            let jid_str = to_store_err!(row)?;
-            if let Ok(jid) = jid_str.parse() {
-                result.push(jid);
-            }
+            let (device_jid, has_key) = to_store_err!(row)?;
+            result.push((device_jid, has_key != 0));
         }
 
         Ok(result)
     }
 
-    async fn add_skdm_recipients(
+    async fn set_sender_key_status(
         &self,
         group_jid: &str,
-        device_jids: &[Jid],
+        entries: &[(&str, bool)],
     ) -> wacore::store::error::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
-        for device_jid in device_jids {
+        for (device_jid, has_key) in entries {
             to_store_err!(execute: conn.execute(
-                "INSERT OR IGNORE INTO skdm_recipients (group_jid, device_jid, device_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![group_jid, device_jid.to_string(), self.device_id, now],
+                "INSERT INTO sender_key_devices
+                 (group_jid, device_jid, has_key, device_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(group_jid, device_jid, device_id) DO UPDATE SET
+                   has_key = excluded.has_key,
+                   updated_at = excluded.updated_at",
+                params![
+                    group_jid,
+                    device_jid,
+                    if *has_key { 1_i64 } else { 0_i64 },
+                    self.device_id,
+                    now,
+                ],
             ))?;
         }
 
         Ok(())
     }
 
-    async fn clear_skdm_recipients(&self, group_jid: &str) -> wacore::store::error::Result<()> {
+    async fn clear_sender_key_devices(
+        &self,
+        group_jid: &str,
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
-            "DELETE FROM skdm_recipients WHERE group_jid = ?1 AND device_id = ?2",
+            "DELETE FROM sender_key_devices WHERE group_jid = ?1 AND device_id = ?2",
             params![group_jid, self.device_id],
+        ))
+    }
+
+    async fn delete_sender_key_device_rows(
+        &self,
+        device_jids: &[&str],
+    ) -> wacore::store::error::Result<()> {
+        if device_jids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        for device_jid in device_jids {
+            to_store_err!(execute: conn.execute(
+                "DELETE FROM sender_key_devices
+                 WHERE device_jid = ?1 AND device_id = ?2",
+                params![device_jid, self.device_id],
+            ))?;
+        }
+        Ok(())
+    }
+
+    async fn clear_all_sender_key_devices(&self) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        to_store_err!(execute: conn.execute(
+            "DELETE FROM sender_key_devices WHERE device_id = ?1",
+            params![self.device_id],
         ))
     }
 
@@ -715,9 +857,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -745,9 +885,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -836,9 +974,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(same) => Ok(same),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -864,15 +1000,20 @@ impl ProtocolStore for RusqliteStore {
         let devices_json = to_store_err!(serde_json::to_string(&record.devices))?;
         let now = chrono::Utc::now().timestamp();
 
+        // raw_id is a wacore 0.6 addition for ADV identity-change detection.
+        // Stored as nullable INTEGER on the new `raw_id` column added by the
+        // schema migration; older rows with a NULL value behave as if no
+        // raw_id was ever recorded for the user (matching upstream behavior).
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO device_registry
-             (user_id, devices_json, timestamp, phash, device_id, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (user_id, devices_json, timestamp, phash, raw_id, device_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 record.user,
                 devices_json,
                 record.timestamp,
                 record.phash,
+                record.raw_id.map(|r| r as i64),
                 self.device_id,
                 now,
             ],
@@ -885,7 +1026,7 @@ impl ProtocolStore for RusqliteStore {
     ) -> wacore::store::error::Result<Option<DeviceListRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT user_id, devices_json, timestamp, phash
+            "SELECT user_id, devices_json, timestamp, phash, raw_id
              FROM device_registry WHERE user_id = ?1 AND device_id = ?2",
             params![user, self.device_id],
             |row| {
@@ -899,11 +1040,13 @@ impl ProtocolStore for RusqliteStore {
                 let devices_json: String = row.get(1)?;
                 let devices: Vec<DeviceInfo> =
                     serde_json::from_str(&devices_json).map_err(to_rusqlite_err)?;
+                let raw_id: Option<i64> = row.get(4)?;
                 Ok(DeviceListRecord {
                     user: row.get(0)?,
                     devices,
                     timestamp: row.get(2)?,
                     phash: row.get(3)?,
+                    raw_id: raw_id.map(|r| r as u32),
                 })
             },
         );
@@ -911,56 +1054,26 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
-    // --- Sender Key Status (Lazy Deletion) ---
-
-    async fn mark_forget_sender_key(
-        &self,
-        group_jid: &str,
-        participant: &str,
-    ) -> wacore::store::error::Result<()> {
+    /// Delete a device list record, forcing a network re-fetch on next query.
+    /// Added in wacore 0.6.
+    async fn delete_devices(&self, user: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
-        let now = chrono::Utc::now().timestamp();
-
         to_store_err!(execute: conn.execute(
-            "INSERT OR REPLACE INTO sender_key_status (group_jid, participant, device_id, marked_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![group_jid, participant, self.device_id, now],
+            "DELETE FROM device_registry WHERE user_id = ?1 AND device_id = ?2",
+            params![user, self.device_id],
         ))
     }
 
-    async fn consume_forget_marks(
-        &self,
-        group_jid: &str,
-    ) -> wacore::store::error::Result<Vec<String>> {
-        let conn = self.conn.lock();
-        let mut stmt = to_store_err!(conn.prepare(
-            "SELECT participant FROM sender_key_status
-             WHERE group_jid = ?1 AND device_id = ?2"
-        ))?;
-
-        let rows = to_store_err!(stmt.query_map(params![group_jid, self.device_id], |row| {
-            row.get::<_, String>(0)
-        }))?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(to_store_err!(row)?);
-        }
-
-        // Delete the marks after consuming them
-        to_store_err!(execute: conn.execute(
-            "DELETE FROM sender_key_status WHERE group_jid = ?1 AND device_id = ?2",
-            params![group_jid, self.device_id],
-        ))?;
-
-        Ok(result)
-    }
+    // NOTE: `mark_forget_sender_key` / `consume_forget_marks` were dropped from
+    // ProtocolStore in wacore 0.6. The lazy-deletion semantics they implemented
+    // (a separate "marked for forget" set drained on next send) are now handled
+    // in-band by the boolean status column on `sender_key_devices` (see
+    // `set_sender_key_status` above). The old `sender_key_status` table is left
+    // in place but is no longer read or written.
 
     // --- TcToken Storage ---
 
@@ -985,9 +1098,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 
@@ -1049,15 +1160,106 @@ impl ProtocolStore for RusqliteStore {
                 "DELETE FROM tc_tokens WHERE token_timestamp < ?1 AND device_id = ?2",
                 params![cutoff_timestamp, self.device_id],
             )
-            .map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))?;
+            .map_err(|e| {
+                wacore::store::error::StoreError::Database(
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                )
+            })?;
 
         let deleted = u32::try_from(deleted).map_err(|_| {
-            wacore::store::error::StoreError::Database(format!(
+            wacore::store::error::StoreError::Validation(format!(
                 "Affected row count overflowed u32: {deleted}"
             ))
         })?;
 
         Ok(deleted)
+    }
+
+    // --- Sent Message Store (retry support) ---
+    //
+    // Added in wacore 0.6 to mirror WA Web's `getMessageTable`. Each outbound
+    // send writes the protobuf-encoded payload here keyed by (chat_jid,
+    // message_id); retry-receipt handling consumes (atomic SELECT + DELETE)
+    // the entry so we don't double-retry. Expiry is invoked from a periodic
+    // cleanup hook ZeroClaw doesn't yet schedule — see TODO in
+    // `delete_expired_sent_messages`.
+
+    async fn store_sent_message(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        payload: &[u8],
+    ) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        to_store_err!(execute: conn.execute(
+            "INSERT OR REPLACE INTO sent_messages
+             (chat_jid, message_id, payload, device_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_jid, message_id, payload, self.device_id, now],
+        ))
+    }
+
+    async fn take_sent_message(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        let mut conn = self.conn.lock();
+        // Atomic SELECT+DELETE under an immediate transaction matches upstream's
+        // SqliteStore::take_sent_message: prevents two concurrent retry-receipts
+        // from each consuming and re-encrypting the same payload.
+        let tx = to_store_err!(conn.transaction())?;
+
+        let payload: Option<Vec<u8>> = match tx.query_row(
+            "SELECT payload FROM sent_messages
+             WHERE chat_jid = ?1 AND message_id = ?2 AND device_id = ?3",
+            params![chat_jid, message_id, self.device_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(p) => Some(p),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                return Err(wacore::store::error::StoreError::Database(Box::new(e)));
+            }
+        };
+
+        if payload.is_some() {
+            to_store_err!(execute: tx.execute(
+                "DELETE FROM sent_messages
+                 WHERE chat_jid = ?1 AND message_id = ?2 AND device_id = ?3",
+                params![chat_jid, message_id, self.device_id],
+            ))?;
+        }
+
+        to_store_err!(tx.commit())?;
+        Ok(payload)
+    }
+
+    /// Delete sent messages older than `cutoff_timestamp` (unix seconds).
+    /// TODO(wacore-0.6): wire to a periodic cleanup cron in the daemon. The
+    /// current implementation is correct but the table will grow unbounded
+    /// until the cron is hooked up.
+    async fn delete_expired_sent_messages(
+        &self,
+        cutoff_timestamp: i64,
+    ) -> wacore::store::error::Result<u32> {
+        let conn = self.conn.lock();
+        let deleted = conn
+            .execute(
+                "DELETE FROM sent_messages WHERE created_at < ?1 AND device_id = ?2",
+                params![cutoff_timestamp, self.device_id],
+            )
+            .map_err(|e| {
+                wacore::store::error::StoreError::Database(
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                )
+            })?;
+        u32::try_from(deleted).map_err(|_| {
+            wacore::store::error::StoreError::Validation(format!(
+                "Affected row count overflowed u32: {deleted}"
+            ))
+        })
     }
 }
 
@@ -1219,9 +1421,7 @@ impl DeviceStoreTrait for RusqliteStore {
         match result {
             Ok(device) => Ok(Some(device)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wacore::store::error::StoreError::Database(
-                e.to_string(),
-            )),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
     }
 

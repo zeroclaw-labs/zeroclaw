@@ -69,6 +69,10 @@ cpal = { version = "0.15", optional = true }
 whatsapp-rust-ureq-http-client = { version = "0.6", optional = true }
 whatsapp-rust-tokio-transport = { version = "0.6", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
+# `bytes` is required for the `Bytes` return types in wacore 0.6 storage
+# traits (SignalStore::get_session / load_prekey). Feature-gated to
+# whatsapp-web alongside the rest of the WA Web stack.
+bytes = { version = "1", optional = true }
 shellexpand = "3.1"
 
 # WeChat iLink (optional) — AES-128-ECB and MD5 are mandated by the iLink
@@ -93,7 +97,7 @@ channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
-whatsapp-web = ["dep:whatsapp-rust", "dep:wacore", "dep:wacore-binary", "dep:waproto", "dep:serde-big-array", "dep:whatsapp-rust-ureq-http-client", "dep:whatsapp-rust-tokio-transport", "dep:qrcode"]
+whatsapp-web = ["dep:whatsapp-rust", "dep:wacore", "dep:wacore-binary", "dep:waproto", "dep:serde-big-array", "dep:whatsapp-rust-ureq-http-client", "dep:whatsapp-rust-tokio-transport", "dep:qrcode", "dep:bytes", "dep:prost"]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
 channel-slack = []
