@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-progress-observer = { workspace = true }
 zeroclaw-channel-wukongim = { workspace = true, optional = true }
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = true }

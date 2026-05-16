@@ -105,6 +105,8 @@ use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer, runtime_trace};
+use zeroclaw_config::schema::ProgressObserverConfig;
+use zeroclaw_progress_observer::{ProgressEventToggles, ProgressReportingObserver};
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
@@ -169,6 +171,17 @@ impl Observer for ChannelNotifyObserver {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn progress_toggles_from_config(cfg: &ProgressObserverConfig) -> ProgressEventToggles {
+    ProgressEventToggles {
+        agent_start: cfg.agent_start,
+        agent_end: cfg.agent_end,
+        tool_call_start: cfg.tool_call_start,
+        tool_call: cfg.tool_call,
+        llm_thinking: cfg.llm_thinking,
+        error: cfg.error,
     }
 }
 
@@ -3397,10 +3410,31 @@ async fn process_channel_message(
         _ => None,
     };
 
+    // Build progress-reporting observer (fire-and-forget per-message streaming)
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let progress_cfg = &ctx.prompt_config.progress_observer;
+    let progress_inner: Arc<dyn Observer> = if progress_cfg.enabled {
+        if let Some(ref ch) = target_channel {
+            let toggles = progress_toggles_from_config(progress_cfg);
+            Arc::new(ProgressReportingObserver::new(
+                execution_id.clone(),
+                Arc::clone(ch),
+                msg.reply_target.clone(),
+                followup_thread_id(&msg),
+                toggles,
+                Arc::clone(&ctx.observer),
+            ))
+        } else {
+            Arc::clone(&ctx.observer)
+        }
+    } else {
+        Arc::clone(&ctx.observer)
+    };
+
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
-        inner: Arc::clone(&ctx.observer),
+        inner: progress_inner,
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
     });
