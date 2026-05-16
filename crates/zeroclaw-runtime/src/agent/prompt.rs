@@ -496,7 +496,7 @@ mod tests {
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -542,7 +542,7 @@ mod tests {
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
