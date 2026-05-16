@@ -57,15 +57,17 @@ webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
 # WhatsApp Web (optional)
-wa-rs = { version = "0.2", optional = true, default-features = false }
-wa-rs-core = { version = "0.2", optional = true, default-features = false }
-wa-rs-binary = { version = "0.2", optional = true, default-features = false }
-wa-rs-proto = { version = "0.2", optional = true, default-features = false }
+# Upstream-published crates (oxidezap/whatsapp-rust 0.6 on crates.io, 2026-05-11).
+# Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
+whatsapp-rust = { version = "0.6", optional = true, default-features = false, features = ["tokio-runtime"] }
+wacore = { version = "0.6", optional = true, default-features = false }
+wacore-binary = { version = "0.6", optional = true, default-features = false }
+waproto = { version = "0.6", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.15", optional = true }
-wa-rs-ureq-http = { version = "0.2", optional = true }
-wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { version = "0.6", optional = true }
+whatsapp-rust-tokio-transport = { version = "0.6", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
 shellexpand = "3.1"
 
@@ -91,7 +93,7 @@ channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode"]
+whatsapp-web = ["dep:whatsapp-rust", "dep:wacore", "dep:wacore-binary", "dep:waproto", "dep:serde-big-array", "dep:whatsapp-rust-ureq-http-client", "dep:whatsapp-rust-tokio-transport", "dep:qrcode"]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
 channel-slack = []

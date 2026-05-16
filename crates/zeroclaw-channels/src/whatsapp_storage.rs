@@ -24,19 +24,19 @@ use std::sync::Arc;
 #[cfg(feature = "whatsapp-web")]
 use prost::Message;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_binary::jid::Jid;
+use wacore_binary::jid::Jid;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::appstate::hash::HashState;
+use wacore::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::appstate::processor::AppStateMutationMAC;
+use wacore::appstate::processor::AppStateMutationMAC;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::Device as CoreDevice;
+use wacore::store::Device as CoreDevice;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::traits::DeviceInfo;
+use wacore::store::traits::DeviceInfo;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::traits::DeviceStore as DeviceStoreTrait;
+use wacore::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::traits::*;
+use wacore::store::traits::*;
 
 /// Custom wa-rs storage backend using rusqlite
 ///
@@ -61,11 +61,11 @@ macro_rules! to_store_err {
     (execute: $expr:expr) => {
         $expr
             .map(|_| ())
-            .map_err(|e| wa_rs_core::store::error::StoreError::Database(e.to_string()))
+            .map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))
     };
     // For other expressions
     ($expr:expr) => {
-        $expr.map_err(|e| wa_rs_core::store::error::StoreError::Database(e.to_string()))
+        $expr.map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))
     };
 }
 
@@ -270,7 +270,7 @@ impl SignalStore for RusqliteStore {
         &self,
         address: &str,
         key: [u8; 32],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO identities (address, key, device_id)
@@ -282,7 +282,7 @@ impl SignalStore for RusqliteStore {
     async fn load_identity(
         &self,
         address: &str,
-    ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key FROM identities WHERE address = ?1 AND device_id = ?2",
@@ -293,13 +293,13 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(key) => Ok(Some(key)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
     }
 
-    async fn delete_identity(&self, address: &str) -> wa_rs_core::store::error::Result<()> {
+    async fn delete_identity(&self, address: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM identities WHERE address = ?1 AND device_id = ?2",
@@ -312,7 +312,7 @@ impl SignalStore for RusqliteStore {
     async fn get_session(
         &self,
         address: &str,
-    ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM sessions WHERE address = ?1 AND device_id = ?2",
@@ -323,7 +323,7 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -333,7 +333,7 @@ impl SignalStore for RusqliteStore {
         &self,
         address: &str,
         session: &[u8],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO sessions (address, record, device_id)
@@ -342,7 +342,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn delete_session(&self, address: &str) -> wa_rs_core::store::error::Result<()> {
+    async fn delete_session(&self, address: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM sessions WHERE address = ?1 AND device_id = ?2",
@@ -357,7 +357,7 @@ impl SignalStore for RusqliteStore {
         id: u32,
         record: &[u8],
         uploaded: bool,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO prekeys (id, key, uploaded, device_id)
@@ -366,7 +366,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn load_prekey(&self, id: u32) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    async fn load_prekey(&self, id: u32) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key FROM prekeys WHERE id = ?1 AND device_id = ?2",
@@ -377,13 +377,13 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(key) => Ok(Some(key)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
     }
 
-    async fn remove_prekey(&self, id: u32) -> wa_rs_core::store::error::Result<()> {
+    async fn remove_prekey(&self, id: u32) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM prekeys WHERE id = ?1 AND device_id = ?2",
@@ -397,7 +397,7 @@ impl SignalStore for RusqliteStore {
         &self,
         id: u32,
         record: &[u8],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO signed_prekeys (id, record, device_id)
@@ -409,7 +409,7 @@ impl SignalStore for RusqliteStore {
     async fn load_signed_prekey(
         &self,
         id: u32,
-    ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM signed_prekeys WHERE id = ?1 AND device_id = ?2",
@@ -420,7 +420,7 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -428,7 +428,7 @@ impl SignalStore for RusqliteStore {
 
     async fn load_all_signed_prekeys(
         &self,
-    ) -> wa_rs_core::store::error::Result<Vec<(u32, Vec<u8>)>> {
+    ) -> wacore::store::error::Result<Vec<(u32, Vec<u8>)>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(
             conn.prepare("SELECT id, record FROM signed_prekeys WHERE device_id = ?1")
@@ -446,7 +446,7 @@ impl SignalStore for RusqliteStore {
         Ok(result)
     }
 
-    async fn remove_signed_prekey(&self, id: u32) -> wa_rs_core::store::error::Result<()> {
+    async fn remove_signed_prekey(&self, id: u32) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM signed_prekeys WHERE id = ?1 AND device_id = ?2",
@@ -460,7 +460,7 @@ impl SignalStore for RusqliteStore {
         &self,
         address: &str,
         record: &[u8],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO sender_keys (address, record, device_id)
@@ -472,7 +472,7 @@ impl SignalStore for RusqliteStore {
     async fn get_sender_key(
         &self,
         address: &str,
-    ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM sender_keys WHERE address = ?1 AND device_id = ?2",
@@ -483,13 +483,13 @@ impl SignalStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
     }
 
-    async fn delete_sender_key(&self, address: &str) -> wa_rs_core::store::error::Result<()> {
+    async fn delete_sender_key(&self, address: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM sender_keys WHERE address = ?1 AND device_id = ?2",
@@ -504,7 +504,7 @@ impl AppSyncStore for RusqliteStore {
     async fn get_sync_key(
         &self,
         key_id: &[u8],
-    ) -> wa_rs_core::store::error::Result<Option<AppStateSyncKey>> {
+    ) -> wacore::store::error::Result<Option<AppStateSyncKey>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key_data FROM app_state_keys WHERE key_id = ?1 AND device_id = ?2",
@@ -519,7 +519,7 @@ impl AppSyncStore for RusqliteStore {
         match result {
             Ok(key) => Ok(Some(key)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -529,7 +529,7 @@ impl AppSyncStore for RusqliteStore {
         &self,
         key_id: &[u8],
         key: AppStateSyncKey,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let key_data = to_store_err!(serde_json::to_vec(&key))?;
 
@@ -540,7 +540,7 @@ impl AppSyncStore for RusqliteStore {
         ))
     }
 
-    async fn get_version(&self, name: &str) -> wa_rs_core::store::error::Result<HashState> {
+    async fn get_version(&self, name: &str) -> wacore::store::error::Result<HashState> {
         let conn = self.conn.lock();
         let state_data: Vec<u8> = to_store_err!(conn.query_row(
             "SELECT state_data FROM app_state_versions WHERE name = ?1 AND device_id = ?2",
@@ -555,7 +555,7 @@ impl AppSyncStore for RusqliteStore {
         &self,
         name: &str,
         state: HashState,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let state_data = to_store_err!(serde_json::to_vec(&state))?;
 
@@ -571,7 +571,7 @@ impl AppSyncStore for RusqliteStore {
         name: &str,
         version: u64,
         mutations: &[AppStateMutationMAC],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
 
         for mutation in mutations {
@@ -593,7 +593,7 @@ impl AppSyncStore for RusqliteStore {
         &self,
         name: &str,
         index_mac: &[u8],
-    ) -> wa_rs_core::store::error::Result<Option<Vec<u8>>> {
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
 
@@ -607,7 +607,7 @@ impl AppSyncStore for RusqliteStore {
         match result {
             Ok(mac) => Ok(Some(mac)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -617,7 +617,7 @@ impl AppSyncStore for RusqliteStore {
         &self,
         name: &str,
         index_macs: &[Vec<u8>],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
 
         for index_mac in index_macs {
@@ -642,7 +642,7 @@ impl ProtocolStore for RusqliteStore {
     async fn get_skdm_recipients(
         &self,
         group_jid: &str,
-    ) -> wa_rs_core::store::error::Result<Vec<Jid>> {
+    ) -> wacore::store::error::Result<Vec<Jid>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(conn.prepare(
             "SELECT device_jid FROM skdm_recipients WHERE group_jid = ?1 AND device_id = ?2"
@@ -667,7 +667,7 @@ impl ProtocolStore for RusqliteStore {
         &self,
         group_jid: &str,
         device_jids: &[Jid],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
@@ -682,7 +682,7 @@ impl ProtocolStore for RusqliteStore {
         Ok(())
     }
 
-    async fn clear_skdm_recipients(&self, group_jid: &str) -> wa_rs_core::store::error::Result<()> {
+    async fn clear_skdm_recipients(&self, group_jid: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM skdm_recipients WHERE group_jid = ?1 AND device_id = ?2",
@@ -695,7 +695,7 @@ impl ProtocolStore for RusqliteStore {
     async fn get_lid_mapping(
         &self,
         lid: &str,
-    ) -> wa_rs_core::store::error::Result<Option<LidPnMappingEntry>> {
+    ) -> wacore::store::error::Result<Option<LidPnMappingEntry>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT lid, phone_number, created_at, learning_source, updated_at
@@ -715,7 +715,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -724,7 +724,7 @@ impl ProtocolStore for RusqliteStore {
     async fn get_pn_mapping(
         &self,
         phone: &str,
-    ) -> wa_rs_core::store::error::Result<Option<LidPnMappingEntry>> {
+    ) -> wacore::store::error::Result<Option<LidPnMappingEntry>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT lid, phone_number, created_at, learning_source, updated_at
@@ -745,7 +745,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -754,7 +754,7 @@ impl ProtocolStore for RusqliteStore {
     async fn put_lid_mapping(
         &self,
         entry: &LidPnMappingEntry,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO lid_pn_mapping
@@ -773,7 +773,7 @@ impl ProtocolStore for RusqliteStore {
 
     async fn get_all_lid_mappings(
         &self,
-    ) -> wa_rs_core::store::error::Result<Vec<LidPnMappingEntry>> {
+    ) -> wacore::store::error::Result<Vec<LidPnMappingEntry>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(conn.prepare(
             "SELECT lid, phone_number, created_at, learning_source, updated_at
@@ -805,7 +805,7 @@ impl ProtocolStore for RusqliteStore {
         address: &str,
         message_id: &str,
         base_key: &[u8],
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
@@ -821,7 +821,7 @@ impl ProtocolStore for RusqliteStore {
         address: &str,
         message_id: &str,
         current_base_key: &[u8],
-    ) -> wa_rs_core::store::error::Result<bool> {
+    ) -> wacore::store::error::Result<bool> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT base_key FROM base_keys
@@ -836,7 +836,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(same) => Ok(same),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -846,7 +846,7 @@ impl ProtocolStore for RusqliteStore {
         &self,
         address: &str,
         message_id: &str,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM base_keys WHERE address = ?1 AND message_id = ?2 AND device_id = ?3",
@@ -859,7 +859,7 @@ impl ProtocolStore for RusqliteStore {
     async fn update_device_list(
         &self,
         record: DeviceListRecord,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let devices_json = to_store_err!(serde_json::to_string(&record.devices))?;
         let now = chrono::Utc::now().timestamp();
@@ -882,7 +882,7 @@ impl ProtocolStore for RusqliteStore {
     async fn get_devices(
         &self,
         user: &str,
-    ) -> wa_rs_core::store::error::Result<Option<DeviceListRecord>> {
+    ) -> wacore::store::error::Result<Option<DeviceListRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT user_id, devices_json, timestamp, phash
@@ -911,7 +911,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -923,7 +923,7 @@ impl ProtocolStore for RusqliteStore {
         &self,
         group_jid: &str,
         participant: &str,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
@@ -937,7 +937,7 @@ impl ProtocolStore for RusqliteStore {
     async fn consume_forget_marks(
         &self,
         group_jid: &str,
-    ) -> wa_rs_core::store::error::Result<Vec<String>> {
+    ) -> wacore::store::error::Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(conn.prepare(
             "SELECT participant FROM sender_key_status
@@ -967,7 +967,7 @@ impl ProtocolStore for RusqliteStore {
     async fn get_tc_token(
         &self,
         jid: &str,
-    ) -> wa_rs_core::store::error::Result<Option<TcTokenEntry>> {
+    ) -> wacore::store::error::Result<Option<TcTokenEntry>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT token, token_timestamp, sender_timestamp FROM tc_tokens
@@ -985,7 +985,7 @@ impl ProtocolStore for RusqliteStore {
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
@@ -995,7 +995,7 @@ impl ProtocolStore for RusqliteStore {
         &self,
         jid: &str,
         entry: &TcTokenEntry,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
 
@@ -1014,7 +1014,7 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
-    async fn delete_tc_token(&self, jid: &str) -> wa_rs_core::store::error::Result<()> {
+    async fn delete_tc_token(&self, jid: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM tc_tokens WHERE jid = ?1 AND device_id = ?2",
@@ -1022,7 +1022,7 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
-    async fn get_all_tc_token_jids(&self) -> wa_rs_core::store::error::Result<Vec<String>> {
+    async fn get_all_tc_token_jids(&self) -> wacore::store::error::Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt =
             to_store_err!(conn.prepare("SELECT jid FROM tc_tokens WHERE device_id = ?1"))?;
@@ -1042,17 +1042,17 @@ impl ProtocolStore for RusqliteStore {
     async fn delete_expired_tc_tokens(
         &self,
         cutoff_timestamp: i64,
-    ) -> wa_rs_core::store::error::Result<u32> {
+    ) -> wacore::store::error::Result<u32> {
         let conn = self.conn.lock();
         let deleted = conn
             .execute(
                 "DELETE FROM tc_tokens WHERE token_timestamp < ?1 AND device_id = ?2",
                 params![cutoff_timestamp, self.device_id],
             )
-            .map_err(|e| wa_rs_core::store::error::StoreError::Database(e.to_string()))?;
+            .map_err(|e| wacore::store::error::StoreError::Database(e.to_string()))?;
 
         let deleted = u32::try_from(deleted).map_err(|_| {
-            wa_rs_core::store::error::StoreError::Database(format!(
+            wacore::store::error::StoreError::Database(format!(
                 "Affected row count overflowed u32: {deleted}"
             ))
         })?;
@@ -1064,7 +1064,7 @@ impl ProtocolStore for RusqliteStore {
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl DeviceStoreTrait for RusqliteStore {
-    async fn save(&self, device: &CoreDevice) -> wa_rs_core::store::error::Result<()> {
+    async fn save(&self, device: &CoreDevice) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
 
         // Serialize KeyPairs to bytes
@@ -1127,7 +1127,7 @@ impl DeviceStoreTrait for RusqliteStore {
         ))
     }
 
-    async fn load(&self) -> wa_rs_core::store::error::Result<Option<CoreDevice>> {
+    async fn load(&self) -> wacore::store::error::Result<Option<CoreDevice>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT * FROM device WHERE id = ?1",
@@ -1152,7 +1152,7 @@ impl DeviceStoreTrait for RusqliteStore {
                     return Err(rusqlite::Error::InvalidParameterName("key_pair".into()));
                 }
 
-                use wa_rs_core::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+                use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 
                 let noise_key = KeyPair::new(
                     PublicKey::from_djb_public_key_bytes(&noise_key_bytes[32..64])
@@ -1186,7 +1186,7 @@ impl DeviceStoreTrait for RusqliteStore {
 
                 let account = if let Some(bytes) = account_bytes {
                     Some(
-                        wa_rs_proto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
+                        waproto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
                             .map_err(to_rusqlite_err)?,
                     )
                 } else {
@@ -1219,13 +1219,13 @@ impl DeviceStoreTrait for RusqliteStore {
         match result {
             Ok(device) => Ok(Some(device)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(wa_rs_core::store::error::StoreError::Database(
+            Err(e) => Err(wacore::store::error::StoreError::Database(
                 e.to_string(),
             )),
         }
     }
 
-    async fn exists(&self) -> wa_rs_core::store::error::Result<bool> {
+    async fn exists(&self) -> wacore::store::error::Result<bool> {
         let conn = self.conn.lock();
         let count: i64 = to_store_err!(conn.query_row(
             "SELECT COUNT(*) FROM device WHERE id = ?1",
@@ -1236,7 +1236,7 @@ impl DeviceStoreTrait for RusqliteStore {
         Ok(count > 0)
     }
 
-    async fn create(&self) -> wa_rs_core::store::error::Result<i32> {
+    async fn create(&self) -> wacore::store::error::Result<i32> {
         // Device already created in constructor, just return the ID
         Ok(self.device_id)
     }
@@ -1245,7 +1245,7 @@ impl DeviceStoreTrait for RusqliteStore {
         &self,
         name: &str,
         extra_content: Option<&[u8]>,
-    ) -> wa_rs_core::store::error::Result<()> {
+    ) -> wacore::store::error::Result<()> {
         // Create a snapshot by copying the database file
         let snapshot_path = format!("{}.snapshot.{}", self.db_path, name);
 
@@ -1265,7 +1265,7 @@ impl DeviceStoreTrait for RusqliteStore {
 mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
-    use wa_rs_core::store::traits::{LidPnMappingEntry, ProtocolStore, TcTokenEntry};
+    use wacore::store::traits::{LidPnMappingEntry, ProtocolStore, TcTokenEntry};
 
     #[cfg(feature = "whatsapp-web")]
     #[test]

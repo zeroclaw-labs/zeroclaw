@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::select;
-use wa_rs_proto::whatsapp::device_props::PlatformType;
+use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 #[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
@@ -79,7 +79,7 @@ pub struct WhatsAppWebChannel {
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
-    client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
+    client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
@@ -276,7 +276,7 @@ impl WhatsAppWebChannel {
     /// processed normally (#6354 review).
     #[cfg(feature = "whatsapp-web")]
     fn lid_rejection_diagnostic(
-        sender: &wa_rs_binary::jid::Jid,
+        sender: &wacore_binary::jid::Jid,
         mapped_phone: Option<&str>,
     ) -> String {
         if !sender.is_lid() {
@@ -298,8 +298,8 @@ impl WhatsAppWebChannel {
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
-        sender: &wa_rs_binary::jid::Jid,
-        sender_alt: Option<&wa_rs_binary::jid::Jid>,
+        sender: &wacore_binary::jid::Jid,
+        sender_alt: Option<&wacore_binary::jid::Jid>,
         mapped_phone: Option<&str>,
     ) -> Vec<String> {
         let mut candidates = Vec::new();
@@ -368,7 +368,7 @@ impl WhatsAppWebChannel {
     /// - Full JIDs (e.g. "12345@s.whatsapp.net")
     /// - E.164-like numbers (e.g. "+1234567890")
     #[cfg(feature = "whatsapp-web")]
-    fn recipient_to_jid(&self, recipient: &str) -> Result<wa_rs_binary::jid::Jid> {
+    fn recipient_to_jid(&self, recipient: &str) -> Result<wacore_binary::jid::Jid> {
         let trimmed = recipient.trim();
         if trimmed.is_empty() {
             anyhow::bail!("Recipient cannot be empty");
@@ -376,7 +376,7 @@ impl WhatsAppWebChannel {
 
         if trimmed.contains('@') {
             return trimmed
-                .parse::<wa_rs_binary::jid::Jid>()
+                .parse::<wacore_binary::jid::Jid>()
                 .map_err(|e| anyhow!("Invalid WhatsApp JID `{trimmed}`: {e}"));
         }
 
@@ -385,7 +385,7 @@ impl WhatsAppWebChannel {
             anyhow::bail!("Recipient `{trimmed}` does not contain a valid phone number");
         }
 
-        Ok(wa_rs_binary::jid::Jid::pn(digits))
+        Ok(wacore_binary::jid::Jid::pn(digits))
     }
 
     // ── Reconnect state-machine helpers (used by listen() and tested directly) ──
@@ -436,8 +436,8 @@ impl WhatsAppWebChannel {
     /// transcription fails (all logged as warnings).
     #[cfg(feature = "whatsapp-web")]
     async fn try_transcribe_voice_note(
-        client: &wa_rs::Client,
-        audio: &wa_rs_proto::whatsapp::message::AudioMessage,
+        client: &whatsapp_rust::Client,
+        audio: &waproto::whatsapp::message::AudioMessage,
         transcription_config: Option<&zeroclaw_config::schema::TranscriptionConfig>,
         transcription_manager: Option<&super::transcription::TranscriptionManager>,
     ) -> Option<String> {
@@ -457,7 +457,7 @@ impl WhatsAppWebChannel {
         }
 
         // Download the encrypted audio
-        use wa_rs::download::Downloadable;
+        use whatsapp_rust::download::Downloadable;
         let audio_data = match client.download(audio as &dyn Downloadable).await {
             Ok(data) => data,
             Err(e) => {
@@ -503,8 +503,8 @@ impl WhatsAppWebChannel {
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
-        client: &wa_rs::Client,
-        to: &wa_rs_binary::jid::Jid,
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
         text: &str,
         tts_config: &zeroclaw_config::schema::TtsConfig,
     ) -> Result<()> {
@@ -517,7 +517,7 @@ impl WhatsAppWebChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        use wa_rs_core::download::MediaType;
+        use wacore::download::MediaType;
         let upload = client
             .upload(audio_bytes, MediaType::Audio)
             .await
@@ -533,8 +533,8 @@ impl WhatsAppWebChannel {
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
-        let voice_msg = wa_rs_proto::whatsapp::Message {
-            audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+        let voice_msg = waproto::whatsapp::Message {
+            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
                 media_key: Some(upload.media_key),
@@ -578,8 +578,8 @@ impl WhatsAppWebChannel {
     /// document) carry mentions in their own `context_info`, but `text_content()` already
     /// ignores captions so those messages are filtered out upstream as empty text.
     #[cfg(feature = "whatsapp-web")]
-    fn extract_mentioned_jids(msg: &wa_rs_proto::whatsapp::Message) -> Vec<String> {
-        use wa_rs_core::proto_helpers::MessageExt;
+    fn extract_mentioned_jids(msg: &waproto::whatsapp::Message) -> Vec<String> {
+        use wacore::proto_helpers::MessageExt;
         let base = msg.get_base_message();
 
         if let Some(ref ext) = base.extended_text_message
@@ -671,8 +671,8 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     #[allow(dead_code)] // WIP: not yet wired into send path
     async fn send_wa_attachment(
-        client: &wa_rs::Client,
-        to: &wa_rs_binary::jid::Jid,
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
         attachment: &WaAttachment,
     ) -> Result<()> {
         let target = attachment.target.trim();
@@ -703,8 +703,8 @@ impl WhatsAppWebChannel {
             .to_string();
 
         let outgoing = match attachment.kind {
-            WaAttachmentKind::Image => wa_rs_proto::whatsapp::Message {
-                image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+            WaAttachmentKind::Image => waproto::whatsapp::Message {
+                image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -716,8 +716,8 @@ impl WhatsAppWebChannel {
                 })),
                 ..Default::default()
             },
-            WaAttachmentKind::Video => wa_rs_proto::whatsapp::Message {
-                video_message: Some(Box::new(wa_rs_proto::whatsapp::message::VideoMessage {
+            WaAttachmentKind::Video => waproto::whatsapp::Message {
+                video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -733,8 +733,8 @@ impl WhatsAppWebChannel {
                 let is_voice = attachment.kind == WaAttachmentKind::Voice;
                 #[allow(clippy::cast_possible_truncation)]
                 let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
-                wa_rs_proto::whatsapp::Message {
-                    audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+                waproto::whatsapp::Message {
+                    audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
                         url: Some(upload.url),
                         direct_path: Some(upload.direct_path),
                         media_key: Some(upload.media_key),
@@ -749,8 +749,8 @@ impl WhatsAppWebChannel {
                     ..Default::default()
                 }
             }
-            WaAttachmentKind::Document => wa_rs_proto::whatsapp::Message {
-                document_message: Some(Box::new(wa_rs_proto::whatsapp::message::DocumentMessage {
+            WaAttachmentKind::Document => waproto::whatsapp::Message {
+                document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(upload.media_key),
@@ -958,12 +958,12 @@ fn mime_from_path(path: &Path) -> &'static str {
 /// Map our attachment kind to the wa-rs `MediaType` used for upload encryption.
 #[cfg(feature = "whatsapp-web")]
 #[allow(dead_code)] // WIP: used by send_wa_attachment, not yet wired into send path
-fn wa_media_type(kind: WaAttachmentKind) -> wa_rs_core::download::MediaType {
+fn wa_media_type(kind: WaAttachmentKind) -> wacore::download::MediaType {
     match kind {
-        WaAttachmentKind::Image => wa_rs_core::download::MediaType::Image,
-        WaAttachmentKind::Video => wa_rs_core::download::MediaType::Video,
-        WaAttachmentKind::Audio | WaAttachmentKind::Voice => wa_rs_core::download::MediaType::Audio,
-        WaAttachmentKind::Document => wa_rs_core::download::MediaType::Document,
+        WaAttachmentKind::Image => wacore::download::MediaType::Image,
+        WaAttachmentKind::Video => wacore::download::MediaType::Video,
+        WaAttachmentKind::Audio | WaAttachmentKind::Voice => wacore::download::MediaType::Audio,
+        WaAttachmentKind::Document => wacore::download::MediaType::Document,
     }
 }
 
@@ -1075,7 +1075,7 @@ impl Channel for WhatsAppWebChannel {
         }
 
         // Send text message
-        let outgoing = wa_rs_proto::whatsapp::Message {
+        let outgoing = waproto::whatsapp::Message {
             conversation: Some(message.content.clone()),
             ..Default::default()
         };
@@ -1093,14 +1093,14 @@ impl Channel for WhatsAppWebChannel {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
-        use wa_rs::bot::Bot;
-        use wa_rs::pair_code::PairCodeOptions;
-        use wa_rs::store::{Device, DeviceStore};
-        use wa_rs_binary::jid::JidExt as _;
-        use wa_rs_core::proto_helpers::MessageExt;
-        use wa_rs_core::types::events::Event;
-        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
-        use wa_rs_ureq_http::UreqHttpClient;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust::pair_code::PairCodeOptions;
+        use whatsapp_rust::store::{Device, DeviceStore};
+        use wacore_binary::jid::JidExt as _;
+        use wacore::proto_helpers::MessageExt;
+        use wacore::types::events::Event;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -1788,7 +1788,7 @@ impl Channel for WhatsAppWebChannel {
 mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
-    use wa_rs_binary::jid::Jid;
+    use wacore_binary::jid::Jid;
 
     #[cfg(feature = "whatsapp-web")]
     fn make_channel() -> WhatsAppWebChannel {
