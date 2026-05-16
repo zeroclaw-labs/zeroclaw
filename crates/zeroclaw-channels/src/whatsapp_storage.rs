@@ -293,7 +293,15 @@ impl RusqliteStore {
                 device_id INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (jid, device_id)
-            );",
+            );
+
+            -- Index supporting `delete_expired_sent_messages`
+            -- (WHERE device_id = ? AND created_at < ?). Without it the cleanup
+            -- pass would full-scan `sent_messages`, which grows unbounded until
+            -- the periodic cleanup hook lands. `IF NOT EXISTS` keeps re-init
+            -- idempotent across restarts.
+            CREATE INDEX IF NOT EXISTS idx_sent_messages_device_created
+                ON sent_messages(device_id, created_at);",
         ))?;
 
         // Migration: ensure `raw_id` column exists on legacy device_registry
