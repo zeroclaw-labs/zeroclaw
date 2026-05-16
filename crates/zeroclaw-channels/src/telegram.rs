@@ -1,11 +1,12 @@
 use anyhow::Context;
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use directories::UserDirs;
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -365,7 +366,11 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
-    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// Who is allowed to talk to this bot. Wildcard `"*"` admits everyone;
+    /// an empty list denies everyone. Identities are normalized with
+    /// `trim()` + leading-`@` stripping at check time, so `"@alice"` in
+    /// config matches `"alice"` from the Telegram update.
+    allowlist: AllowlistAspect,
     pairing: Option<PairingGuard>,
     client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -415,8 +420,14 @@ enum EditMessageResult {
 
 impl TelegramChannel {
     pub fn new(bot_token: String, allowed_users: Vec<String>, mention_only: bool) -> Self {
-        let normalized_allowed = Self::normalize_allowed_users(allowed_users);
-        let pairing = if normalized_allowed.is_empty() {
+        let allowlist = AllowlistAspect::new(
+            allowed_users
+                .into_iter()
+                .map(|s| Self::normalize_identity(&s))
+                .filter(|s| !s.is_empty()),
+        )
+        .with_normalizer(|s| s.trim().trim_start_matches('@').to_string());
+        let pairing = if allowlist.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 println!("  🔐 Telegram pairing required. One-time bind code: {code}");
@@ -429,7 +440,7 @@ impl TelegramChannel {
 
         Self {
             bot_token,
-            allowed_users: Arc::new(RwLock::new(normalized_allowed)),
+            allowlist,
             pairing,
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
@@ -592,14 +603,6 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    fn normalize_allowed_users(allowed_users: Vec<String>) -> Vec<String> {
-        allowed_users
-            .into_iter()
-            .map(|entry| Self::normalize_identity(&entry))
-            .filter(|entry| !entry.is_empty())
-            .collect()
-    }
-
     async fn load_config_without_env() -> anyhow::Result<Config> {
         let home = UserDirs::new()
             .map(|u| u.home_dir().to_path_buf())
@@ -649,11 +652,7 @@ impl TelegramChannel {
         if normalized.is_empty() {
             return;
         }
-        if let Ok(mut users) = self.allowed_users.write()
-            && !users.iter().any(|u| u == &normalized)
-        {
-            users.push(normalized);
-        }
+        self.allowlist.add(normalized);
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -1069,19 +1068,11 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
-    fn is_user_allowed(&self, username: &str) -> bool {
-        let identity = Self::normalize_identity(username);
-        self.allowed_users
-            .read()
-            .map(|users| users.iter().any(|u| u == "*" || u == &identity))
-            .unwrap_or(false)
-    }
-
     fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
     where
         I: IntoIterator<Item = &'a str>,
     {
-        identities.into_iter().any(|id| self.is_user_allowed(id))
+        identities.into_iter().any(|id| self.allowlist.is_allowed(id))
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -3603,56 +3594,56 @@ mod tests {
     #[test]
     fn telegram_user_allowed_wildcard() {
         let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn telegram_user_allowed_specific() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "bob".into()], false);
-        assert!(ch.is_user_allowed("alice"));
-        assert!(!ch.is_user_allowed("eve"));
+        assert!(ch.allowlist.is_allowed("alice"));
+        assert!(!ch.allowlist.is_allowed("eve"));
     }
 
     #[test]
     fn telegram_user_allowed_with_at_prefix_in_config() {
         let ch = TelegramChannel::new("t".into(), vec!["@alice".into()], false);
-        assert!(ch.is_user_allowed("alice"));
+        assert!(ch.allowlist.is_allowed("alice"));
     }
 
     #[test]
     fn telegram_user_denied_empty() {
         let ch = TelegramChannel::new("t".into(), vec![], false);
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn telegram_user_exact_match_not_substring() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into()], false);
-        assert!(!ch.is_user_allowed("alice_bot"));
-        assert!(!ch.is_user_allowed("alic"));
-        assert!(!ch.is_user_allowed("malice"));
+        assert!(!ch.allowlist.is_allowed("alice_bot"));
+        assert!(!ch.allowlist.is_allowed("alic"));
+        assert!(!ch.allowlist.is_allowed("malice"));
     }
 
     #[test]
     fn telegram_user_empty_string_denied() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into()], false);
-        assert!(!ch.is_user_allowed(""));
+        assert!(!ch.allowlist.is_allowed(""));
     }
 
     #[test]
     fn telegram_user_case_sensitive() {
         let ch = TelegramChannel::new("t".into(), vec!["Alice".into()], false);
-        assert!(ch.is_user_allowed("Alice"));
-        assert!(!ch.is_user_allowed("alice"));
-        assert!(!ch.is_user_allowed("ALICE"));
+        assert!(ch.allowlist.is_allowed("Alice"));
+        assert!(!ch.allowlist.is_allowed("alice"));
+        assert!(!ch.allowlist.is_allowed("ALICE"));
     }
 
     #[test]
     fn telegram_wildcard_with_specific_users() {
         let ch = TelegramChannel::new("t".into(), vec!["alice".into(), "*".into()], false);
-        assert!(ch.is_user_allowed("alice"));
-        assert!(ch.is_user_allowed("bob"));
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("alice"));
+        assert!(ch.allowlist.is_allowed("bob"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
@@ -5851,5 +5842,53 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    /// Parity oracle: the aspect-backed check must return byte-identical
+    /// results to the pre-migration shape across a truth table covering
+    /// wildcard, empty list, `@`-prefix normalization, case-sensitivity,
+    /// and substring rejection. If this drifts, the migration is unsound.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        fn norm(s: &str) -> String {
+            s.trim().trim_start_matches('@').to_string()
+        }
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice"),
+            (vec![], ""),
+            (vec!["*"], "alice"),
+            (vec!["*"], ""),
+            (vec!["alice"], "alice"),
+            (vec!["alice"], "eve"),
+            (vec!["@alice"], "alice"),
+            (vec!["alice"], "@alice"),
+            (vec!["  alice  "], "alice"),
+            (vec!["alice", "bob"], "bob"),
+            (vec!["alice", "*"], "anyone"),
+            (vec!["*", "alice"], "anyone"),
+            (vec!["alice"], "alice_bot"), // substring rejected
+            (vec!["alice"], "alic"),      // prefix rejected
+            (vec!["Alice"], "alice"),     // case-sensitive
+            (vec!["Alice"], "Alice"),
+            (vec!["123456789"], "123456789"),
+        ];
+        for (entries, identity) in cases {
+            let normalized_entries: Vec<String> =
+                entries.iter().map(|s| norm(s)).filter(|s| !s.is_empty()).collect();
+            let needle = norm(identity);
+            let baseline = normalized_entries
+                .iter()
+                .any(|u| u == "*" || u == &needle);
+            let ch = TelegramChannel::new(
+                "t".into(),
+                entries.iter().map(|s| (*s).to_string()).collect(),
+                false,
+            );
+            assert_eq!(
+                ch.allowlist.is_allowed(identity),
+                baseline,
+                "aspect drift for entries={entries:?} identity={identity:?}",
+            );
+        }
     }
 }
