@@ -78,7 +78,7 @@ pub fn get_permissions_status() -> Vec<PermissionInfo> {
         vec![
             PermissionInfo {
                 name: "screen_recording".into(),
-                label: "Screen Capture (Wayland Portal)".into(),
+                label: "Screen Capture (macOS-only for now)".into(),
                 status: permissions::check_screen_recording().into(),
             },
             PermissionInfo {
