@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
@@ -351,6 +352,12 @@ where
                 Err(e) => {
                     crate::health::mark_component_error(name, e.to_string());
                     tracing::error!("Daemon component '{name}' failed: {e}");
+                    if is_non_retryable_component_error(name, &e) {
+                        tracing::error!(
+                            "Daemon component '{name}' hit a non-retryable error; supervisor will stop retrying"
+                        );
+                        break;
+                    }
                 }
             }
 
@@ -359,6 +366,28 @@ where
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
+    })
+}
+
+fn is_non_retryable_component_error(name: &str, error: &anyhow::Error) -> bool {
+    if name != "gateway" {
+        return false;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                if io_error.kind() == ErrorKind::AddrInUse {
+                    tracing::error!(
+                        "Gateway port is already in use — another zeroclaw process may be running. \
+                         Run `pkill zeroclaw` to stop it, then restart the daemon."
+                    );
+                    true
+                } else {
+                    false
+                }
+            })
     })
 }
 
@@ -1055,6 +1084,17 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_is_non_retryable() {
+        let error = anyhow::Error::from(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "Address already in use",
+        ));
+
+        assert!(is_non_retryable_component_error("gateway", &error));
+        assert!(!is_non_retryable_component_error("channels", &error));
     }
 
     #[tokio::test]
