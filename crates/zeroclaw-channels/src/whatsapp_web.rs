@@ -76,8 +76,10 @@ pub struct WhatsAppWebChannel {
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
-    /// Bot handle for shutdown
-    bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Bot handle for shutdown.
+    /// whatsapp-rust 0.6: `Bot::run()` now returns `BotHandle` (a Future + abort)
+    /// rather than a tokio JoinHandle directly (oxidezap/whatsapp-rust BotHandle wrapper).
+    bot_handle: Arc<Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
     /// Client handle for sending messages and typing indicators
     client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
     /// Message sender channel
@@ -517,9 +519,10 @@ impl WhatsAppWebChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
+        use whatsapp_rust::upload::UploadOptions;
         use wacore::download::MediaType;
         let upload = client
-            .upload(audio_bytes, MediaType::Audio)
+            .upload(audio_bytes, MediaType::Audio, UploadOptions::default())
             .await
             .map_err(|e| anyhow!("Failed to upload TTS audio: {e}"))?;
 
@@ -533,13 +536,20 @@ impl WhatsAppWebChannel {
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
+        // whatsapp-rust 0.6: UploadResponse cryptographic fields became
+        // `[u8; 32]` for type safety. Pull the Vec<u8> copies before
+        // consuming the strings so the partial-move on `upload.direct_path`
+        // doesn't bite.
+        let media_key = upload.media_key_vec();
+        let file_enc_sha256 = upload.file_enc_sha256_vec();
+        let file_sha256 = upload.file_sha256_vec();
         let voice_msg = waproto::whatsapp::Message {
             audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
+                media_key: Some(media_key),
+                file_enc_sha256: Some(file_enc_sha256),
+                file_sha256: Some(file_sha256),
                 file_length: Some(upload.file_length),
                 mimetype: Some("audio/ogg; codecs=opus".to_string()),
                 ptt: Some(true),
@@ -690,8 +700,10 @@ impl WhatsAppWebChannel {
         }
 
         let media_type = wa_media_type(attachment.kind);
+        // whatsapp-rust 0.6: upload() takes a third UploadOptions arg; default
+        // reuses the legacy behavior (fresh media key generated server-side).
         let upload = client
-            .upload(file_bytes, media_type)
+            .upload(file_bytes, media_type, whatsapp_rust::upload::UploadOptions::default())
             .await
             .map_err(|e| anyhow!("WhatsApp upload failed for {target}: {e}"))?;
 
@@ -702,15 +714,25 @@ impl WhatsAppWebChannel {
             .unwrap_or("file")
             .to_string();
 
+        // whatsapp-rust 0.6: UploadResponse exposes crypto fields as `[u8; 32]`.
+        // Pull the Vec<u8> copies up front so the move of `upload.direct_path`
+        // into the protobuf field doesn't make follow-on accessors fail to
+        // borrow the partially-moved struct.
+        let media_key = upload.media_key_vec();
+        let file_enc_sha256 = upload.file_enc_sha256_vec();
+        let file_sha256 = upload.file_sha256_vec();
+        let file_length = upload.file_length;
+        let upload_url = upload.url;
+        let upload_direct_path = upload.direct_path;
         let outgoing = match attachment.kind {
             WaAttachmentKind::Image => waproto::whatsapp::Message {
                 image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
-                    file_length: Some(upload.file_length),
+                    url: Some(upload_url),
+                    direct_path: Some(upload_direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(file_length),
                     mimetype: Some(mimetype),
                     ..Default::default()
                 })),
@@ -718,12 +740,12 @@ impl WhatsAppWebChannel {
             },
             WaAttachmentKind::Video => waproto::whatsapp::Message {
                 video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
-                    file_length: Some(upload.file_length),
+                    url: Some(upload_url),
+                    direct_path: Some(upload_direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(file_length),
                     mimetype: Some(mimetype),
                     ..Default::default()
                 })),
@@ -732,15 +754,15 @@ impl WhatsAppWebChannel {
             WaAttachmentKind::Audio | WaAttachmentKind::Voice => {
                 let is_voice = attachment.kind == WaAttachmentKind::Voice;
                 #[allow(clippy::cast_possible_truncation)]
-                let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+                let estimated_seconds = std::cmp::max(1, (file_length / 4000) as u32);
                 waproto::whatsapp::Message {
                     audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(upload.media_key),
-                        file_enc_sha256: Some(upload.file_enc_sha256),
-                        file_sha256: Some(upload.file_sha256),
-                        file_length: Some(upload.file_length),
+                        url: Some(upload_url),
+                        direct_path: Some(upload_direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(file_length),
                         mimetype: Some(mimetype),
                         ptt: Some(is_voice),
                         seconds: Some(estimated_seconds),
@@ -751,12 +773,12 @@ impl WhatsAppWebChannel {
             }
             WaAttachmentKind::Document => waproto::whatsapp::Message {
                 document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
-                    url: Some(upload.url),
-                    direct_path: Some(upload.direct_path),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
-                    file_sha256: Some(upload.file_sha256),
-                    file_length: Some(upload.file_length),
+                    url: Some(upload_url),
+                    direct_path: Some(upload_direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(file_length),
                     mimetype: Some(mimetype),
                     file_name: Some(file_name.clone()),
                     title: Some(file_name),
@@ -1080,11 +1102,13 @@ impl Channel for WhatsAppWebChannel {
             ..Default::default()
         };
 
-        let message_id = client.send_message(to, outgoing).await?;
+        // whatsapp-rust 0.6: send_message returns `SendResult { message_id, to }`
+        // instead of a bare `String` (oxidezap/whatsapp-rust#597).
+        let send_result = client.send_message(to, outgoing).await?;
         tracing::debug!(
             "WhatsApp Web: sent text to {} (id: {})",
             message.recipient,
-            message_id
+            send_result.message_id
         );
         Ok(())
     }
@@ -1093,11 +1117,13 @@ impl Channel for WhatsAppWebChannel {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
+        use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
         use whatsapp_rust::pair_code::PairCodeOptions;
         use whatsapp_rust::store::{Device, DeviceStore};
         use wacore_binary::jid::JidExt as _;
         use wacore::proto_helpers::MessageExt;
+        use wacore::store::DevicePropsOverride;
         use wacore::types::events::Event;
         use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
         use whatsapp_rust_ureq_http_client::UreqHttpClient;
@@ -1164,14 +1190,21 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
+            // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
+            // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
+            // required before `.build()` resolves; we use the bundled
+            // `TokioRuntime`. `with_device_props` switched from three
+            // positional Options to a `DevicePropsOverride` builder
+            // (oxidezap/whatsapp-rust#586).
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_runtime(TokioRuntime)
                 .with_device_props(
-                    Some("ZeroClaw".to_string()),
-                    None,
-                    Some(PlatformType::Desktop),
+                    DevicePropsOverride::new()
+                        .with_os("ZeroClaw")
+                        .with_platform_type(PlatformType::Desktop),
                 )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
@@ -1189,7 +1222,10 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
-                        match event {
+                        // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
+                        // per PR #613, so we match against `&*event` to get a
+                        // `&Event` reference and bind variant fields by ref.
+                        match &*event {
                             Event::Message(msg, info) => {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
@@ -1197,8 +1233,18 @@ impl Channel for WhatsAppWebChannel {
                                 let _is_group = info.source.chat.is_group();
                                 let chat = info.source.chat.to_string();
 
+                                // whatsapp-rust 0.6: `Client::get_phone_number_from_lid`
+                                // was replaced by the unified `get_lid_pn_entry`
+                                // (oxidezap/whatsapp-rust#487). The new helper
+                                // returns the full LID↔phone entry; we extract
+                                // the phone field on hit, swallow lookup errors
+                                // back to `None` (consistent with the legacy
+                                // semantics — best-effort enrichment).
                                 let mapped_phone = if sender_jid.is_lid() {
-                                    client.get_phone_number_from_lid(&sender_jid.user).await
+                                    match client.get_lid_pn_entry(&sender_jid).await {
+                                        Ok(Some(entry)) => Some(entry.phone_number),
+                                        _ => None,
+                                    }
                                 } else {
                                     None
                                 };
