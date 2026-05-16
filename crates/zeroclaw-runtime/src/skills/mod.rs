@@ -177,17 +177,18 @@ pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier
 /// missing-tag fallback) gets the Community warn block.
 pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
     let version_label = version.unwrap_or("?");
-    match tier {
-        SkillTier::Official => {
-            format!("Installing {name} v{version_label} — Official (zeroclaw-labs maintained)\n")
+    let args = [("name", name), ("version", version_label)];
+    let key = match tier {
+        SkillTier::Official => "cli-skills-install-tier-official",
+        SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => {
+            "cli-skills-install-tier-community"
         }
-        SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => format!(
-            "Installing {name} v{version_label} — Community submission\n\
-             This skill is not audited by ZeroClaw. Review the skill content\n\
-             and run `zeroclaw skills audit {name}` before granting any\n\
-             permissions or running it in production.\n"
-        ),
+    };
+    let mut banner = crate::i18n::get_required_cli_string_with_args(key, &args);
+    if !banner.ends_with('\n') {
+        banner.push('\n');
     }
+    banner
 }
 
 /// Print the install-time tier banner to stdout.
