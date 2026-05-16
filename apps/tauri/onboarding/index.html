@@ -215,11 +215,16 @@
     </footer>
 
     <script>
-      function detectPlatform() {
-        const ua = navigator.userAgent.toLowerCase();
-        if (ua.includes("windows")) return "windows";
-        if (ua.includes("linux")) return "linux";
-        return "macos";
+      async function detectPlatform() {
+        try {
+          return await callInvoke("get_runtime_platform");
+        } catch (_) {
+          // Fallback for browser-only preview without Tauri IPC.
+          const ua = navigator.userAgent.toLowerCase();
+          if (ua.includes("windows")) return "windows";
+          if (ua.includes("linux")) return "linux";
+          return "macos";
+        }
       }
 
       function buildSteps(platform) {
@@ -407,8 +412,7 @@
         ];
       }
 
-      const PLATFORM = detectPlatform();
-      const STEPS = buildSteps(PLATFORM);
+      let STEPS = [];
 
       function resolveInvoke() {
         return window.__TAURI__?.core?.invoke ?? null;
@@ -608,10 +612,18 @@
       skipBtn.addEventListener("click", skip);
       nextBtn.addEventListener("click", next);
 
+      async function init() {
+        const platform = await detectPlatform();
+        STEPS = buildSteps(platform);
+        currentIndex = 0;
+        statusMap = {};
+        renderStep();
+        await refresh();
+        setInterval(refresh, 2000);
+      }
+
       // Initial render + polling.
-      renderStep();
-      refresh();
-      setInterval(refresh, 2000);
+      init();
     </script>
   </body>
 </html>

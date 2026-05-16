@@ -14,7 +14,7 @@ struct WindowsPrivacySnapshot {
     admin: bool,
 }
 
-const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
+const SNAPSHOT_TTL: Duration = Duration::from_secs(1);
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WindowsPrivacySnapshot)>>> = OnceLock::new();
 
 fn powershell(script: &str) -> Option<String> {
@@ -110,10 +110,16 @@ fn snapshot() -> WindowsPrivacySnapshot {
 
 fn open_settings(uri: &str) -> Result<(), String> {
     // Empty string is the "window title" placeholder required by `start`.
-    Command::new("cmd")
+    let status = Command::new("cmd")
         .args(["/C", "start", "", uri])
         .status()
         .map_err(|e| format!("failed to open settings URI {uri}: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "settings command for {uri} exited with code {:?}",
+            status.code()
+        ));
+    }
     Ok(())
 }
 

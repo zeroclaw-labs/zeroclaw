@@ -123,6 +123,29 @@ pub fn get_permissions_status() -> Vec<PermissionInfo> {
     }
 }
 
+#[tauri::command]
+pub fn get_runtime_platform() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return "macos".into();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return "linux".into();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return "windows".into();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unknown".into()
+    }
+}
+
 /// Request a specific permission or open its System Settings pane.
 #[tauri::command]
 pub fn request_permission<R: Runtime>(app: AppHandle<R>, name: String) -> Result<String, String> {

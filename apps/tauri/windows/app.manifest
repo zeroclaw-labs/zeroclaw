@@ -25,6 +25,10 @@
     </application>
   </compatibility>
 
+  <!--
+    UWP-style capabilities are only honored for packaged MSIX/AppX builds.
+    They are kept here for forward compatibility with packaged Windows targets.
+  -->
   <Capabilities
     xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
     xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">

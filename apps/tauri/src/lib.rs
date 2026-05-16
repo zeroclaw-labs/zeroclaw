@@ -108,6 +108,7 @@ pub fn run() {
             commands::pairing::get_devices,
             commands::agent::send_message,
             commands::permissions::get_permissions_status,
+            commands::permissions::get_runtime_platform,
             commands::permissions::request_permission,
             commands::permissions::open_privacy_settings,
             commands::onboarding::get_onboarding_state,
