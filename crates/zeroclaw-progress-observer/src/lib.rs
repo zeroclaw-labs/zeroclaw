@@ -14,5 +14,5 @@ mod observer;
 #[cfg(test)]
 mod mock;
 
-// pub use toggles::ProgressEventToggles;
+pub use toggles::ProgressEventToggles;
 // pub use observer::ProgressReportingObserver;
