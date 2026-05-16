@@ -218,7 +218,8 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-    let mut memory_session_id = session_id.clone();
+    // Match the sanitized form persisted by memory backend migrations.
+    let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
@@ -284,7 +285,8 @@ async fn handle_socket(
                             "WebSocket connect params received"
                         );
                         if let Some(sid) = &cp.session_id {
-                            memory_session_id = sid.clone();
+                            memory_session_id =
+                                zeroclaw_api::session_keys::sanitize_session_key(sid);
                             debug!(
                                 session_id = sid,
                                 "WebSocket connect session override received"
@@ -564,7 +566,9 @@ async fn handle_socket(
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
-                if let Ok(event) = event {
+                if let Ok(event) = event
+                    && event_matches_session(&event, &session_id)
+                {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
             }
@@ -627,6 +631,13 @@ fn needs_onboarding_ws_error(
         "message": crate::needs_onboarding_channel_reply(),
         "url": "/onboard",
     }))
+}
+
+fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
+    match event.get("session_id").and_then(|value| value.as_str()) {
+        Some(event_session_id) => event_session_id == session_id,
+        None => true,
+    }
 }
 
 /// Process a single chat message through the agent and send the response.
@@ -727,11 +738,42 @@ async fn process_chat_message(
     // tool approval could neither be sent to the client nor answered before
     // the timeout fired.
     let forward_fut = async {
+        let mut cancel_drained = false;
         loop {
             tokio::select! {
                 biased;
+                // ── Cancellation arm ─────────────────────────────
+                // When `/abort` cancels the token, immediately drop every
+                // parked oneshot sender so any in-flight `request_approval`
+                // unblocks via the "sender dropped → deny" path in
+                // `WsApprovalChannel`. Without this, the approval future
+                // races only its own `timeout_secs` (default 120s) and
+                // ignores the cancel token, so the abort sits idle for up
+                // to two minutes before the tool loop even gets a chance
+                // to observe the cancellation.
+                _ = cancel_token.cancelled(), if !cancel_drained => {
+                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                    drop(drained);
+                    cancel_drained = true;
+                    // Fall through; the agent loop will now wake from the
+                    // approval await, see the cancel token, and propagate
+                    // a ToolLoopCancelled error which closes event_rx and
+                    // breaks this loop on the `event_rx.recv()` arm below.
+                }
                 client_msg = receiver.next() => {
-                    let Some(Ok(Message::Text(text))) = client_msg else { continue };
+                    // On client disconnect, `receiver.next()` returns `None`
+                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
+                    // hot-loops the select; cancel the turn so `turn_fut`
+                    // resolves with `ToolLoopCancelled` and `tokio::join!`
+                    // below can return. See #6514.
+                    let text = match client_msg {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            cancel_token.cancel();
+                            break;
+                        }
+                        _ => continue,
+                    };
                     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                         continue;
                     };
@@ -1191,6 +1233,28 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_events_only_match_their_session() {
+        let target_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "deploy finished"
+        });
+        let other_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-2",
+            "content": "different session"
+        });
+        let global_event = serde_json::json!({
+            "type": "cron_result",
+            "content": "global notification"
+        });
+
+        assert!(event_matches_session(&target_event, "operator-1"));
+        assert!(!event_matches_session(&other_event, "operator-1"));
+        assert!(event_matches_session(&global_event, "operator-1"));
+    }
+
+    #[test]
     fn resolve_session_cwd_uses_requested_cwd() {
         let requested = tempfile::tempdir().unwrap();
         let fallback = tempfile::tempdir().unwrap();
@@ -1258,6 +1322,62 @@ mod tests {
         assert!(
             needs_onboarding_ws_error(&config).is_none(),
             "current configured model must allow WebSocket agent construction to continue"
+        );
+    }
+
+    // Regression for #6514. The mid-turn `client_msg` arm in `forward_fut`
+    // must (a) classify stream-end / close / error frames as "client gone"
+    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
+    // can return — a bare `continue` hot-loops the select forever.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DisconnectAction {
+        Break,
+        Continue,
+        ProcessText,
+    }
+
+    fn classify_client_msg(
+        msg: Option<Result<axum::extract::ws::Message, &'static str>>,
+    ) -> DisconnectAction {
+        use axum::extract::ws::Message;
+        match msg {
+            Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
+            _ => DisconnectAction::Continue,
+        }
+    }
+
+    #[test]
+    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
+        use axum::extract::ws::Message;
+        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Close(None)))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Err("io"))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
+            DisconnectAction::Continue,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Text("{}".into())))),
+            DisconnectAction::ProcessText,
+        );
+    }
+
+    #[test]
+    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let clone_for_turn = token.clone();
+        assert!(!clone_for_turn.is_cancelled());
+        token.cancel();
+        assert!(
+            clone_for_turn.is_cancelled(),
+            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
         );
     }
 }

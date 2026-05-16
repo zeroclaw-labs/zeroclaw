@@ -300,8 +300,9 @@ impl Provider for RouterProvider {
 
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -327,6 +328,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
+        vision: bool,
     }
 
     impl MockProvider {
@@ -335,7 +337,13 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
+                vision: false,
             }
+        }
+
+        fn with_vision(mut self, vision: bool) -> Self {
+            self.vision = vision;
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -359,6 +367,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
 
@@ -1105,5 +1117,52 @@ mod tests {
         assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(streaming.tool_event_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    // Regression for #6589: supports_vision() must reflect the default provider,
+    // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
+    // fallback in run_tool_call_loop and the image-marker stripping in the context
+    // compressor are silently bypassed in mixed-provider configurations.
+    #[test]
+    fn supports_vision_reflects_default_provider_not_any_route() {
+        let default_provider = Box::new(MockProvider::new("nope").with_vision(false));
+        let vision_route_provider = Box::new(MockProvider::new("ok").with_vision(true));
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".into(), default_provider as Box<dyn Provider>),
+                ("vision".into(), vision_route_provider as Box<dyn Provider>),
+            ],
+            vec![(
+                "hint:vision".into(),
+                Route {
+                    provider_name: "vision".into(),
+                    model: "vision-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.supports_vision(),
+            "router with non-vision default must report supports_vision()=false even when a vision-capable route exists"
+        );
+    }
+
+    #[test]
+    fn supports_vision_true_when_default_provider_supports_vision() {
+        let default_provider = Box::new(MockProvider::new("ok").with_vision(true));
+        let aux_provider = Box::new(MockProvider::new("nope").with_vision(false));
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".into(), default_provider as Box<dyn Provider>),
+                ("aux".into(), aux_provider as Box<dyn Provider>),
+            ],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(router.supports_vision());
     }
 }

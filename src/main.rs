@@ -1505,10 +1505,10 @@ async fn main() -> Result<()> {
         // registered"). `register_delivery_fn` is idempotent (backed by
         // `OnceLock::set`), so calling it once here is safe.
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |config, channel, target, output| {
+            |config, channel, target, thread_id, output| {
                 Box::pin(async move {
                     zeroclaw_channels::orchestrator::deliver_announcement(
-                        &config, &channel, &target, &output,
+                        &config, &channel, &target, thread_id, &output,
                     )
                     .await
                 })
@@ -1614,13 +1614,12 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
-                    let host = &config.gateway.host;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
                         .await
                     {
                         Ok(Some(code)) => {
@@ -3011,7 +3010,9 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
                 r#"
 # Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
-    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    # Capture the original clap-generated function body so the wrapper
+    # can fall back to it without entering an infinite recursion loop.
+    eval "$(declare -f _zeroclaw | sed '1s/_zeroclaw/_zeroclaw_clap_orig/')"
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
         if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
@@ -3988,6 +3989,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn bash_completion_avoids_infinite_recursion() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Bash, &mut output)
+            .expect("completion generation should succeed");
+        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
+        // The wrapper must capture the original clap-generated function body
+        // (via declare -f) rather than calling _zeroclaw by name, which would
+        // create an infinite recursion loop after _zeroclaw is redefined.
+        assert!(
+            script.contains("declare -f _zeroclaw"),
+            "bash completion should use declare -f to capture the original _zeroclaw function body"
+        );
+        assert!(
+            !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
+            "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_force_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
@@ -4015,6 +4036,56 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--port",
+            "3001",
+            "--host",
+            "192.168.1.20",
+        ])
+        .expect("gateway get-paircode overrides should parse");
+
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+            } => {
+                assert!(new);
+                assert_eq!(port, Some(3001));
+                assert_eq!(host.as_deref(), Some("192.168.1.20"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    /// Regression for PR #6192: when the user passes `--port`/`--host` to
+    /// `gateway get-paircode`, the override must compose with the configured
+    /// `path_prefix` rather than bypass it. `fetch_paircode` threads
+    /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
+    /// we'd actually send still hits `<prefix>/admin/paircode/new`.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url(
+                "127.0.0.1",
+                9001,
+                Some("/agents/myagent"),
+                "/admin/paircode/new"
+            ),
+            "http://127.0.0.1:9001/agents/myagent/admin/paircode/new",
+        );
+        assert_eq!(
+            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
+            "http://192.168.1.20:42617/gw/admin/paircode",
+        );
     }
 
     #[test]

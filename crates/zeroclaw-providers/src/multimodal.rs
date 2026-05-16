@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use std::collections::HashSet;
 use std::path::Path;
 use zeroclaw_api::provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
@@ -131,10 +132,21 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+}
+
+fn count_image_markers_with_latest_tool_results(
+    messages: &[ChatMessage],
+    latest_tool_result_indices: &HashSet<usize>,
+) -> usize {
     messages
         .iter()
-        .filter(|m| should_normalize_message_images(&m.role))
-        .map(|m| parse_image_markers(&m.content).1.len())
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, latest_tool_result_indices)
+        })
+        .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
 }
 
@@ -181,8 +193,100 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-fn should_normalize_message_images(role: &str) -> bool {
-    matches!(role, "user" | "tool")
+fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
+    message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
+}
+
+fn is_tool_result_carrier(message: &ChatMessage) -> bool {
+    message.role == "tool" || is_prompt_tool_result_message(message)
+}
+
+fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
+        return indices;
+    };
+
+    if is_prompt_tool_result_message(last_message) {
+        indices.insert(last_index);
+        return indices;
+    }
+
+    if last_message.role == "tool" {
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.role != "tool" {
+                break;
+            }
+            indices.insert(index);
+        }
+    }
+
+    indices
+}
+
+fn should_normalize_message_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> bool {
+    if is_tool_result_carrier(message) {
+        return latest_tool_result_indices.contains(&index);
+    }
+
+    message.role == "user"
+}
+
+fn stripped_image_marker_text(content: &str) -> String {
+    let (cleaned, refs) = parse_image_markers(content);
+    if refs.is_empty() {
+        return content.to_string();
+    }
+
+    if cleaned.trim().is_empty() {
+        "[image removed from history]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+        return message.clone();
+    }
+
+    if message.role == "tool"
+        && let Ok(serde_json::Value::Object(mut obj)) =
+            serde_json::from_str::<serde_json::Value>(&message.content)
+        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
+    {
+        let stripped = stripped_image_marker_text(&inner);
+        if stripped == inner {
+            return message.clone();
+        }
+
+        obj.insert("content".to_string(), serde_json::Value::String(stripped));
+        return ChatMessage {
+            role: message.role.clone(),
+            content: serde_json::Value::Object(obj).to_string(),
+        };
+    }
+
+    ChatMessage {
+        role: message.role.clone(),
+        content: stripped_image_marker_text(&message.content),
+    }
+}
+
+fn replay_message_without_stale_tool_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> ChatMessage {
+    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+        strip_tool_result_image_markers(message)
+    } else {
+        message.clone()
+    }
 }
 
 /// Attempt to normalize image markers inside a native tool-result JSON
@@ -236,11 +340,18 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let total_images = count_image_markers(messages);
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
-            messages: messages.to_vec(),
+            messages: messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                })
+                .collect(),
             contains_images: false,
         });
     }
@@ -256,11 +367,16 @@ pub async fn prepare_messages_for_provider(
     };
 
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+    let latest_tool_indices = latest_tool_result_indices(&trimmed);
 
     let mut normalized_messages = Vec::with_capacity(trimmed.len());
-    for message in &trimmed {
-        if !should_normalize_message_images(&message.role) {
-            normalized_messages.push(message.clone());
+    for (index, message) in trimmed.iter().enumerate() {
+        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+            normalized_messages.push(replay_message_without_stale_tool_images(
+                index,
+                message,
+                &latest_tool_indices,
+            ));
             continue;
         }
 
@@ -319,11 +435,14 @@ pub async fn prepare_messages_for_provider(
 /// Strip image markers from older messages (oldest first) until total image
 /// count is within `max_images`. Keeps the text content of each message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
+    let latest_tool_indices = latest_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| should_normalize_message_images(&m.role))
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, &latest_tool_indices)
+        })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
             if count > 0 { Some((i, count)) } else { None }
@@ -360,7 +479,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                     content: text,
                 }
             } else {
-                m.clone()
+                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
             }
         })
         .collect()
@@ -878,6 +997,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_strips_stale_native_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", image_path.display()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("What happened next?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "stale tool-result images should not keep the request in vision mode"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-native-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_prompt_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-prompt-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("Continue.".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale prompt-mode tool images");
+
+        assert!(!prepared.contains_images);
+        assert!(prepared.messages[0].content.contains("[Tool results]"));
+        assert!(prepared.messages[0].content.contains("Generated"));
+        assert!(!prepared.messages[0].content.contains("[IMAGE:"));
+        assert!(!prepared.messages[0].content.contains("data:image"));
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("stale-prompt-tool-result.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_tool_image_while_normalizing_current_user_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale_path = temp.path().join("stale-tool-result.png");
+        let fresh_path = temp.path().join("fresh-user-image.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&stale_path, png).unwrap();
+        std::fs::write(&fresh_path, png).unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user(format!("Now inspect this [IMAGE:{}]", fresh_path.display())),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images and normalize current user image");
+
+        assert!(prepared.contains_images);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-tool-result.png"));
+
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
+        assert_eq!(cleaned, "Now inspect this");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("fresh-user-image.png")
+        );
+    }
+
+    #[test]
+    fn count_image_markers_ignores_stale_tool_results() {
+        let messages = vec![
+            ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 0);
+
+        let messages = vec![
+            ChatMessage::user("Create an image".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[tokio::test]
     async fn prepare_messages_trims_excess_images_from_older_messages() {
         // 3 messages, each with 1 image — max is 2.
         // The oldest message's image should be stripped.
@@ -968,16 +1249,16 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_counts_tool_messages() {
+    fn trim_old_images_counts_latest_tool_messages() {
         let messages = vec![
-            ChatMessage::tool("[IMAGE:/tmp/tool-old.png]\nGenerated".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/user-new.png]\nNewest".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool-new.png]\nGenerated".to_string()),
         ];
 
         let trimmed = trim_old_images(&messages, 1);
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty(), "oldest tool image should be stripped");
-        assert!(trimmed[0].content.contains("Generated"));
+        assert!(refs0.is_empty(), "oldest user image should be stripped");
+        assert!(trimmed[0].content.contains("Oldest"));
 
         let (_, refs1) = parse_image_markers(&trimmed[1].content);
         assert_eq!(refs1.len(), 1);

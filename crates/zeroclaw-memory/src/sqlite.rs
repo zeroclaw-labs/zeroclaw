@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
@@ -231,6 +232,45 @@ impl SqliteMemory {
         // Migration: add superseded_by column
         if !schema_sql.contains("superseded_by") {
             conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
+        }
+
+        Self::migrate_session_ids_to_sanitized(conn)?;
+
+        Ok(())
+    }
+
+    /// One-shot, idempotent normalization of `memories.session_id`.
+    ///
+    /// The orchestrator sanitizes session keys at the source so the runtime
+    /// HashMap, on-disk JSONL filename, and `session_id` filter for recall
+    /// all agree. Rows written before that fix retained the raw, un-sanitized
+    /// form (e.g. `slack_C123_1.2_user one`) and would be invisible to the
+    /// new sanitized recall filter. Rewrite them once at startup; later runs
+    /// find nothing to update because `sanitize_session_key` is idempotent.
+    fn migrate_session_ids_to_sanitized(conn: &Connection) -> anyhow::Result<()> {
+        let distinct: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT session_id FROM memories WHERE session_id IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut update =
+            conn.prepare("UPDATE memories SET session_id = ?1 WHERE session_id = ?2")?;
+        let mut rewritten = 0usize;
+        for old in &distinct {
+            let new = sanitize_session_key(old);
+            if new != *old {
+                update.execute(params![new, old])?;
+                rewritten += 1;
+            }
+        }
+
+        if rewritten > 0 {
+            tracing::info!(
+                rewritten,
+                "Normalized session_id values in memories table to sanitized form"
+            );
         }
 
         Ok(())
@@ -2944,5 +2984,83 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
+    }
+
+    // ── session_id migration ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn migrates_legacy_session_ids_to_sanitized_form() {
+        let tmp = TempDir::new().unwrap();
+        let raw_sid = "slack_C123_1.2_user one";
+        let sanitized = sanitize_session_key(raw_sid);
+        assert_ne!(
+            raw_sid, sanitized,
+            "test only meaningful when sanitization changes the value"
+        );
+
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            mem.store(
+                "legacy_key",
+                "stored before sanitize fix",
+                MemoryCategory::Conversation,
+                Some(raw_sid),
+            )
+            .await
+            .unwrap();
+            let pre = mem.list(None, Some(raw_sid)).await.unwrap();
+            assert_eq!(pre.len(), 1, "raw session_id should match before migration");
+        }
+
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        let by_sanitized = mem.list(None, Some(&sanitized)).await.unwrap();
+        assert_eq!(
+            by_sanitized.len(),
+            1,
+            "row must be discoverable via sanitized session_id"
+        );
+        assert_eq!(by_sanitized[0].key, "legacy_key");
+
+        let by_raw = mem.list(None, Some(raw_sid)).await.unwrap();
+        assert!(
+            by_raw.is_empty(),
+            "raw form must no longer match after migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_migration_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let sanitized = sanitize_session_key("slack_C123_1.2_user");
+
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            mem.store("k", "v", MemoryCategory::Core, Some(&sanitized))
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..3 {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let entries = mem.list(None, Some(&sanitized)).await.unwrap();
+            assert_eq!(entries.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_id_migration_leaves_null_rows_untouched() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            mem.store("global", "no session", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let entry = mem.get("global").await.unwrap().expect("row should exist");
+        assert!(entry.session_id.is_none());
     }
 }

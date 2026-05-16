@@ -72,6 +72,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
 
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': '需要授权工具调用',
+    'agent.approval_tool': '工具',
+    'agent.approval_arguments': '参数',
+    'agent.approval_timeout_in': '超时自动拒绝',
+    'agent.approval_approve': '批准',
+    'agent.approval_deny': '拒绝',
+    'agent.approval_always': '始终批准',
+    'agent.approval_always_hint': '本会话内自动批准此工具',
+
     // Tools
     'tools.title': '可用工具',
     'tools.name': '名称',
@@ -458,6 +468,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.running': 'Running…',
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': 'Tool approval required',
+    'agent.approval_tool': 'Tool',
+    'agent.approval_arguments': 'Arguments',
+    'agent.approval_timeout_in': 'Auto-deny in',
+    'agent.approval_approve': 'Approve',
+    'agent.approval_deny': 'Deny',
+    'agent.approval_always': 'Always approve',
+    'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
     'agent.stop': 'Stop',
 
     // Tools

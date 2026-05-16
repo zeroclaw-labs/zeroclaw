@@ -993,7 +993,10 @@ pub fn all_tools_with_runtime(
         } else {
             std::path::PathBuf::from(&root_config.workspace.workspaces_dir)
         };
-        let ws_manager = zeroclaw_config::workspace::WorkspaceManager::new(workspaces_dir);
+        let mut ws_manager = zeroclaw_config::workspace::WorkspaceManager::new(workspaces_dir);
+        if let Err(e) = ws_manager.load_profiles_blocking() {
+            tracing::warn!("failed to load workspace profiles at startup: {e}");
+        }
         tool_arcs.push(Arc::new(WorkspaceTool::new(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
             security.clone(),

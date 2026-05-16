@@ -212,7 +212,7 @@ tokio-rustls = { version = "0.26.4", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 
