@@ -17,8 +17,9 @@ struct WindowsPrivacySnapshot {
 const SNAPSHOT_TTL: Duration = Duration::from_secs(1);
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WindowsPrivacySnapshot)>>> = OnceLock::new();
 
-fn execute_powershell_script(script: &str) -> Option<String> {
+fn execute_powershell_script(script: &str, envs: &[(&str, &str)]) -> Option<String> {
     let out = Command::new("powershell")
+        .envs(envs.iter().copied())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .ok()?;
@@ -38,27 +39,30 @@ fn map_consent(value: &str) -> &'static str {
     }
 }
 
-fn escape_for_powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn query_snapshot() -> WindowsPrivacySnapshot {
     let app_exe = std::env::current_exe()
         .ok()
-        .and_then(|p| p.to_str().map(ToOwned::to_owned))
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let app_exe = escape_for_powershell_single_quoted(&app_exe);
 
-    let script_template = r#"
-$appExe = '__APP_EXE__'
+    let script = r##"
+$appExe = $env:ZEROCLAW_APP_EXE
 function Get-AppConsentValue {
   param([string]$cap, [string]$appExe)
+  function Matches-AppConsentEntryName {
+    param([string]$name, [string]$needleFull)
+    if (-not [string]::IsNullOrWhiteSpace($needleFull) -and $name.Contains($needleFull)) { return $true }
+    return $false
+  }
   $paths = @(
     "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap",
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap"
   )
-  $needleFull = ($appExe.ToLowerInvariant() -replace "\\", "#")
-  $needleFile = [System.IO.Path]::GetFileName($appExe).ToLowerInvariant()
+  $needleFull = ""
+  if (-not [string]::IsNullOrWhiteSpace($appExe)) {
+    # Windows stores NonPackaged app executable paths in ConsentStore key names by replacing `\` with `#`.
+    $needleFull = ($appExe.ToLowerInvariant() -replace "\\", "#")
+  }
   foreach ($p in $paths) {
     if (-not (Test-Path $p)) { continue }
 
@@ -66,7 +70,7 @@ function Get-AppConsentValue {
     if (Test-Path $nonPackaged) {
       foreach ($entry in (Get-ChildItem -Path $nonPackaged -ErrorAction SilentlyContinue)) {
         $name = $entry.PSChildName.ToLowerInvariant()
-        if (($needleFull -and $name.Contains($needleFull)) -or ($needleFile -and $name.Contains($needleFile))) {
+        if (Matches-AppConsentEntryName $name $needleFull) {
           $v = (Get-ItemProperty -Path $entry.PSPath -Name Value -ErrorAction SilentlyContinue).Value
           if ($v) { return $v }
         }
@@ -76,7 +80,7 @@ function Get-AppConsentValue {
     foreach ($entry in (Get-ChildItem -Path $p -ErrorAction SilentlyContinue)) {
       if ($entry.PSChildName -eq "NonPackaged") { continue }
       $name = $entry.PSChildName.ToLowerInvariant()
-      if (($needleFull -and $name.Contains($needleFull)) -or ($needleFile -and $name.Contains($needleFile))) {
+      if (Matches-AppConsentEntryName $name $needleFull) {
         $v = (Get-ItemProperty -Path $entry.PSPath -Name Value -ErrorAction SilentlyContinue).Value
         if ($v) { return $v }
       }
@@ -94,10 +98,9 @@ $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   camera = (Get-AppConsentValue "webcam" $appExe)
   admin = $admin
 } | ConvertTo-Json -Compress
-"#;
-    let script = script_template.replace("__APP_EXE__", &app_exe);
+"##;
 
-    if let Some(json) = execute_powershell_script(&script)
+    if let Some(json) = execute_powershell_script(script, &[("ZEROCLAW_APP_EXE", app_exe.as_str())])
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json)
     {
         return WindowsPrivacySnapshot {
