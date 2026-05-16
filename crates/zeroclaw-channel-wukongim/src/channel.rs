@@ -511,7 +511,7 @@ impl WuKongIMChannel {
             client_msg_no: Uuid::new_v4().to_string(),
             channel_id: channel_id.to_string(),
             channel_type,
-            payload: payload_b64,
+            payload: serde_json::Value::String(payload_b64),
             header: None,
             setting: None,
             msg_key: None,
