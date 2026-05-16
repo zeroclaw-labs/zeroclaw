@@ -41,9 +41,9 @@ open /Applications/ZeroClaw.app
 ### What works now
 - App builds with Linux-specific permission probes and onboarding sections.
 - Onboarding is simplified to a short Linux flow (welcome + ready).
-- Screen capture reports:
-  - **X11**: granted
-  - **Wayland + xdg-desktop-portal available**: not determined (prompted at capture time)
+- Screen capture reports **denied** on Linux for now (capture is still macOS-only in the desktop capability layer):
+  - **X11**: denied
+  - **Wayland + xdg-desktop-portal available**: denied
   - **Wayland without portal**: denied
 - Notifications report granted (no centralized Linux privacy gate).
 - Bundle targets remain `.deb` and `.AppImage`.
@@ -51,8 +51,8 @@ open /Applications/ZeroClaw.app
 ### What to test
 - Fresh `.deb` install on Ubuntu 22.04+ → onboarding shows simplified ~2-step flow → tray works
 - Fresh `.AppImage` on Fedora/Arch → same
-- Wayland host with portal: screen capture shows Not Set until first capture flow
-- X11 host: screen capture already Granted
+- Wayland host with portal: screen capture remains Denied (no Linux capture path yet)
+- X11 host: screen capture remains Denied
 - Notification appears via D-Bus
 
 ### How to attempt a build today (will compile, won't be useful)
