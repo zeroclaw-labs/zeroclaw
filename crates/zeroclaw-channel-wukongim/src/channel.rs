@@ -759,6 +759,7 @@ mod tests {
         assert!(ch.mention_only);
         assert_eq!(ch.approval_timeout_secs, 300);
         assert_eq!(ch.downloads_dir, workspace.join("downloads"));
+        assert!(!ch.progress_streaming, "progress_streaming must map from config");
     }
 
     #[test]

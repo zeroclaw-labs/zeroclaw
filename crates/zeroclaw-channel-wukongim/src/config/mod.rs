@@ -30,7 +30,7 @@ mod tests {
         };
         assert_eq!(cfg.device_id, "web-001");
         assert_eq!(cfg.device_flag, 2);
-        assert!(!cfg.progress_streaming);
+        assert!(!cfg.progress_streaming, "progress_streaming should default to false");
     }
 
     #[test]
