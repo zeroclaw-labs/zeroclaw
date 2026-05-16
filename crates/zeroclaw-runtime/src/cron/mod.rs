@@ -760,6 +760,7 @@ mod validate_delivery_tests {
             to: Some("user-42".into()),
             thread_id: Some("conv-99".into()),
             best_effort: true,
+            suppress_if_contains: None,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook with thread_id must validate");
     }
@@ -772,6 +773,7 @@ mod validate_delivery_tests {
             to: Some("user-42".into()),
             thread_id: None,
             best_effort: true,
+            suppress_if_contains: None,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
     }
@@ -784,6 +786,7 @@ mod validate_delivery_tests {
             to: Some("user-42".into()),
             thread_id: None,
             best_effort: true,
+            suppress_if_contains: None,
         };
         let err = validate_delivery_config(Some(&delivery)).expect_err("unknown channel must fail");
         assert!(err.to_string().contains("unsupported delivery channel"));

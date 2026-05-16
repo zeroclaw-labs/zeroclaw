@@ -6572,6 +6572,10 @@ pub struct DeliveryConfigDecl {
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// Skip delivery if the job output contains this string. Useful for suppressing
+    /// posts when the agent has nothing to report (e.g. `suppress_if_contains = "__NO_REPORT__"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppress_if_contains: Option<String>,
 }
 
 fn default_job_type_decl() -> String {

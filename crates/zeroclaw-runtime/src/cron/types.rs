@@ -117,6 +117,9 @@ pub struct DeliveryConfig {
     pub thread_id: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// Skip delivery if the job output contains this string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppress_if_contains: Option<String>,
 }
 
 impl Default for DeliveryConfig {
@@ -127,6 +130,7 @@ impl Default for DeliveryConfig {
             to: None,
             thread_id: None,
             best_effort: true,
+            suppress_if_contains: None,
         }
     }
 }

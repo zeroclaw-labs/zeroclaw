@@ -1009,6 +1009,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         to: decl.to.clone(),
         thread_id: decl.thread_id.clone(),
         best_effort: decl.best_effort,
+        suppress_if_contains: decl.suppress_if_contains.clone(),
     }
 }
 
@@ -1430,6 +1431,7 @@ mod tests {
                 to: Some("1234567890".into()),
                 thread_id: None,
                 best_effort: true,
+                suppress_if_contains: None,
             }),
         )
         .unwrap();
@@ -1465,6 +1467,7 @@ mod tests {
                 to: None,
                 thread_id: None,
                 best_effort: true,
+                suppress_if_contains: None,
             }),
             false,
             None,
@@ -1493,6 +1496,7 @@ mod tests {
                 to: Some("1234567890".into()),
                 thread_id: None,
                 best_effort: true,
+                suppress_if_contains: None,
             }),
         )
         .unwrap_err();
