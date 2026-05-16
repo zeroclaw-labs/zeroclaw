@@ -6,12 +6,13 @@
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_runtime::i18n;
@@ -370,7 +371,9 @@ pub struct WeChatChannel {
     /// CDN base URL.
     cdn_base_url: String,
     /// Allowed WeChat user IDs. Empty = deny all, `"*"` = allow all.
-    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// Backed by `aspect-std::AllowlistAspect` so the check is centralized
+    /// rather than re-implemented per-channel.
+    allowlist: AllowlistAspect,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
     /// HTTP client for API requests.
@@ -603,7 +606,7 @@ impl WeChatChannel {
             account_id: RwLock::new(None),
             api_base_url,
             cdn_base_url,
-            allowed_users: Arc::new(RwLock::new(allowed_users)),
+            allowlist: AllowlistAspect::new(allowed_users),
             pairing,
             client: reqwest::Client::new(),
             context_tokens: Mutex::new(HashMap::new()),
@@ -713,22 +716,11 @@ impl WeChatChannel {
         self.context_tokens.lock().get(user_id).cloned()
     }
 
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users
-            .read()
-            .map(|users| users.iter().any(|u| u == "*" || u == user_id))
-            .unwrap_or(false)
-    }
-
     fn add_allowed_identity_runtime(&self, identity: &str) {
         if identity.is_empty() {
             return;
         }
-        if let Ok(mut users) = self.allowed_users.write()
-            && !users.iter().any(|u| u == identity)
-        {
-            users.push(identity.to_string());
-        }
+        self.allowlist.add(identity);
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -1865,7 +1857,7 @@ impl Channel for WeChatChannel {
                 let text = extract_text_from_items(&items);
 
                 // Check authorization
-                if !self.is_user_allowed(from_user_id) {
+                if !self.allowlist.is_allowed(from_user_id) {
                     self.handle_unauthorized_message(from_user_id, &text).await;
                     continue;
                 }
@@ -2082,7 +2074,7 @@ mod tests {
             Some("/tmp/test-wechat".into()),
         )
         .unwrap();
-        assert!(ch.is_user_allowed("anyone@im.wechat"));
+        assert!(ch.allowlist.is_allowed("anyone@im.wechat"));
     }
 
     #[test]
@@ -2094,8 +2086,8 @@ mod tests {
             Some("/tmp/test-wechat".into()),
         )
         .unwrap();
-        assert!(ch.is_user_allowed("user1@im.wechat"));
-        assert!(!ch.is_user_allowed("user2@im.wechat"));
+        assert!(ch.allowlist.is_allowed("user1@im.wechat"));
+        assert!(!ch.allowlist.is_allowed("user2@im.wechat"));
     }
 
     #[test]
@@ -2235,5 +2227,42 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or("");
         assert!(!version.is_empty());
+    }
+
+    /// Parity oracle: the aspect-backed check must return byte-identical
+    /// results to the pre-migration shape across a truth table covering
+    /// wildcard, empty list, case-sensitivity, and substring rejection.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice@im.wechat"),
+            (vec![], ""),
+            (vec!["*"], "alice@im.wechat"),
+            (vec!["*"], ""),
+            (vec!["user1@im.wechat"], "user1@im.wechat"),
+            (vec!["user1@im.wechat"], "user2@im.wechat"),
+            (vec!["a", "b"], "b"),
+            (vec!["a", "*"], "anyone"),
+            (vec!["*", "a"], "anyone"),
+            (vec!["alice"], "alice_bot"), // substring rejected
+            (vec!["alice"], "alic"),      // prefix rejected
+            (vec!["Alice"], "alice"),     // case-sensitive
+            (vec!["Alice"], "Alice"),
+        ];
+        for (entries, identity) in cases {
+            let baseline = entries.iter().any(|u| *u == "*" || *u == identity);
+            let ch = WeChatChannel::new(
+                entries.iter().map(|s| (*s).to_string()).collect(),
+                None,
+                None,
+                Some("/tmp/test-wechat-parity".into()),
+            )
+            .unwrap();
+            assert_eq!(
+                ch.allowlist.is_allowed(identity),
+                baseline,
+                "aspect drift for entries={entries:?} identity={identity:?}",
+            );
+        }
     }
 }
