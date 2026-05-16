@@ -655,12 +655,23 @@ fn emit_tool_call(
     }
 }
 
+#[derive(Debug)]
+struct ResponsesStreamApiError(String);
+
+impl std::fmt::Display for ResponsesStreamApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpenAI Codex stream error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ResponsesStreamApiError {}
+
 fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
     if let Some(message) = extract_stream_error_message(&event) {
-        anyhow::bail!("OpenAI Codex stream error: {message}");
+        return Err(ResponsesStreamApiError(message).into());
     }
 
     let mut emitted = Vec::new();
@@ -859,9 +870,13 @@ fn process_sse_chunk(
         if line.is_empty() || line == "[DONE]" {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<Value>(line) {
-            emitted.extend(process_responses_stream_event(event, state)?);
-        }
+        let event = serde_json::from_str::<Value>(line).map_err(|err| {
+            anyhow::anyhow!(
+                "OpenAI Codex SSE data parse failed: {err}. Payload: {}",
+                super::sanitize_api_error(line)
+            )
+        })?;
+        emitted.extend(process_responses_stream_event(event, state)?);
     }
 
     Ok(emitted)
@@ -1065,6 +1080,42 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
 }
 
 impl OpenAiCodexProvider {
+    fn responses_request_builder(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
+    ) -> reqwest::RequestBuilder {
+        let mut request_builder = self
+            .client
+            .post(&self.responses_url)
+            .header("Authorization", format!("Bearer {bearer_token}"))
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "pi")
+            .header("Content-Type", "application/json");
+
+        if request.stream {
+            request_builder = request_builder.header("accept", "text/event-stream");
+        }
+
+        if let Some(account_id) = account_id {
+            request_builder = request_builder.header("chatgpt-account-id", account_id);
+        }
+
+        if use_gateway_api_key_auth {
+            if let Some(access_token) = access_token {
+                request_builder = request_builder.header("x-openai-access-token", access_token);
+            }
+            if let Some(account_id) = account_id {
+                request_builder = request_builder.header("x-openai-account-id", account_id);
+            }
+        }
+
+        request_builder
+    }
+
     async fn send_responses_request(
         &self,
         input: Vec<Value>,
@@ -1130,7 +1181,7 @@ impl OpenAiCodexProvider {
         let normalized_model = normalize_model_id(model);
 
         let has_tools = tools.is_some();
-        let request = ResponsesRequest {
+        let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
             instructions,
@@ -1158,27 +1209,13 @@ impl OpenAiCodexProvider {
             access_token.as_deref().unwrap_or_default()
         };
 
-        let mut request_builder = self
-            .client
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {bearer_token}"))
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "pi")
-            .header("accept", "text/event-stream")
-            .header("Content-Type", "application/json");
-
-        if let Some(account_id) = account_id.as_deref() {
-            request_builder = request_builder.header("chatgpt-account-id", account_id);
-        }
-
-        if use_gateway_api_key_auth {
-            if let Some(access_token) = access_token.as_deref() {
-                request_builder = request_builder.header("x-openai-access-token", access_token);
-            }
-            if let Some(account_id) = account_id.as_deref() {
-                request_builder = request_builder.header("x-openai-account-id", account_id);
-            }
-        }
+        let request_builder = self.responses_request_builder(
+            bearer_token,
+            account_id.as_deref(),
+            access_token.as_deref(),
+            use_gateway_api_key_auth,
+            &request,
+        );
 
         let response = request_builder.json(&request).send().await?;
 
@@ -1186,7 +1223,47 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        match decode_responses_body(response).await {
+            Ok(result) => Ok(result),
+            Err(stream_err) => {
+                if stream_err
+                    .downcast_ref::<ResponsesStreamApiError>()
+                    .is_some()
+                {
+                    return Err(stream_err);
+                }
+
+                tracing::warn!(
+                    error = %stream_err,
+                    "OpenAI Codex streaming response decode failed, retrying without streaming"
+                );
+
+                request.stream = false;
+                let non_streaming_response = self
+                    .responses_request_builder(
+                        bearer_token,
+                        account_id.as_deref(),
+                        access_token.as_deref(),
+                        use_gateway_api_key_auth,
+                        &request,
+                    )
+                    .json(&request)
+                    .send()
+                    .await?;
+
+                if !non_streaming_response.status().is_success() {
+                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
+                }
+
+                decode_responses_body(non_streaming_response)
+                    .await
+                    .map_err(|fallback_err| {
+                        anyhow::anyhow!(
+                            "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
+                        )
+                    })
+            }
+        }
     }
 }
 
@@ -1357,6 +1434,80 @@ mod tests {
     use super::*;
     use crate::test_util::{EnvGuard, env_lock};
 
+    enum MockCodexReply {
+        Sse(&'static str),
+        Json(serde_json::Value),
+        Status(axum::http::StatusCode, &'static str),
+    }
+
+    async fn mock_codex_provider(
+        replies: Vec<MockCodexReply>,
+    ) -> (
+        OpenAiCodexProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let replies_clone = Arc::clone(&replies);
+
+        let app = Router::new().route(
+            "/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_clone);
+                let replies = Arc::clone(&replies_clone);
+                async move {
+                    captured.lock().unwrap().push(body);
+                    match replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(MockCodexReply::Status(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "",
+                        )) {
+                        MockCodexReply::Sse(body) => (
+                            axum::http::StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            body.to_string(),
+                        )
+                            .into_response(),
+                        MockCodexReply::Json(body) => Json(body).into_response(),
+                        MockCodexReply::Status(status, body) => {
+                            (status, body.to_string()).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = ProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{addr}")),
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
+
+        (provider, captured, server_handle, temp_dir)
+    }
+
     #[test]
     fn extracts_output_text_first() {
         let response = ResponsesResponse {
@@ -1460,6 +1611,135 @@ mod tests {
         let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
         assert!(provider.custom_endpoint);
         assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
+    }
+
+    #[tokio::test]
+    async fn codex_retries_non_streaming_when_stream_decode_fails() {
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+            MockCodexReply::Json(serde_json::json!({
+                "output_text": "fallback ok",
+                "output": []
+            })),
+        ])
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("provider should retry with stream=false after streaming decode failure");
+
+        assert_eq!(response.text.as_deref(), Some("fallback ok"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected one retry request");
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            MockCodexReply::Sse(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
+            ),
+            MockCodexReply::Json(serde_json::json!({
+                "output_text": "fallback after partial",
+                "output": []
+            })),
+        ])
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("provider should retry after malformed stream frame");
+
+        assert_eq!(response.text.as_deref(), Some("fallback after partial"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "expected one retry request");
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_retry_stream_api_error_events() {
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            MockCodexReply::Sse(
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n",
+            ),
+        ])
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("stream API errors should not be retried");
+
+        assert!(
+            err.to_string()
+                .contains("OpenAI Codex stream error: quota exceeded"),
+            "{err}"
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_retry_failed_http_status() {
+        let (provider, captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Status(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "server down",
+            )])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("HTTP errors should not be retried");
+
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        server_handle.abort();
     }
 
     #[test]
@@ -1583,7 +1863,7 @@ data: [DONE]
         let err = parse_responses_body(payload).expect_err("empty SSE should fail closed");
         assert!(
             err.to_string()
-                .contains("No response from OpenAI Codex stream payload"),
+                .contains("OpenAI Codex SSE data parse failed"),
             "{err}"
         );
     }

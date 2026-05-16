@@ -356,7 +356,11 @@ pub async fn handle_api_cron_run(
         && let (Some(channel), Some(target)) =
             (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
         && let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
-            &config, channel, target, &output,
+            &config,
+            channel,
+            target,
+            job.delivery.thread_id.as_deref(),
+            &output,
         )
         .await
     {

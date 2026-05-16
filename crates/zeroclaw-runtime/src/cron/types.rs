@@ -108,6 +108,13 @@ pub struct DeliveryConfig {
     pub channel: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
+    /// Optional thread/conversation identifier carried into the outbound send.
+    /// Used by channels whose recipient and thread-of-conversation are distinct
+    /// (notably webhook, where a callback service routes on `thread_id`).
+    /// Persisted via the `delivery` JSON column, so existing rows without this
+    /// field deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
 }
@@ -118,6 +125,7 @@ impl Default for DeliveryConfig {
             mode: "none".to_string(),
             channel: None,
             to: None,
+            thread_id: None,
             best_effort: true,
         }
     }

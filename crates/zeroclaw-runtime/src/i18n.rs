@@ -413,6 +413,106 @@ mod tests {
     }
 
     #[test]
+    fn skills_install_cli_strings_format_from_fluent() {
+        type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let en_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["Installing skill from", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  Resolving", "example-skill", "skills registry"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "3 files scanned"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  Security audit completed successfully"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "Official"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "Community submission",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+        let zh_cn_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["正在安装技能来源", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  正在从技能注册表解析", "example-skill"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "已扫描 3 个文件"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  安全审计已成功完成"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "官方"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "社区提交",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+
+        for (source, locale, cases) in [
+            (include_str!("../locales/en/cli.ftl"), "en", en_cases),
+            (
+                include_str!("../locales/zh-CN/cli.ftl"),
+                "zh-CN",
+                zh_cn_cases,
+            ),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn normalize_locale_strips_encoding() {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");

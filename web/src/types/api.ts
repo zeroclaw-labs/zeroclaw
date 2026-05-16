@@ -147,7 +147,9 @@ export interface WsMessage {
     | 'error'
     | 'session_start'
     | 'connected'
-    | 'cron_result';
+    | 'cron_result'
+    | 'approval_request'
+    | 'aborted';
   content?: string;
   full_response?: string;
   name?: string;
@@ -161,6 +163,22 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  // Supervised-mode tool approval (server → client). See #6522.
+  request_id?: string;
+  tool?: string;
+  arguments_summary?: string;
+  timeout_secs?: number;
+}
+
+export type ApprovalDecision = 'approve' | 'deny' | 'always';
+
+export interface PendingApproval {
+  requestId: string;
+  toolName: string;
+  argumentsSummary: string;
+  timeoutSecs: number;
+  /** Wall-clock millis when the request arrived; used to compute remaining time. */
+  receivedAt: number;
 }
 
 /** Row from GET /api/sessions/{id}/messages */

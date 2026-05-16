@@ -23,6 +23,7 @@ pub mod peripherals_traits;
 pub mod provider;
 pub mod runtime_traits;
 pub mod schema;
+pub mod session_keys;
 pub mod tool;
 pub mod vad;
 
