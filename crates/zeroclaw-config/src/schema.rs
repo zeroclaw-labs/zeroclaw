@@ -470,6 +470,12 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub escalation: EscalationConfig,
+
+    /// Progress observer settings — controls real-time per-turn status
+    /// updates emitted to opt-in channels (see [`ProgressObserverConfig`]).
+    #[serde(default)]
+    #[nested]
+    pub progress_observer: ProgressObserverConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -1794,6 +1800,49 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+        }
+    }
+}
+
+/// Configuration for the sidelined progress observer that streams agent
+/// execution progress back to opt-in channels.
+///
+/// Defaults: master switch on, every per-event toggle off. With the
+/// defaults, the observer is attached on each channel turn but every
+/// event short-circuits — no `StatusUpdate` is produced until the user
+/// explicitly enables a sub-toggle.
+#[derive(Debug, Clone, Deserialize, Serialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "progress_observer"]
+#[serde(default)]
+pub struct ProgressObserverConfig {
+    /// Master switch. When false, the observer is not attached at all and
+    /// no per-event check fires.
+    pub enabled: bool,
+    /// Emit a status update when the agent loop starts a new session.
+    pub agent_start: bool,
+    /// Emit a status update when the agent loop finishes.
+    pub agent_end: bool,
+    /// Emit a status update when a tool call starts.
+    pub tool_call_start: bool,
+    /// Emit a status update when a tool call completes (success or failure).
+    pub tool_call: bool,
+    /// Emit a status update when an LLM request is dispatched.
+    pub llm_thinking: bool,
+    /// Emit a status update for runtime Error events.
+    pub error: bool,
+}
+
+impl Default for ProgressObserverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            agent_start: false,
+            agent_end: false,
+            tool_call_start: false,
+            tool_call: false,
+            llm_thinking: false,
+            error: false,
         }
     }
 }
@@ -9858,6 +9907,7 @@ impl Default for Config {
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
+            progress_observer: ProgressObserverConfig::default(),
         }
     }
 }
@@ -12927,7 +12977,10 @@ hooks: HooksConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
+            progress_observer: ProgressObserverConfig::default(),
         };
+        let toml_str = toml::to_string(&config).expect("config serializes to TOML");
+        let parsed: Config = toml::from_str(&toml_str).expect("TOML round-trips back to Config");
         assert_eq!(parsed.providers.fallback, config.providers.fallback);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
@@ -13477,6 +13530,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
@@ -13493,6 +13547,7 @@ default_temperature = 0.7
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
+            progress_observer: ProgressObserverConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.
@@ -19558,5 +19613,39 @@ allowed_users = ["@u:m"]
             "rejection message must name the object requirement, got: {}",
             err.message
         );
+    }
+
+    // ── ProgressObserverConfig ─────────────────────────────────
+
+    #[test]
+    async fn default_values_are_master_on_subs_off() {
+        let cfg = ProgressObserverConfig::default();
+        assert!(cfg.enabled, "master switch should default on");
+        assert!(!cfg.agent_start);
+        assert!(!cfg.agent_end);
+        assert!(!cfg.tool_call_start);
+        assert!(!cfg.tool_call);
+        assert!(!cfg.llm_thinking);
+        assert!(!cfg.error);
+    }
+
+    #[test]
+    async fn deserialize_partial_toml_keeps_defaults() {
+        let toml_input = r#"
+            enabled = true
+            agent_start = true
+        "#;
+        let cfg: ProgressObserverConfig = toml::from_str(toml_input).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.agent_start);
+        assert!(!cfg.tool_call);
+        assert!(!cfg.error);
+    }
+
+    #[test]
+    async fn config_has_progress_observer_field_with_default() {
+        let cfg = Config::default();
+        assert!(cfg.progress_observer.enabled);
+        assert!(!cfg.progress_observer.agent_start);
     }
 }
