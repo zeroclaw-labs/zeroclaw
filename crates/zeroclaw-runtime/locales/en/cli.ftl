@@ -275,6 +275,12 @@ cli-self-test-long-about =
       zeroclaw self-test             # full suite
       zeroclaw self-test --quick     # quick checks only (no network)
 
+cli-skills-install-suggestion =
+    It looks like this request needs the `{$name}` skill, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.
 

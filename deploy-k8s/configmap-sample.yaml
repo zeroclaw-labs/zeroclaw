@@ -19,7 +19,7 @@ data:
     host = "[::]"
     allow_public_bind = true
     require_pairing = true
-    web_dist_dir = "/zeroclaw-data/web/dist"
+    web_dist_dir = "/usr/share/zeroclawlabs/web/dist"
 
     [autonomy]
     level = "supervised"

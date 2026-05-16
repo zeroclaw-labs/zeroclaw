@@ -15,7 +15,10 @@ use zip::ZipArchive;
 pub mod audit;
 pub mod creator;
 pub mod improver;
+mod suggestions;
 pub mod testing;
+
+pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
