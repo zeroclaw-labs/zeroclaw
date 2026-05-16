@@ -519,8 +519,8 @@ impl WhatsAppWebChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        use whatsapp_rust::upload::UploadOptions;
         use wacore::download::MediaType;
+        use whatsapp_rust::upload::UploadOptions;
         let upload = client
             .upload(audio_bytes, MediaType::Audio, UploadOptions::default())
             .await
@@ -703,7 +703,11 @@ impl WhatsAppWebChannel {
         // whatsapp-rust 0.6: upload() takes a third UploadOptions arg; default
         // reuses the legacy behavior (fresh media key generated server-side).
         let upload = client
-            .upload(file_bytes, media_type, whatsapp_rust::upload::UploadOptions::default())
+            .upload(
+                file_bytes,
+                media_type,
+                whatsapp_rust::upload::UploadOptions::default(),
+            )
             .await
             .map_err(|e| anyhow!("WhatsApp upload failed for {target}: {e}"))?;
 
@@ -1119,14 +1123,14 @@ impl Channel for WhatsAppWebChannel {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
+        use wacore::proto_helpers::MessageExt;
+        use wacore::store::DevicePropsOverride;
+        use wacore::types::events::Event;
+        use wacore_binary::jid::JidExt as _;
         use whatsapp_rust::TokioRuntime;
         use whatsapp_rust::bot::Bot;
         use whatsapp_rust::pair_code::PairCodeOptions;
         use whatsapp_rust::store::{Device, DeviceStore};
-        use wacore_binary::jid::JidExt as _;
-        use wacore::proto_helpers::MessageExt;
-        use wacore::store::DevicePropsOverride;
-        use wacore::types::events::Event;
         use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
         use whatsapp_rust_ureq_http_client::UreqHttpClient;
 

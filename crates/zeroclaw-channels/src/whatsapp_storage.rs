@@ -63,15 +63,17 @@ macro_rules! to_store_err {
     // For expressions returning Result<usize, E>
     (execute: $expr:expr) => {
         $expr.map(|_| ()).map_err(|e| {
-            wacore::store::error::StoreError::Database(Box::new(e)
-                as Box<dyn std::error::Error + Send + Sync>)
+            wacore::store::error::StoreError::Database(
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            )
         })
     };
     // For other expressions
     ($expr:expr) => {
         $expr.map_err(|e| {
-            wacore::store::error::StoreError::Database(Box::new(e)
-                as Box<dyn std::error::Error + Send + Sync>)
+            wacore::store::error::StoreError::Database(
+                Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            )
         })
     };
 }
@@ -323,11 +325,7 @@ impl RusqliteStore {
 impl SignalStore for RusqliteStore {
     // --- Identity Operations ---
 
-    async fn put_identity(
-        &self,
-        address: &str,
-        key: [u8; 32],
-    ) -> wacore::store::error::Result<()> {
+    async fn put_identity(&self, address: &str, key: [u8; 32]) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO identities (address, key, device_id)
@@ -336,10 +334,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn load_identity(
-        &self,
-        address: &str,
-    ) -> wacore::store::error::Result<Option<[u8; 32]>> {
+    async fn load_identity(&self, address: &str) -> wacore::store::error::Result<Option<[u8; 32]>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT key FROM identities WHERE address = ?1 AND device_id = ?2",
@@ -374,10 +369,7 @@ impl SignalStore for RusqliteStore {
 
     // --- Session Operations ---
 
-    async fn get_session(
-        &self,
-        address: &str,
-    ) -> wacore::store::error::Result<Option<Bytes>> {
+    async fn get_session(&self, address: &str) -> wacore::store::error::Result<Option<Bytes>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM sessions WHERE address = ?1 AND device_id = ?2",
@@ -392,11 +384,7 @@ impl SignalStore for RusqliteStore {
         }
     }
 
-    async fn put_session(
-        &self,
-        address: &str,
-        session: &[u8],
-    ) -> wacore::store::error::Result<()> {
+    async fn put_session(&self, address: &str, session: &[u8]) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO sessions (address, record, device_id)
@@ -487,10 +475,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn load_signed_prekey(
-        &self,
-        id: u32,
-    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+    async fn load_signed_prekey(&self, id: u32) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM signed_prekeys WHERE id = ?1 AND device_id = ?2",
@@ -505,9 +490,7 @@ impl SignalStore for RusqliteStore {
         }
     }
 
-    async fn load_all_signed_prekeys(
-        &self,
-    ) -> wacore::store::error::Result<Vec<(u32, Vec<u8>)>> {
+    async fn load_all_signed_prekeys(&self) -> wacore::store::error::Result<Vec<(u32, Vec<u8>)>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(
             conn.prepare("SELECT id, record FROM signed_prekeys WHERE device_id = ?1")
@@ -548,10 +531,7 @@ impl SignalStore for RusqliteStore {
         ))
     }
 
-    async fn get_sender_key(
-        &self,
-        address: &str,
-    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+    async fn get_sender_key(&self, address: &str) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT record FROM sender_keys WHERE address = ?1 AND device_id = ?2",
@@ -626,11 +606,7 @@ impl AppSyncStore for RusqliteStore {
         to_store_err!(serde_json::from_slice(&state_data))
     }
 
-    async fn set_version(
-        &self,
-        name: &str,
-        state: HashState,
-    ) -> wacore::store::error::Result<()> {
+    async fn set_version(&self, name: &str, state: HashState) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         let state_data = to_store_err!(serde_json::to_vec(&state))?;
 
@@ -795,10 +771,7 @@ impl ProtocolStore for RusqliteStore {
         Ok(())
     }
 
-    async fn clear_sender_key_devices(
-        &self,
-        group_jid: &str,
-    ) -> wacore::store::error::Result<()> {
+    async fn clear_sender_key_devices(&self, group_jid: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "DELETE FROM sender_key_devices WHERE group_jid = ?1 AND device_id = ?2",
@@ -889,10 +862,7 @@ impl ProtocolStore for RusqliteStore {
         }
     }
 
-    async fn put_lid_mapping(
-        &self,
-        entry: &LidPnMappingEntry,
-    ) -> wacore::store::error::Result<()> {
+    async fn put_lid_mapping(&self, entry: &LidPnMappingEntry) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO lid_pn_mapping
@@ -909,9 +879,7 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
-    async fn get_all_lid_mappings(
-        &self,
-    ) -> wacore::store::error::Result<Vec<LidPnMappingEntry>> {
+    async fn get_all_lid_mappings(&self) -> wacore::store::error::Result<Vec<LidPnMappingEntry>> {
         let conn = self.conn.lock();
         let mut stmt = to_store_err!(conn.prepare(
             "SELECT lid, phone_number, created_at, learning_source, updated_at
@@ -1077,10 +1045,7 @@ impl ProtocolStore for RusqliteStore {
 
     // --- TcToken Storage ---
 
-    async fn get_tc_token(
-        &self,
-        jid: &str,
-    ) -> wacore::store::error::Result<Option<TcTokenEntry>> {
+    async fn get_tc_token(&self, jid: &str) -> wacore::store::error::Result<Option<TcTokenEntry>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT token, token_timestamp, sender_timestamp FROM tc_tokens
