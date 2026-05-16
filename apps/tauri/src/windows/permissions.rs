@@ -4,6 +4,18 @@
 //! input monitoring style hooks.
 
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct WindowsPrivacySnapshot {
+    microphone: String,
+    camera: String,
+    admin: bool,
+}
+
+const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
+static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WindowsPrivacySnapshot)>>> = OnceLock::new();
 
 fn powershell(script: &str) -> Option<String> {
     let out = Command::new("powershell")
@@ -16,39 +28,88 @@ fn powershell(script: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn read_consent_store(capability: &str) -> &'static str {
-    let script = format!(
-        r#"
-$paths = @(
-  "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{cap}",
-  "HKLM:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{cap}"
-)
-foreach ($p in $paths) {{
-  if (Test-Path $p) {{
-    $v = (Get-ItemProperty -Path $p -Name Value -ErrorAction SilentlyContinue).Value
-    if ($v) {{ Write-Output $v; break }}
-  }}
-}}
-"#,
-        cap = capability
-    );
-
-    match powershell(&script) {
-        Some(value) if value.eq_ignore_ascii_case("allow") => "granted",
-        Some(value) if value.eq_ignore_ascii_case("deny") => "denied",
-        _ => "not_determined",
+fn map_consent(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("allow") {
+        "granted"
+    } else if value.eq_ignore_ascii_case("deny") {
+        "denied"
+    } else {
+        "not_determined"
     }
 }
 
-fn is_admin() -> bool {
+fn query_snapshot() -> WindowsPrivacySnapshot {
     let script = r#"
+$probe = {
+  param([string]$cap)
+  $paths = @(
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap",
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap"
+  )
+  foreach ($p in $paths) {
+    if (Test-Path $p) {
+      $v = (Get-ItemProperty -Path $p -Name Value -ErrorAction SilentlyContinue).Value
+      if ($v) { return $v }
+    }
+  }
+  return ""
+}
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { "true" } else { "false" }
+$admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+[PSCustomObject]@{
+  microphone = (& $probe "microphone")
+  camera = (& $probe "webcam")
+  admin = $admin
+} | ConvertTo-Json -Compress
 "#;
-    matches!(powershell(script).as_deref(), Some("true"))
+    if let Some(json) = powershell(script)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json)
+    {
+        return WindowsPrivacySnapshot {
+            microphone: value
+                .get("microphone")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            camera: value
+                .get("camera")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            admin: value
+                .get("admin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+    }
+
+    WindowsPrivacySnapshot {
+        microphone: String::new(),
+        camera: String::new(),
+        admin: false,
+    }
+}
+
+fn snapshot() -> WindowsPrivacySnapshot {
+    let cache = SNAPSHOT_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return query_snapshot(),
+    };
+
+    if let Some((ts, snap)) = guard.as_ref()
+        && ts.elapsed() < SNAPSHOT_TTL
+    {
+        return snap.clone();
+    }
+
+    let fresh = query_snapshot();
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
 }
 
 fn open_settings(uri: &str) -> Result<(), String> {
+    // Empty string is the "window title" placeholder required by `start`.
     Command::new("cmd")
         .args(["/C", "start", "", uri])
         .status()
@@ -57,15 +118,19 @@ fn open_settings(uri: &str) -> Result<(), String> {
 }
 
 pub fn check_microphone() -> &'static str {
-    read_consent_store("microphone")
+    map_consent(&snapshot().microphone)
 }
 
 pub fn check_camera() -> &'static str {
-    read_consent_store("webcam")
+    map_consent(&snapshot().camera)
 }
 
 pub fn check_input_monitoring() -> &'static str {
-    if is_admin() { "granted" } else { "denied" }
+    if snapshot().admin {
+        "granted"
+    } else {
+        "denied"
+    }
 }
 
 pub fn check_notifications() -> &'static str {
@@ -84,7 +149,11 @@ pub fn request_camera() -> &'static str {
 }
 
 pub fn request_input_monitoring() -> &'static str {
-    if is_admin() { "granted" } else { "denied" }
+    if snapshot().admin {
+        "granted"
+    } else {
+        "denied"
+    }
 }
 
 pub fn request_notifications() -> &'static str {

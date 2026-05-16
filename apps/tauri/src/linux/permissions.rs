@@ -58,28 +58,9 @@ pub fn request_screen_recording() -> &'static str {
         return "granted";
     }
 
-    if !portal_available() {
-        return "denied";
-    }
-
-    // Best-effort portal interaction to confirm handler availability.
-    // Wayland consent is typically granted per capture attempt.
-    let attempted = Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.freedesktop.portal.Desktop",
-            "--object-path",
-            "/org/freedesktop/portal/desktop",
-            "--method",
-            "org.freedesktop.portal.ScreenCast.CreateSession",
-            "{}",
-        ])
-        .output()
-        .is_ok();
-
-    if attempted {
+    if portal_available() {
+        // ScreenCast consent is granted during an actual capture flow.
+        // Request here only confirms readiness of the portal path.
         "not_determined"
     } else {
         "denied"

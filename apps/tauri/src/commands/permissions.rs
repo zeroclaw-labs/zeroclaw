@@ -148,7 +148,8 @@ pub fn request_permission<R: Runtime>(app: AppHandle<R>, name: String) -> Result
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        result = Err(format!("Unknown permission: {name}"));
+        let _ = name;
+        result = Err("Permission requests are not supported on this platform".into());
     }
 
     #[cfg(target_os = "linux")]
