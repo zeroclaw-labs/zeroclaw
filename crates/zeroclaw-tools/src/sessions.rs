@@ -54,6 +54,21 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionValidationError> {
     Ok(())
 }
 
+fn resolve_existing_session_key(backend: &dyn SessionBackend, session_id: &str) -> Option<String> {
+    let requested = session_id.trim();
+    let sessions = backend.list_sessions();
+    if sessions.iter().any(|key| key == requested) {
+        return Some(requested.to_string());
+    }
+    if !requested.starts_with("gw_") {
+        let gateway_key = format!("gw_{requested}");
+        if sessions.iter().any(|key| key == &gateway_key) {
+            return Some(gateway_key);
+        }
+    }
+    None
+}
+
 // ── SessionsListTool ────────────────────────────────────────────────
 
 /// Lists active sessions with their channel, last activity time, and message count.
@@ -256,7 +271,7 @@ impl Tool for SessionsSendTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The target session ID (e.g. telegram__user123)"
+                    "description": "The target session ID (e.g. telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>."
                 },
                 "message": {
                     "type": "string",
@@ -301,14 +316,35 @@ impl Tool for SessionsSendTool {
             });
         }
 
+        let Some(target_session_key) =
+            resolve_existing_session_key(self.backend.as_ref(), session_id)
+        else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
+                )),
+            });
+        };
+
         let chat_msg = zeroclaw_api::provider::ChatMessage::user(message);
 
-        match self.backend.append(session_id, &chat_msg) {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Message sent to session '{session_id}'."),
-                error: None,
-            }),
+        match self.backend.append(&target_session_key, &chat_msg) {
+            Ok(()) => {
+                let output = if target_session_key == session_id.trim() {
+                    format!("Message sent to session '{target_session_key}'.")
+                } else {
+                    format!(
+                        "Message sent to session '{target_session_key}' (requested '{session_id}')."
+                    )
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -759,8 +795,11 @@ mod tests {
     // ── SessionsSendTool tests ──────────────────────────────────────
 
     #[tokio::test]
-    async fn send_appends_message() {
+    async fn send_appends_message_to_existing_session() {
         let (_tmp, backend) = test_backend();
+        backend
+            .append("telegram__alice", &ChatMessage::user("Hello from Alice"))
+            .unwrap();
         let tool = SessionsSendTool::new(backend.clone(), test_security());
         let result = tool
             .execute(json!({
@@ -774,9 +813,9 @@ mod tests {
 
         // Verify message was appended
         let messages = backend.load("telegram__alice");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "Hello from another agent");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "Hello from another agent");
     }
 
     #[tokio::test]
@@ -795,6 +834,60 @@ mod tests {
         let messages = backend.load("telegram__alice");
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].content, "Inter-agent message");
+    }
+
+    #[tokio::test]
+    async fn send_to_gateway_session_accepts_dashboard_session_id() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append(
+                "gw_operator-1",
+                &ChatMessage::assistant("Existing dashboard message"),
+            )
+            .unwrap();
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "session_id": "operator-1",
+                "message": "Wake up"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("gw_operator-1"));
+
+        let gateway_messages = backend.load("gw_operator-1");
+        assert_eq!(gateway_messages.len(), 2);
+        assert_eq!(gateway_messages[1].role, "user");
+        assert_eq!(gateway_messages[1].content, "Wake up");
+        assert!(backend.load("operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_rejects_unknown_session() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "session_id": "operator-1",
+                "message": "Wake up"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not found")
+        );
+        assert!(backend.load("operator-1").is_empty());
+        assert!(backend.load("gw_operator-1").is_empty());
     }
 
     #[tokio::test]
