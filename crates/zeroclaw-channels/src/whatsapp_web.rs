@@ -1102,9 +1102,11 @@ impl Channel for WhatsAppWebChannel {
             ..Default::default()
         };
 
+        // Box::pin the large future (~34KB) so it doesn't inflate the
+        // enclosing Send future's stack slot — clippy::large_futures.
         // whatsapp-rust 0.6: send_message returns `SendResult { message_id, to }`
         // instead of a bare `String` (oxidezap/whatsapp-rust#597).
-        let send_result = client.send_message(to, outgoing).await?;
+        let send_result = Box::pin(client.send_message(to, outgoing)).await?;
         tracing::debug!(
             "WhatsApp Web: sent text to {} (id: {})",
             message.recipient,
