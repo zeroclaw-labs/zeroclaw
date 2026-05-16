@@ -102,6 +102,16 @@ When evaluating won't-fix candidates, check against these constraints from `AGEN
 | No vendor lock-in | Grants one provider privilege outside the trait boundary |
 | Zero external infra | Makes a third-party service a hard dependency for core functionality |
 
+## Work Queue
+
+The accepted-but-unassigned work queue is a single `gh` query — no dedicated skill needed:
+
+```bash
+gh issue list --repo zeroclaw-labs/zeroclaw --label "status:accepted" --no-assignee --json number,title
+```
+
+Use this to find issues ready for someone to pick up.
+
 ## Session Report
 
 After any mode completes (except accounting), report:
