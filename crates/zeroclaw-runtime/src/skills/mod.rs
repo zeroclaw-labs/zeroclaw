@@ -1809,7 +1809,7 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         return Vec::new();
     }
 
-    let plugins_dir = config.plugins.resolved_plugins_dir();
+    let plugins_dir = config.resolved_plugins_discovery_dir();
 
     let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
         &config.plugins.security.signature_mode,
@@ -2408,5 +2408,75 @@ description = "fine"
             !names.contains(&"bad-open"),
             "bad open-skill must be skipped, not silently accepted; got: {names:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "plugins-wasm"))]
+mod plugin_skill_discovery_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use zeroclaw_config::schema::{Config, PluginsConfig};
+
+    fn write_skill_plugin(plugins_dir: &Path, plugin_name: &str, skill_name: &str) {
+        let plugin_dir = plugins_dir.join(plugin_name);
+        let skill_dir = plugin_dir.join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!("name = \"{plugin_name}\"\nversion = \"0.1.0\"\ncapabilities = [\"skill\"]\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill_name}\ndescription: test skill\n---\n\nBody\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_plugin_skill_discovery_uses_configured_plugins_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let plugins_dir = tmp.path().join("configured-plugins");
+        write_skill_plugin(&plugins_dir, "configured-plugin", "configured-skill");
+
+        let config = Config {
+            workspace_dir: workspace,
+            config_path: tmp.path().join("config.toml"),
+            plugins: PluginsConfig {
+                enabled: true,
+                plugins_dir: plugins_dir.to_string_lossy().into_owned(),
+                ..PluginsConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let skills = load_plugin_skills_from_config(&config);
+        let names: Vec<_> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, vec!["plugin:configured-plugin/configured-skill"]);
+    }
+
+    #[test]
+    fn runtime_plugin_skill_discovery_falls_back_to_legacy_workspace_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let workspace = tmp.path().join("workspace");
+        write_skill_plugin(&workspace.join("plugins"), "legacy-plugin", "legacy-skill");
+
+        let plugins = PluginsConfig {
+            enabled: true,
+            ..PluginsConfig::default()
+        };
+
+        let config = Config {
+            workspace_dir: workspace,
+            config_path: config_dir.join("config.toml"),
+            plugins,
+            ..Config::default()
+        };
+
+        let skills = load_plugin_skills_from_config(&config);
+        let names: Vec<_> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, vec!["plugin:legacy-plugin/legacy-skill"]);
     }
 }
