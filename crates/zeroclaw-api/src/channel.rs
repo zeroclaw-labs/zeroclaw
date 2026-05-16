@@ -179,6 +179,23 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Deliver an out-of-band execution-progress update for the current
+    /// turn. Default no-op so channels without progress streaming support
+    /// are unaffected.
+    ///
+    /// Implementations should treat this as best-effort: they MUST NOT
+    /// block, MUST NOT retry, and MUST tolerate the runtime calling this
+    /// at any point during a turn (including before the first user
+    /// response is sent).
+    async fn send_status_update(
+        &self,
+        _recipient: &str,
+        _thread_ts: Option<&str>,
+        _update: StatusUpdate,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     async fn finalize_draft(
         &self,
@@ -283,5 +300,70 @@ pub trait Channel: Send + Sync {
     /// fast with a useful error instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
+    }
+}
+
+/// Out-of-band execution-progress update.
+///
+/// Carried by [`Channel::send_status_update`] for channels that opt in to
+/// real-time progress streaming. Generic by design: each channel adapter is
+/// free to render this however it fits its protocol (cmd message, edited
+/// draft, ephemeral note, etc.). The default trait implementation is a
+/// no-op so channels that don't care are unaffected.
+#[derive(Clone, Debug)]
+pub struct StatusUpdate {
+    pub execution_id: String,
+    pub phase: StatusPhase,
+    pub name: String,
+    pub desc: String,
+}
+
+/// Coarse phase tag for [`StatusUpdate`]. The adapter may use this to pick
+/// rendering style; the user-facing wording lives entirely in [`StatusUpdate::desc`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatusPhase {
+    AgentStart,
+    LlmThinking,
+    ToolStart,
+    ToolDone { success: bool, elapsed_ms: u64 },
+    Error,
+    AgentEnd,
+}
+
+#[cfg(test)]
+mod status_update_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct DummyChannel;
+
+    #[async_trait]
+    impl Channel for DummyChannel {
+        fn name(&self) -> &str { "dummy" }
+        async fn send(&self, _: &SendMessage) -> anyhow::Result<()> { Ok(()) }
+        async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_send_status_update_is_noop_ok() {
+        let ch = DummyChannel;
+        let update = StatusUpdate {
+            execution_id: "exec-1".into(),
+            phase: StatusPhase::AgentStart,
+            name: "agent".into(),
+            desc: "Agent 启动".into(),
+        };
+        assert!(ch.send_status_update("recipient", None, update).await.is_ok());
+    }
+
+    #[test]
+    fn status_phase_equality() {
+        assert_eq!(StatusPhase::AgentStart, StatusPhase::AgentStart);
+        assert_ne!(
+            StatusPhase::ToolDone { success: true, elapsed_ms: 10 },
+            StatusPhase::ToolDone { success: false, elapsed_ms: 10 },
+        );
     }
 }
