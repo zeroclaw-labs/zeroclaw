@@ -62,26 +62,6 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
-/// Coerce a JSON value into the string form `Config::set_prop` accepts.
-///
-/// Thin wrapper over the shared `zeroclaw_config::typed_value::coerce_for_set_prop`
-/// helper that the gateway PATCH/PUT endpoints use. Looking up a path's
-/// declared `PropKind` requires a `Config` reference, which the patch handler
-/// has — so this looks the kind up against the live config and forwards.
-fn json_value_to_setprop_string(
-    value: &serde_json::Value,
-    config: &Config,
-    path: &str,
-) -> Result<String> {
-    let kind = config
-        .prop_fields()
-        .into_iter()
-        .find(|f| f.name == path)
-        .map(|f| f.kind);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
-        .map_err(|e| anyhow::anyhow!("{}", e.message))
-}
-
 fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
     config
         .prop_fields()
@@ -104,6 +84,21 @@ fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) 
 fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(err)?);
     std::process::exit(1);
+}
+
+fn config_patch_json_value_type_error(
+    message: impl Into<String>,
+    path: Option<String>,
+    op_index: Option<usize>,
+) -> ConfigApiError {
+    let mut err = ConfigApiError::new(ConfigApiCode::ValueTypeMismatch, message.into());
+    if let Some(path) = path {
+        err = err.with_path(path);
+    }
+    if let Some(op_index) = op_index {
+        err = err.with_op_index(op_index);
+    }
+    err
 }
 
 fn config_patch_fail_json_or_human<T>(
@@ -2634,34 +2629,128 @@ async fn main() -> Result<()> {
                     None | Some("-") => {
                         use std::io::Read;
                         let mut buf = String::new();
-                        std::io::stdin()
-                            .read_to_string(&mut buf)
-                            .context("Failed to read JSON Patch from stdin")?;
+                        if let Err(err) = std::io::stdin().read_to_string(&mut buf) {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from stdin: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from stdin: {err}"),
+                            )?;
+                        }
                         buf
                     }
-                    Some(path) => tokio::fs::read_to_string(path)
-                        .await
-                        .with_context(|| format!("Failed to read JSON Patch from {path}"))?,
+                    Some(path) => match tokio::fs::read_to_string(path).await {
+                        Ok(body) => body,
+                        Err(err) => {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from {path}: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from {path}: {err}"),
+                            )?
+                        }
+                    },
                 };
 
-                let ops: Vec<serde_json::Value> = serde_json::from_str(body.trim())
-                    .context("JSON Patch body must be a JSON array of operations")?;
+                let parsed: serde_json::Value = match serde_json::from_str(body.trim()) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        let api_err = config_patch_json_value_type_error(
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                        )?
+                    }
+                };
+                let ops = match parsed.as_array() {
+                    Some(ops) => ops,
+                    None => {
+                        let api_err = config_patch_json_value_type_error(
+                            "JSON Patch body must be a JSON array of operations",
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            "JSON Patch body must be a JSON array of operations",
+                        )?
+                    }
+                };
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
-                    let op_name = op
-                        .get("op")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `op` field"))?;
-                    let raw_path = op
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `path` field"))?;
+                    let object = match op.as_object() {
+                        Some(object) => object,
+                        None => {
+                            let message = format!("JSON Patch op[{idx}] must be an object");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let op_name = match object.get("op").and_then(|v| v.as_str()) {
+                        Some(op_name) => op_name,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `op` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let raw_path = match object.get("path").and_then(|v| v.as_str()) {
+                        Some(raw_path) => raw_path,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `path` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
                     let path = if let Some(stripped) = raw_path.strip_prefix('/') {
                         stripped.replace('/', ".")
                     } else {
                         raw_path.to_string()
+                    };
+                    let comment = match object.get("comment") {
+                        Some(value) => match value.as_str() {
+                            Some(comment) => Some(comment),
+                            None => {
+                                let message = format!(
+                                    "JSON Patch op[{idx}] `comment` field must be a string"
+                                );
+                                let api_err = config_patch_json_value_type_error(
+                                    message.clone(),
+                                    Some(path.clone()),
+                                    Some(idx),
+                                );
+                                config_patch_fail_json_or_human(json, api_err, message)?
+                            }
+                        },
+                        None => None,
                     };
                     let is_secret = Config::prop_is_secret(&path);
 
@@ -2831,10 +2920,25 @@ async fn main() -> Result<()> {
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
-                config.save().await?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    config_patch_fail_json_or_human(
+                        json,
+                        api_err,
+                        "validation failed after applying patch - no changes saved",
+                    )?;
+                }
+                if let Err(err) = config.save().await {
+                    let api_err = ConfigApiError::new(
+                        ConfigApiCode::ReloadFailed,
+                        format!("save failed: {err}"),
+                    );
+                    config_patch_fail_json_or_human(
+                        json,
+                        api_err,
+                        format!("failed to save config after applying patch: {err}"),
+                    )?;
+                }
 
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
