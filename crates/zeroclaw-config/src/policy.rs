@@ -642,7 +642,11 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
         // non-operator character after the device name prevents the match —
         // blocking bypasses like `2>/dev/stderr.log` or `>/dev/zero/path`.
         // The terminator is captured and preserved in the replacement.
-        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\s|[;&|)]|$)").unwrap()
+        Regex::new(&format!(
+            r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
+            safe_device_redirect_names_pattern()
+        ))
+        .unwrap()
     });
 
     let safe = re.replace_all(command, "$2").to_string();
@@ -776,18 +780,52 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn redirection_target(token: &str) -> Option<&str> {
-    let marker_idx = token.find(['<', '>'])?;
+enum RedirectionArgument<'a> {
+    Target { prefix: &'a str, target: &'a str },
+    NeedsNextToken { prefix: &'a str },
+    FdOnly { prefix: &'a str },
+    None,
+}
+
+fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
+    let Some(marker_idx) = token.find(['<', '>']) else {
+        return RedirectionArgument::None;
+    };
+    let prefix = token[..marker_idx].trim();
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
+    if let Some(after_amp) = rest.strip_prefix('&') {
+        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
+        if remaining.is_empty() {
+            return RedirectionArgument::FdOnly { prefix };
+        }
+    }
     rest = rest.trim_start_matches('&');
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        None
+        RedirectionArgument::NeedsNextToken { prefix }
     } else {
-        Some(trimmed)
+        RedirectionArgument::Target {
+            prefix,
+            target: trimmed,
+        }
     }
+}
+
+const SAFE_DEVICE_REDIRECT_TARGETS: [&str; 4] =
+    ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/zero"];
+
+fn safe_device_redirect_names_pattern() -> String {
+    SAFE_DEVICE_REDIRECT_TARGETS
+        .iter()
+        .map(|target| target.trim_start_matches("/dev/"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn is_safe_device_redirect_target(target: &str) -> bool {
+    SAFE_DEVICE_REDIRECT_TARGETS.contains(&strip_wrapping_quotes(target).trim())
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -1293,6 +1331,26 @@ impl SecurityPolicy {
                 None
             }
         };
+        let forbidden_non_redirect_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if candidate.starts_with('-') {
+                if let Some((_, value)) = candidate.split_once('=')
+                    && let Some(blocked) = forbidden_candidate(value)
+                {
+                    return Some(blocked);
+                }
+                if let Some(value) = attached_short_option_value(candidate)
+                    && let Some(blocked) = forbidden_candidate(value)
+                {
+                    return Some(blocked);
+                }
+                return None;
+            }
+            forbidden_candidate(candidate)
+        };
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
@@ -1301,42 +1359,78 @@ impl SecurityPolicy {
                 continue;
             };
 
+            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
+            let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
-            if let Some(target) = redirection_target(strip_wrapping_quotes(executable))
-                && let Some(blocked) = forbidden_candidate(target)
-            {
-                return Some(blocked);
+            match executable_redirect {
+                RedirectionArgument::Target { target, .. } => {
+                    if !is_safe_device_redirect_target(target)
+                        && let Some(blocked) = forbidden_candidate(target)
+                    {
+                        return Some(blocked);
+                    }
+                }
+                RedirectionArgument::NeedsNextToken { .. } => {
+                    next_is_redirect_target = true;
+                }
+                RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
             for token in words {
                 let candidate = strip_wrapping_quotes(token).trim();
-                if candidate.is_empty() || candidate.contains("://") {
+                if candidate.is_empty() {
                     continue;
                 }
 
-                if let Some(target) = redirection_target(candidate)
-                    && let Some(blocked) = forbidden_candidate(target)
-                {
-                    return Some(blocked);
+                if next_is_redirect_target {
+                    next_is_redirect_target = false;
+                    if is_safe_device_redirect_target(candidate) {
+                        continue;
+                    }
+                    if let Some(blocked) = forbidden_candidate(candidate) {
+                        return Some(blocked);
+                    }
+                    continue;
+                }
+
+                if candidate.contains("://") {
+                    continue;
+                }
+
+                match parse_redirection_argument(candidate) {
+                    RedirectionArgument::Target { prefix, target } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        if is_safe_device_redirect_target(target) {
+                            continue;
+                        }
+                        if let Some(blocked) = forbidden_candidate(target) {
+                            return Some(blocked);
+                        }
+                    }
+                    RedirectionArgument::NeedsNextToken { prefix } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        next_is_redirect_target = true;
+                        continue;
+                    }
+                    RedirectionArgument::FdOnly { prefix } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        continue;
+                    }
+                    RedirectionArgument::None => {}
                 }
 
                 // Handle option assignment forms like `--file=/etc/passwd`.
-                if candidate.starts_with('-') {
-                    if let Some((_, value)) = candidate.split_once('=')
-                        && let Some(blocked) = forbidden_candidate(value)
-                    {
-                        return Some(blocked);
-                    }
-                    if let Some(value) = attached_short_option_value(candidate)
-                        && let Some(blocked) = forbidden_candidate(value)
-                    {
-                        return Some(blocked);
-                    }
-                    continue;
-                }
-
-                if let Some(blocked) = forbidden_candidate(candidate) {
+                if let Some(blocked) = forbidden_non_redirect_candidate(candidate) {
                     return Some(blocked);
+                }
+                if candidate.starts_with('-') {
+                    continue;
                 }
             }
         }
@@ -1743,6 +1837,14 @@ mod tests {
 
     fn default_policy() -> SecurityPolicy {
         SecurityPolicy::default()
+    }
+
+    fn unix_forbidden_path_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            forbidden_paths: vec!["/dev".into(), "/etc".into()],
+            ..SecurityPolicy::default()
+        }
     }
 
     fn readonly_policy() -> SecurityPolicy {
@@ -2745,7 +2847,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_absolute_path() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("cat /etc/passwd"),
             Some("/etc/passwd".into())
@@ -2774,7 +2876,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_option_assignment_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
             Some("/etc/passwd".into())
@@ -2796,7 +2898,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_short_option_attached_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
             Some("/etc/passwd".into())
@@ -2832,13 +2934,80 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_input_redirection_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("cat </etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
             p.forbidden_path_argument("cat</etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_device_redirect_targets() {
+        let p = unix_forbidden_path_policy();
+        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
+        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
+        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
+        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
+        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
+        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
+        let p = unix_forbidden_path_policy();
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi > /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            Some("/dev/stderr.log".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            Some("/dev/stderr.log".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            Some("/dev/zero/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            Some("/dev/null/../../etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd>&2"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
     }
