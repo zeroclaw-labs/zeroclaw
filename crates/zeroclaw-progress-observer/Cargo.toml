@@ -1,0 +1,20 @@
+[package]
+name = "zeroclaw-progress-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sidelined observer that streams agent execution progress back to opt-in channels"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+zeroclaw-api = { workspace = true }
+tokio = { version = "1.50", default-features = false, features = ["rt", "sync"] }
+tracing = { version = "0.1", default-features = false }
+async-trait = "0.1"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.50", default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "test-util"] }
