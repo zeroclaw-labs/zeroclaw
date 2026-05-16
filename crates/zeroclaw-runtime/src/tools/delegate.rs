@@ -1111,7 +1111,7 @@ impl DelegateTool {
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: self.skills_prompt_mode.clone(),
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
