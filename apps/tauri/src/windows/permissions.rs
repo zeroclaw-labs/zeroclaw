@@ -84,11 +84,7 @@ pub fn request_camera() -> &'static str {
 }
 
 pub fn request_input_monitoring() -> &'static str {
-    if is_admin() {
-        "granted"
-    } else {
-        "denied"
-    }
+    if is_admin() { "granted" } else { "denied" }
 }
 
 pub fn request_notifications() -> &'static str {

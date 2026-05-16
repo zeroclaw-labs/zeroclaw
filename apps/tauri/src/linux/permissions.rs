@@ -79,7 +79,11 @@ pub fn request_screen_recording() -> &'static str {
         .output()
         .is_ok();
 
-    if attempted { "not_determined" } else { "denied" }
+    if attempted {
+        "not_determined"
+    } else {
+        "denied"
+    }
 }
 
 pub fn check_notifications() -> &'static str {
