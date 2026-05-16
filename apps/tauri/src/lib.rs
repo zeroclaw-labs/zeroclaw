@@ -4,9 +4,11 @@ pub mod capabilities;
 pub mod commands;
 pub mod gateway_client;
 pub mod health;
+pub mod linux;
 pub mod macos;
 pub mod state;
 pub mod tray;
+pub mod windows;
 
 use commands::onboarding::read_onboarding_complete;
 use gateway_client::GatewayClient;
