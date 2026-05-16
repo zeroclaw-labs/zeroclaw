@@ -218,7 +218,8 @@
       async function detectPlatform() {
         try {
           return await tauriInvoke("get_runtime_platform");
-        } catch (_) {
+        } catch (err) {
+          console.warn("get_runtime_platform failed, falling back to userAgent", err);
           // Fallback for browser-only preview without Tauri IPC.
           const ua = navigator.userAgent.toLowerCase();
           if (ua.includes("windows")) return "windows";
@@ -437,6 +438,7 @@
 
       let currentIndex = 0;
       let statusMap = {};
+      let refreshIntervalId = null;
 
       function el(tag, className, text) {
         const node = document.createElement(tag);
@@ -619,7 +621,8 @@
         statusMap = {};
         renderStep();
         await refresh();
-        setInterval(refresh, 2000);
+        if (refreshIntervalId) clearInterval(refreshIntervalId);
+        refreshIntervalId = setInterval(refresh, 2000);
       }
 
       // Initial render + polling.

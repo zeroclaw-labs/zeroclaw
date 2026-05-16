@@ -10,7 +10,7 @@ fn env_var_present(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
 }
 
-pub fn is_wayland() -> bool {
+fn is_wayland() -> bool {
     env_var_present("WAYLAND_DISPLAY")
         || std::env::var("XDG_SESSION_TYPE")
             .map(|v| v.eq_ignore_ascii_case("wayland"))

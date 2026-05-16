@@ -17,7 +17,7 @@ struct WindowsPrivacySnapshot {
 const SNAPSHOT_TTL: Duration = Duration::from_secs(1);
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WindowsPrivacySnapshot)>>> = OnceLock::new();
 
-fn powershell(script: &str) -> Option<String> {
+fn execute_powershell_script(script: &str) -> Option<String> {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
@@ -62,7 +62,7 @@ $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   admin = $admin
 } | ConvertTo-Json -Compress
 "#;
-    if let Some(json) = powershell(script)
+    if let Some(json) = execute_powershell_script(script)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json)
     {
         return WindowsPrivacySnapshot {
@@ -112,6 +112,7 @@ fn open_settings(uri: &str) -> Result<(), String> {
     // Empty string is the console-window title parameter required by `start`
     // before URL arguments.
     let status = Command::new("cmd")
+        // `start` syntax: start "<title>" <target>; we pass an empty title.
         .args(["/C", "start", "", uri])
         .status()
         .map_err(|e| format!("failed to open settings URI {uri}: {e}"))?;
@@ -133,6 +134,7 @@ pub fn check_camera() -> &'static str {
 }
 
 pub fn check_input_monitoring() -> &'static str {
+    // Desktop-wide input hooks on Windows typically require elevated privileges.
     if snapshot().admin {
         "granted"
     } else {
