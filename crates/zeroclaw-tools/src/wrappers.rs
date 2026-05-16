@@ -36,7 +36,27 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 ///
 /// Replaces the repeated `is_rate_limited()` / `record_action()` guard blocks
 /// previously inlined in every tool's `execute` method (~30 files, ~50 call
-/// sites).  The inner tool receives the call only when the rate limit allows it.
+/// sites).
+///
+/// # Budget semantics
+///
+/// `record_action()` runs **after** the inner tool returns and only when
+/// `ToolResult.success == true`.  This matches the pre-wrapper behaviour: only
+/// calls that actually performed work consumed the action budget.  Validation,
+/// policy, path-allowlist, read-only, and command-validation failures all
+/// surface as `success: false` from the inner tool (or inner wrapper) and do
+/// not consume a slot.
+///
+/// ## Read-tool exception (anti-probing)
+///
+/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) and `PdfReadTool` in
+/// this crate intentionally call `record_action()` *themselves* on the
+/// post-`PathGuardedTool` `resolve_candidate` / `canonicalize` failure paths.
+/// This prevents an attacker from probing path existence for free: each
+/// attempt — successful or failed — consumes exactly one slot.  The outer
+/// `RateLimitedTool` only records on `success: true`, so the totals stay at
+/// one slot per attempt.  When introducing a new read-style tool, follow the
+/// same pattern.
 pub struct RateLimitedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
@@ -71,7 +91,14 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
             });
         }
 
-        if !self.security.record_action() {
+        // Delegate first; only record against the budget when the inner tool
+        // actually performed work (ToolResult.success == true).  This preserves
+        // the pre-wrapper semantics where validation/policy failures (forbidden
+        // paths, malformed args, disabled config, read-only blocks, command
+        // validation) did not consume the action budget.
+        let result = self.inner.execute(args).await?;
+
+        if result.success && !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -79,7 +106,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
             });
         }
 
-        self.inner.execute(args).await
+        Ok(result)
     }
 }
 
@@ -358,5 +385,84 @@ mod tests {
             .unwrap();
         assert!(!blocked.success);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_does_not_consume_budget_on_failure() {
+        // Inner tool that always reports failure (e.g. validation error).
+        // record_action() must NOT fire, so the budget stays at full and
+        // a subsequent successful call still goes through.
+        struct AlwaysFails;
+        #[async_trait]
+        impl Tool for AlwaysFails {
+            fn name(&self) -> &str {
+                "always_fails"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("validation failed".into()),
+                })
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let failing = RateLimitedTool::new(AlwaysFails, sec.clone());
+
+        // Three failed calls — none should consume the single-slot budget.
+        for _ in 0..3 {
+            let r = failing.execute(serde_json::json!({})).await.unwrap();
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("validation failed"));
+        }
+
+        // Now a fresh successful tool wrapped against the same policy must
+        // still have its slot available.
+        let (success_inner, counter) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(success_inner, sec);
+        let r = succeeding.execute(serde_json::json!({})).await.unwrap();
+        assert!(r.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composed_wrappers_path_block_preserves_budget() {
+        // RateLimited(PathGuarded(CountingTool)) — PathGuard blocks the call,
+        // budget must NOT be consumed, so a subsequent allowed call still runs.
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+
+        let blocked = tool
+            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Budget intact: an allowed call should still pass.
+        let allowed = tool
+            .execute(serde_json::json!({"path": "src/main.rs"}))
+            .await
+            .unwrap();
+        assert!(allowed.success, "budget should still have a slot");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

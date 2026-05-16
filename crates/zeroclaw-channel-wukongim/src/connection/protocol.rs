@@ -89,7 +89,7 @@ pub struct SendParams {
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: String,
+    pub payload: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Header>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +116,7 @@ pub struct RecvNotificationParams {
     pub channel_id: String,
     #[serde(rename = "channelType")]
     pub channel_type: u8,
-    pub payload: String,
+    pub payload: serde_json::Value,
     pub timestamp: i64,
 }
 
@@ -146,7 +146,7 @@ pub struct SyncMessage {
     pub message_seq: u32,
     #[serde(rename = "from_uid")]
     pub from_uid: String,
-    pub payload: String,
+    pub payload: serde_json::Value,
     pub timestamp: i64,
 }
 
@@ -159,7 +159,7 @@ pub struct SyncResponse {
 pub struct SyncConversation {
     pub channel_id: String,
     pub channel_type: u8,
-    pub unread: u32,
+    pub unread: Option<u32>,
     pub timestamp: i64,
     pub last_msg_seq: u32,
     pub version: i64,

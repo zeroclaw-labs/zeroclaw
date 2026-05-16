@@ -458,7 +458,11 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+    if is_matrix_channel_name(&msg.channel) {
+        msg.thread_ts.clone()
+    } else {
+        msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
+    }
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -818,6 +822,10 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
 }
 
+fn is_matrix_channel_name(channel_name: &str) -> bool {
+    channel_name == "matrix" || channel_name.starts_with("matrix:")
+}
+
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
@@ -998,6 +1006,7 @@ fn decrypt_optional_secret_for_runtime_reload(
 }
 
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -2196,6 +2205,10 @@ enum NoReplyKind {
     /// "I tried but couldn't fulfil" — external failures, missing
     /// resources, timeouts where the assistant gave up. Reaction: ⚠️.
     Failed,
+    /// Message contains silent marker (<!-- zeroclaw:silent -->).
+    /// Used for background processing (recording to memory) without replying.
+    /// Reaction: None.
+    SilentMarker,
 }
 
 impl NoReplyKind {
@@ -2204,6 +2217,7 @@ impl NoReplyKind {
             NoReplyKind::Informational => "👍",
             NoReplyKind::Refused => "🚫",
             NoReplyKind::Failed => "⚠️",
+            NoReplyKind::SilentMarker => "",
         }
     }
 }
@@ -2797,6 +2811,19 @@ async fn process_channel_message(
         msg
     };
 
+    // ── Silent Message Marker ────────────────────────────
+    // Detect messages that should be saved but not reply to.
+    let mut silent_request = false;
+    if msg.content.contains("<!-- zeroclaw:silent -->") {
+        silent_request = true;
+        msg.content = msg.content.replace("<!-- zeroclaw:silent -->", "").trim().to_string();
+        tracing::debug!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            "Detected silent message marker; turn will be recorded but not replied to"
+        );
+    }
+
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision = ctx.provider.supports_vision();
@@ -2935,6 +2962,25 @@ async fn process_channel_message(
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+
+    // Handle silent requests after recording the user turn so they appear in history
+    if silent_request {
+        let history_response = AssistantChannelOutcome::NoReply {
+            kind: NoReplyKind::SilentMarker,
+            reason: Some("Message marked as silent (not addressed to bot)".to_string()),
+        }
+        .history_marker();
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::assistant(&history_response),
+        );
+        println!(
+            "  🤖 No reply [SILENT] ({}ms): Message marked as silent",
+            started_at.elapsed().as_millis()
+        );
+        return;
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = if force_fresh_session {
@@ -3128,6 +3174,7 @@ async fn process_channel_message(
         // them. Best-effort: log on failure, never propagate. Channels that
         // don't implement add_reaction get the trait's no-op default.
         if ctx.ack_reactions
+            && !silent_request
             && let Some(channel) = target_channel.as_ref()
         {
             let emoji = kind.emoji();
@@ -10410,6 +10457,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -10448,6 +10496,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -10496,6 +10545,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -10782,7 +10832,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "U123".into(),
             reply_target: "C456".into(),
             content: "hello".into(),
-            channel: "cli".into(),
+            channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
@@ -10790,6 +10840,68 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
+    }
+
+    #[test]
+    fn followup_thread_id_does_not_open_matrix_thread_for_root_message() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "$event:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "hello".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(followup_thread_id(&msg), None);
+    }
+
+    #[test]
+    fn matrix_root_conversation_history_key_omits_event_id() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "$first:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "send a.txt".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "$second:server".into(),
+            content: "send it again".into(),
+            timestamp: 2,
+            ..first.clone()
+        };
+
+        let key = conversation_history_key(&first);
+        assert_eq!(key, conversation_history_key(&second));
+        assert!(!key.contains("$first:server"));
+        assert!(!key.contains("$second:server"));
+    }
+
+    #[test]
+    fn matrix_thread_conversation_history_key_uses_thread_root() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "thread reply".into(),
+            channel: "matrix".into(),
+            timestamp: 1,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            attachments: vec![],
+        };
+
+        let key = conversation_history_key(&msg);
+        assert!(key.contains("$root:server"));
+        assert!(!key.contains("$reply:server"));
     }
 
     #[test]
@@ -11900,7 +12012,7 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
         let channels = collect_configured_channels(&config, "test", &[], memory);
 
         assert!(
@@ -11924,7 +12036,7 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
         let channels = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
@@ -11941,7 +12053,7 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test")?);
+        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
         let channels = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels
@@ -12559,6 +12671,8 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_tokens: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -12683,6 +12797,8 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_tokens: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -12799,6 +12915,8 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            max_tokens: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -12928,12 +13046,16 @@ This is an example JSON object for profile settings."#;
                 provider: "fast-provider".into(),
                 model: "fast-model".into(),
                 api_key: None,
+                max_tokens: None,
+                temperature: None,
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "code".into(),
                 provider: "code-provider".into(),
                 model: "code-model".into(),
                 api_key: None,
+                max_tokens: None,
+                temperature: None,
             },
         ];
 

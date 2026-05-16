@@ -1614,13 +1614,12 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
-                    let host = &config.gateway.host;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
                         .await
                     {
                         Ok(Some(code)) => {
@@ -4015,6 +4014,56 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--port",
+            "3001",
+            "--host",
+            "192.168.1.20",
+        ])
+        .expect("gateway get-paircode overrides should parse");
+
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+            } => {
+                assert!(new);
+                assert_eq!(port, Some(3001));
+                assert_eq!(host.as_deref(), Some("192.168.1.20"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    /// Regression for PR #6192: when the user passes `--port`/`--host` to
+    /// `gateway get-paircode`, the override must compose with the configured
+    /// `path_prefix` rather than bypass it. `fetch_paircode` threads
+    /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
+    /// we'd actually send still hits `<prefix>/admin/paircode/new`.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url(
+                "127.0.0.1",
+                9001,
+                Some("/agents/myagent"),
+                "/admin/paircode/new"
+            ),
+            "http://127.0.0.1:9001/agents/myagent/admin/paircode/new",
+        );
+        assert_eq!(
+            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
+            "http://192.168.1.20:42617/gw/admin/paircode",
+        );
     }
 
     #[test]
