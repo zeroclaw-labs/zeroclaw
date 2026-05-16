@@ -1089,6 +1089,22 @@ pub async fn run_tool_call_loop(
             }),
         );
 
+        // 打印完整的 LLM 请求
+        for (i, msg) in prepared_messages.messages.iter().enumerate() {
+            let content_preview = if msg.content.chars().count() > 500 {
+                truncate_with_ellipsis(&msg.content, 500)
+            } else {
+                msg.content.clone()
+            };
+            tracing::info!(
+                iteration = iteration + 1,
+                message_index = i,
+                role = %msg.role,
+                content = %scrub_credentials(&content_preview),
+                "llm.request_message"
+            );
+        }
+
         let llm_started_at = Instant::now();
 
         // Fire void hook before LLM call
@@ -1309,6 +1325,30 @@ pub async fn run_tool_call_loop(
                         parsed_text = fallback_text;
                     }
                     calls = fallback_calls;
+                }
+
+                // 打印 LLM 响应内容
+                let response_preview = if response_text.len() > 1000 {
+                    format!("{}...", &response_text[..1000])
+                } else {
+                    response_text.clone()
+                };
+                tracing::info!(
+                    iteration = iteration + 1,
+                    response_text = %scrub_credentials(&response_preview),
+                    tool_calls_count = calls.len(),
+                    "llm.response_content"
+                );
+
+                // 打印每个 tool 调用
+                for (i, call) in calls.iter().enumerate() {
+                    tracing::info!(
+                        iteration = iteration + 1,
+                        tool_index = i,
+                        tool_name = %call.name,
+                        arguments = %call.arguments,
+                        "llm.tool_call"
+                    );
                 }
 
                 let parse_issue = if tool_specs.is_empty() {
