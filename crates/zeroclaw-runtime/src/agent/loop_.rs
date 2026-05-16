@@ -1329,7 +1329,8 @@ pub async fn run_tool_call_loop(
 
                 // 打印 LLM 响应内容
                 let response_preview = if response_text.len() > 1000 {
-                    format!("{}...", &response_text[..1000])
+                    let end = (0..=1000).rev().find(|&i| response_text.is_char_boundary(i)).unwrap_or(0);
+                    format!("{}...", &response_text[..end])
                 } else {
                     response_text.clone()
                 };
