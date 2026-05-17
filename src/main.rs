@@ -249,6 +249,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Emit raw LLM message payload trace events for local debugging; default
+    /// logging writes them to stderr, but custom subscribers may route them
+    /// elsewhere. May include prompts, history, and tool output.
+    #[arg(long, global = true)]
+    log_llm: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -1257,11 +1263,20 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level));
+    if cli.log_llm {
+        zeroclaw_providers::reliable::set_llm_payload_tracing_enabled(true);
+        filter = filter.add_directive(
+            "zeroclaw_providers::reliable=trace"
+                .parse()
+                .expect("valid log-llm tracing directive"),
+        );
+    }
+
     let subscriber = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
+        .with_env_filter(filter)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -3907,6 +3922,38 @@ mod tests {
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn log_llm_is_global_flag_for_agent_debugging() {
+        for args in [
+            ["zeroclaw", "--log-llm", "agent", "--message", "hello"],
+            ["zeroclaw", "agent", "--log-llm", "--message", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("--log-llm should parse globally");
+
+            assert!(
+                cli.log_llm,
+                "--log-llm should opt in to provider payload tracing"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn log_llm_help_warns_about_raw_payloads() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(help.contains("--log-llm"));
+        assert!(help.contains("Emit raw LLM message payload trace events"));
+        assert!(help.contains("default logging writes them to stderr"));
+        assert!(help.contains("custom subscribers may route them elsewhere"));
+        assert!(help.contains("May include prompts, history, and tool output"));
     }
 
     #[test]
