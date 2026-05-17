@@ -80,7 +80,7 @@ impl WuKongIMChannel {
             dawn_url: config.dawn_url.clone(),
             dawn_token: config.dawn_token.clone(),
             ack_reactions: config.ack_reactions,
-            ack_reactions_message: if config.ack_reactions_message.is_empty() { "👋 收到".to_string() } else { config.ack_reactions_message.clone() },
+            ack_reactions_message: if config.ack_reactions_message.is_empty() { "👌 收到，我想想...".to_string() } else { config.ack_reactions_message.clone() },
             ack_reactions_delay_secs: config.ack_reactions_delay,
             memory,
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
