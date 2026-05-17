@@ -1216,16 +1216,34 @@ async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
                 .unwrap_or_default()
         });
 
+    // Diagnostic file written to config_dir so it is visible even under
+    // CREATE_NO_WINDOW. Helps diagnose why file logging may not activate.
+    let diag = config_dir.join("zeroclaw-logging-debug.txt");
+
     let Ok(content) = tokio::fs::read_to_string(config_dir.join("config.toml")).await else {
+        let _ = std::fs::write(&diag, format!(
+            "config_dir: {}\nERROR: could not read config.toml\nargs: {:?}",
+            config_dir.display(), std::env::args().collect::<Vec<_>>()
+        ));
         return LoggingConfig::default();
     };
     let Ok(table) = content.parse::<toml::Value>() else {
+        let _ = std::fs::write(&diag, format!(
+            "config_dir: {}\nERROR: could not parse config.toml as TOML",
+            config_dir.display()
+        ));
         return LoggingConfig::default();
     };
-    table
+    let cfg = table
         .get("logging")
         .and_then(|v| toml::to_string(v).ok().and_then(|s| toml::from_str::<LoggingConfig>(&s).ok()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let _ = std::fs::write(&diag, format!(
+        "config_dir: {}\nlevel: {}\ndir: {:?}\nout_file: {:?}\nerr_file: {:?}\nargs: {:?}",
+        config_dir.display(), cfg.level, cfg.dir, cfg.out_file, cfg.err_file,
+        std::env::args().collect::<Vec<_>>()
+    ));
+    cfg
 }
 
 /// Scan raw CLI args for `--config-dir <path>` without going through Clap.
