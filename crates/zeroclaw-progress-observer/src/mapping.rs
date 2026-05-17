@@ -67,10 +67,11 @@ pub(crate) fn event_to_status(
         }
         ObserverEvent::ToolCall { tool, duration, success } if toggles.tool_call => {
             let elapsed_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+            let label = tool_label(tool);
             let desc = if *success {
-                format!("{} 执行完成（{}ms）", tool, elapsed_ms)
+                format!("{} 执行完成（{}ms）", label, elapsed_ms)
             } else {
-                format!("{} 执行失败", tool)
+                format!("{} 执行失败", label)
             };
             Some(make(
                 execution_id,
@@ -92,18 +93,31 @@ pub(crate) fn event_to_status(
     }
 }
 
+fn tool_label(tool: &str) -> &str {
+    match tool {
+        "shell" => "执行命令",
+        "web_search_tool" => "搜索",
+        "web_fetch" => "抓取网页",
+        "content_search" => "搜索内容",
+        "glob_search" => "搜索文件",
+        "file_read" => "读取文件",
+        "file_write" => "写入文件",
+        "file_edit" => "编辑文件",
+        "http_request" => "HTTP 请求",
+        _ => tool,
+    }
+}
+
 fn format_tool_start_desc(tool: &str, snippet: Option<&str>) -> String {
-    match (tool, snippet) {
-        ("shell", Some(s)) => format!("执行命令：{}", s),
-        ("web_search_tool", Some(s)) => format!("搜索：{}", s),
-        ("web_fetch", Some(s)) => format!("抓取网页：{}", s),
-        ("content_search", Some(s)) => format!("搜索内容：{}", s),
-        ("glob_search", Some(s)) => format!("搜索文件：{}", s),
-        ("file_read", Some(s)) => format!("读取文件：{}", s),
-        ("file_write", Some(s)) => format!("写入文件：{}", s),
-        ("file_edit", Some(s)) => format!("编辑文件：{}", s),
-        ("http_request", Some(s)) => format!("HTTP 请求：{}", s),
-        (other, _) => format!("调用工具：{}", other),
+    let label = tool_label(tool);
+    if label == tool {
+        // unknown tool — generic fallback, snippet not shown
+        format!("调用工具：{}", tool)
+    } else {
+        match snippet {
+            Some(s) => format!("{}：{}", label, s),
+            None => label.to_string(),
+        }
     }
 }
 
@@ -291,18 +305,18 @@ mod event_to_status_tests {
             }
             _ => panic!("wrong phase"),
         }
-        assert_eq!(out.desc, "shell 执行完成（42ms）");
+        assert_eq!(out.desc, "执行命令 执行完成（42ms）");
     }
 
     #[test]
     fn tool_call_failure_uses_failure_template() {
         let ev = ObserverEvent::ToolCall {
-            tool: "http".into(),
+            tool: "file_read".into(),
             duration: Duration::from_millis(1500),
             success: false,
         };
         let out = event_to_status("e", &ev, &all_on()).unwrap();
-        assert_eq!(out.desc, "http 执行失败");
+        assert_eq!(out.desc, "读取文件 执行失败");
     }
 
     #[test]
