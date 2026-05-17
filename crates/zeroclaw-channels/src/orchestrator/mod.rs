@@ -99,7 +99,6 @@ use zeroclaw_runtime::agent::loop_::{
     scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
-#[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer, runtime_trace};
@@ -1619,21 +1618,41 @@ async fn create_resilient_provider_nonblocking(
     .context("failed to join provider initialization task")?
 }
 
+fn channel_runtime_string(key: &str) -> String {
+    i18n::get_required_cli_string(key)
+}
+
+fn channel_runtime_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn build_current_route_summary(current: &ChannelRouteSelection) -> String {
+    channel_runtime_string_with_args(
+        "channel-runtime-current-route",
+        &[
+            ("provider", current.provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    )
+}
+
 fn build_models_help_response(
     current: &ChannelRouteSelection,
     workspace_dir: &Path,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
-    response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
+    response.push_str(&build_current_route_summary(current));
+    response.push_str("\n\n");
+    response.push_str(&channel_runtime_string("channel-runtime-switch-model-help"));
+    response.push('\n');
 
     if !model_routes.is_empty() {
-        response.push_str("\nConfigured model routes:\n");
+        response.push('\n');
+        response.push_str(&channel_runtime_string(
+            "channel-runtime-configured-model-routes",
+        ));
+        response.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 response,
@@ -1645,17 +1664,19 @@ fn build_models_help_response(
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
-        let _ = writeln!(
-            response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --provider {}`.",
-            current.provider, current.provider
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_string_with_args(
+            "channel-runtime-no-cached-models",
+            &[("provider", current.provider.as_str())],
+        ));
+        response.push('\n');
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_string_with_args(
+            "channel-runtime-cached-models",
+            &[("count", &cached_models.len().to_string())],
+        ));
+        response.push('\n');
         for model in cached_models {
             let _ = writeln!(response, "- `{model}`");
         }
@@ -1666,23 +1687,33 @@ fn build_models_help_response(
 
 fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
-    response.push_str("\nSwitch provider with `/models <provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
-    response.push_str("Available providers:\n");
+    response.push_str(&build_current_route_summary(current));
+    response.push_str("\n\n");
+    response.push_str(&channel_runtime_string(
+        "channel-runtime-switch-provider-help",
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_string(
+        "channel-runtime-switch-model-command-help",
+    ));
+    response.push_str("\n\n");
+    response.push_str(&channel_runtime_string(
+        "channel-runtime-available-providers",
+    ));
+    response.push('\n');
     for provider in zeroclaw_providers::list_providers() {
         if provider.aliases.is_empty() {
             let _ = writeln!(response, "- {}", provider.name);
         } else {
+            let aliases = provider.aliases.join(", ");
             let _ = writeln!(
                 response,
-                "- {} (aliases: {})",
+                "- {} ({})",
                 provider.name,
-                provider.aliases.join(", ")
+                channel_runtime_string_with_args(
+                    "channel-runtime-provider-aliases",
+                    &[("aliases", aliases.as_str())]
+                )
             );
         }
     }
@@ -1696,17 +1727,21 @@ fn build_config_text_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut resp = String::new();
-    let _ = writeln!(
-        resp,
-        "Current provider: `{}`\nCurrent model: `{}`",
-        current.provider, current.model
-    );
-    resp.push_str("\nAvailable providers:\n");
+    resp.push_str(&build_current_route_summary(current));
+    resp.push_str("\n\n");
+    resp.push_str(&channel_runtime_string(
+        "channel-runtime-available-providers",
+    ));
+    resp.push('\n');
     for p in zeroclaw_providers::list_providers() {
         let _ = writeln!(resp, "- `{}`", p.name);
     }
     if !model_routes.is_empty() {
-        resp.push_str("\nConfigured model routes:\n");
+        resp.push('\n');
+        resp.push_str(&channel_runtime_string(
+            "channel-runtime-configured-model-routes",
+        ));
+        resp.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 resp,
@@ -1715,9 +1750,10 @@ fn build_config_text_response(
             );
         }
     }
-    resp.push_str(
-        "\nUse `/models <provider>` to switch provider.\nUse `/model <model-id>` to switch model.",
-    );
+    resp.push('\n');
+    resp.push_str(&channel_runtime_string(
+        "channel-runtime-use-models-and-model",
+    ));
     resp
 }
 
@@ -1804,7 +1840,10 @@ fn build_config_block_kit(
     let mut provider_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_provider",
-        "placeholder": { "type": "plain_text", "text": "Select provider" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_string("channel-runtime-select-provider")
+        },
         "options": provider_options
     });
     if let Some(init) = initial_provider {
@@ -1814,7 +1853,10 @@ fn build_config_block_kit(
     let mut model_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_model",
-        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_string("channel-runtime-select-model")
+        },
         "options": model_options
     });
     if let Some(init) = initial_model {
@@ -1826,22 +1868,31 @@ fn build_config_block_kit(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!(
-                    "*Model Configuration*\nCurrent: `{}` / `{}`",
-                    current.provider, current.model
+                "text": channel_runtime_string_with_args(
+                    "channel-runtime-config-block-title",
+                    &[
+                        ("provider", current.provider.as_str()),
+                        ("model", current.model.as_str()),
+                    ],
                 )
             }
         },
         {
             "type": "section",
             "block_id": "config_provider_block",
-            "text": { "type": "mrkdwn", "text": "*Provider*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_string("channel-runtime-provider-label")
+            },
             "accessory": provider_select
         },
         {
             "type": "section",
             "block_id": "config_model_block",
-            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_string("channel-runtime-model-label")
+            },
             "accessory": model_select
         }
     ]);
@@ -1877,21 +1928,29 @@ async fn handle_runtime_command_if_needed(
                                 set_route_selection(ctx, &sender_key, current.clone());
                             }
 
-                            format!(
-                                "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                                current.model
+                            channel_runtime_string_with_args(
+                                "channel-runtime-provider-switched",
+                                &[
+                                    ("provider", provider_name.as_str()),
+                                    ("model", current.model.as_str()),
+                                ],
                             )
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                            format!(
-                                "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                            channel_runtime_string_with_args(
+                                "channel-runtime-provider-init-failed",
+                                &[
+                                    ("provider", provider_name.as_str()),
+                                    ("details", safe_err.as_str()),
+                                ],
                             )
                         }
                     }
                 }
-                None => format!(
-                    "Unknown provider `{raw_provider}`. Use `/models` to list valid providers."
+                None => channel_runtime_string_with_args(
+                    "channel-runtime-unknown-provider",
+                    &[("provider", raw_provider.as_str())],
                 ),
             }
         }
@@ -1901,7 +1960,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                channel_runtime_string("channel-runtime-model-id-empty")
             } else {
                 // Resolve provider+model from model_routes (match by model name or hint)
                 if let Some(route) = ctx.model_routes.iter().find(|r| {
@@ -1915,9 +1974,12 @@ async fn handle_runtime_command_if_needed(
                 }
                 set_route_selection(ctx, &sender_key, current.clone());
 
-                format!(
-                    "Model switched to `{}` (provider: `{}`). Context preserved.",
-                    current.model, current.provider
+                channel_runtime_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.provider.as_str()),
+                    ],
                 )
             }
         }
@@ -1942,7 +2004,7 @@ async fn handle_runtime_command_if_needed(
                 tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            channel_runtime_string("channel-runtime-new-session")
         }
     };
 
@@ -2861,31 +2923,30 @@ async fn process_channel_message(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut active_provider = match get_or_create_provider(
-        ctx.as_ref(),
-        &route.provider,
-        route.api_key.as_deref(),
-    )
-    .await
-    {
-        Ok(provider) => provider,
-        Err(err) => {
-            let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
+    let mut active_provider =
+        match get_or_create_provider(ctx.as_ref(), &route.provider, route.api_key.as_deref()).await
+        {
+            Ok(provider) => provider,
+            Err(err) => {
+                let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                let message = channel_runtime_string_with_args(
+                    "channel-runtime-provider-unavailable",
+                    &[
+                        ("provider", route.provider.as_str()),
+                        ("details", safe_err.as_str()),
+                    ],
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(message, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
@@ -3628,13 +3689,12 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let mut delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
-            };
+            let mut delivered_response =
+                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                    channel_runtime_string("channel-runtime-malformed-tool-output")
+                } else {
+                    sanitized_response
+                };
 
             // Append a footer when the response was served by a different provider family.
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
@@ -3645,13 +3705,15 @@ async fn process_channel_message(
                     || req_base.starts_with(act_base)
                     || act_base.starts_with(req_base);
                 if !same_family {
-                    use std::fmt::Write as _;
-                    write!(
-                        delivered_response,
-                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
-                        fb.requested_provider, fb.actual_provider, fb.actual_model,
-                    )
-                    .ok();
+                    delivered_response.push_str("\n\n");
+                    delivered_response.push_str(&channel_runtime_string_with_args(
+                        "channel-runtime-fallback-footer",
+                        &[
+                            ("requested_provider", fb.requested_provider.as_str()),
+                            ("actual_provider", fb.actual_provider.as_str()),
+                            ("actual_model", fb.actual_model.as_str()),
+                        ],
+                    ));
                 }
             }
 
@@ -3736,8 +3798,7 @@ async fn process_channel_message(
                 if receipts.is_empty() {
                     None
                 } else {
-                    use std::fmt::Write as _;
-                    let mut block = String::from("---\nTool receipts:");
+                    let mut block = channel_runtime_string("channel-runtime-tool-receipts-header");
                     for r in receipts.iter() {
                         write!(block, "\n  {r}").ok();
                     }
@@ -3822,9 +3883,9 @@ async fn process_channel_message(
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                    channel_runtime_string("channel-runtime-context-window-exceeded-compacted")
                 } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                    channel_runtime_string("channel-runtime-context-window-exceeded")
                 };
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
@@ -3848,7 +3909,7 @@ async fn process_channel_message(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -3951,11 +4012,10 @@ async fn process_channel_message(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = channel_runtime_string("channel-runtime-request-timed-out");
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel
@@ -4066,9 +4126,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                channel_runtime_string("channel-runtime-stop-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                channel_runtime_string("channel-runtime-stop-none")
             };
             let channel = ctx
                 .channels_by_name
@@ -8126,6 +8186,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         // Two sends: the model's reply and the trailing receipts block.
         assert!(
             sent_messages.len() >= 2,
@@ -8136,10 +8197,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let receipts_message = sent_messages
             .iter()
-            .find(|m| m.contains("Tool receipts:"))
+            .find(|m| m.contains(&receipts_header))
             .unwrap_or_else(|| {
                 panic!(
-                    "no `Tool receipts:` send found; got {:?}",
+                    "no localized tool receipts send found; got {:?}",
                     sent_messages.as_slice()
                 )
             });
@@ -8148,8 +8209,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "receipts block must be sent to the same reply target as the agent reply, got {receipts_message}"
         );
         assert!(
-            receipts_message.contains("---\nTool receipts:"),
-            "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
+            receipts_message.contains(&receipts_header),
+            "receipts block must be prefixed with the localized receipt header, got {receipts_message}"
         );
         assert!(
             receipts_message.contains("zc-receipt-"),
@@ -8260,8 +8321,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         assert!(
-            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            !sent_messages.iter().any(|m| m.contains(&receipts_header)),
             "no receipts block must be sent when show_receipts_in_response=false; got {:?}",
             sent_messages.as_slice()
         );
@@ -8372,8 +8434,9 @@ BTC is currently around $65,000 based on latest tool output."#
             "no zc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         assert!(
-            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            !sent_messages.iter().any(|m| m.contains(&receipts_header)),
             "no `Tool receipts:` block must be sent when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
@@ -8788,7 +8851,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("Provider switched to `openrouter`"));
+        assert!(sent[0].contains(&i18n::get_required_cli_string_with_args(
+            "channel-runtime-provider-switched",
+            &[("provider", "openrouter"), ("model", "default-model")]
+        )));
 
         let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
@@ -11710,10 +11776,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let new_session_message = i18n::get_required_cli_string("channel-runtime-new-session");
         assert!(
-            sent_messages.iter().any(|message| {
-                message.contains("Conversation history cleared. Starting fresh.")
-            })
+            sent_messages
+                .iter()
+                .any(|message| { message.contains(&new_session_message) })
         );
     }
 
