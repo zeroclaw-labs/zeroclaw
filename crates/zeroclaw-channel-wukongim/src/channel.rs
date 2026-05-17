@@ -529,7 +529,7 @@ impl WuKongIMChannel {
     ///
     /// WuKongIM's Go server expects `SendParams.payload` as `[]uint8`, which
     /// JSON-encodes as a base64 string — same contract as `send_text_message`.
-    async fn send_cmd_message(
+    async fn send_status_message(
         &self,
         channel_id: &str,
         channel_type: u8,
@@ -617,7 +617,7 @@ impl Channel for WuKongIMChannel {
                 "desc": update.desc,
             }
         });
-        self.send_cmd_message(&channel_id, channel_type, payload).await
+        self.send_status_message(&channel_id, channel_type, payload).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
