@@ -1194,18 +1194,27 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 
 /// Read just `[logging]` from config.toml before the full Config::load_or_init().
 /// Falls back silently to defaults on any I/O or parse error.
+///
+/// Config-dir resolution order (mirrors Config::load_or_init precedence):
+///   1. `--config-dir <path>` CLI argument (for daemon/adapter launch)
+///   2. `ZEROCLAW_CONFIG_DIR` env var
+///   3. `HOME` env var → `$HOME/.zeroclaw`
+///   4. `directories` crate home → `~/.zeroclaw`
 async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
     use zeroclaw_config::schema::LoggingConfig;
 
-    let config_dir = if let Ok(dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
-        std::path::PathBuf::from(dir)
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home).join(".zeroclaw")
-    } else {
-        directories::UserDirs::new()
-            .map(|u| u.home_dir().join(".zeroclaw"))
-            .unwrap_or_default()
-    };
+    let config_dir = config_dir_from_args()
+        .or_else(|| std::env::var("ZEROCLAW_CONFIG_DIR").ok().map(std::path::PathBuf::from))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".zeroclaw"))
+        })
+        .unwrap_or_else(|| {
+            directories::UserDirs::new()
+                .map(|u| u.home_dir().join(".zeroclaw"))
+                .unwrap_or_default()
+        });
 
     let Ok(content) = tokio::fs::read_to_string(config_dir.join("config.toml")).await else {
         return LoggingConfig::default();
@@ -1217,6 +1226,15 @@ async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
         .get("logging")
         .and_then(|v| v.clone().try_into().ok())
         .unwrap_or_default()
+}
+
+/// Scan raw CLI args for `--config-dir <path>` without going through Clap.
+/// Needed because logging must be initialized before the full arg-parse runs.
+fn config_dir_from_args() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    args.windows(2)
+        .find(|w| w[0] == "--config-dir")
+        .map(|w| std::path::PathBuf::from(&w[1]))
 }
 
 /// Initialize tracing. Returns guards that must live until end of `main()`.
