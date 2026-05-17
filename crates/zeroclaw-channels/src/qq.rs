@@ -298,6 +298,9 @@ pub struct QQChannel {
     session_id: Arc<RwLock<Option<String>>>,
     /// Last sequence number received, used for gateway resume (opcode 6).
     last_sequence: Arc<RwLock<Option<i64>>>,
+    /// Latest QQ msg_id per reply_target, used to send passive replies instead of
+    /// active messages. Without this, group replies fail with error 40034102.
+    pending_passive_msg_ids: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl QQChannel {
@@ -314,6 +317,7 @@ impl QQChannel {
             proxy_url: None,
             session_id: Arc::new(RwLock::new(None)),
             last_sequence: Arc::new(RwLock::new(None)),
+            pending_passive_msg_ids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -658,20 +662,29 @@ impl QQChannel {
     }
 
     /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
+    /// Pass `msg_id` to send as a passive reply (avoids active-message permission errors).
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        file_info: &str,
+        msg_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "msg_type": 7,
             "media": {
                 "file_info": file_info,
             },
             "msg_seq": next_msg_seq(),
         });
+        if let Some(mid) = msg_id {
+            body["msg_id"] = json!(mid);
+        }
 
         let resp = self
             .http_client()
@@ -695,6 +708,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        msg_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -715,7 +729,8 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, msg_id)
+                .await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -744,7 +759,7 @@ impl QQChannel {
             // Check upload cache
             if let Some(cached_file_info) = self.get_cached_upload(&cache_key).await {
                 tracing::debug!("QQ: using cached upload for {target}");
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, msg_id)
                     .await?;
                 return Ok(());
             }
@@ -766,7 +781,8 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, msg_id)
+                .await?;
         }
 
         Ok(())
@@ -943,20 +959,29 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    /// Pass `msg_id` to send as a passive reply (avoids active-message permission errors).
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        msg_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "markdown": {
                 "content": content,
             },
             "msg_type": 2,
             "msg_seq": next_msg_seq(),
         });
+        if let Some(mid) = msg_id {
+            body["msg_id"] = json!(mid);
+        }
 
         let resp = self
             .http_client()
@@ -983,24 +1008,36 @@ impl Channel for QQChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // Look up the passive reply msg_id for this recipient. Group messages require
+        // a msg_id in the request body to be treated as passive replies; without it
+        // QQ rejects them as active messages (error 40034102, no permission).
+        let passive_msg_id = {
+            let map = self.pending_passive_msg_ids.read().await;
+            map.get(&message.recipient).cloned()
+        };
+        let msg_id = passive_msg_id.as_deref();
+
         let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(&message.recipient, &message.content, msg_id)
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
+            self.send_text_markdown(&message.recipient, &cleaned_text, msg_id)
                 .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self
+                .send_attachment(&message.recipient, attachment, msg_id)
+                .await
+            {
                 tracing::warn!(
                     target = attachment.target,
                     error = %e,
@@ -1017,7 +1054,7 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
+                self.send_text_markdown(&message.recipient, &fallback, msg_id)
                     .await?;
             }
         }
@@ -1323,6 +1360,13 @@ impl Channel for QQChannel {
 
                             let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
                             let chat_id = format!("group:{group_openid}");
+
+                            // Store msg_id so send() can include it as a passive reply reference.
+                            // Without this, QQ rejects group replies as active messages (40034102).
+                            if !msg_id.is_empty() {
+                                self.pending_passive_msg_ids.write().await
+                                    .insert(chat_id.clone(), msg_id.to_string());
+                            }
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
