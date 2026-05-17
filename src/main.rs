@@ -1224,7 +1224,7 @@ async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
     };
     table
         .get("logging")
-        .and_then(|v| v.clone().try_into().ok())
+        .and_then(|v| toml::to_string(v).ok().and_then(|s| toml::from_str::<LoggingConfig>(&s).ok()))
         .unwrap_or_default()
 }
 
@@ -1262,6 +1262,15 @@ fn init_logging(
     let stderr_layer = fmt::layer().with_writer(std::io::stderr);
     let mut guards: Vec<WorkerGuard> = Vec::new();
 
+    // When running under CREATE_NO_WINDOW (e.g. yumclaw adapter on Windows),
+    // eprintln! is invisible. Write errors to a diagnostic file so problems
+    // with file-logging setup can be diagnosed.
+    let write_init_error = |dir: &str, msg: &str| {
+        let path = std::path::Path::new(dir).join("zeroclaw-logging-error.txt");
+        let _ = std::fs::write(&path, msg);
+        eprintln!("Warning: {msg}");
+    };
+
     let out_layer = cfg.dir.as_deref().zip(cfg.out_file.as_deref()).and_then(|(dir, file)| {
         match logging::DailyRotatingFile::new(dir, file) {
             Ok(w) => {
@@ -1270,7 +1279,7 @@ fn init_logging(
                 Some(fmt::layer().with_writer(nb).with_ansi(false))
             }
             Err(e) => {
-                eprintln!("Warning: failed to open logging.out_file: {e}");
+                write_init_error(dir, &format!("failed to open out_file '{file}' in '{dir}': {e}"));
                 None
             }
         }
@@ -1289,7 +1298,7 @@ fn init_logging(
                 )
             }
             Err(e) => {
-                eprintln!("Warning: failed to open logging.err_file: {e}");
+                write_init_error(dir, &format!("failed to open err_file '{file}' in '{dir}': {e}"));
                 None
             }
         }
