@@ -3484,6 +3484,10 @@ async fn process_channel_message(
         )
     });
     let llm_call_start = Instant::now();
+    notify_observer.record_event(&ObserverEvent::AgentStart {
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+    });
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
@@ -3626,6 +3630,13 @@ async fn process_channel_message(
         msg.thread_ts = followup_thread_id(&msg);
     }
     // Drop the notify sender so the forwarder task finishes
+    notify_observer.record_event(&ObserverEvent::AgentEnd {
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+        duration: llm_call_start.elapsed(),
+        tokens_used: None,
+        cost_usd: None,
+    });
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(handle) = notify_task {
