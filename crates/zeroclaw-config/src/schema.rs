@@ -13047,6 +13047,7 @@ hooks: HooksConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         };
         let toml_str = toml::to_string(&config).expect("config serializes to TOML");
         let parsed: Config = toml::from_str(&toml_str).expect("TOML round-trips back to Config");
@@ -13617,6 +13618,7 @@ default_temperature = 0.7
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.

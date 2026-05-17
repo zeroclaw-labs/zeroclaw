@@ -869,16 +869,17 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
-        return true;
-    }
-
+    // On Windows, command names are case-insensitive (both cmd.exe and
+    // PowerShell treat "Get-ChildItem" and "get-childitem" as the same).
+    // Also match when the executable has a .exe/.cmd/.bat suffix that the
+    // allowlist entry omits (e.g., allowlist "git" matches "git.exe").
     #[cfg(target_os = "windows")]
     {
         let base_lower = executable_base.to_ascii_lowercase();
         let allowed_lower = allowed.to_ascii_lowercase();
+        if base_lower == allowed_lower {
+            return true;
+        }
         for ext in &[".exe", ".cmd", ".bat"] {
             if base_lower == format!("{allowed_lower}{ext}") {
                 return true;
@@ -887,6 +888,11 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
                 return true;
             }
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if allowed == executable_base {
+        return true;
     }
 
     false
@@ -1991,6 +1997,22 @@ mod tests {
 
         assert!(p.is_command_allowed("/usr/bin/antigravity"));
         assert!(!p.is_command_allowed("antigravity"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_command_matching_is_case_insensitive() {
+        // PowerShell cmdlets are case-insensitive: "Get-ChildItem" == "get-childitem".
+        // Config typically stores lowercase names; LLMs may use canonical PascalCase.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["get-childitem".into(), "select-object".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("Get-ChildItem -Force 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("get-childitem -Force 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("GET-CHILDITEM 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("Get-ChildItem | Select-Object Name"));
+        assert!(!p.is_command_allowed("Remove-Item 'C:\\Users\\foo'"));
     }
 
     #[test]
