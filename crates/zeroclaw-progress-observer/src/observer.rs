@@ -54,12 +54,30 @@ impl ProgressReportingObserver {
     }
 }
 
+fn event_name(event: &ObserverEvent) -> &'static str {
+    match event {
+        ObserverEvent::AgentStart { .. } => "AgentStart",
+        ObserverEvent::LlmRequest { .. } => "LlmRequest",
+        ObserverEvent::LlmResponse { .. } => "LlmResponse",
+        ObserverEvent::AgentEnd { .. } => "AgentEnd",
+        ObserverEvent::ToolCallStart { .. } => "ToolCallStart",
+        ObserverEvent::ToolCall { .. } => "ToolCall",
+        ObserverEvent::Error { .. } => "Error",
+        ObserverEvent::TurnComplete => "TurnComplete",
+        ObserverEvent::HeartbeatTick => "HeartbeatTick",
+        ObserverEvent::CacheHit { .. } => "CacheHit",
+        ObserverEvent::CacheMiss { .. } => "CacheMiss",
+        ObserverEvent::ChannelMessage { .. } => "ChannelMessage",
+        _ => "Unknown",
+    }
+}
+
 impl Observer for ProgressReportingObserver {
     fn record_event(&self, event: &ObserverEvent) {
         let update = event_to_status(&self.execution_id, event, &self.toggles);
         tracing::info!(
             target: "zeroclaw::progress_observer",
-            event = ?std::mem::discriminant(event),
+            event = event_name(event),
             will_emit = update.is_some(),
             "record_event"
         );
