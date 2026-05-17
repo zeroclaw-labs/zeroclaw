@@ -2918,6 +2918,16 @@ impl Channel for TelegramChannel {
         self.bot_username.lock().clone()
     }
 
+    /// Telegram users mention the bot as `@bot_username` in chat. The
+    /// cached `bot_username` from `getMe` is already the bare form;
+    /// prepend `@` to match what arrives in inbound message text.
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle().map(|name| {
+            let trimmed = name.trim_start_matches('@');
+            format!("@{trimmed}")
+        })
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }

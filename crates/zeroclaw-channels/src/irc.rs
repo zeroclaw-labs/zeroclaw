@@ -388,6 +388,13 @@ impl Channel for IrcChannel {
         Some(self.nickname.clone())
     }
 
+    /// IRC clients address other users by bare nick (`nick: hello` or
+    /// `nick, hello`); there is no sigil. The cached nickname IS the
+    /// addressable form.
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle()
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut guard = self.writer.lock().await;
         let writer = guard

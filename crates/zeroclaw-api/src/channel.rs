@@ -180,6 +180,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         None
     }
 
+    /// The exact form the bot expects to see when addressed by users on
+    /// this channel. Discord wraps the snowflake as `<@1088...>`,
+    /// Telegram presents `@bot_username`, Matrix presents
+    /// `@bot:server`, Slack wraps the user ID as `<@U02...>`. Returned
+    /// verbatim into the per-channel system prompt so the agent
+    /// recognizes its own mention without guessing, and uses the same
+    /// form to tag itself or peers in outbound replies.
+    ///
+    /// Default `None` for channels that have no inbound mention
+    /// concept (CLI, webhook, hardware, ACP elicitation). Channels
+    /// that override `self_handle` should usually override this too,
+    /// applying their platform-native mention wrapper to the handle.
+    fn self_addressed_mention(&self) -> Option<String> {
+        None
+    }
+
     /// Whether the orchestrator should drop an inbound message as
     /// self-authored (multi-agent self-loop guard).
     ///

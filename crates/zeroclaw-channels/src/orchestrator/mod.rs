@@ -673,6 +673,7 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     sender: &str,
+    bot_mention: Option<&str>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -701,6 +702,17 @@ fn build_channel_system_prompt(
         } else {
             prompt = format!("{prompt}\n\n{instructions}");
         }
+    }
+
+    if let Some(mention) = bot_mention {
+        let block = format!(
+            "\n\nYour addressable handle on this channel: {mention}. \
+             When you see this exact string anywhere in an inbound message, \
+             it refers to YOU, not another agent or user. This same format \
+             is also what you should emit when you need to tag yourself or \
+             address peers in outbound replies on this channel."
+        );
+        prompt.push_str(&block);
     }
 
     if !reply_target.is_empty() {
@@ -3124,11 +3136,16 @@ async fn process_channel_message_body(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
+    let bot_mention = ctx
+        .channels_by_name
+        .get(msg.channel.as_str())
+        .and_then(|c| c.self_addressed_mention());
     let mut system_prompt = build_channel_system_prompt(
         &base_system_prompt,
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+        bot_mention.as_deref(),
     );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
@@ -15057,6 +15074,7 @@ This is an example JSON object for profile settings."#;
             "mattermost",
             "channel123:root456",
             "user_abc123",
+            None,
         );
         assert!(prompt.contains("sender=user_abc123"));
         assert!(prompt.contains("channel=mattermost"));
@@ -15065,15 +15083,18 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123");
+        let prompt =
+            build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123", None);
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa");
-        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb");
+        let prompt_a =
+            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa", None);
+        let prompt_b =
+            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb", None);
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
@@ -15090,6 +15111,7 @@ This is an example JSON object for profile settings."#;
             "webhook",
             "agent-chat:agent-1:thread-7",
             "user:abc",
+            None,
         );
         assert!(
             prompt.contains("\"to\":\"user:abc\""),
@@ -15107,7 +15129,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
-        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890");
+        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890", None);
         assert!(
             prompt.contains("\"to\":\"C12345\""),
             "non-webhook cron hint should keep reply_target as `to`: {prompt}"
@@ -15115,6 +15137,46 @@ This is an example JSON object for profile settings."#;
         assert!(
             !prompt.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
+    }
+
+    /// When the channel supplies its addressable mention form, the
+    /// prompt carries the EXACT string the agent will see in inbound
+    /// messages plus the instruction to emit the same form when
+    /// tagging itself or peers outbound. Without this block the model
+    /// has no ground truth about its own mention (the loneliness/GLaDOS
+    /// confusion from the e2e Discord test).
+    #[test]
+    fn build_channel_system_prompt_injects_bot_mention_when_supplied() {
+        let mention = "<@1088318168398827550>";
+        let prompt = build_channel_system_prompt(
+            "Base.",
+            "discord",
+            "channel-123",
+            "user-456",
+            Some(mention),
+        );
+        assert!(
+            prompt.contains(mention),
+            "prompt must carry the exact mention string verbatim: {prompt}"
+        );
+        assert!(
+            prompt.contains("refers to YOU"),
+            "prompt must spell out that the mention is the bot itself: {prompt}"
+        );
+        assert!(
+            prompt.contains("tag yourself"),
+            "prompt must tell the agent to emit the same format outbound: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_omits_bot_mention_block_when_none() {
+        let prompt =
+            build_channel_system_prompt("Base.", "discord", "channel-123", "user-456", None);
+        assert!(
+            !prompt.contains("addressable handle on this channel"),
+            "prompt must not emit a hollow handle block when bot_mention is None: {prompt}"
         );
     }
 }

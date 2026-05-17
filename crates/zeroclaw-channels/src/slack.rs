@@ -3729,6 +3729,14 @@ impl Channel for SlackChannel {
             .and_then(|guard| guard.clone())
     }
 
+    /// Slack renders user mentions as `<@USER_ID>` in message text
+    /// (Block Kit and incoming events use the same form). Returns the
+    /// cached bot user_id wrapped in that shape; matches what the
+    /// agent sees when a teammate `@`s it.
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle().map(|id| format!("<@{id}>"))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Detect Block Kit payloads produced by the `/config` command.
         let body = if let Some(blocks_json) =

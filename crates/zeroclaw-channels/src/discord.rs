@@ -1291,6 +1291,15 @@ impl Channel for DiscordChannel {
         Self::bot_user_id_from_token(&self.bot_token)
     }
 
+    /// Discord renders user mentions as `<@SNOWFLAKE>` (or
+    /// `<@!SNOWFLAKE>` with the legacy nickname prefix, which the API
+    /// normalizes to the bare form on inbound). Returns the bot's
+    /// snowflake wrapped in that exact form so the agent matches its
+    /// own mention without parsing the angle brackets itself.
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle().map(|id| format!("<@{id}>"))
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
