@@ -71,17 +71,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .ok();
     let server = if let Some(store) = store {
         Arc::new(AcpServer::new_with_writer_and_store(
-            config,
-            acp_config,
-            output_tx,
-            store,
+            config, acp_config, output_tx, store,
         ))
     } else {
-        Arc::new(AcpServer::new_with_writer(
-            config,
-            acp_config,
-            output_tx,
-        ))
+        Arc::new(AcpServer::new_with_writer(config, acp_config, output_tx))
     };
 
     let server_task = tokio::spawn(Arc::clone(&server).run_messages(input_rx));
