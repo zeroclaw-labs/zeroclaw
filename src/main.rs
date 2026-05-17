@@ -271,6 +271,10 @@ enum Commands {
         #[arg(long)]
         quick: bool,
 
+        /// Force interactive onboarding mode.
+        #[arg(long, conflicts_with = "quick")]
+        interactive: bool,
+
         /// Force the dialoguer CLI backend instead of the default ratatui TUI.
         #[arg(long)]
         cli: bool,
@@ -1281,17 +1285,14 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
-    // provider flags were given, it runs the full interactive wizard; otherwise
-    // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
-    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
-    // detection fails.  This means `curl … | bash` and
-    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
-    // `zeroclaw onboard` in a terminal launches the wizard.
+    // Onboard defaults to the interactive flow. Use --quick to force scriptable
+    // quick setup, or --interactive to spell the interactive path explicitly
+    // for compatibility with older invocations.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         section,
         quick,
+        interactive: _interactive,
         cli: use_cli,
         tui: use_tui_deprecated,
         force,
@@ -4068,9 +4069,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4083,6 +4089,12 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn onboard_cli_rejects_quick_with_interactive_flag() {
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--interactive"]).is_err());
     }
 
     #[test]
