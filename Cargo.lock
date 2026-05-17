@@ -13012,6 +13012,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "fluent-syntax",
  "reqwest 0.12.28",
  "serde_json",
  "tempfile",
