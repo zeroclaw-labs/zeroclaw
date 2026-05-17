@@ -99,7 +99,10 @@ jobs:
 
       - name: Setup Android NDK
         if: matrix.ndk
-        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+        shell: bash
+        run: |
+          NDK_PREBUILT="$(find "$ANDROID_NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
 
       - name: Build release
         shell: bash
@@ -109,6 +112,7 @@ jobs:
           fi
           if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
             export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CFLAGS_ARM_UNKNOWN_LINUX_GNUEABIHF="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
