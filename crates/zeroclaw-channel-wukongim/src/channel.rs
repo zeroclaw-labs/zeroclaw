@@ -525,28 +525,24 @@ impl WuKongIMChannel {
         Ok(())
     }
 
-    /// Send a structured "application command" message (JSON-shaped payload
-    /// distinct from the base64-encoded text payload used by
-    /// [`send_text_message`]).
+    /// Send a structured "application command" message.
     ///
-    /// Payload format decision (see spec OQ-2 / P-1): we send the JSON
-    /// object verbatim as `SendParams.payload`. The receive path
-    /// (`la_init_helloworld` parsing) treats `payload` as a JSON object
-    /// already, so the symmetric send shape is also JSON object. If WK
-    /// rejects this shape in the field, change the body of this helper
-    /// to base64-encode the serialized JSON into a `Value::String`.
+    /// WuKongIM's Go server expects `SendParams.payload` as `[]uint8`, which
+    /// JSON-encodes as a base64 string — same contract as `send_text_message`.
     async fn send_cmd_message(
         &self,
         channel_id: &str,
         channel_type: u8,
         cmd_payload: serde_json::Value,
     ) -> anyhow::Result<()> {
+        let json = serde_json::to_string(&cmd_payload)?;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
             channel_id: channel_id.to_string(),
             channel_type,
-            payload: cmd_payload,
+            payload: serde_json::Value::String(payload_b64),
             header: None,
             setting: None,
             msg_key: None,
