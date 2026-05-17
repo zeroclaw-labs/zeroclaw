@@ -420,6 +420,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.uptime': 'Uptime',
     'dashboard.temperature': 'Temperature',
     'dashboard.gateway_port': 'Gateway Port',
+    'dashboard.version': 'Version',
     'dashboard.memory_backend': 'Memory Backend',
     'dashboard.paired': 'Paired',
     'dashboard.channels': 'Channels',
