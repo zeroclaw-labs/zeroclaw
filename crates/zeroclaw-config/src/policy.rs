@@ -1759,15 +1759,28 @@ impl SecurityPolicy {
 
         // Workspace constraint
         if self.workspace_only {
-            let _ = writeln!(
-                out,
-                "**Workspace boundary**: file operations are restricted to `{}`.",
-                self.workspace_dir.display()
-            );
-        }
-
-        // Allowed roots
-        if !self.allowed_roots.is_empty() {
+            if self.allowed_roots.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "**Workspace boundary**: file operations are restricted to `{}`.",
+                    self.workspace_dir.display()
+                );
+            } else {
+                let roots: Vec<String> = self
+                    .allowed_roots
+                    .iter()
+                    .map(|p| format!("`{}`", p.display()))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "**Workspace boundary**: file operations are restricted to `{}` (workspace) \
+                     and the following additional allowed paths: {}. \
+                     You MAY read and write files in any of these locations.",
+                    self.workspace_dir.display(),
+                    roots.join(", ")
+                );
+            }
+        } else if !self.allowed_roots.is_empty() {
             let roots: Vec<String> = self
                 .allowed_roots
                 .iter()
