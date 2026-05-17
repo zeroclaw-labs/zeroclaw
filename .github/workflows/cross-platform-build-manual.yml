@@ -101,7 +101,19 @@ jobs:
         if: matrix.ndk
         shell: bash
         run: |
-          NDK_PREBUILT="$(find "$ANDROID_NDK/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          case "$(uname -m)" in
+            x86_64) NDK_HOST="linux-x86_64" ;;
+            aarch64) NDK_HOST="linux-aarch64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          NDK_PREBUILT="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST"
+          if [ ! -d "$NDK_PREBUILT" ]; then
+            echo "Android NDK prebuilt directory not found: $NDK_PREBUILT" >&2
+            exit 1
+          fi
           echo "$NDK_PREBUILT/bin" >> "$GITHUB_PATH"
 
       - name: Build release
@@ -112,7 +124,6 @@ jobs:
           fi
           if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
             export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
-            export CFLAGS_ARM_UNKNOWN_LINUX_GNUEABIHF="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
