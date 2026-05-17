@@ -251,13 +251,13 @@ impl PluginHost {
 
     /// Remove a plugin by name.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
-        if self.loaded.remove(name).is_none() {
-            return Err(PluginError::NotFound(name.to_string()));
-        }
+        let plugin = self
+            .loaded
+            .remove(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
 
-        let plugin_dir = self.plugins_dir.join(name);
-        if plugin_dir.exists() {
-            std::fs::remove_dir_all(plugin_dir)?;
+        if plugin.plugin_dir.exists() {
+            std::fs::remove_dir_all(plugin.plugin_dir)?;
         }
 
         Ok(())

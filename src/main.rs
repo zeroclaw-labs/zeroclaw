@@ -3052,14 +3052,14 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let plugins_dir = config.resolved_plugins_discovery_dir();
                 let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 host.remove(&name)?;
                 println!("Plugin '{name}' removed.");
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let plugins_dir = config.plugins.resolved_plugins_dir();
+                let plugins_dir = config.resolved_plugins_discovery_dir();
                 let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
