@@ -1217,21 +1217,21 @@ async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
         });
 
     let Ok(content) = tokio::fs::read_to_string(config_dir.join("config.toml")).await else {
-        eprintln!("[logging] config_dir={} — could not read config.toml; args={:?}",
-            config_dir.display(), std::env::args().collect::<Vec<_>>());
         return LoggingConfig::default();
     };
-    let Ok(table) = content.parse::<toml::Value>() else {
-        eprintln!("[logging] config_dir={} — config.toml parse error", config_dir.display());
-        return LoggingConfig::default();
-    };
-    let cfg = table
-        .get("logging")
-        .and_then(|v| toml::to_string(v).ok().and_then(|s| toml::from_str::<LoggingConfig>(&s).ok()))
-        .unwrap_or_default();
-    eprintln!("[logging] config_dir={} level={} dir={:?} out_file={:?} err_file={:?}",
-        config_dir.display(), cfg.level, cfg.dir, cfg.out_file, cfg.err_file);
-    cfg
+
+    // Use a minimal wrapper so unknown fields in the full config are ignored.
+    // Avoids toml::Value::from_str which behaves differently from toml::from_str
+    // on complex keys like [providers.models."custom:http://..."].
+    #[derive(serde::Deserialize, Default)]
+    struct EarlyConfig {
+        #[serde(default)]
+        logging: LoggingConfig,
+    }
+
+    toml::from_str::<EarlyConfig>(&content)
+        .map(|c| c.logging)
+        .unwrap_or_default()
 }
 
 /// Scan raw CLI args for `--config-dir <path>` without going through Clap.
