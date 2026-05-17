@@ -35,6 +35,8 @@
     unused_imports
 )]
 
+mod logging;
+
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
@@ -42,7 +44,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+#[allow(unused_imports)]
+use tracing_subscriber::Layer as _;
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -1187,6 +1192,101 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
     cmd
 }
 
+/// Read just `[logging]` from config.toml before the full Config::load_or_init().
+/// Falls back silently to defaults on any I/O or parse error.
+async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
+    use zeroclaw_config::schema::LoggingConfig;
+
+    let config_dir = if let Ok(dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        std::path::PathBuf::from(dir)
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".zeroclaw")
+    } else {
+        directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".zeroclaw"))
+            .unwrap_or_default()
+    };
+
+    let Ok(content) = tokio::fs::read_to_string(config_dir.join("config.toml")).await else {
+        return LoggingConfig::default();
+    };
+    let Ok(table) = content.parse::<toml::Value>() else {
+        return LoggingConfig::default();
+    };
+    table
+        .get("logging")
+        .and_then(|v| v.clone().try_into().ok())
+        .unwrap_or_default()
+}
+
+/// Initialize tracing. Returns guards that must live until end of `main()`.
+///
+/// Priority: RUST_LOG env var > config.toml `[logging] level` > "info".
+/// ACP mode is forced to "warn" regardless of config to avoid corrupting
+/// the stdio JSON protocol.
+fn init_logging(
+    is_acp: bool,
+    cfg: &zeroclaw_config::schema::LoggingConfig,
+) -> Vec<WorkerGuard> {
+    let base = if is_acp {
+        // acp_server injects data into the JSON stream — keep logs quiet.
+        "warn".to_string()
+    } else {
+        // matrix_sdk is noisy at INFO; suppress it unless the user overrides via RUST_LOG.
+        format!(
+            "{},matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn",
+            cfg.level
+        )
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&base));
+
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let mut guards: Vec<WorkerGuard> = Vec::new();
+
+    let out_layer = cfg.out.as_ref().and_then(|o| {
+        match logging::DailyRotatingFile::new(&o.dir, &o.file) {
+            Ok(w) => {
+                let (nb, guard) = tracing_appender::non_blocking(w);
+                guards.push(guard);
+                Some(fmt::layer().with_writer(nb).with_ansi(false))
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to open logging.out file: {e}");
+                None
+            }
+        }
+    });
+
+    let err_layer = cfg.err.as_ref().and_then(|e_cfg| {
+        match logging::DailyRotatingFile::new(&e_cfg.dir, &e_cfg.file) {
+            Ok(w) => {
+                let (nb, guard) = tracing_appender::non_blocking(w);
+                guards.push(guard);
+                Some(
+                    fmt::layer()
+                        .with_writer(nb)
+                        .with_ansi(false)
+                        .with_filter(LevelFilter::WARN),
+                )
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to open logging.err file: {e}");
+                None
+            }
+        }
+    });
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(out_layer)
+        .with(err_layer)
+        .init();
+
+    guards
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -1244,27 +1344,13 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
-    // We also always redirect logs to stderr so stdout remains clean for data.
-    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
-        "warn"
-    } else {
-        // matrix_sdk crates are suppressed to warn because they are extremely
-        // noisy at info level. To restore SDK-level output for Matrix debugging:
-        //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
-        // acp_server has to be WARN because INFO injects junk data into the JSON stream.
-        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
-    };
-
-    let subscriber = fmt::Subscriber::builder()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // Initialize logging. Level and file output are read from [logging] in config.toml
+    // (best-effort early read — falls back to defaults on any error).
+    // RUST_LOG env var always takes precedence over config.toml.
+    let logging_cfg = load_logging_config_early().await;
+    let is_acp = matches!(cli.command, Commands::Acp { .. });
+    // _logging_guards must live until end of main to flush file appenders.
+    let _logging_guards = init_logging(is_acp, &logging_cfg);
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise

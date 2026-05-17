@@ -476,6 +476,11 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub progress_observer: ProgressObserverConfig,
+
+    /// Logging configuration — log level and optional file output (`[logging]`).
+    #[serde(default)]
+    #[nested]
+    pub logging: LoggingConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -1802,6 +1807,52 @@ impl Default for PacingConfig {
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
         }
     }
+}
+
+/// File output sub-config for [`LoggingConfig`] (`[logging.out]` / `[logging.err]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct LoggingOutputConfig {
+    /// Directory where log files are written.
+    pub dir: String,
+    /// Base file name including extension, e.g. `"zeroclaw.log"`.
+    /// Files are rotated daily as `{stem}.{YYMMDD}.{ext}`.
+    pub file: String,
+}
+
+/// Logging configuration (`[logging]` section).
+///
+/// Controls the tracing log level and optional file output.
+/// The `RUST_LOG` environment variable always takes precedence over `level`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "logging"]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Log level filter using RUST_LOG syntax. Default: `"info"`.
+    /// Examples: `"debug"`, `"warn"`, `"info,some_crate=debug"`.
+    #[serde(default = "default_logging_level")]
+    pub level: String,
+
+    /// Write all log lines to this daily-rotating file.
+    /// Not set by default (logs go to stderr only).
+    #[serde(default)]
+    pub out: Option<LoggingOutputConfig>,
+
+    /// Write WARN and ERROR log lines to this daily-rotating file.
+    /// Not set by default.
+    #[serde(default)]
+    pub err: Option<LoggingOutputConfig>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self { level: default_logging_level(), out: None, err: None }
+    }
+}
+
+fn default_logging_level() -> String {
+    "info".to_string()
 }
 
 /// Configuration for the sidelined progress observer that streams agent
@@ -9916,6 +9967,7 @@ impl Default for Config {
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -12273,6 +12325,10 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
 );
+
+impl HasPropKind for LoggingOutputConfig {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 
 impl HasPropKind for ModelPricing {
     // ModelPricing is a 2-field struct (`input`, `output`). Wire form is a
