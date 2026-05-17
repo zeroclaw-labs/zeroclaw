@@ -63,7 +63,7 @@ pub(crate) fn event_to_status(
         ObserverEvent::ToolCallStart { tool, arguments } if toggles.tool_call_start => {
             let snippet = summarize_tool_args(arguments.as_deref());
             let desc = format_tool_start_desc(tool, snippet.as_deref());
-            Some(make(execution_id, StatusPhase::ToolStart, tool, desc))
+            Some(make(execution_id, StatusPhase::ToolStart, "tool", desc))
         }
         ObserverEvent::ToolCall { tool, duration, success } if toggles.tool_call => {
             let elapsed_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -75,7 +75,7 @@ pub(crate) fn event_to_status(
             Some(make(
                 execution_id,
                 StatusPhase::ToolDone { success: *success, elapsed_ms },
-                tool,
+                "tool",
                 desc,
             ))
         }
@@ -95,9 +95,14 @@ pub(crate) fn event_to_status(
 fn format_tool_start_desc(tool: &str, snippet: Option<&str>) -> String {
     match (tool, snippet) {
         ("shell", Some(s)) => format!("执行命令：{}", s),
-        ("web_search", Some(s)) => format!("搜索：{}", s),
-        ("read_file", Some(s)) => format!("读取文件：{}", s),
-        ("http", Some(s)) => format!("HTTP 请求：{}", s),
+        ("web_search_tool", Some(s)) => format!("搜索：{}", s),
+        ("web_fetch", Some(s)) => format!("抓取网页：{}", s),
+        ("content_search", Some(s)) => format!("搜索内容：{}", s),
+        ("glob_search", Some(s)) => format!("搜索文件：{}", s),
+        ("file_read", Some(s)) => format!("读取文件：{}", s),
+        ("file_write", Some(s)) => format!("写入文件：{}", s),
+        ("file_edit", Some(s)) => format!("编辑文件：{}", s),
+        ("http_request", Some(s)) => format!("HTTP 请求：{}", s),
         (other, _) => format!("调用工具：{}", other),
     }
 }
@@ -257,7 +262,7 @@ mod event_to_status_tests {
         };
         let out = event_to_status("e", &ev, &all_on()).unwrap();
         assert_eq!(out.phase, StatusPhase::ToolStart);
-        assert_eq!(out.name, "shell");
+        assert_eq!(out.name, "tool");
         assert_eq!(out.desc, "执行命令：grep -c TODO README.md");
     }
 
