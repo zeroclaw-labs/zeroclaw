@@ -71,29 +71,78 @@ pub fn get_permissions_status() -> Vec<PermissionInfo> {
         ]
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        // On non-macOS platforms, report all as granted (not applicable).
-        let names = [
-            ("accessibility", "Accessibility"),
-            ("screen_recording", "Screen Recording"),
-            ("input_monitoring", "Input Monitoring"),
-            ("automation", "Automation (AppleScript)"),
-            ("microphone", "Microphone"),
-            ("camera", "Camera"),
-            ("speech_recognition", "Speech Recognition"),
-            ("notifications", "Notifications"),
-            ("full_disk_access", "Full Disk Access"),
-            ("local_network", "Local Network"),
-        ];
-        names
-            .into_iter()
-            .map(|(name, label)| PermissionInfo {
-                name: name.into(),
-                label: label.into(),
-                status: "granted".into(),
-            })
-            .collect()
+        use crate::linux::permissions;
+
+        vec![
+            PermissionInfo {
+                name: "screen_recording".into(),
+                label: "Screen Capture (macOS-only for now)".into(),
+                status: permissions::check_screen_recording().into(),
+            },
+            PermissionInfo {
+                name: "notifications".into(),
+                label: "Notifications".into(),
+                status: permissions::check_notifications().into(),
+            },
+        ]
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use crate::windows::permissions;
+
+        vec![
+            PermissionInfo {
+                name: "microphone".into(),
+                label: "Microphone".into(),
+                status: permissions::check_microphone().into(),
+            },
+            PermissionInfo {
+                name: "camera".into(),
+                label: "Camera".into(),
+                status: permissions::check_camera().into(),
+            },
+            PermissionInfo {
+                name: "input_monitoring".into(),
+                label: "Input Monitoring (Admin)".into(),
+                status: permissions::check_input_monitoring().into(),
+            },
+            PermissionInfo {
+                name: "notifications".into(),
+                label: "Notifications".into(),
+                status: permissions::check_notifications().into(),
+            },
+        ]
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        vec![]
+    }
+}
+
+#[tauri::command]
+pub fn get_runtime_platform() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return "macos".into();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return "linux".into();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return "windows".into();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        "unknown".into()
     }
 }
 
@@ -120,10 +169,32 @@ pub fn request_permission<R: Runtime>(app: AppHandle<R>, name: String) -> Result
         };
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = name;
-        result = Ok("granted".into());
+        result = Err("Permission requests are not supported on this platform".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux::permissions;
+        result = match name.as_str() {
+            "screen_recording" => Ok(permissions::request_screen_recording().into()),
+            "notifications" => Ok(permissions::request_notifications().into()),
+            _ => Err(format!("Unknown permission: {name}")),
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use crate::windows::permissions;
+        result = match name.as_str() {
+            "camera" => Ok(permissions::request_camera().into()),
+            "microphone" => Ok(permissions::request_microphone().into()),
+            "input_monitoring" => Ok(permissions::request_input_monitoring().into()),
+            "notifications" => Ok(permissions::request_notifications().into()),
+            _ => Err(format!("Unknown permission: {name}")),
+        };
     }
 
     // Best-effort: keep the gateway's view of capabilities fresh after any successful
@@ -143,9 +214,14 @@ pub fn open_privacy_settings(pane: String) -> Result<(), String> {
         crate::macos::permissions::open_system_settings(&pane)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows::permissions::open_privacy_settings(&pane)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = pane;
-        Err("System Settings is only available on macOS".into())
+        Err("Privacy settings integration is only available on macOS and Windows".into())
     }
 }
