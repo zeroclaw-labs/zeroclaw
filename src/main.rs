@@ -1295,7 +1295,7 @@ fn init_logging(
                 )
             }
             Err(e) => {
-                write_init_error(dir, &format!("failed to open err_file '{file}' in '{dir}': {e}"));
+                eprintln!("Warning: failed to open err_file '{file}' in '{dir}': {e}");
                 None
             }
         }
