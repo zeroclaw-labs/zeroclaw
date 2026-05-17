@@ -52,6 +52,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
@@ -61,6 +63,16 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
+          - os: ubuntu-latest
+            target: arm-unknown-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            ndk: true
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
@@ -85,10 +97,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
       - name: Build release
         shell: bash
         run: |
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
