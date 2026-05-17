@@ -1244,22 +1244,22 @@ fn init_logging(
     let stderr_layer = fmt::layer().with_writer(std::io::stderr);
     let mut guards: Vec<WorkerGuard> = Vec::new();
 
-    let out_layer = cfg.out.as_ref().and_then(|o| {
-        match logging::DailyRotatingFile::new(&o.dir, &o.file) {
+    let out_layer = cfg.dir.as_deref().zip(cfg.out_file.as_deref()).and_then(|(dir, file)| {
+        match logging::DailyRotatingFile::new(dir, file) {
             Ok(w) => {
                 let (nb, guard) = tracing_appender::non_blocking(w);
                 guards.push(guard);
                 Some(fmt::layer().with_writer(nb).with_ansi(false))
             }
             Err(e) => {
-                eprintln!("Warning: failed to open logging.out file: {e}");
+                eprintln!("Warning: failed to open logging.out_file: {e}");
                 None
             }
         }
     });
 
-    let err_layer = cfg.err.as_ref().and_then(|e_cfg| {
-        match logging::DailyRotatingFile::new(&e_cfg.dir, &e_cfg.file) {
+    let err_layer = cfg.dir.as_deref().zip(cfg.err_file.as_deref()).and_then(|(dir, file)| {
+        match logging::DailyRotatingFile::new(dir, file) {
             Ok(w) => {
                 let (nb, guard) = tracing_appender::non_blocking(w);
                 guards.push(guard);
@@ -1271,7 +1271,7 @@ fn init_logging(
                 )
             }
             Err(e) => {
-                eprintln!("Warning: failed to open logging.err file: {e}");
+                eprintln!("Warning: failed to open logging.err_file: {e}");
                 None
             }
         }

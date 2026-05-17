@@ -1809,21 +1809,19 @@ impl Default for PacingConfig {
     }
 }
 
-/// File output sub-config for [`LoggingConfig`] (`[logging.out]` / `[logging.err]`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct LoggingOutputConfig {
-    /// Directory where log files are written.
-    pub dir: String,
-    /// Base file name including extension, e.g. `"zeroclaw.log"`.
-    /// Files are rotated daily as `{stem}.{YYMMDD}.{ext}`.
-    pub file: String,
-}
-
 /// Logging configuration (`[logging]` section).
 ///
 /// Controls the tracing log level and optional file output.
 /// The `RUST_LOG` environment variable always takes precedence over `level`.
+///
+/// Example:
+/// ```toml
+/// [logging]
+/// level    = "debug"
+/// dir      = "/var/zeroclaw/log"
+/// out_file = "zeroclaw.log"      # daily-rotated → zeroclaw.YYMMDD.log
+/// err_file = "zeroclaw-err.log"  # WARN/ERROR only
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "logging"]
@@ -1834,20 +1832,31 @@ pub struct LoggingConfig {
     #[serde(default = "default_logging_level")]
     pub level: String,
 
-    /// Write all log lines to this daily-rotating file.
-    /// Not set by default (logs go to stderr only).
+    /// Directory where log files are written. Required when `out_file` or
+    /// `err_file` is set.
     #[serde(default)]
-    pub out: Option<LoggingOutputConfig>,
+    pub dir: Option<String>,
 
-    /// Write WARN and ERROR log lines to this daily-rotating file.
-    /// Not set by default.
+    /// File name for all-levels log output (daily rotating).
+    /// Rotated files are named `{stem}.{YYMMDD}.{ext}`.
+    /// Only active when `dir` is also set.
     #[serde(default)]
-    pub err: Option<LoggingOutputConfig>,
+    pub out_file: Option<String>,
+
+    /// File name for WARN/ERROR-only log output (daily rotating).
+    /// Only active when `dir` is also set.
+    #[serde(default)]
+    pub err_file: Option<String>,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { level: default_logging_level(), out: None, err: None }
+        Self {
+            level: default_logging_level(),
+            dir: None,
+            out_file: None,
+            err_file: None,
+        }
     }
 }
 
@@ -12325,10 +12334,6 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
 );
-
-impl HasPropKind for LoggingOutputConfig {
-    const PROP_KIND: PropKind = PropKind::Object;
-}
 
 impl HasPropKind for ModelPricing {
     // ModelPricing is a 2-field struct (`input`, `output`). Wire form is a
