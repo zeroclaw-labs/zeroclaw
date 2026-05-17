@@ -327,8 +327,9 @@ fn section_group(key: &str) -> &'static str {
         | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
         | "project_intel" | "shell_tool" | "text_browser" | "transcription" | "tts"
         | "web_fetch" | "web_search" => "Tools",
-        // External services / vendor integrations.
-        "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
+        // External services / vendor integrations. ACP is included because
+        // it is always client-paired — you cannot use it without a client.
+        "acp" | "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
         | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => "Integrations",
         // Networking / multi-node infrastructure.
         "gateway" | "node_transport" | "nodes" | "proxy" => "Network",
@@ -363,6 +364,10 @@ fn section_help(key: &str) -> &'static str {
         "tunnel" => {
             "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
                      Pick `none` to keep it localhost-only."
+        }
+        "acp" => {
+            "Agent Client Protocol — JSON-RPC 2.0 over stdio for IDE and editor integrations. \
+             Configure session limits and idle timeout here."
         }
         _ => "",
     }
