@@ -7,12 +7,70 @@
 
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+#[cfg(unix)]
+use libc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Windows Job Object wrapper for process-tree cleanup on timeout.
+///
+/// Opens a handle to the child via `OpenProcess`, assigns it to a new Job
+/// Object, then closes the process handle (the job holds its own reference).
+/// On timeout, `terminate()` kills every process in the tree; the job handle
+/// is closed automatically via `Drop` on both the happy path and timeout.
+#[cfg(windows)]
+mod win_job {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+
+    pub struct WinJob(HANDLE);
+
+    // SAFETY: Job Object HANDLEs are valid to use from any thread.
+    unsafe impl Send for WinJob {}
+    unsafe impl Sync for WinJob {}
+
+    impl WinJob {
+        /// Open a handle to `pid`, create a Job Object, assign the process to
+        /// it, then close the process handle.  Returns `None` if any Win32 call
+        /// fails (graceful fallback — timeout still fires, orphans may survive).
+        pub fn from_pid(pid: u32) -> Option<Self> {
+            let proc = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, pid) }.ok()?;
+            let job = match unsafe { CreateJobObjectW(None, None) } {
+                Ok(j) => j,
+                Err(_) => {
+                    let _ = unsafe { CloseHandle(proc) };
+                    return None;
+                }
+            };
+            let ok = unsafe { AssignProcessToJobObject(job, proc) }.is_ok();
+            let _ = unsafe { CloseHandle(proc) };
+            if ok {
+                Some(WinJob(job))
+            } else {
+                let _ = unsafe { CloseHandle(job) };
+                None
+            }
+        }
+
+        /// Send `TerminateJobObject` to kill the entire process tree.
+        pub fn terminate(&self) {
+            let _ = unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for WinJob {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Default execution time for a skill shell command (seconds).
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -23,6 +81,7 @@ pub struct SkillShellTool {
     tool_description: String,
     command_template: String,
     args: HashMap<String, String>,
+    timeout_secs: u64,
     security: Arc<SecurityPolicy>,
 }
 
@@ -41,6 +100,7 @@ impl SkillShellTool {
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
             security,
         }
     }
@@ -131,6 +191,18 @@ impl Tool for SkillShellTool {
         cmd.arg("-c").arg(&command);
         cmd.current_dir(&self.security.workspace_dir);
         cmd.env_clear();
+        // Pipe stdout/stderr so wait_with_output() captures them (unlike
+        // output(), spawn() does not set up pipes automatically).
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        // On Unix, run the shell in its own process group so a SIGKILL on
+        // timeout reaches grandchildren too. On Windows a Job Object (created
+        // after spawn) provides the same guarantee. Other platforms fall back
+        // to kill_on_drop which only kills the direct child.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(not(any(unix, windows)))]
+        cmd.kill_on_drop(true);
 
         // Only pass safe environment variables
         for var in &[
@@ -141,11 +213,32 @@ impl Tool for SkillShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+        // Capture platform-specific process-tree kill handles before moving
+        // child into wait_with_output().
+        #[cfg(unix)]
+        let pgid = child.id();
+        #[cfg(windows)]
+        let win_job = child.id().and_then(win_job::WinJob::from_pid);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            child.wait_with_output(),
+        )
+        .await;
 
         match result {
             Ok(Ok(output)) => {
+                // win_job dropped here on Windows: CloseHandle with no termination.
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -181,13 +274,28 @@ impl Tool for SkillShellTool {
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
             }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
-                )),
-            }),
+            Err(_elapsed) => {
+                // Kill the entire process tree before returning the timeout error.
+                #[cfg(unix)]
+                if let Some(pid) = pgid {
+                    // SAFETY: pid is a valid process group we created above;
+                    // negative first arg means "send to process group".
+                    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                }
+                #[cfg(windows)]
+                if let Some(ref job) = win_job {
+                    job.terminate();
+                }
+                // win_job dropped here on Windows: CloseHandle after termination.
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {}s and was killed",
+                        self.timeout_secs
+                    )),
+                })
+            }
         }
     }
 }
@@ -206,6 +314,21 @@ mod tests {
         })
     }
 
+    /// Security policy for tests that need to run arbitrary shell constructs
+    /// (background operators, file redirects) that the default policy blocks.
+    /// Only used in process-kill tests where the point is to verify kill
+    /// semantics, not policy enforcement.
+    #[cfg(unix)]
+    fn test_unrestricted_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".to_string()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        })
+    }
+
     fn sample_skill_tool() -> SkillTool {
         let mut args = HashMap::new();
         args.insert("file".to_string(), "The file to lint".to_string());
@@ -220,6 +343,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -278,6 +402,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -294,6 +419,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
@@ -308,5 +434,117 @@ mod tests {
         assert_eq!(spec.name, "my_skill.run_lint");
         assert_eq!(spec.description, "Run the linter on a file");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[test]
+    fn skill_shell_tool_default_timeout() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_custom_timeout() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(3600),
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_timeout_enforced() {
+        let st = SkillTool {
+            name: "slow".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            // tail -f /dev/null blocks indefinitely and is allowed by the security
+            // policy (tail is in allowed_commands, /dev/null is always permitted).
+            command: "tail -f /dev/null".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout message, got: {err}"
+        );
+        assert!(
+            err.contains("1s"),
+            "expected timeout duration in message, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_shell_tool_timeout_kills_process() {
+        let pid_file = std::env::temp_dir().join("zeroclaw_timeout_kills_test.pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let pid_path = pid_file.display().to_string();
+
+        let st = SkillTool {
+            name: "slow".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            // Background a long-running sleep, record its PID, then wait.
+            // The sleep is the grandchild; process-group kill must reach it.
+            command: format!("sleep 60 & echo $! > {pid_path} && wait"),
+            args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+        let tool = SkillShellTool::new("test", &st, test_unrestricted_security());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+
+        // Brief pause for SIGKILL delivery and OS reaping.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let pid_str = std::fs::read_to_string(&pid_file)
+            .expect("shell did not write grandchild PID before timeout");
+        let pid: u32 = pid_str.trim().parse().expect("invalid PID in file");
+
+        // /proc/<pid> exists iff the process is still alive.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "grandchild sleep process {pid} was not killed on timeout"
+        );
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[test]
+    fn skill_shell_tool_zero_timeout_clamped_to_one() {
+        let st = SkillTool {
+            name: "t".to_string(),
+            description: "".to_string(),
+            kind: "shell".to_string(),
+            command: "true".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(0),
+        };
+        let tool = SkillShellTool::new("s", &st, test_security());
+        assert_eq!(
+            tool.timeout_secs, 1,
+            "zero timeout_secs must be clamped to 1"
+        );
     }
 }
