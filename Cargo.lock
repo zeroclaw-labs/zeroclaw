@@ -13174,6 +13174,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.29.0",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "url",
  "uuid",
@@ -13247,6 +13248,7 @@ dependencies = [
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-memory",
+ "zeroclaw-progress-observer",
  "zeroclaw-providers",
  "zeroclaw-runtime",
  "zeroclaw-tools",
@@ -13457,6 +13459,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "zeroclaw-api",
+]
+
+[[package]]
+name = "zeroclaw-progress-observer"
+version = "0.7.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
  "tracing",
  "zeroclaw-api",
 ]
