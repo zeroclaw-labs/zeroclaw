@@ -21,6 +21,7 @@ pub mod skill_http {
     pub use zeroclaw_runtime::skills::skill_http::*;
 }
 
+// The lib target sees this as dead; only the bin target calls it from main.rs.
 #[allow(dead_code)]
 pub async fn handle_command(
     command: crate::SkillCommands,
