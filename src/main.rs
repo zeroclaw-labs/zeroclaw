@@ -1563,7 +1563,10 @@ async fn main() -> Result<()> {
             max_sessions,
             session_timeout,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig::default();
+            let mut acp_config = channels::acp_server::AcpServerConfig {
+                max_sessions: config.acp.max_sessions,
+                session_timeout_secs: config.acp.session_timeout_secs,
+            };
             if let Some(max) = max_sessions {
                 acp_config.max_sessions = max;
             }

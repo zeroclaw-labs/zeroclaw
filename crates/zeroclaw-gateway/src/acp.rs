@@ -61,6 +61,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
 
     let config = state.config.lock().clone();
+    let acp_config = AcpServerConfig {
+        max_sessions: config.acp.max_sessions,
+        session_timeout_secs: config.acp.session_timeout_secs,
+    };
     let store = AcpSessionStore::new(&config.workspace_dir)
         .map(Arc::new)
         .inspect_err(|e| warn!("Failed to open ACP session store: {e}"))
@@ -68,14 +72,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let server = if let Some(store) = store {
         Arc::new(AcpServer::new_with_writer_and_store(
             config,
-            AcpServerConfig::default(),
+            acp_config,
             output_tx,
             store,
         ))
     } else {
         Arc::new(AcpServer::new_with_writer(
             config,
-            AcpServerConfig::default(),
+            acp_config,
             output_tx,
         ))
     };
