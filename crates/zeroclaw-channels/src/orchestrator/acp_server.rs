@@ -697,20 +697,25 @@ impl AcpServer {
             loading.insert(session_id.clone());
         }
 
+        // Flatten both the SQLite error and the not-found case into a single
+        // Result so the cleanup match below runs for every failure after the
+        // reservation was inserted.
         let data = store
             .load_session(&session_id)
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
                 data: None,
-            })?
-            .ok_or_else(|| RpcError {
-                code: SESSION_NOT_FOUND,
-                message: format!("Session not found: {session_id}"),
-                data: None,
+            })
+            .and_then(|opt| {
+                opt.ok_or_else(|| RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!("Session not found: {session_id}"),
+                    data: None,
+                })
             });
 
-        // On error, release the reservation before returning
+        // On error (SQLite failure or not-found), release the reservation.
         let data = match data {
             Ok(d) => d,
             Err(e) => {
@@ -831,14 +836,16 @@ impl AcpServer {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
                 data: None,
-            })?
-            .ok_or_else(|| RpcError {
-                code: SESSION_NOT_FOUND,
-                message: format!("Session not found: {session_id}"),
-                data: None,
+            })
+            .and_then(|opt| {
+                opt.ok_or_else(|| RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!("Session not found: {session_id}"),
+                    data: None,
+                })
             });
 
-        // On error, release the reservation before returning
+        // On error (SQLite failure or not-found), release the reservation.
         let data = match data {
             Ok(d) => d,
             Err(e) => {
@@ -2820,6 +2827,118 @@ mod tests {
             err.code, SESSION_LIMIT_REACHED,
             "expected SESSION_LIMIT_REACHED, got: {:?}",
             err
+        );
+    }
+
+    /// A SQLite error during `store.load_session` must release the `loading_sessions`
+    /// reservation so a subsequent restore attempt is not permanently blocked.
+    #[tokio::test]
+    async fn session_load_releases_reservation_on_store_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-load-store-err";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // Drop the schema via a second connection to force a "no such table"
+        // error on the store's next query_row call.
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        {
+            let second =
+                rusqlite::Connection::open(&db_path).expect("second conn must open same db");
+            second
+                .execute_batch(
+                    "DROP TABLE IF EXISTS acp_messages; DROP TABLE IF EXISTS acp_sessions;",
+                )
+                .expect("schema drop must succeed on second conn");
+        }
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // First call: must fail with INTERNAL_ERROR (SQLite "no such table").
+        let first_err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("session/load must fail when store returns Err");
+        assert_eq!(
+            first_err.code, INTERNAL_ERROR,
+            "expected INTERNAL_ERROR from store failure, got: {:?}",
+            first_err
+        );
+
+        // Second call for the same session: must also fail with INTERNAL_ERROR,
+        // NOT with INVALID_PARAMS ("already active"). A leaked reservation would
+        // cause INVALID_PARAMS, proving the slot was never released.
+        let second_err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("second session/load must also fail");
+        assert_eq!(
+            second_err.code, INTERNAL_ERROR,
+            "second load must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
+            second_err
+        );
+    }
+
+    /// Same coverage as `session_load_releases_reservation_on_store_error` but
+    /// for the `session/resume` path.
+    #[tokio::test]
+    async fn session_resume_releases_reservation_on_store_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-store-err";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        {
+            let second =
+                rusqlite::Connection::open(&db_path).expect("second conn must open same db");
+            second
+                .execute_batch(
+                    "DROP TABLE IF EXISTS acp_messages; DROP TABLE IF EXISTS acp_sessions;",
+                )
+                .expect("schema drop must succeed on second conn");
+        }
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        let first_err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("session/resume must fail when store returns Err");
+        assert_eq!(
+            first_err.code, INTERNAL_ERROR,
+            "expected INTERNAL_ERROR from store failure, got: {:?}",
+            first_err
+        );
+
+        let second_err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("second session/resume must also fail");
+        assert_eq!(
+            second_err.code, INTERNAL_ERROR,
+            "second resume must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
+            second_err
         );
     }
 }
