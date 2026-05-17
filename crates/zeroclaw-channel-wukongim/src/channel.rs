@@ -609,11 +609,11 @@ impl Channel for WuKongIMChannel {
         }
         let (channel_id, channel_type) = parse_recipient(recipient);
         let payload = serde_json::json!({
-            "cmd": "la_status_update",
-            "content": phase_to_content(&update.phase),
-            "param": {
+            "type": 23,
+            "content": {
+                "title": phase_to_content(&update.phase),
                 "mid": update.execution_id,
-                "name": update.name,
+                "type": update.name,
                 "desc": update.desc,
             }
         });
