@@ -601,9 +601,12 @@ mod e2e_tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn attribution_span_populates_alias_bound_fields() {
-        // Single global subscriber lock — multiple tests would otherwise
-        // race to set_global_default and the broadcast hook.
-        let _guard = TEST_LOCK.lock();
+        // Hold both the subscriber lock and the writer lock: this test
+        // fires record! through the global LogCaptureLayer, which forwards
+        // to writer::record_event. Without the writer lock, a concurrent
+        // writer::tests run sees this test's event land in its tempdir.
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
 
         try_install_capture_subscriber();
         let mut rx = subscribe_or_install();

@@ -35,9 +35,18 @@ fn v3_value() -> toml::Value {
 /// Run a V2-shape TOML literal through `V2Config::migrate()` directly. Used by
 /// V2→V3-only transform tests where threading data through a V1 fixture would
 /// fake a starting state that no real user ever wrote.
+///
+/// Gate: the V3 output must round-trip as `Config` (no `unknown field`, no
+/// type mismatches). This closes the V2-fixture-round-trip gate from the
+/// migration plan in one place: every test that calls `migrate_v2` proves
+/// its V2 input also produces a V3-loadable config.
 fn migrate_v2(input: &str) -> toml::Value {
     let v2: V2Config = toml::from_str(input).expect("V2 input parses as V2Config");
-    v2.migrate().expect("V2 → V3 migration succeeds")
+    let value = v2.migrate().expect("V2 → V3 migration succeeds");
+    let serialized = toml::to_string(&value).expect("V3 output serializes to TOML");
+    let _: Config =
+        toml::from_str(&serialized).expect("V3 output parses as Config (schema-round-trip gate)");
+    value
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1741,9 +1750,8 @@ allowed_numbers = ["+15551234567"]
 
 [channels.linq]
 enabled = true
-account_sid = "AC"
-auth_token = "tok"
-from_number = "+15555550100"
+api_token = "linq-tok"
+from_phone = "+15555550100"
 allowed_senders = ["+15551234567"]
 
 [channels.nostr]
@@ -1761,6 +1769,7 @@ smtp_host = "smtp.example"
 smtp_port = 587
 username = "bot@example"
 password = "p"
+from_address = "bot@example"
 allowed_senders = ["ops@example"]
 "#,
     );
@@ -2724,6 +2733,72 @@ fn map_key_sections_exposes_typed_family_slots() {
         assert!(
             paths.contains(required),
             "map_key_sections() must expose `{required}` — frontend depends on this via /api/config/templates",
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Runtime-acceptance gate: every alias reference on every agent
+// in a migrated V2 config resolves to a real config entry. Closes
+// the migration-plan item "post-migration runtime accepts the
+// migrated config, loads agents, and resolves all alias references"
+// at the config layer (no live provider / channel / memory I/O).
+// ─────────────────────────────────────────────────────────────
+
+#[test]
+fn migrated_v2_agent_alias_references_all_resolve() {
+    // Two-agent V2 install with explicit per-agent brain + risk override.
+    // Exercises the synthesized model-provider alias path, the
+    // synthesized risk/runtime profile defaults, and the channels
+    // back-reference rewrite.
+    let v3 = migrate_v2(
+        r#"
+schema_version = 2
+
+[autonomy]
+level = "supervised"
+
+[channels.telegram]
+enabled = true
+bot_token = "tg-tok"
+agent = "scout"
+
+[agents.scout]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+api_key = "sk-ant-scout"
+
+[agents.lead]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-openai-lead"
+"#,
+    );
+
+    let serialized = toml::to_string(&v3).expect("V3 output serializes");
+    let cfg: zeroclaw_config::schema::Config =
+        toml::from_str(&serialized).expect("V3 output parses as Config");
+
+    assert!(
+        !cfg.agents.is_empty(),
+        "V2 fixture must produce at least one agent"
+    );
+
+    for (alias, agent) in &cfg.agents {
+        assert!(
+            cfg.risk_profile_for_agent(alias).is_some(),
+            "agent `{alias}` references risk_profile `{}` which does not resolve",
+            agent.risk_profile
+        );
+        assert!(
+            cfg.runtime_profile_for_agent(alias).is_some(),
+            "agent `{alias}` references runtime_profile `{}` which does not resolve",
+            agent.runtime_profile
+        );
+        assert!(
+            cfg.model_provider_for_agent(alias).is_some(),
+            "agent `{alias}` references model_provider `{}` which does not resolve",
+            agent.model_provider
         );
     }
 }

@@ -2381,9 +2381,13 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
                     section
                 }
             }
-            _ => return,
+            _ => {
+                drop_empty_subsystem_blocks(passthrough);
+                return;
+            }
         };
         if config_table.is_empty() {
+            drop_empty_subsystem_blocks(passthrough);
             return;
         }
 
@@ -2403,6 +2407,23 @@ fn fold_v2_storage_subsystems(passthrough: &mut toml::Table) {
                     .with_attrs(::serde_json::json!({"provider_type": provider_type})),
                 "[storage.provider.config provider=] promoted to [storage..default]"
             );
+        }
+    }
+
+    drop_empty_subsystem_blocks(passthrough);
+}
+
+/// Drop top-level blocks that the storage fold emptied. `[memory]` requires
+/// `backend` and `[storage]` requires at least one backend instance, so an
+/// empty table at either path would fail V3 schema validation. The default
+/// at parse time (struct Default for both) is the correct fallback when the
+/// operator hadn't authored anything beyond the now-lifted subentries.
+fn drop_empty_subsystem_blocks(passthrough: &mut toml::Table) {
+    for key in ["memory", "storage"] {
+        if let Some(toml::Value::Table(t)) = passthrough.get(key)
+            && t.is_empty()
+        {
+            passthrough.remove(key);
         }
     }
 }
@@ -2670,5 +2691,1308 @@ fn ensure_unique_key(existing: &toml::Table, key: String) -> String {
             return candidate;
         }
         n += 1;
+    }
+}
+
+// =============================================================================
+// V2 → V3 filesystem & memory-backend migration
+// =============================================================================
+//
+// One source of truth for every V2→V3 disk move and backend agent_id backfill.
+// The dispatch tables below drive both production migration and the e2e test;
+// adding a new legacy entry is one row, picked up by both sides without further
+// edits.
+
+use anyhow::{Context as MigContext, Result as MigResult};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
+
+/// Destination class for a top-level entry under the legacy
+/// `<install>/workspace/` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2WorkspaceDest {
+    /// Wholesale relocation into `<install>/data/<name>`.
+    DataDir,
+    /// Wholesale relocation into `<install>/shared/<name>`.
+    SharedDir,
+    /// Wholesale relocation into `<install>/agents/default/workspace/<name>`.
+    AgentDefault,
+    /// `workspace/memory/` has mixed contents: shared DBs / archive /
+    /// snapshot stay in `data/memory/`; markdown daily files belong to
+    /// the agent. The orchestrator iterates subentries and dispatches
+    /// via [`V2_MEMORY_DATA_NAMES`].
+    MemorySubentryDispatch,
+}
+
+/// Single canonical V2 → V3 top-level workspace dispatch.
+///
+/// Anything not in this list falls through to
+/// [`V2WorkspaceDest::AgentDefault`].
+///
+/// Adding a new entry here is the ONLY edit needed to extend coverage —
+/// the orchestrator and the e2e test both iterate this table.
+pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
+    ("memory", V2WorkspaceDest::MemorySubentryDispatch),
+    ("sessions", V2WorkspaceDest::DataDir),
+    ("state", V2WorkspaceDest::DataDir),
+    ("skills", V2WorkspaceDest::SharedDir),
+    // Top-level instance-state file. The DeviceRegistry reader at
+    // `api_pairing.rs:40` opens `<data_dir>/devices.db`, so unlike
+    // per-agent files this has to land in `data/`, not in the agent
+    // workspace where the default-branch would otherwise send it.
+    ("devices.db", V2WorkspaceDest::DataDir),
+];
+
+/// Subentries of legacy `<install>/workspace/memory/` that belong to the
+/// shared instance memory dir (`<install>/data/memory/`).
+///
+/// Anything else under `workspace/memory/` (notably markdown daily files
+/// like `2025-04-12.md`) goes to
+/// `<install>/agents/default/workspace/memory/<name>` so the per-agent
+/// markdown backend (which reads from the agent workspace) can find them.
+pub const V2_MEMORY_DATA_NAMES: &[&str] = &[
+    "brain.db",
+    "audit.db",
+    "response_cache.db",
+    "MEMORY_SNAPSHOT.md",
+    "archive",
+];
+
+/// V3 root directories that should exist after a successful migration.
+/// The e2e test asserts every entry under `<install>` is either one of
+/// these, the post-migration `config.toml(.backup)?`, or a `backup-*/`.
+pub const V3_INSTALL_ROOT_NAMES: &[&str] = &["data", "shared", "agents"];
+
+/// Dispatch a top-level legacy entry name to its V2WorkspaceDest class.
+pub fn v2_workspace_toplevel_dest(name: &str) -> V2WorkspaceDest {
+    V2_WORKSPACE_TOPLEVEL_DISPATCH
+        .iter()
+        .copied()
+        .find(|(n, _)| *n == name)
+        .map(|(_, d)| d)
+        .unwrap_or(V2WorkspaceDest::AgentDefault)
+}
+
+/// V3 destination path for a top-level entry under legacy `workspace/`.
+///
+/// For `MemorySubentryDispatch` entries the returned path is the
+/// `data/<name>` prefix; the caller iterates the entry's subdir and uses
+/// [`memory_subentry_v3_path`] per subentry.
+pub fn workspace_toplevel_v3_path(install: &Path, name: &str) -> PathBuf {
+    match v2_workspace_toplevel_dest(name) {
+        V2WorkspaceDest::DataDir | V2WorkspaceDest::MemorySubentryDispatch => {
+            install.join("data").join(name)
+        }
+        V2WorkspaceDest::SharedDir => install.join("shared").join(name),
+        V2WorkspaceDest::AgentDefault => install
+            .join("agents")
+            .join("default")
+            .join("workspace")
+            .join(name),
+    }
+}
+
+/// V3 destination path for a subentry under legacy `workspace/memory/`.
+pub fn memory_subentry_v3_path(install: &Path, sub_name: &str) -> PathBuf {
+    if V2_MEMORY_DATA_NAMES.contains(&sub_name) {
+        install.join("data").join("memory").join(sub_name)
+    } else {
+        install
+            .join("agents")
+            .join("default")
+            .join("workspace")
+            .join("memory")
+            .join(sub_name)
+    }
+}
+
+/// Result of a successful filesystem migration.
+#[derive(Debug, Clone)]
+pub struct FilesystemMigrationReport {
+    /// Timestamped backup directory (e.g. `<install>/backup-20260516T140530`).
+    /// Empty when no migration ran.
+    pub backup_dir: Option<PathBuf>,
+    /// Number of top-level entries relocated.
+    pub entries_relocated: usize,
+}
+
+/// V2 → V3 install-root filesystem migration.
+///
+/// 1. Back up the entire legacy `<install>/workspace/` tree under
+///    `<install>/backup-<ts>/legacy-workspace/` (copy-not-rename so a
+///    partial failure leaves the legacy data untouched).
+/// 2. Iterate legacy top-level entries; for each, look up the V3
+///    destination via [`workspace_toplevel_v3_path`] (or the
+///    [`memory_subentry_v3_path`] sub-dispatch for `memory/`) and move it.
+/// 3. Heal intermediate v0.8.0-pre installs by relocating
+///    `agents/default/workspace/skills/` to `shared/skills/`.
+///
+/// Idempotent: on a fresh install or an already-migrated install the
+/// function is a no-op. Refuses to clobber an existing target —
+/// surfacing a WARN and leaving the legacy entry in place rather than
+/// overwriting operator data.
+pub fn migrate_v2_to_v3_install_filesystem(
+    install_root: &Path,
+) -> MigResult<FilesystemMigrationReport> {
+    let legacy = install_root.join("workspace");
+    let agent_default = install_root
+        .join("agents")
+        .join("default")
+        .join("workspace");
+
+    if !legacy.is_dir() {
+        relocate_default_agent_skills_to_shared(install_root)?;
+        return Ok(FilesystemMigrationReport {
+            backup_dir: None,
+            entries_relocated: 0,
+        });
+    }
+
+    let data_target = install_root.join("data");
+    let data_populated = data_target
+        .is_dir()
+        .then(|| std::fs::read_dir(&data_target).ok())
+        .flatten()
+        .is_some_and(|mut it| it.next().is_some());
+    let agent_populated = agent_default
+        .is_dir()
+        .then(|| std::fs::read_dir(&agent_default).ok())
+        .flatten()
+        .is_some_and(|mut it| it.next().is_some());
+    if data_populated && agent_populated {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "data_target": data_target.display().to_string(),
+                    "agent_target": agent_default.display().to_string(),
+                    "legacy": legacy.display().to_string(),
+                })
+            ),
+            "[system] filesystem migration: targets already populated; skipping split"
+        );
+        relocate_default_agent_skills_to_shared(install_root)?;
+        return Ok(FilesystemMigrationReport {
+            backup_dir: None,
+            entries_relocated: 0,
+        });
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+    let backup_dir = install_root
+        .join(format!("backup-{timestamp}"))
+        .join("legacy-workspace");
+    std::fs::create_dir_all(&backup_dir).with_context(|| {
+        format!(
+            "[system] failed to create migration backup dir at {}",
+            backup_dir.display()
+        )
+    })?;
+    copy_dir_recursive(&legacy, &backup_dir).with_context(|| {
+        format!(
+            "[system] failed to back up legacy workspace from {} to {}",
+            legacy.display(),
+            backup_dir.display()
+        )
+    })?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "backup": backup_dir.display().to_string(),
+            })
+        ),
+        "[system] filesystem migration: legacy workspace backed up"
+    );
+
+    let entries_relocated = relocate_workspace_toplevel(&legacy, install_root, &backup_dir)
+        .with_context(|| {
+            format!(
+                "[system] failed during workspace top-level relocation under {}",
+                install_root.display()
+            )
+        })?;
+
+    if std::fs::read_dir(&legacy)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&legacy);
+    }
+
+    relocate_default_agent_skills_to_shared(install_root)?;
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "backup": backup_dir.display().to_string(),
+                "entries_relocated": entries_relocated,
+            })
+        ),
+        "[system] filesystem migration: legacy workspace split into V3 layout"
+    );
+
+    Ok(FilesystemMigrationReport {
+        backup_dir: Some(backup_dir.parent().unwrap_or(&backup_dir).to_path_buf()),
+        entries_relocated,
+    })
+}
+
+/// Iterate `legacy/` top-level entries and relocate each via the
+/// dispatch tables. Returns the count of entries successfully moved
+/// (entries already at the target are counted as moved).
+fn relocate_workspace_toplevel(
+    legacy: &Path,
+    install_root: &Path,
+    backup_dir: &Path,
+) -> MigResult<usize> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(legacy).with_context(|| {
+        format!(
+            "[system] failed to enumerate legacy workspace at {}",
+            legacy.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "legacy": legacy.display().to_string(),
+                    })),
+                "[system] filesystem migration: skipping non-UTF-8 entry"
+            );
+            continue;
+        };
+        let src = entry.path();
+
+        match v2_workspace_toplevel_dest(name_str) {
+            V2WorkspaceDest::MemorySubentryDispatch => {
+                count += relocate_memory_subentries(&src, install_root, backup_dir)?;
+            }
+            _ => {
+                let dst = workspace_toplevel_v3_path(install_root, name_str);
+                if move_with_refuse_to_clobber(&src, &dst)? {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Iterate `legacy/memory/`'s subentries and route each per
+/// [`memory_subentry_v3_path`].
+fn relocate_memory_subentries(
+    legacy_memory_dir: &Path,
+    install_root: &Path,
+    _backup_dir: &Path,
+) -> MigResult<usize> {
+    if !legacy_memory_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(legacy_memory_dir).with_context(|| {
+        format!(
+            "[system] failed to enumerate {} during memory sub-dispatch",
+            legacy_memory_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "legacy_memory_dir": legacy_memory_dir.display().to_string(),
+                    })),
+                "[system] filesystem migration: skipping non-UTF-8 entry under memory"
+            );
+            continue;
+        };
+        let src = entry.path();
+        let dst = memory_subentry_v3_path(install_root, name_str);
+        if move_with_refuse_to_clobber(&src, &dst)? {
+            count += 1;
+        }
+    }
+    // Remove the now-empty memory dir (best-effort).
+    if std::fs::read_dir(legacy_memory_dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(legacy_memory_dir);
+    }
+    Ok(count)
+}
+
+/// Move `src` to `dst`, creating intermediate dirs and falling back to
+/// copy+remove for cross-filesystem moves. Returns `Ok(true)` if the
+/// move ran, `Ok(false)` if the destination already existed (operator
+/// data preserved, WARN logged, caller continues with the rest of the
+/// split).
+fn move_with_refuse_to_clobber(src: &Path, dst: &Path) -> MigResult<bool> {
+    if dst.exists() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": src.display().to_string(),
+                    "target": dst.display().to_string(),
+                })),
+            "[system] filesystem migration: target already exists; refusing to clobber"
+        );
+        return Ok(false);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("[system] failed to create parent dir {}", parent.display())
+        })?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(true);
+    }
+    // Cross-filesystem fallback.
+    if src.is_dir() {
+        copy_dir_recursive(src, dst).with_context(|| {
+            format!(
+                "[system] failed to copy {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+        std::fs::remove_dir_all(src)
+            .with_context(|| format!("[system] failed to remove {} after copy", src.display()))?;
+    } else {
+        std::fs::copy(src, dst).with_context(|| {
+            format!(
+                "[system] failed to copy {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+        std::fs::remove_file(src)
+            .with_context(|| format!("[system] failed to remove {} after copy", src.display()))?;
+    }
+    Ok(true)
+}
+
+/// Heal intermediate v0.8.0-pre installs that landed skills under
+/// `agents/default/workspace/skills/` before the host-wide
+/// `shared/skills/` layout was introduced. Idempotent.
+pub fn relocate_default_agent_skills_to_shared(install_root: &Path) -> MigResult<bool> {
+    let src = install_root
+        .join("agents")
+        .join("default")
+        .join("workspace")
+        .join("skills");
+    let dst = install_root.join("shared").join("skills");
+    if !src.is_dir() {
+        return Ok(false);
+    }
+    let dst_populated = dst
+        .is_dir()
+        .then(|| std::fs::read_dir(&dst).ok())
+        .flatten()
+        .is_some_and(|mut it| it.next().is_some());
+    if dst_populated {
+        return Ok(false);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "[system] failed to create shared workspace parent {}",
+                parent.display()
+            )
+        })?;
+    }
+    if std::fs::rename(&src, &dst).is_err() {
+        copy_dir_recursive(&src, &dst).with_context(|| {
+            format!(
+                "[system] failed to copy {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+        std::fs::remove_dir_all(&src)
+            .with_context(|| format!("[system] failed to remove {} after copy", src.display()))?;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "from": src.display().to_string(),
+                "to": dst.display().to_string(),
+            })
+        ),
+        "[system] filesystem migration: lifted default-agent skills into shared/"
+    );
+    Ok(true)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> MigResult<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// SQLite agent_id backfill.
+// -----------------------------------------------------------------------------
+
+/// On-disk schema version stamped after a successful SQLite memory
+/// migration. Future migrations consult this rather than re-running
+/// PRAGMA detection.
+pub const SQLITE_MEMORY_SCHEMA_VERSION: i64 = 1;
+
+/// Migrate a SQLite memory database to the V3 multi-agent shape.
+///
+/// Adds the `agents` table, the `agent_id` column on `memories`,
+/// backfills existing rows to a synthesized `default` agent, and
+/// promotes the column to `NOT NULL REFERENCES agents(id)` via a table
+/// rebuild. Idempotent: re-running on an already-migrated DB is a
+/// no-op. Before any destructive step the file is backed up at
+/// `<db_path>.backup-<ts>` when there are rows that would be touched.
+///
+/// The caller is responsible for opening the connection with
+/// `PRAGMA foreign_keys = ON` (and any other backend-specific PRAGMA
+/// tuning); this function operates on the open connection.
+pub fn migrate_sqlite_memory_to_v3(db_path: &Path, conn: &Connection) -> MigResult<()> {
+    if sqlite_memories_agent_id_is_not_null(conn)? {
+        return Ok(());
+    }
+
+    if sqlite_memories_row_count(conn)? > 0 && db_path.exists() {
+        backup_sqlite_for_multi_agent_migration(db_path)?;
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys = ON;")?;
+    let result = (|| -> MigResult<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agents (
+                id          TEXT PRIMARY KEY,
+                alias       TEXT NOT NULL UNIQUE,
+                created_at  TEXT NOT NULL
+             );",
+        )?;
+        let default_uuid = sqlite_ensure_default_agent_uuid(conn)?;
+
+        if !sqlite_memories_has_agent_id_column(conn)? {
+            conn.execute_batch("ALTER TABLE memories ADD COLUMN agent_id TEXT;")?;
+        }
+        conn.execute(
+            "UPDATE memories SET agent_id = ?1 WHERE agent_id IS NULL",
+            params![default_uuid],
+        )?;
+
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS memories_ai;
+             DROP TRIGGER IF EXISTS memories_ad;
+             DROP TRIGGER IF EXISTS memories_au;
+             DROP TABLE IF EXISTS memories_fts;
+
+             CREATE TABLE memories_new (
+                id            TEXT PRIMARY KEY,
+                key           TEXT NOT NULL UNIQUE,
+                content       TEXT NOT NULL,
+                category      TEXT NOT NULL DEFAULT 'core',
+                embedding     BLOB,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                session_id    TEXT,
+                namespace     TEXT DEFAULT 'default',
+                importance    REAL DEFAULT 0.5,
+                superseded_by TEXT,
+                agent_id      TEXT NOT NULL REFERENCES agents(id)
+             );
+
+             INSERT INTO memories_new (
+                id, key, content, category, embedding, created_at, updated_at,
+                session_id, namespace, importance, superseded_by, agent_id
+             )
+             SELECT
+                id, key, content, category, embedding, created_at, updated_at,
+                session_id, namespace, importance, superseded_by, agent_id
+             FROM memories;
+
+             DROP TABLE memories;
+             ALTER TABLE memories_new RENAME TO memories;
+
+             CREATE INDEX IF NOT EXISTS idx_memories_category  ON memories(category);
+             CREATE INDEX IF NOT EXISTS idx_memories_key       ON memories(key);
+             CREATE INDEX IF NOT EXISTS idx_memories_session   ON memories(session_id);
+             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
+             CREATE INDEX IF NOT EXISTS idx_memories_agent_id  ON memories(agent_id);
+
+             CREATE VIRTUAL TABLE memories_fts USING fts5(
+                key, content, content=memories, content_rowid=rowid
+             );
+             INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+
+             CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, key, content)
+                VALUES (new.rowid, new.key, new.content);
+             END;
+             CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                VALUES ('delete', old.rowid, old.key, old.content);
+             END;
+             CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, key, content)
+                VALUES ('delete', old.rowid, old.key, old.content);
+                INSERT INTO memories_fts(rowid, key, content)
+                VALUES (new.rowid, new.key, new.content);
+             END;",
+        )?;
+
+        sqlite_ensure_schema_version_table(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (component, version, applied_at) \
+             VALUES ('memories', ?1, ?2)",
+            params![
+                SQLITE_MEMORY_SCHEMA_VERSION,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn sqlite_ensure_schema_version_table(conn: &Connection) -> MigResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            component  TEXT PRIMARY KEY,
+            version    INTEGER NOT NULL,
+            applied_at TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+fn sqlite_memories_agent_id_is_not_null(conn: &Connection) -> MigResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let agent_id_notnull: Option<bool> = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let notnull: i64 = row.get(3)?;
+            Ok((name, notnull != 0))
+        })?
+        .filter_map(Result::ok)
+        .find(|(name, _)| name == "agent_id")
+        .map(|(_, notnull)| notnull);
+
+    let Some(true) = agent_id_notnull else {
+        return Ok(false);
+    };
+
+    let mut fk_stmt = conn.prepare("PRAGMA foreign_key_list(memories)")?;
+    let has_fk = fk_stmt
+        .query_map([], |row| {
+            let target_table: String = row.get(2)?;
+            let from_col: String = row.get(3)?;
+            Ok((target_table, from_col))
+        })?
+        .filter_map(Result::ok)
+        .any(|(target, from)| target == "agents" && from == "agent_id");
+    Ok(has_fk)
+}
+
+fn sqlite_memories_has_agent_id_column(conn: &Connection) -> MigResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    Ok(stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == "agent_id"))
+}
+
+fn sqlite_memories_row_count(conn: &Connection) -> MigResult<i64> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Mint or query the `default` agent's row. Idempotent on concurrent
+/// first-init: the returned UUID is the row that actually persisted,
+/// not the candidate we attempted to insert.
+pub fn sqlite_ensure_default_agent_uuid(conn: &Connection) -> MigResult<String> {
+    sqlite_ensure_agent_uuid(conn, "default")
+}
+
+/// Mint-or-query a single agent row keyed by alias. Used by the
+/// SQLite migration's default-agent backfill and by the `ensure_agent_uuid`
+/// trait impl on the memory backend (alias resolution at agent-loop entry).
+pub fn sqlite_ensure_agent_uuid(conn: &Connection, alias: &str) -> MigResult<String> {
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO agents (id, alias, created_at) VALUES (?1, ?2, ?3)",
+        params![new_id, alias, now],
+    )?;
+    let final_id: String = conn.query_row(
+        "SELECT id FROM agents WHERE alias = ?1 LIMIT 1",
+        params![alias],
+        |row| row.get(0),
+    )?;
+    Ok(final_id)
+}
+
+fn backup_sqlite_for_multi_agent_migration(db_path: &Path) -> MigResult<()> {
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+    let backup_path = db_path.with_file_name(format!(
+        "{}.backup-{timestamp}",
+        db_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "brain.db".to_string()),
+    ));
+    std::fs::copy(db_path, &backup_path).with_context(|| {
+        format!(
+            "failed to copy {} to {} before multi-agent migration",
+            db_path.display(),
+            backup_path.display(),
+        )
+    })?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "backup": backup_path.display().to_string(),
+            })
+        ),
+        "multi-agent migration: backed up SQLite memory DB before adding agents table"
+    );
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Postgres agent_id backfill.
+// -----------------------------------------------------------------------------
+
+/// Migrate a Postgres memory schema to the V3 multi-agent shape.
+///
+/// Adds the `agents` table and the `agent_id` column on the qualified
+/// memories table, with a default-agent backfill. Idempotent: every
+/// step uses `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` so re-runs are
+/// no-ops. Uses the low-lock NOT VALID → VALIDATE pattern so the
+/// upgrade does not take ACCESS EXCLUSIVE on a populated table.
+///
+/// Backups are the operator's responsibility for Postgres (documented
+/// in the release notes); reaching across the network to dump a
+/// managed cluster from inside the binary is out of scope.
+#[cfg(feature = "memory-postgres")]
+pub fn migrate_postgres_memory_to_v3(
+    client: &mut postgres::Client,
+    schema_ident: &str,
+    qualified_table: &str,
+) -> MigResult<()> {
+    let qualified_agents = format!("{schema_ident}.agents");
+
+    client.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {qualified_agents} (
+            id          TEXT PRIMARY KEY,
+            alias       TEXT NOT NULL UNIQUE,
+            created_at  TIMESTAMPTZ NOT NULL
+        );"
+    ))?;
+
+    let candidate_uuid = uuid::Uuid::new_v4().to_string();
+    client.execute(
+        &format!(
+            "INSERT INTO {qualified_agents} (id, alias, created_at)
+             VALUES ($1, 'default', NOW())
+             ON CONFLICT (alias) DO NOTHING"
+        ),
+        &[&candidate_uuid],
+    )?;
+    let default_uuid: String = client
+        .query_one(
+            &format!("SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1"),
+            &[],
+        )?
+        .get(0);
+
+    client.batch_execute(&format!(
+        "ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS agent_id TEXT;
+         CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON {qualified_table}(agent_id);"
+    ))?;
+    client.execute(
+        &format!("UPDATE {qualified_table} SET agent_id = $1 WHERE agent_id IS NULL"),
+        &[&default_uuid],
+    )?;
+
+    client.batch_execute(&format!(
+        "
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'memories_agent_id_notnull_chk'
+            ) THEN
+                ALTER TABLE {qualified_table}
+                    ADD CONSTRAINT memories_agent_id_notnull_chk
+                    CHECK (agent_id IS NOT NULL) NOT VALID;
+            END IF;
+        END$$;
+        ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_notnull_chk;
+        ALTER TABLE {qualified_table} ALTER COLUMN agent_id SET NOT NULL;
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'memories_agent_id_fk'
+            ) THEN
+                ALTER TABLE {qualified_table}
+                    ADD CONSTRAINT memories_agent_id_fk
+                    FOREIGN KEY (agent_id) REFERENCES {qualified_agents}(id) NOT VALID;
+            END IF;
+        END$$;
+        ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_fk;
+        "
+    ))?;
+
+    client.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {schema_ident}.schema_version (
+            component  TEXT PRIMARY KEY,
+            version    INTEGER NOT NULL,
+            applied_at TIMESTAMPTZ NOT NULL
+        );"
+    ))?;
+    client.execute(
+        &format!(
+            "INSERT INTO {schema_ident}.schema_version (component, version, applied_at) \
+             VALUES ('memories', $1, NOW()) \
+             ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at"
+        ),
+        &[&SQLITE_MEMORY_SCHEMA_VERSION],
+    )?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Qdrant agent_id backfill (NEW for V3; closes the gap where pre-V3 points
+// without `agent_id` payload would be silently filtered out by the
+// AgentScopedMemory `must` clause).
+// -----------------------------------------------------------------------------
+
+/// V3 default agent_id payload value on Qdrant collections.
+///
+/// Qdrant does not maintain an `agents` table; it stores the agent
+/// alias directly as the `agent_id` payload field. The
+/// `AgentScopedMemory` wrapper's `must` filter expects `agent_id ==
+/// "default"` for the V1/V2 single-agent bridge.
+pub const QDRANT_DEFAULT_AGENT_ID: &str = "default";
+
+/// Migrate a Qdrant collection to the V3 multi-agent shape.
+///
+/// Scrolls the collection in pages of 1000 points; for any point whose
+/// payload lacks `agent_id`, issues a `set payload` to add
+/// `agent_id = "default"`. Idempotent: subsequent runs skip points
+/// that already carry the field.
+///
+/// Backups are the operator's responsibility (documented in the
+/// release notes); we cannot snapshot a remote Qdrant cluster from
+/// inside the binary.
+pub async fn migrate_qdrant_collection_to_v3(
+    client: &reqwest::Client,
+    base_url: &str,
+    collection: &str,
+    api_key: Option<&str>,
+) -> MigResult<usize> {
+    let base_url = base_url.trim_end_matches('/');
+    let mut next_offset: Option<serde_json::Value> = None;
+    let mut updated = 0usize;
+
+    loop {
+        let mut scroll_body = serde_json::json!({
+            "limit": 1000,
+            "with_payload": true,
+            "with_vector": false,
+            // Match only points that lack agent_id. is_empty supports
+            // the missing-key case (the filter matches a point whose
+            // payload key is absent or whose stored value is null).
+            "filter": {
+                "must": [{ "is_empty": { "key": "agent_id" } }]
+            }
+        });
+        if let Some(ref offset) = next_offset {
+            scroll_body["offset"] = offset.clone();
+        }
+
+        let url = format!("{base_url}/collections/{collection}/points/scroll");
+        let mut req = client.request(reqwest::Method::POST, &url);
+        if let Some(key) = api_key {
+            req = req.header("api-key", key);
+        }
+        let resp = req
+            .header("Content-Type", "application/json")
+            .json(&scroll_body)
+            .send()
+            .await
+            .context("[system] Qdrant V3 migration: scroll request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ScrollPage {
+            result: ScrollResult,
+        }
+        #[derive(serde::Deserialize)]
+        struct ScrollResult {
+            points: Vec<ScrollPoint>,
+            #[serde(default)]
+            next_page_offset: Option<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ScrollPoint {
+            id: serde_json::Value,
+        }
+
+        let page: ScrollPage = resp
+            .json()
+            .await
+            .context("[system] Qdrant V3 migration: scroll page parse failed")?;
+        let ids: Vec<serde_json::Value> = page.result.points.into_iter().map(|p| p.id).collect();
+        if !ids.is_empty() {
+            let set_url = format!("{base_url}/collections/{collection}/points/payload");
+            let body = serde_json::json!({
+                "payload": { "agent_id": QDRANT_DEFAULT_AGENT_ID },
+                "points": ids,
+            });
+            let mut req = client.request(reqwest::Method::POST, &set_url);
+            if let Some(key) = api_key {
+                req = req.header("api-key", key);
+            }
+            let resp = req
+                .header("Content-Type", "application/json")
+                .query(&[("wait", "true")])
+                .json(&body)
+                .send()
+                .await
+                .context("[system] Qdrant V3 migration: set payload request failed")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant set payload failed ({status}): {text}");
+            }
+            let batch_count = body["points"].as_array().map(|a| a.len()).unwrap_or(0);
+            updated += batch_count;
+        }
+
+        match page.result.next_page_offset {
+            Some(offset) if !offset.is_null() => next_offset = Some(offset),
+            _ => break,
+        }
+    }
+
+    if updated > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "collection": collection,
+                    "updated": updated,
+                })
+            ),
+            "[system] Qdrant V3 migration: backfilled agent_id payload"
+        );
+    }
+    Ok(updated)
+}
+
+#[cfg(test)]
+mod fs_db_migration_tests {
+    //! End-to-end V2 → V3 filesystem & DB migration test.
+    //!
+    //! Lays down a V2 install in a `TempDir` (real disk), drives the
+    //! orchestrator, and asserts every relocated path matches the
+    //! shared dispatch fns (`workspace_toplevel_v3_path`,
+    //! `memory_subentry_v3_path`). The test loops over the canonical
+    //! dispatch tables — adding a new entry there auto-extends test
+    //! coverage with no companion edit here.
+    use super::*;
+    use rusqlite::Connection;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Walk a directory tree and return a sorted list of (relative
+    /// path, file contents) pairs. Used to diff pre-migration backup
+    /// against the legacy snapshot for byte-equal verification.
+    fn snapshot_tree(root: &Path) -> BTreeSet<(PathBuf, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<(PathBuf, Vec<u8>)>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    walk(root, &path, out);
+                } else if let Ok(bytes) = fs::read(&path)
+                    && let Ok(rel) = path.strip_prefix(root)
+                {
+                    out.insert((rel.to_path_buf(), bytes));
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// Lay down a V2 install rooted at `install`: a `workspace/` tree
+    /// hitting every dispatch branch, plus a populated `brain.db` in
+    /// pre-multi-agent shape so the SQLite migration has rows to
+    /// backfill.
+    fn seed_v2_install(install: &Path) {
+        // Top-level instance file (devices.db bug fix lands this in
+        // data/ post-migration).
+        fs::create_dir_all(install.join("workspace")).unwrap();
+        fs::write(
+            install.join("workspace/devices.db"),
+            b"pretend-paired-devices-blob",
+        )
+        .unwrap();
+
+        // Per-agent identity files (default branch → agent workspace).
+        for fname in [
+            "MEMORY.md",
+            "IDENTITY.md",
+            "SOUL.md",
+            "USER.md",
+            "AGENTS.md",
+        ] {
+            fs::write(install.join("workspace").join(fname), format!("# {fname}")).unwrap();
+        }
+
+        // workspace/sessions/ (wholesale → data/sessions/).
+        fs::create_dir_all(install.join("workspace/sessions")).unwrap();
+        fs::write(install.join("workspace/sessions/sessions.db"), b"sessions").unwrap();
+
+        // workspace/state/ (wholesale → data/state/).
+        fs::create_dir_all(install.join("workspace/state")).unwrap();
+        fs::write(
+            install.join("workspace/state/runtime-trace.jsonl"),
+            b"trace",
+        )
+        .unwrap();
+
+        // workspace/skills/ (wholesale → shared/skills/).
+        fs::create_dir_all(install.join("workspace/skills/my-skill")).unwrap();
+        fs::write(install.join("workspace/skills/my-skill/SKILL.md"), b"skill").unwrap();
+
+        // workspace/memory/ subentries: split between data/memory/ and
+        // agents/default/workspace/memory/ per V2_MEMORY_DATA_NAMES.
+        let mem_dir = install.join("workspace/memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        for sub in V2_MEMORY_DATA_NAMES {
+            let p = mem_dir.join(sub);
+            if *sub == "archive" {
+                fs::create_dir_all(&p).unwrap();
+                fs::write(p.join("old-recall.jsonl"), b"archived").unwrap();
+            } else if (*sub).ends_with(".db") {
+                // Real SQLite file so the in-DB migration has something
+                // to migrate after the FS move.
+                let conn = Connection::open(&p).unwrap();
+                if *sub == "brain.db" {
+                    conn.execute_batch(
+                        "PRAGMA foreign_keys = ON;
+                         CREATE TABLE memories (
+                            id TEXT PRIMARY KEY,
+                            key TEXT NOT NULL UNIQUE,
+                            content TEXT NOT NULL,
+                            category TEXT NOT NULL DEFAULT 'core',
+                            embedding BLOB,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            session_id TEXT,
+                            namespace TEXT DEFAULT 'default',
+                            importance REAL DEFAULT 0.5,
+                            superseded_by TEXT
+                         );
+                         INSERT INTO memories (id, key, content, created_at, updated_at)
+                         VALUES ('m1', 'hello', 'world', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                                ('m2', 'foo',   'bar',   '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+                    )
+                    .unwrap();
+                }
+            } else {
+                fs::write(&p, format!("{sub} payload").as_bytes()).unwrap();
+            }
+        }
+        // Markdown daily files (must land in agents/default/workspace/memory/).
+        fs::write(
+            mem_dir.join("2025-04-12.md"),
+            b"# daily 2025-04-12\nhello world\n",
+        )
+        .unwrap();
+        fs::write(
+            mem_dir.join("2025-04-13.md"),
+            b"# daily 2025-04-13\nstill here\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_v2_install_into_v3_layout_with_real_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+
+        let legacy_snapshot = snapshot_tree(&install.join("workspace"));
+        assert!(
+            !legacy_snapshot.is_empty(),
+            "fixture seed must produce content under workspace/"
+        );
+
+        let report = migrate_v2_to_v3_install_filesystem(install).expect("migration must succeed");
+        assert!(report.entries_relocated > 0);
+        let backup_root = report.backup_dir.expect("backup dir present");
+
+        // Backup is byte-equal to the pre-migration workspace snapshot.
+        let backup_snapshot = snapshot_tree(&backup_root.join("legacy-workspace"));
+        assert_eq!(
+            backup_snapshot, legacy_snapshot,
+            "backup must be a byte-equal copy of the pre-migration workspace"
+        );
+
+        // Every legacy file lives at exactly one V3 location, predicted
+        // by the shared dispatch fns. We never name V3 paths here —
+        // the same fns the migration uses produce them.
+        for (rel, expected_bytes) in &legacy_snapshot {
+            let v3_path = predict_v3_path(install, rel);
+            assert!(
+                v3_path.exists(),
+                "file {} should exist at predicted V3 path {}",
+                rel.display(),
+                v3_path.display(),
+            );
+            let actual_bytes = fs::read(&v3_path).unwrap_or_else(|e| {
+                panic!(
+                    "failed to read predicted V3 path {} for legacy {}: {e}",
+                    v3_path.display(),
+                    rel.display(),
+                )
+            });
+            assert_eq!(
+                actual_bytes,
+                *expected_bytes,
+                "byte mismatch at {}",
+                v3_path.display()
+            );
+        }
+
+        // Legacy workspace/ is gone (it was empty after the relocation).
+        assert!(
+            !install.join("workspace").exists(),
+            "legacy workspace must be removed after a clean split"
+        );
+
+        // Nothing outside the V3 root names + backup + (no config.toml in
+        // this test) lives at install root.
+        let mut roots = BTreeSet::new();
+        for entry in fs::read_dir(install).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            roots.insert(name);
+        }
+        for name in &roots {
+            let allowed =
+                V3_INSTALL_ROOT_NAMES.contains(&name.as_str()) || name.starts_with("backup-");
+            assert!(
+                allowed,
+                "unexpected install-root entry {name:?}; allowed: {V3_INSTALL_ROOT_NAMES:?} + backup-*"
+            );
+        }
+
+        // Idempotent re-run is a no-op: same on-disk state afterward.
+        let post_first = snapshot_tree(install);
+        let report2 =
+            migrate_v2_to_v3_install_filesystem(install).expect("second run must be a no-op");
+        assert_eq!(report2.entries_relocated, 0);
+        let post_second = snapshot_tree(install);
+        assert_eq!(
+            post_first, post_second,
+            "idempotent re-run must not modify disk"
+        );
+
+        // In-DB migration: open the now-moved brain.db and run
+        // migrate_sqlite_memory_to_v3. Should backfill agent_id on the
+        // 2 seeded rows and stamp schema_version.
+        let brain_path = install.join("data/memory/brain.db");
+        assert!(
+            brain_path.is_file(),
+            "brain.db must have moved to data/memory/"
+        );
+        let conn = Connection::open(&brain_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate_sqlite_memory_to_v3(&brain_path, &conn).expect("SQLite migration must succeed");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_count, 0,
+            "all memories must have agent_id post-migration"
+        );
+
+        let agent_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE alias = 'default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_row_count, 1, "default agent row must exist");
+
+        // SQLite migration is idempotent.
+        migrate_sqlite_memory_to_v3(&brain_path, &conn)
+            .expect("SQLite migration second run must be a no-op");
+
+        // SQLite backup file from the in-DB migration is present.
+        let backup_glob: Vec<_> = fs::read_dir(install.join("data/memory"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("brain.db.backup-")
+            })
+            .collect();
+        assert_eq!(
+            backup_glob.len(),
+            1,
+            "in-DB SQLite migration must write exactly one backup file"
+        );
+    }
+
+    /// Predict the V3 absolute path for a legacy path relative to
+    /// `<install>/workspace/`. Uses the same dispatch fns the migration
+    /// uses; never names a V3 path literally.
+    fn predict_v3_path(install: &Path, rel: &Path) -> PathBuf {
+        let mut parts = rel.components();
+        let top = parts
+            .next()
+            .expect("legacy snapshot paths have at least one component");
+        let top_name = top.as_os_str().to_string_lossy().to_string();
+
+        // Sub-dispatch for memory/<x>: first segment is the subentry name.
+        if v2_workspace_toplevel_dest(&top_name) == V2WorkspaceDest::MemorySubentryDispatch {
+            let sub = parts.next();
+            let Some(sub) = sub else {
+                return workspace_toplevel_v3_path(install, &top_name);
+            };
+            let sub_name = sub.as_os_str().to_string_lossy().to_string();
+            let base = memory_subentry_v3_path(install, &sub_name);
+            let rest: PathBuf = parts.as_path().to_path_buf();
+            if rest.as_os_str().is_empty() {
+                base
+            } else {
+                base.join(rest)
+            }
+        } else {
+            let top_v3 = workspace_toplevel_v3_path(install, &top_name);
+            let rest: PathBuf = parts.as_path().to_path_buf();
+            if rest.as_os_str().is_empty() {
+                top_v3
+            } else {
+                top_v3.join(rest)
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_install_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let report =
+            migrate_v2_to_v3_install_filesystem(tmp.path()).expect("fresh install must be a no-op");
+        assert_eq!(report.entries_relocated, 0);
+        assert!(report.backup_dir.is_none());
+    }
+
+    #[test]
+    fn refuse_to_clobber_existing_v3_target() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path();
+        seed_v2_install(install);
+
+        // Pre-seed an operator-authored file at the V3 destination for
+        // devices.db. Migration must NOT overwrite it.
+        fs::create_dir_all(install.join("data")).unwrap();
+        let v3_devices = workspace_toplevel_v3_path(install, "devices.db");
+        fs::write(&v3_devices, b"operator-owned").unwrap();
+
+        let _ = migrate_v2_to_v3_install_filesystem(install).expect("migration must not fail");
+
+        // Operator file untouched.
+        let after = fs::read(&v3_devices).unwrap();
+        assert_eq!(
+            after, b"operator-owned",
+            "refuse-to-clobber: operator file must survive"
+        );
+
+        // Legacy devices.db is still in place (left for operator inspection)
+        // OR moved to backup; in either case the file is not lost.
+        let legacy_still = install.join("workspace/devices.db").exists();
+        let in_backup = fs::read_dir(install).unwrap().flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("backup-") && e.path().join("legacy-workspace/devices.db").exists()
+        });
+        assert!(
+            legacy_still || in_backup,
+            "legacy devices.db must be preserved (in legacy/ or backup/)"
+        );
     }
 }

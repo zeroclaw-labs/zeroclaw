@@ -118,7 +118,11 @@ impl PostgresMemory {
                     .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
-                Self::migrate_multi_agent(&mut client, &schema_ident, &qualified_table)?;
+                zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
+                    &mut client,
+                    &schema_ident,
+                    &qualified_table,
+                )?;
                 Ok(client)
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
@@ -126,150 +130,6 @@ impl PostgresMemory {
         init_handle
             .join()
             .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?
-    }
-
-    /// Multi-agent DB migration for the Postgres backend.
-    ///
-    /// Adds the `agents` table and the `agent_id` column on the
-    /// memories table, with a default-agent backfill. Idempotent: every
-    /// step uses `IF NOT EXISTS` / `ON CONFLICT DO NOTHING` so re-runs
-    /// are no-ops.
-    ///
-    /// Backups are the operator's responsibility for Postgres
-    /// (documented in the release notes); we cannot reach across the
-    /// network to dump a managed cluster from inside the binary.
-    /// The default-agent UUID is generated in Rust so it has the same
-    /// shape as SQLite/Lucid (TEXT, lowercase hyphenated).
-    fn migrate_multi_agent(
-        client: &mut Client,
-        schema_ident: &str,
-        qualified_table: &str,
-    ) -> Result<()> {
-        let qualified_agents = format!("{schema_ident}.agents");
-
-        // Create the agents table. Same shape as the SQLite migration:
-        // TEXT primary key for cross-DB UUID portability, alias UNIQUE
-        // for human reference and rename surface, created_at audit.
-        client.batch_execute(&format!(
-            "
-            CREATE TABLE IF NOT EXISTS {qualified_agents} (
-                id          TEXT PRIMARY KEY,
-                alias       TEXT NOT NULL UNIQUE,
-                created_at  TIMESTAMPTZ NOT NULL
-            );
-            "
-        ))?;
-
-        // Insert the default agent if absent. The Rust-side UUID is
-        // bound as a parameter so the row that ends up persisted has
-        // the same shape as the SQLite path.
-        let candidate_uuid = uuid::Uuid::new_v4().to_string();
-        client.execute(
-            &format!(
-                "INSERT INTO {qualified_agents} (id, alias, created_at)
-                 VALUES ($1, 'default', NOW())
-                 ON CONFLICT (alias) DO NOTHING"
-            ),
-            &[&candidate_uuid],
-        )?;
-
-        // Read back whatever row actually persisted so the backfill
-        // points at the canonical default-agent UUID even on
-        // concurrent first-init.
-        let default_uuid: String = client
-            .query_one(
-                &format!("SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1"),
-                &[],
-            )?
-            .get(0);
-
-        // ALTER memories ADD COLUMN agent_id, backfill, index. Postgres
-        // accepts ADD COLUMN IF NOT EXISTS (since 9.6) and CREATE INDEX
-        // IF NOT EXISTS (since 9.5), so the whole block is safely
-        // idempotent on every supported PG version. The default-agent
-        // UUID is bound rather than inlined to dodge any SQL-injection
-        // footgun even though uuid_v4 strings are hex+hyphens.
-        client.batch_execute(&format!(
-            "
-            ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS agent_id TEXT;
-            CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON {qualified_table}(agent_id);
-            "
-        ))?;
-        client.execute(
-            &format!("UPDATE {qualified_table} SET agent_id = $1 WHERE agent_id IS NULL"),
-            &[&default_uuid],
-        )?;
-
-        // Promote agent_id to NOT NULL REFERENCES agents(id) using the
-        // low-lock pattern so operators with populated production
-        // databases don't take an ACCESS EXCLUSIVE during the upgrade:
-        //
-        //  1. Add a CHECK (agent_id IS NOT NULL) NOT VALID — catalog-
-        //     only, no scan, brief lock.
-        //  2. VALIDATE CONSTRAINT in its own statement — SHARE UPDATE
-        //     EXCLUSIVE lock; concurrent reads and writes continue.
-        //  3. Once the CHECK is validated, ALTER COLUMN ... SET NOT
-        //     NULL becomes metadata-only on PostgreSQL 12+: the
-        //     planner uses the validated CHECK as proof and skips the
-        //     full table scan that would otherwise hold ACCESS
-        //     EXCLUSIVE for minutes on a large table.
-        //  4. The FK is added NOT VALID for the same reason, then
-        //     validated in a separate statement.
-        //
-        // Each step is idempotent (DO-block guard against re-runs);
-        // the migration is safe to re-run after a partial failure.
-        let qualified_agents = format!("{schema_ident}.agents");
-        client.batch_execute(&format!(
-            "
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'memories_agent_id_notnull_chk'
-                ) THEN
-                    ALTER TABLE {qualified_table}
-                        ADD CONSTRAINT memories_agent_id_notnull_chk
-                        CHECK (agent_id IS NOT NULL) NOT VALID;
-                END IF;
-            END$$;
-            ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_notnull_chk;
-            ALTER TABLE {qualified_table} ALTER COLUMN agent_id SET NOT NULL;
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'memories_agent_id_fk'
-                ) THEN
-                    ALTER TABLE {qualified_table}
-                        ADD CONSTRAINT memories_agent_id_fk
-                        FOREIGN KEY (agent_id) REFERENCES {qualified_agents}(id) NOT VALID;
-                END IF;
-            END$$;
-            ALTER TABLE {qualified_table} VALIDATE CONSTRAINT memories_agent_id_fk;
-            "
-        ))?;
-
-        // Stamp the schema version so future migrations can detect
-        // on-disk shape without parsing system catalogs.
-        client.batch_execute(&format!(
-            "
-            CREATE TABLE IF NOT EXISTS {schema_ident}.schema_version (
-                component  TEXT PRIMARY KEY,
-                version    INTEGER NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL
-            );
-            "
-        ))?;
-        client.execute(
-            &format!(
-                "INSERT INTO {schema_ident}.schema_version (component, version, applied_at) \
-                 VALUES ('memories', $1, NOW()) \
-                 ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at"
-            ),
-            &[&1_i64],
-        )?;
-
-        Ok(())
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {

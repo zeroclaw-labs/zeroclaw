@@ -13161,26 +13161,31 @@ impl Config {
                 Some(v) if v < crate::migration::CURRENT_SCHEMA_VERSION
             );
         if needs_fs_migration
-            && let Err(e) =
-                crate::migration::migrate_legacy_workspace_to_default_agent(&zeroclaw_dir)
+            && let Err(e) = crate::schema::v2::migrate_v2_to_v3_install_filesystem(&zeroclaw_dir)
         {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "[system] filesystem migration failed (continuing with legacy layout): "
+                    .with_attrs(::serde_json::json!({
+                        "install": zeroclaw_dir.display().to_string(),
+                        "error": e.to_string(),
+                    })),
+                "[system] filesystem migration failed; continuing with legacy layout"
             );
-        }
-        // Heal pre-shared-workspace V3 installs whose skills landed in
-        // `agents/default/workspace/skills/`. Idempotent.
-        if let Err(e) = crate::migration::relocate_default_agent_skills_to_shared(&zeroclaw_dir) {
+        } else if !needs_fs_migration
+            && let Err(e) =
+                crate::schema::v2::relocate_default_agent_skills_to_shared(&zeroclaw_dir)
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "[system] skills relocation to shared workspace failed (continuing): "
+                    .with_attrs(::serde_json::json!({
+                        "install": zeroclaw_dir.display().to_string(),
+                        "error": e.to_string(),
+                    })),
+                "[system] skills relocation to shared workspace failed; continuing"
             );
         }
 

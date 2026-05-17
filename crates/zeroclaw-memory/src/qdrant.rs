@@ -46,6 +46,13 @@ impl QdrantMemory {
         mem.ensure_collection().await?;
         if mem.embedder.dimensions() > 0 {
             mem.migrate_session_ids_to_sanitized().await?;
+            zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
+                &mem.client,
+                &mem.base_url,
+                &mem.collection,
+                mem.api_key.as_deref(),
+            )
+            .await?;
         }
         mem.initialized.set(()).ok();
 
@@ -84,6 +91,13 @@ impl QdrantMemory {
                 self.ensure_collection().await?;
                 if self.embedder.dimensions() > 0 {
                     self.migrate_session_ids_to_sanitized().await?;
+                    zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
+                        &self.client,
+                        &self.base_url,
+                        &self.collection,
+                        self.api_key.as_deref(),
+                    )
+                    .await?;
                 }
                 Ok::<(), anyhow::Error>(())
             })
