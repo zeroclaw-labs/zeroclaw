@@ -3821,12 +3821,12 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_positional_sections_parse() {
-        // Drive from the canonical const so adding a wizard section
-        // forces parser coverage here. clap subcommand names are the
-        // wizard's `as_str()` keys (snake_case) verbatim, set via
+        // Drive from the canonical const so adding a section forces
+        // parser coverage here. clap subcommand names are the
+        // section's `as_str()` keys (snake_case) verbatim, set via
         // `#[command(name = $key)]` inside the `sections!` macro that
         // also defines the enum.
-        for w in zeroclaw_config::sections::ONBOARDING_WIZARD {
+        for w in zeroclaw_config::sections::ONBOARDING_SECTIONS {
             let cli = Cli::try_parse_from(["zeroclaw", "onboard", w.as_str()])
                 .unwrap_or_else(|_| panic!("onboard {} should parse", w.as_str()));
             match cli.command {

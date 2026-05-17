@@ -231,7 +231,7 @@ async fn no_wizard_acknowledge(
 /// rewinds to the previous section. Back at the first section exits
 /// onboarding cleanly (user bails out).
 async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
-    let order: Vec<Section> = zeroclaw_config::sections::ONBOARDING_WIZARD.to_vec();
+    let order: Vec<Section> = zeroclaw_config::sections::ONBOARDING_SECTIONS.to_vec();
     let mut i: usize = 0;
     loop {
         let Some(section) = order.get(i).copied() else {

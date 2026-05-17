@@ -154,10 +154,12 @@ pub struct SectionInfo {
     /// `Tools`, etc.). Curated server-side until v3 / #5947 lands a schema
     /// attribute that encodes the grouping declaratively.
     pub group: String,
-    /// `true` when this section is part of the `/onboard` wizard
-    /// (`zeroclaw_config::sections::ONBOARDING_WIZARD`). Frontends
-    /// filter on this flag so the wizard's section list is server-derived
-    /// rather than duplicated on every client.
+    /// `true` when this section is part of `/onboard`'s canonical
+    /// section list (`zeroclaw_config::sections::ONBOARDING_SECTIONS`).
+    /// Since the wizard/explorer split was retired, every known section
+    /// returns `true`; the field is preserved for API stability so the
+    /// frontend's `.filter((s) => s.is_onboarding)` stays a no-op rather
+    /// than failing to compile.
     pub is_onboarding: bool,
     /// Editor shape (direct form / one-tier alias map / typed-family map /
     /// backend picker). Server-emitted from
@@ -370,7 +372,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
     // but are part of the wizard flow (personality lives as markdown
     // files, not TOML). Inject so the canonical-order sort places them
     // correctly and frontends don't need to know which ones to splice.
-    for s in zeroclaw_config::sections::ONBOARDING_WIZARD {
+    for s in zeroclaw_config::sections::ONBOARDING_SECTIONS {
         roots.insert(s.as_str().to_string());
     }
 
@@ -398,8 +400,8 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
     let mut ordered: Vec<String> = roots.into_iter().collect();
     ordered.sort_by(|a, b| {
         match (
-            zeroclaw_config::sections::wizard_index_for_key(a),
-            zeroclaw_config::sections::wizard_index_for_key(b),
+            zeroclaw_config::sections::section_index_for_key(a),
+            zeroclaw_config::sections::section_index_for_key(b),
         ) {
             (Some(ai), Some(bi)) => ai.cmp(&bi),
             (Some(_), None) => std::cmp::Ordering::Less,

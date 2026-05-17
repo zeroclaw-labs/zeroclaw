@@ -61,7 +61,7 @@ const GROUP_ORDER = [
 ] as const;
 
 // Foundation order is gateway-provided: the server returns sections
-// pre-ordered by `zeroclaw_config::onboarding::ONBOARDING_WIZARD_SECTIONS`
+// pre-ordered by `zeroclaw_config::sections::ONBOARDING_SECTIONS`
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
@@ -498,8 +498,8 @@ export default function Config() {
                 )
                 .sort((a, b) => {
                   // Foundation: preserve server-provided canonical order
-                  // (driven by `ONBOARDING_WIZARD_SECTIONS` in the Rust
-                  // config crate). Other groups: alphabetize by label.
+                  // (driven by `ONBOARDING_SECTIONS` in the Rust config
+                  // crate). Other groups: alphabetize by label.
                   if (groupName === 'Foundation') {
                     return sections.indexOf(a) - sections.indexOf(b);
                   }

@@ -41,8 +41,8 @@ import SectionPicker from '../../components/onboard/SectionPicker';
 // is wrong and produces `path_not_found` from set_prop.
 const COMPLETED_SECTIONS_PATH = 'onboard_state.completed-sections';
 
-// Wizard sections + their canonical order both come from the gateway,
-// which derives them from `zeroclaw_config::onboarding::ONBOARDING_WIZARD_SECTIONS`
+// Section list + its canonical order both come from the gateway,
+// which derives them from `zeroclaw_config::sections::ONBOARDING_SECTIONS`
 // (single source of truth, also used by the CLI runtime). The frontend
 // filters by `is_onboarding` and trusts response order — no client-side
 // list to drift out of sync with the Rust canonical const.
