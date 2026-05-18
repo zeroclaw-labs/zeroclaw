@@ -6,6 +6,10 @@
 # Rust build artifacts (can be multiple GB)
 target
 
+# Web build artifacts and local dependencies
+web/node_modules
+web/dist
+
 # Documentation and examples (not needed for runtime)
 docs
 examples

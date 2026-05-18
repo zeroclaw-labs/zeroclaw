@@ -249,6 +249,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Emit raw LLM message payload trace events for local debugging; default
+    /// logging writes them to stderr, but custom subscribers may route them
+    /// elsewhere. May include prompts, history, and tool output.
+    #[arg(long, global = true)]
+    log_llm: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -264,6 +270,10 @@ enum Commands {
         /// Skip interactive prompts; read from --api-key/--provider/--model/--memory.
         #[arg(long)]
         quick: bool,
+
+        /// Force interactive onboarding mode.
+        #[arg(long, conflicts_with = "quick")]
+        interactive: bool,
 
         /// Force the dialoguer CLI backend instead of the default ratatui TUI.
         #[arg(long)]
@@ -1257,26 +1267,32 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level));
+    if cli.log_llm {
+        zeroclaw_providers::reliable::set_llm_payload_tracing_enabled(true);
+        filter = filter.add_directive(
+            "zeroclaw_providers::reliable=trace"
+                .parse()
+                .expect("valid log-llm tracing directive"),
+        );
+    }
+
     let subscriber = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
+        .with_env_filter(filter)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
-    // provider flags were given, it runs the full interactive wizard; otherwise
-    // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
-    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
-    // detection fails.  This means `curl … | bash` and
-    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
-    // `zeroclaw onboard` in a terminal launches the wizard.
+    // Onboard defaults to the interactive flow. Use --quick to force scriptable
+    // quick setup, or --interactive to spell the interactive path explicitly
+    // for compatibility with older invocations.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         section,
         quick,
+        interactive: _interactive,
         cli: use_cli,
         tui: use_tui_deprecated,
         force,
@@ -1505,10 +1521,10 @@ async fn main() -> Result<()> {
         // registered"). `register_delivery_fn` is idempotent (backed by
         // `OnceLock::set`), so calling it once here is safe.
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |config, channel, target, output| {
+            |config, channel, target, thread_id, output| {
                 Box::pin(async move {
                     zeroclaw_channels::orchestrator::deliver_announcement(
-                        &config, &channel, &target, &output,
+                        &config, &channel, &target, thread_id, &output,
                     )
                     .await
                 })
@@ -1553,6 +1569,7 @@ async fn main() -> Result<()> {
                 peripheral,
                 true,
                 session_state_file,
+                None,
                 None,
             ))
             .await
@@ -1614,13 +1631,12 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
-                    let host = &config.gateway.host;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
                         .await
                     {
                         Ok(Some(code)) => {
@@ -1802,22 +1818,32 @@ async fn main() -> Result<()> {
                             .await
                         })
                     })),
-                    mqtt_start: Some(Box::new(|mqtt_config| {
-                        Box::pin(async move {
-                            use std::sync::{Arc, Mutex};
-                            use zeroclaw_config::schema::SopConfig;
-                            use zeroclaw_memory::NoneMemory;
-                            use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-
-                            let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+                    mqtt_start: Some(Box::new({
+                        use std::sync::{Arc, Mutex};
+                        use zeroclaw_config::schema::SopConfig;
+                        use zeroclaw_memory::NoneMemory;
+                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                        let sop_config = current_config.sop.clone();
+                        let workspace_dir = current_config.workspace_dir.clone();
+                        move |mqtt_config| {
+                            let engine = if sop_config.sops_dir.is_some() {
+                                let mut e = SopEngine::new(sop_config.clone());
+                                e.reload(&workspace_dir);
+                                e
+                            } else {
+                                SopEngine::new(SopConfig::default())
+                            };
+                            let engine = Arc::new(Mutex::new(engine));
                             let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
-                            .await
-                        })
+                            Box::pin(async move {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            })
+                        }
                     })),
                 };
                 let exit = Box::pin(daemon::run(
@@ -3001,7 +3027,9 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
                 r#"
 # Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
-    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    # Capture the original clap-generated function body so the wrapper
+    # can fall back to it without entering an infinite recursion loop.
+    eval "$(declare -f _zeroclaw | sed '1s/_zeroclaw/_zeroclaw_clap_orig/')"
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
         if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
@@ -3900,6 +3928,38 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn log_llm_is_global_flag_for_agent_debugging() {
+        for args in [
+            ["zeroclaw", "--log-llm", "agent", "--message", "hello"],
+            ["zeroclaw", "agent", "--log-llm", "--message", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("--log-llm should parse globally");
+
+            assert!(
+                cli.log_llm,
+                "--log-llm should opt in to provider payload tracing"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn log_llm_help_warns_about_raw_payloads() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(help.contains("--log-llm"));
+        assert!(help.contains("Emit raw LLM message payload trace events"));
+        assert!(help.contains("default logging writes them to stderr"));
+        assert!(help.contains("custom subscribers may route them elsewhere"));
+        assert!(help.contains("May include prompts, history, and tool output"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
             gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
@@ -3978,6 +4038,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn bash_completion_avoids_infinite_recursion() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Bash, &mut output)
+            .expect("completion generation should succeed");
+        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
+        // The wrapper must capture the original clap-generated function body
+        // (via declare -f) rather than calling _zeroclaw by name, which would
+        // create an infinite recursion loop after _zeroclaw is redefined.
+        assert!(
+            script.contains("declare -f _zeroclaw"),
+            "bash completion should use declare -f to capture the original _zeroclaw function body"
+        );
+        assert!(
+            !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
+            "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_force_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
@@ -3990,9 +4070,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4005,6 +4090,62 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn onboard_cli_rejects_quick_with_interactive_flag() {
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--interactive"]).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--port",
+            "3001",
+            "--host",
+            "192.168.1.20",
+        ])
+        .expect("gateway get-paircode overrides should parse");
+
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+            } => {
+                assert!(new);
+                assert_eq!(port, Some(3001));
+                assert_eq!(host.as_deref(), Some("192.168.1.20"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    /// Regression for PR #6192: when the user passes `--port`/`--host` to
+    /// `gateway get-paircode`, the override must compose with the configured
+    /// `path_prefix` rather than bypass it. `fetch_paircode` threads
+    /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
+    /// we'd actually send still hits `<prefix>/admin/paircode/new`.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url(
+                "127.0.0.1",
+                9001,
+                Some("/agents/myagent"),
+                "/admin/paircode/new"
+            ),
+            "http://127.0.0.1:9001/agents/myagent/admin/paircode/new",
+        );
+        assert_eq!(
+            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
+            "http://192.168.1.20:42617/gw/admin/paircode",
+        );
     }
 
     #[test]

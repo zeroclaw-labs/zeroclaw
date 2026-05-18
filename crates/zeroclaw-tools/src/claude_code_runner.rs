@@ -105,14 +105,8 @@ impl Tool for ClaudeCodeRunnerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -182,15 +176,6 @@ impl Tool for ClaudeCodeRunnerTool {
             .get("slack_channel")
             .and_then(|v| v.as_str())
             .map(String::from);
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Generate a unique session ID
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();

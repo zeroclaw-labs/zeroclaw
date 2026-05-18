@@ -6,6 +6,56 @@ fn main() {
     // the build fails, we skip silently — the binary works fine without it.
     build_web_dashboard();
     ensure_embedded_web_dist_when_enabled();
+    emit_git_info();
+}
+
+/// Captures git commit SHA and dirty-tree status at build time and exposes
+/// them as `GIT_COMMIT_SHA` / `GIT_DIRTY` env vars for `env!()` in the crate.
+///
+/// Fails silently in environments where git is unavailable or the source was
+/// extracted from a tarball — `"unknown"` / `"false"` are used as fallbacks
+/// so the binary still builds cleanly in those cases (e.g. Docker multi-stage
+/// builds, `cargo install` from crates.io, CI without `.git`).
+fn emit_git_info() {
+    // Resolve the workspace root so we can point at .git/ from this crate's
+    // build script regardless of where cargo runs from.
+    let git_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join(".git"));
+
+    // Rerun the build script when HEAD or any ref changes so the embedded
+    // SHA stays current on every commit or branch switch.
+    if let Some(ref git_dir) = git_dir
+        && git_dir.exists()
+    {
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+        println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
+    }
+
+    // Short commit SHA — 9 hex chars gives 1-in-34-billion collision odds,
+    // comfortably unambiguous for build identification.
+    let sha = Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("cargo:rustc-env=GIT_COMMIT_SHA={sha}");
+
+    // Dirty flag: non-empty `git status --porcelain` means uncommitted changes.
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    println!("cargo:rustc-env=GIT_DIRTY={dirty}");
 }
 
 fn build_web_dashboard() {
@@ -70,6 +120,6 @@ fn ensure_embedded_web_dist_when_enabled() {
 
     assert!(
         web_dist.join("index.html").exists(),
-        "feature `embedded-web` requires `web/dist/index.html`; run: cd web && npm ci && npm run build"
+        "feature `embedded-web` requires `web/dist/index.html`; run: cargo web build"
     );
 }

@@ -85,23 +85,9 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 3. Rate limit check ────────────────────────────────────
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // ── 4. Path pre-validation ─────────────────────────────────
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         let full_path = self.security.resolve_tool_path(path);
 
@@ -172,15 +158,6 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 8. Record action ───────────────────────────────────────
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         // ── 9. Read → match → replace → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
@@ -236,6 +213,7 @@ impl Tool for FileEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -246,6 +224,21 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileEditTool::new(security)
+    }
+
+    /// Wraps `FileEditTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     fn test_tool_with(
@@ -479,7 +472,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = test_tool(dir.clone());
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "../../etc/passwd",
@@ -490,14 +483,18 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_edit_blocks_absolute_path() {
-        let tool = test_tool(std::env::temp_dir());
+        let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({
                 "path": "/etc/passwd",
@@ -508,7 +505,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -657,42 +658,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_edit_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello")
-            .await
-            .unwrap();
-
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
-        let result = tool
-            .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "world"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
-
-        let content = tokio::fs::read_to_string(dir.join("test.txt"))
-            .await
-            .unwrap();
-        assert_eq!(content, "hello");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn file_edit_nonexistent_file() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_nofile");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -765,7 +730,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = test_tool(dir.clone());
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test\0evil.txt",
@@ -775,7 +740,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

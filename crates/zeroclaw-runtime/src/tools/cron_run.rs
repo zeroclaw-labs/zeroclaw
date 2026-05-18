@@ -116,15 +116,21 @@ impl Tool for CronRunTool {
 
         let started_at = Utc::now();
         let (mut success, output) =
-            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
+            Box::pin(cron::scheduler::execute_job_now(&self.config, &job, None)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
 
         if job.delivery.mode.eq_ignore_ascii_case("announce")
             && let (Some(channel), Some(target)) =
                 (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-            && let Err(e) =
-                cron::scheduler::deliver_announcement(&self.config, channel, target, &output).await
+            && let Err(e) = cron::scheduler::deliver_announcement(
+                &self.config,
+                channel,
+                target,
+                job.delivery.thread_id.as_deref(),
+                &output,
+            )
+            .await
         {
             if job.delivery.best_effort {
                 tracing::warn!(
