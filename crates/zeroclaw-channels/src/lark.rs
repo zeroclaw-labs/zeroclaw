@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -386,7 +387,7 @@ pub struct LarkChannel {
     app_secret: String,
     verification_token: String,
     port: Option<u16>,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
@@ -440,7 +441,7 @@ impl LarkChannel {
             app_secret,
             verification_token,
             port,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
             platform,
@@ -894,7 +895,7 @@ impl LarkChannel {
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
                     let sender_open_id = recv.sender.sender_id.open_id.as_deref().unwrap_or("");
-                    if !self.is_user_allowed(sender_open_id) {
+                    if !self.allowlist.is_allowed(sender_open_id) {
                         tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
                         continue;
                     }
@@ -1037,11 +1038,6 @@ impl LarkChannel {
             }
         }
         Ok(())
-    }
-
-    /// Check if a user open_id is allowed
-    fn is_user_allowed(&self, open_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == open_id)
     }
 
     /// Get or refresh tenant access token
@@ -1488,7 +1484,7 @@ impl LarkChannel {
             .pointer("/event/sender/sender_id/open_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !self.is_user_allowed(open_id) {
+        if !self.allowlist.is_allowed(open_id) {
             tracing::warn!("Lark: ignoring audio from unauthorized user: {open_id}");
             return vec![];
         }
@@ -1612,7 +1608,7 @@ impl LarkChannel {
         }
 
         // Check allowlist
-        if !self.is_user_allowed(open_id) {
+        if !self.allowlist.is_allowed(open_id) {
             tracing::warn!("Lark: ignoring message from unauthorized user: {open_id}");
             return messages;
         }
@@ -2609,8 +2605,8 @@ mod tests {
     #[test]
     fn lark_user_allowed_exact() {
         let ch = make_channel();
-        assert!(ch.is_user_allowed("ou_testuser123"));
-        assert!(!ch.is_user_allowed("ou_other"));
+        assert!(ch.allowlist.is_allowed("ou_testuser123"));
+        assert!(!ch.allowlist.is_allowed("ou_other"));
     }
 
     #[test]
@@ -2623,7 +2619,7 @@ mod tests {
             vec!["*".into()],
             true,
         );
-        assert!(ch.is_user_allowed("ou_anyone"));
+        assert!(ch.allowlist.is_allowed("ou_anyone"));
     }
 
     #[test]
@@ -2636,7 +2632,7 @@ mod tests {
             vec![],
             true,
         );
-        assert!(!ch.is_user_allowed("ou_anyone"));
+        assert!(!ch.allowlist.is_allowed("ou_anyone"));
     }
 
     #[tokio::test]
