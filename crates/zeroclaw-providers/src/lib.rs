@@ -1018,6 +1018,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "avian" => vec!["AVIAN_API_KEY"],
         "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
         "morph" => vec!["MORPH_API_KEY"],
+        "github-models" | "github_models" => vec!["GITHUB_MODELS_TOKEN"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1760,6 +1761,12 @@ fn create_provider_with_url_and_options(
         "huggingface" | "hf" => Ok(compat(OpenAiCompatibleProvider::new(
             "Hugging Face",
             "https://router.huggingface.co/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "github-models" | "github_models" => Ok(compat(OpenAiCompatibleProvider::new(
+            "GitHub Models",
+            "https://models.github.ai/inference",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2613,6 +2620,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "Hugging Face",
             description: "Open-source models via Inference API",
             aliases: &["hf"],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
+            name: "github-models",
+            display_name: "GitHub Models",
+            description: "OpenAI/Meta/Microsoft via one GitHub PAT",
+            aliases: &["github_models"],
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
@@ -3771,6 +3786,29 @@ mod tests {
         assert_eq!(resolved, Some("morph-test-key".to_string()));
     }
 
+    #[test]
+    fn factory_github_models() {
+        assert!(create_provider("github-models", Some("ghp_test_token")).is_ok());
+        assert!(create_provider("github_models", Some("ghp_test_token")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_github_models_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("GITHUB_MODELS_TOKEN", Some("ghp_models_test"));
+        let resolved = resolve_provider_credential("github-models", None);
+        assert_eq!(resolved, Some("ghp_models_test".to_string()));
+    }
+
+    #[test]
+    fn github_models_does_not_consume_github_token() {
+        let _env_lock = env_lock();
+        let _models_guard = EnvGuard::set("GITHUB_MODELS_TOKEN", None);
+        let _token_guard = EnvGuard::set("GITHUB_TOKEN", Some("gho_copilot_only"));
+        let resolved = resolve_provider_credential("github-models", None);
+        assert_ne!(resolved, Some("gho_copilot_only".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -4097,6 +4135,7 @@ mod tests {
             "astrai",
             "avian",
             "morph",
+            "github-models",
             "ovhcloud",
         ];
         for name in providers {
