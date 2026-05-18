@@ -5280,6 +5280,8 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Install { source } => {
+                // Installs are writes, so they always target the configured
+                // plugins dir instead of migrating legacy discovery results.
                 let plugins_dir = config.plugins.resolved_plugins_dir();
                 let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 host.install(&source)?;
@@ -5294,6 +5296,8 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Remove { name } => {
+                // Removes follow discovery so users can delete plugins that
+                // still live in the pre-config-dir workspace fallback.
                 let plugins_dir = config.resolved_plugins_discovery_dir();
                 let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(&plugins_dir)?;
                 host.remove(&name)?;

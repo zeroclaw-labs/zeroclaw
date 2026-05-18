@@ -2849,6 +2849,7 @@ mod plugin_skill_discovery_tests {
 
         let plugins = PluginsConfig {
             enabled: true,
+            plugins_dir: config_dir.join("plugins").to_string_lossy().into_owned(),
             ..PluginsConfig::default()
         };
 
