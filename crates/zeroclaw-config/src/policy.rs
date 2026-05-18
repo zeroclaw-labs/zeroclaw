@@ -231,6 +231,21 @@ pub struct SecurityPolicy {
     /// allowed set comes from `allowed_tools` or from the unrestricted
     /// default). `None` and `Some(vec![])` both mean "exclude nothing".
     pub excluded_tools: Option<Vec<String>>,
+    /// Tools that never require approval in this profile. Mirrors
+    /// `RiskProfileConfig.auto_approve`.
+    pub auto_approve: Vec<String>,
+    /// Tools that always require approval in this profile. Mirrors
+    /// `RiskProfileConfig.always_ask`.
+    pub always_ask: Vec<String>,
+    /// Whether the sandbox is enabled for this profile. `None`
+    /// inherits the global default at the call site.
+    pub sandbox_enabled: Option<bool>,
+    /// Sandbox backend identifier (e.g. `"firejail"`, `"landlock"`).
+    /// `None` inherits the global default.
+    pub sandbox_backend: Option<String>,
+    /// Extra arguments forwarded to firejail when `sandbox_backend`
+    /// resolves to `"firejail"`.
+    pub firejail_args: Vec<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -530,6 +545,11 @@ impl Default for SecurityPolicy {
             shell_timeout_secs: 60,
             allowed_tools: None,
             excluded_tools: None,
+            auto_approve: vec![],
+            always_ask: vec![],
+            sandbox_enabled: None,
+            sandbox_backend: None,
+            firejail_args: vec![],
             tracker: PerSenderTracker::new(),
         }
     }
@@ -2249,8 +2269,21 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
-            allowed_tools: None,
-            excluded_tools: None,
+            allowed_tools: if risk_profile.allowed_tools.is_empty() {
+                None
+            } else {
+                Some(risk_profile.allowed_tools.clone())
+            },
+            excluded_tools: if risk_profile.excluded_tools.is_empty() {
+                None
+            } else {
+                Some(risk_profile.excluded_tools.clone())
+            },
+            auto_approve: risk_profile.auto_approve.clone(),
+            always_ask: risk_profile.always_ask.clone(),
+            sandbox_enabled: risk_profile.sandbox_enabled,
+            sandbox_backend: risk_profile.sandbox_backend.clone(),
+            firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
     }
