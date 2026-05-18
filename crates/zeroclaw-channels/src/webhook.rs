@@ -206,6 +206,7 @@ fn apply_jitter(delay_ms: u64) -> u64 {
         return 0;
     }
     let jitter_factor = 0.75 + (rand::random::<f64>() * 0.5);
+    // Safe: jitter_factor > 0 keeps the product non-negative; f64→u64 cast saturates on overflow.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let jittered = ((delay_ms as f64) * jitter_factor) as u64;
     jittered
