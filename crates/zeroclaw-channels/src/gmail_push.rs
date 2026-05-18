@@ -18,9 +18,12 @@
 //! and renews it before the 7-day expiry.
 
 use anyhow::{Result, anyhow};
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Client;
+
+use crate::email_channel::email_allowlist_match;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -171,6 +174,11 @@ pub struct WatchResponse {
 /// subscription and periodically renews it.
 pub struct GmailPushChannel {
     pub config: GmailPushConfig,
+    /// Centralized allowlist check (see `aspect_std::AllowlistAspect`).
+    /// Shares the `email_allowlist_match` predicate with `EmailChannel`
+    /// — the entry semantics are identical (full-email / `@domain` /
+    /// bare-domain, ASCII-case-insensitive).
+    allowlist: AllowlistAspect,
     http: Client,
     last_history_id: Arc<Mutex<u64>>,
     /// Sender half injected by the gateway to forward webhook-received messages.
@@ -183,8 +191,11 @@ impl GmailPushChannel {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
+        let allowlist = AllowlistAspect::new(config.allowed_senders.clone())
+            .with_matcher(email_allowlist_match);
         Self {
             config,
+            allowlist,
             http,
             last_history_id: Arc::new(Mutex::new(0)),
             tx: Arc::new(Mutex::new(None)),
@@ -331,26 +342,6 @@ impl GmailPushChannel {
         Ok(resp.json().await?)
     }
 
-    /// Check if a sender email is in the allowlist.
-    pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
-            return false;
-        }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
-            return true;
-        }
-        let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
-            if allowed.starts_with('@') {
-                email_lower.ends_with(&allowed.to_lowercase())
-            } else if allowed.contains('@') {
-                allowed.eq_ignore_ascii_case(email)
-            } else {
-                email_lower.ends_with(&format!("@{}", allowed.to_lowercase()))
-            }
-        })
-    }
-
     /// Process a Pub/Sub push notification and dispatch new messages to the agent.
     pub async fn handle_notification(&self, envelope: &PubSubEnvelope) -> Result<()> {
         let notification = parse_notification(&envelope.message)?;
@@ -407,7 +398,7 @@ impl GmailPushChannel {
                     let sender = extract_header(&gmail_msg, "From").unwrap_or_default();
                     let sender_email = extract_email_from_header(&sender);
 
-                    if !self.is_sender_allowed(&sender_email) {
+                    if !self.allowlist.is_allowed(&sender_email) {
                         warn!("Gmail push: blocked message from {}", sender_email);
                         continue;
                     }
@@ -951,7 +942,7 @@ mod tests {
     #[test]
     fn sender_allowed_empty_denies() {
         let ch = GmailPushChannel::new(GmailPushConfig::default());
-        assert!(!ch.is_sender_allowed("anyone@example.com"));
+        assert!(!ch.allowlist.is_allowed("anyone@example.com"));
     }
 
     #[test]
@@ -960,7 +951,7 @@ mod tests {
             allowed_senders: vec!["*".into()],
             ..Default::default()
         });
-        assert!(ch.is_sender_allowed("anyone@example.com"));
+        assert!(ch.allowlist.is_allowed("anyone@example.com"));
     }
 
     #[test]
@@ -969,8 +960,8 @@ mod tests {
             allowed_senders: vec!["user@example.com".into()],
             ..Default::default()
         });
-        assert!(ch.is_sender_allowed("user@example.com"));
-        assert!(!ch.is_sender_allowed("other@example.com"));
+        assert!(ch.allowlist.is_allowed("user@example.com"));
+        assert!(!ch.allowlist.is_allowed("other@example.com"));
     }
 
     #[test]
@@ -979,9 +970,9 @@ mod tests {
             allowed_senders: vec!["@example.com".into()],
             ..Default::default()
         });
-        assert!(ch.is_sender_allowed("user@example.com"));
-        assert!(ch.is_sender_allowed("admin@example.com"));
-        assert!(!ch.is_sender_allowed("user@other.com"));
+        assert!(ch.allowlist.is_allowed("user@example.com"));
+        assert!(ch.allowlist.is_allowed("admin@example.com"));
+        assert!(!ch.allowlist.is_allowed("user@other.com"));
     }
 
     #[test]
@@ -990,8 +981,8 @@ mod tests {
             allowed_senders: vec!["example.com".into()],
             ..Default::default()
         });
-        assert!(ch.is_sender_allowed("user@example.com"));
-        assert!(!ch.is_sender_allowed("user@other.com"));
+        assert!(ch.allowlist.is_allowed("user@example.com"));
+        assert!(!ch.allowlist.is_allowed("user@other.com"));
     }
 
     // ── Strip HTML ───────────────────────────────────────────────
@@ -1085,5 +1076,65 @@ mod tests {
             size: 12,
         };
         assert_eq!(decode_body(Some(&body)), Some("test content".to_string()));
+    }
+
+    /// Parity oracle: the aspect-backed check must return byte-identical
+    /// results to the pre-migration shape across the full
+    /// email-allowlist truth table. Mirrors the email_channel parity
+    /// test exactly — both channels share the same matcher predicate.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        fn pre_aspect(allowed: &[String], email: &str) -> bool {
+            if allowed.is_empty() {
+                return false;
+            }
+            if allowed.iter().any(|a| a == "*") {
+                return true;
+            }
+            let email_lower = email.to_lowercase();
+            allowed.iter().any(|entry| {
+                if entry.starts_with('@') {
+                    email_lower.ends_with(&entry.to_lowercase())
+                } else if entry.contains('@') {
+                    entry.eq_ignore_ascii_case(email)
+                } else {
+                    email_lower.ends_with(&format!("@{}", entry.to_lowercase()))
+                }
+            })
+        }
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice@example.com"),
+            (vec![], ""),
+            (vec!["*"], "anyone@whatever.com"),
+            (vec!["*"], ""),
+            (vec!["alice@example.com"], "alice@example.com"),
+            (vec!["alice@example.com"], "bob@example.com"),
+            (vec!["alice@example.com"], "ALICE@Example.COM"),
+            (vec!["@example.com"], "anyone@example.com"),
+            (vec!["@example.com"], "anyone@other.com"),
+            (vec!["@Example.COM"], "anyone@example.com"),
+            (vec!["example.com"], "anyone@example.com"),
+            (vec!["example.com"], "anyone@subdomain.example.com"),
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "x@allowed.com"),
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "specific@host.com"),
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "other@host.com"),
+            (vec!["*", "specific@host.com"], "anyone@whatever.com"),
+            (vec!["@example.com"], ""),
+        ];
+        for (entries, email) in cases {
+            let allowed: Vec<String> =
+                entries.iter().map(|s| (*s).to_string()).collect();
+            let baseline = pre_aspect(&allowed, email);
+            let config = GmailPushConfig {
+                allowed_senders: allowed.clone(),
+                ..Default::default()
+            };
+            let ch = GmailPushChannel::new(config);
+            assert_eq!(
+                ch.allowlist.is_allowed(email),
+                baseline,
+                "aspect drift for entries={entries:?} email={email:?}",
+            );
+        }
     }
 }
