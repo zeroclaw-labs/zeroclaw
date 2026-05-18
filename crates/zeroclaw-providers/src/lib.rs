@@ -1007,6 +1007,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
+        "manifest" => vec!["MANIFEST_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
@@ -1016,6 +1017,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "astrai" => vec!["ASTRAI_API_KEY"],
         "avian" => vec!["AVIAN_API_KEY"],
         "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
+        "morph" => vec!["MORPH_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1077,6 +1079,8 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         Some("perplexity")
     } else if key.starts_with("xai-") {
         Some("xai")
+    } else if key.starts_with("mnfst_") {
+        Some("manifest")
     } else if key.starts_with("nvapi-") {
         Some("nvidia")
     } else if key.starts_with("KEY-") {
@@ -1095,6 +1099,7 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         "groq" => expected == "groq",
         "perplexity" => expected == "perplexity",
         "xai" | "grok" => expected == "xai",
+        "manifest" => expected == "manifest",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
         "telnyx" => expected == "telnyx",
         _ => return None, // Unknown format provider — skip
@@ -1367,6 +1372,18 @@ fn create_provider_with_url_and_options(
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
+            )))
+        }
+        "manifest" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("https://app.manifest.build/v1");
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "Manifest",
+                base_url,
+                key,
+                AuthStyle::Bearer,
             )))
         }
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
@@ -1723,6 +1740,12 @@ fn create_provider_with_url_and_options(
         "hyperbolic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Hyperbolic",
             "https://api.hyperbolic.xyz/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "morph" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Morph",
+            "https://api.morphllm.com/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2245,6 +2268,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "manifest",
+            display_name: "Manifest",
+            description: "Open-source LLM router for cost-optimized inference",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             description: "Synthetic AI models",
@@ -2556,6 +2587,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "hyperbolic",
             display_name: "Hyperbolic",
             description: "Hyperbolic Labs inference",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
+            name: "morph",
+            display_name: "Morph (Fast Apply)",
+            description: "Fast apply-edits LLM",
             aliases: &[],
             activation: ProviderActivation::FallbackKey,
             local: false,
@@ -3109,6 +3148,11 @@ mod tests {
         assert!(create_provider("kimi-code", Some("key")).is_ok());
         assert!(create_provider("kimi_coding", Some("key")).is_ok());
         assert!(create_provider("kimi_for_coding", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_manifest() {
+        assert!(create_provider("manifest", Some("mnfst_test")).is_ok());
     }
 
     #[test]
@@ -3714,6 +3758,19 @@ mod tests {
         assert_eq!(resolved, Some("dm-test-key".to_string()));
     }
 
+    #[test]
+    fn factory_morph() {
+        assert!(create_provider("morph", Some("sk-morph-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_morph_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("MORPH_API_KEY", Some("morph-test-key"));
+        let resolved = resolve_provider_credential("morph", None);
+        assert_eq!(resolved, Some("morph-test-key".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -4039,6 +4096,7 @@ mod tests {
             "nvidia",
             "astrai",
             "avian",
+            "morph",
             "ovhcloud",
         ];
         for name in providers {
