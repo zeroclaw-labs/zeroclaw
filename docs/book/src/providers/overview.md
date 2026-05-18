@@ -81,6 +81,6 @@ There are no global TTS or transcription selector fields. Each agent that wants 
 
 - [Configuration](./configuration.md) — the full `[providers.*]` schema, Azure typed config, regional and OAuth variants
 - [Streaming](./streaming.md) — how tokens, tool calls, and reasoning deltas flow
-- [Fallback & routing](./fallback-and-routing.md) — multi-agent dispatch and OpenRouter as a routing layer
+- [Routing](./routing.md) — multi-agent dispatch and OpenRouter as a routing layer
 - [Provider catalog](./catalog.md) — every supported family with a worked TOML example
 - [Custom providers](./custom.md) — pointing the `custom` slot at an OpenAI-compatible endpoint, or implementing the `ModelProvider` trait

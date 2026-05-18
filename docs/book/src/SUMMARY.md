@@ -38,7 +38,7 @@
 - [Overview](./providers/overview.md)
 - [Configuration](./providers/configuration.md)
 - [Streaming](./providers/streaming.md)
-- [Fallback & routing](./providers/fallback-and-routing.md)
+- [Routing](./providers/routing.md)
 - [Provider catalog](./providers/catalog.md)
 - [Custom providers](./providers/custom.md)
 

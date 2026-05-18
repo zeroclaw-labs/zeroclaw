@@ -142,7 +142,7 @@ Notes:
 
 - Subscription auth uses stored auth profiles — set `requires_openai_auth = true` on the alias and leave `api_key` unset.
 - `api_key` / `uri` on the alias entry are only needed for custom OpenAI-compatible gateways or other explicit endpoint overrides.
-- The streaming fallback warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
+- The streaming-disabled warning by itself is not an auth failure; ZeroClaw retries the request in non-streaming mode.
 
 ### Daemon starts, then immediately exits
 
@@ -226,10 +226,6 @@ journalctl --user -u zeroclaw -n 200 | grep -i imap
 API key invalid or expired. Regenerate at the provider's dashboard, update in `[providers.models.<name>] api_key`, restart the service.
 
 If using OAuth (`sk-ant-oat*`), the OAuth token may have expired — OAuth-issued tokens are longer-lived but not infinite. Re-authenticate.
-
-### Fallback chain always uses the fallback, never the primary
-
-Check latency and error logs — the primary may be consistently timing out. If so, lower the retry count on the primary so it fails through faster, or fix whatever's making the primary flaky.
 
 ---
 

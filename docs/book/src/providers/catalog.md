@@ -244,7 +244,7 @@ model   = "anthropic/claude-sonnet-4-20250514"
 api_key = "sk-or-..."
 ```
 
-There is no `reliable` (fallback chain) or `router` (task-hint) meta-family. For per-task routing, run multiple agents and let channels pick which agent handles which traffic — see [Routing](./fallback-and-routing.md). For a narrower in-config hint mechanism, use `[[model_routes]]`.
+For per-task routing, run multiple agents and let channels pick which agent handles which traffic — see [Routing](./routing.md). For a narrower in-config hint mechanism, use `[[model_routes]]`.
 
 ---
 

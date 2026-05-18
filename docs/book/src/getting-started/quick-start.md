@@ -70,7 +70,7 @@ Or go all the way and use [YOLO mode](./yolo.md) — one config preset that disa
 
 ## Next
 
-- [Multi-model setup](./multi-model-setup.md) — fallback chains, routing rules
+- [Multi-model setup](./multi-model-setup.md) — multi-agent dispatch, hint-based routes
 - [Setup → Service management](../setup/service.md) — running as a daemon
 - [Channels → Overview](../channels/overview.md) — wiring up chat platforms
 - [Security → Autonomy levels](../security/autonomy.md) — what the agent is allowed to do

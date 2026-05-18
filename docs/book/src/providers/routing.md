@@ -1,11 +1,11 @@
 # Routing
 
-Routing happens at the **agent layer**. Each agent points at exactly one provider; channels point at agents. There is no meta-provider that selects between backends, and no in-process fallback chain.
+Routing happens at the **agent layer**. Each agent points at exactly one provider; channels point at agents.
 
 Two layers of decisions:
 
 1. **Per-call backend selection** — "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
-2. **Provider reliability** — "if Claude times out, automatically use OpenAI." This is OpenRouter's job, not ZeroClaw's. Configure OpenRouter as a normal provider and let it handle vendor fan-out.
+2. **Provider reliability** — vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
 
 ## Per-agent dispatch
 
@@ -79,39 +79,13 @@ max_tool_iterations  = 50
 max_actions_per_hour = 200
 ```
 
-Each channel binds to one agent. Channels can move between agents by editing `channels = [...]` on the agent that should pick them up; `Config::validate()` makes sure references resolve.
+Each channel binds to one agent. Channels move between agents by editing `channels = [...]` on the agent that should pick them up; `Config::validate()` makes sure references resolve.
 
-For ad-hoc multi-step routing inside a single conversation, use the `delegate` tool: an agent can hand off to another configured agent (referenced by its alias).
-
-## Reliability via OpenRouter
-
-OpenRouter is a single first-class provider. The runtime sees one endpoint; OpenRouter handles vendor fan-out, model selection, and uptime behind that endpoint.
-
-```toml
-[providers.models.openrouter.home]
-model   = "anthropic/claude-sonnet-4-20250514"
-api_key = "sk-or-..."
-
-[agents.assistant]
-model_provider = "openrouter.home"
-risk_profile   = "hardened"
-
-[risk_profiles.hardened]
-level = "supervised"
-```
-
-If OpenRouter is unavailable, that's an outage — there is no in-process fallback. Operators who need cross-vendor reliability run multiple ZeroClaw instances behind a load balancer or use OpenRouter's enterprise SLA.
-
-## Why no in-process fallback
-
-1. **Failure modes are vendor-specific.** "Provider returned 500" means different things for different vendors; a single retry-and-fall-through policy hides bugs more often than it catches them.
-2. **State across providers is hard.** A fallback chain that swaps providers mid-conversation has to reconcile message-format differences, tool-call IDs, and reasoning-token shapes. Doing it correctly is a lot of code; doing it incorrectly silently corrupts conversation state.
-3. **OpenRouter does it better.** Vendor fan-out is OpenRouter's whole product.
-4. **Per-agent dispatch is more honest.** When two channels should use different models, naming two agents is clearer than encoding the routing rule inside a meta-provider.
+For ad-hoc multi-step routing inside a single conversation, the `spawn_subagent` tool lets an agent run an ephemeral child under its own identity. The child inherits the parent's permissions envelope (see `[risk_profiles.<alias>].allowed_tools`) and returns its final response to the parent's tool loop.
 
 ## Hint-based model routes
 
-A separate, narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent.
+A narrower mechanism: `[[model_routes]]` lets an agent override the configured `model_provider` for prompts marked with a hint string. Useful when one agent should occasionally reach for a different model without spinning up a second agent.
 
 ```toml
 [[model_routes]]

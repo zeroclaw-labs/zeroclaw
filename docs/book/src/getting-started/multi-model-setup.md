@@ -4,7 +4,7 @@ A walkthrough of the common patterns for using multiple model providers: per-age
 
 > **Reference material** for the provider system lives in:
 > - [Model Providers → Overview](../providers/overview.md) — what providers are, configuration shape
-> - [Model Providers → Fallback & routing](../providers/fallback-and-routing.md) — per-agent dispatch and OpenRouter
+> - [Model Providers → Routing](../providers/routing.md) — per-agent dispatch and OpenRouter
 > - [Model Providers → Catalog](../providers/catalog.md) — every provider's config shape
 
 ## When to use multi-model setup
@@ -19,7 +19,7 @@ Multi-model configuration is useful for:
 
 ## Core idea — per-agent dispatch
 
-There is no in-process model fallback chain. Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down — the operator picks how the channels above respond (typically by routing to a different agent). See [Fallback & routing](../providers/fallback-and-routing.md) for the rationale.
+Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down; the operator routes affected channels to a different agent. See [Routing](../providers/routing.md) for the full pattern.
 
 To run multiple models, run multiple agents:
 
@@ -86,7 +86,7 @@ Each channel binds to one agent at a time. To move a channel to a different agen
 
 ## Cross-vendor reliability — use OpenRouter
 
-OpenRouter is treated as a single first-class provider. It handles vendor fan-out, fallback, and uptime behind one endpoint:
+OpenRouter is treated as a single first-class provider. It handles vendor fan-out and uptime behind one endpoint:
 
 ```toml
 [providers.models.openrouter.home]
@@ -114,7 +114,7 @@ provider_retries    = 2          # retries per provider attempt before bailing
 provider_backoff_ms = 500        # initial backoff; doubles per retry
 ```
 
-Defaults are 2 retries, 500 ms initial backoff. These are inside-one-provider retries — there is no in-process cross-provider fallback.
+Defaults are 2 retries, 500 ms initial backoff. These are inside-one-provider retries.
 
 ## API key rotation
 
@@ -270,7 +270,7 @@ zeroclaw doctor traces --contains "model_provider"
 ## Best practices
 
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
-2. **Use OpenRouter for cross-vendor reliability.** Don't try to encode "if Claude fails, try OpenAI" in your config — that knob does not exist. OpenRouter does this better than any in-process fallback could.
+2. **Use OpenRouter for cross-vendor reliability.** Cross-vendor "if Claude fails, try OpenAI" is OpenRouter's job; configure it as one provider and let its endpoint handle the fan-out.
 3. **Keep API key rotation pools homogeneous.** All keys in `[reliability] api_keys` should be from the same provider account — this is rate-limit smoothing, not multi-tenancy.
 4. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
 5. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
@@ -291,5 +291,5 @@ Credentials are not shared between providers — set them per provider entry.
 ## Related Documentation
 
 - [Model Providers → Overview](../providers/overview.md)
-- [Model Providers → Fallback & routing](../providers/fallback-and-routing.md)
+- [Model Providers → Routing](../providers/routing.md)
 - [Environment variables](../reference/env-vars.md)

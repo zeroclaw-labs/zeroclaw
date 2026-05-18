@@ -42,15 +42,15 @@ The runtime depends only on these traits, not on concrete implementations. This 
 
 ### `zeroclaw-providers`
 
-All LLM client implementations plus the routing and fallback wrappers. See [Model Providers → Overview](../providers/overview.md) for the list.
+All LLM client implementations plus the routing and retry wrappers. See [Model Providers → Overview](../providers/overview.md) for the list.
 
 Structure:
 
 - `traits.rs` — re-exports from `zeroclaw-api` plus provider-internal helpers
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, … — one file per native provider
 - `compatible.rs` — a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
-- `router.rs` — multi-provider router that routes by task hint
-- `reliable.rs` — fallback-chain wrapper
+- `router.rs` — hint-based per-call model route selection
+- `reliable.rs` — same-provider retry / backoff / API-key rotation wrapper
 - `streaming.rs` — SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`

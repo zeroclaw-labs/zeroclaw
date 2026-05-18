@@ -46,7 +46,7 @@ Run `cargo doc --open -p zeroclaw-config` (or read [`crates/zeroclaw-config/src/
 | `gemini` | Google's API; `gemini_cli` is the CLI-shells-out variant |
 | `bedrock` | AWS-credentials chain, region template |
 | `ollama` | Local inference; `uri` defaults to `http://localhost:11434` |
-| `openrouter` | Multi-vendor routing layer (treated as a single provider; see [Fallback & routing](./fallback-and-routing.md)) |
+| `openrouter` | Multi-vendor routing layer (treated as a single provider; see [Routing](./routing.md)) |
 | `groq`, `mistral`, `xai`, `deepseek`, ... | OpenAI-compatible endpoints, each with its own canonical slot |
 | `moonshot`, `qwen`, `glm`, `minimax`, `zai`, `doubao`, ... | Multi-region families; pick the region with `endpoint = "<variant>"` on the alias entry |
 | `lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm` | Local-server defaults (`http://localhost:<port>/v1`) |
@@ -156,12 +156,12 @@ runtime_profile = "deep"             # alias into runtime_profiles.<alias>; inde
 
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
-For multiple agents pointing at different providers, see [Fallback & routing](./fallback-and-routing.md).
+For multiple agents pointing at different providers, see [Routing](./routing.md).
 
 ## See also
 
 - [Overview](./overview.md)
 - [Provider catalog](./catalog.md) — concrete config example for every family
 - [Streaming](./streaming.md)
-- [Fallback & routing](./fallback-and-routing.md)
+- [Routing](./routing.md)
 - [Custom providers](./custom.md)

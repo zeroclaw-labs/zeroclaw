@@ -147,8 +147,8 @@ limit:
 - `warn` — the default; record the event with a warn-level log and
   let the request through.
 - `block` — refuse the request with a `BudgetExceeded` error.
-- `route_down` — substitute `route_down_model` (e.g. a cheaper
-  fallback) for the original model. The substitution happens before
+- `route_down` — substitute `route_down_model` (a cheaper
+  alternative) for the original model. The substitution happens before
   the request is dispatched.
 
 `allow_override = true` lets a request bypass `block` by passing an
@@ -228,4 +228,4 @@ upstream returned a different model id than what's in the rate
 sheet (some providers return versioned ids like
 `claude-3-5-sonnet-20241022` even when you configured
 `claude-3-5-sonnet`). Add the exact id the warn names, or set the
-unversioned id and rely on `resolve_rates`'s suffix fallback.
+unversioned id and rely on `resolve_rates`'s suffix-match path.

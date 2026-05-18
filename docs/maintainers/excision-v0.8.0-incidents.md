@@ -47,7 +47,7 @@ Out of scope for the excision pass; the right fix is either (a) extend `QuickUi`
 
 Three `#[serde(alias = ...)]` annotations in `crates/zeroclaw-config/src/schema.rs`. Reviewed; all kept:
 
-- `:3646` `alias = "api_url"` on `TtsProviderConfig.uri` — the V1/V2-era field rename. The `migration.rs` walker doesn't currently rewrite this for TTS configs (only for `ModelProviderConfig`), so the serde alias is the operator-facing fallback for old TOMLs. **Kept** until the migration walker is extended.
+- `:3646` `alias = "api_url"` on `TtsProviderConfig.uri` — the V1/V2-era field rename. The `migration.rs` walker doesn't currently rewrite this for TTS configs (only for `ModelProviderConfig`), so the serde alias is the operator-facing migration path for old TOMLs. **Kept** until the migration walker is extended.
 - `:7718` `alias = "dbURL", "database_url", "databaseUrl"` on `PostgresStorageConfig.db_url` — same pattern. Multiple legacy/camelCase forms accepted; migration doesn't rewrite. **Kept**.
 - `:11267` `alias = "sandbox-exec"` on `SandboxBackend::SandboxExec` — the parent enum carries `#[serde(rename_all = "lowercase")]` so the wire form is `sandboxexec`. The alias preserves the natural kebab `sandbox-exec` form for operators. **Kept** as UX, not legacy.
 
