@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -280,7 +281,7 @@ const AUTH_RETRY_MAX_BACKOFF_MS: u64 = 8_000;
 pub struct QQChannel {
     app_id: String,
     app_secret: String,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Cached access token + expiry timestamp.
     token_cache: Arc<RwLock<Option<(String, u64)>>>,
     /// Message deduplication set.
@@ -305,7 +306,7 @@ impl QQChannel {
         Self {
             app_id,
             app_secret,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             token_cache: Arc::new(RwLock::new(None)),
             dedup: Arc::new(RwLock::new(HashSet::new())),
             workspace_dir: None,
@@ -331,10 +332,6 @@ impl QQChannel {
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client("channel.qq", self.proxy_url.as_deref())
-    }
-
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     /// Fetch an access token from QQ's OAuth2 endpoint.
@@ -1276,7 +1273,7 @@ impl Channel for QQChannel {
                             // For QQ, user_openid is the identifier
                             let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
 
-                            if !self.is_user_allowed(user_openid) {
+                            if !self.allowlist.is_allowed(user_openid) {
                                 tracing::warn!("QQ: ignoring C2C message from unauthorized user: {user_openid}");
                                 continue;
                             }
@@ -1316,7 +1313,7 @@ impl Channel for QQChannel {
 
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
-                            if !self.is_user_allowed(author_id) {
+                            if !self.allowlist.is_allowed(author_id) {
                                 tracing::warn!("QQ: ignoring group message from unauthorized user: {author_id}");
                                 continue;
                             }
@@ -1431,20 +1428,20 @@ mod tests {
     #[test]
     fn test_user_allowed_wildcard() {
         let ch = QQChannel::new("id".into(), "secret".into(), vec!["*".into()]);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
         let ch = QQChannel::new("id".into(), "secret".into(), vec!["user123".into()]);
-        assert!(ch.is_user_allowed("user123"));
-        assert!(!ch.is_user_allowed("other"));
+        assert!(ch.allowlist.is_allowed("user123"));
+        assert!(!ch.allowlist.is_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
         let ch = make_channel();
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[tokio::test]
