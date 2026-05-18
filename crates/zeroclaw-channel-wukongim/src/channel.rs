@@ -434,27 +434,27 @@ impl WuKongIMChannel {
         // Send quick acknowledgment message only if:
         // 1. ack_reactions is enabled AND
         // 2. More than 60 seconds have passed since the last message from this sender
-        if self.ack_reactions {
-            let sender_key = format!("{}:{}", params.channel_id, params.from_uid);
-            let now = Instant::now();
-            let should_send = {
-                let last_time = self.last_message_time.read().await;
-                match last_time.get(&sender_key) {
-                    Some(last) if now.duration_since(*last) < Duration::from_secs(self.ack_reactions_delay_secs) => false,
-                    _ => true,
-                }
-            };
-            if should_send {
-                let ack_msg = self.ack_reactions_message.clone();
-                let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
-                let _ = self.send_text_message(target_id, params.channel_type, &ack_msg).await;
-            }
-            // Update last message time
-            {
-                let mut last_time = self.last_message_time.write().await;
-                last_time.insert(sender_key, now);
-            }
-        }
+        // [DISABLED] if self.ack_reactions {
+        // [DISABLED]     let sender_key = format!("{}:{}", params.channel_id, params.from_uid);
+        // [DISABLED]     let now = Instant::now();
+        // [DISABLED]     let should_send = {
+        // [DISABLED]         let last_time = self.last_message_time.read().await;
+        // [DISABLED]         match last_time.get(&sender_key) {
+        // [DISABLED]             Some(last) if now.duration_since(*last) < Duration::from_secs(self.ack_reactions_delay_secs) => false,
+        // [DISABLED]             _ => true,
+        // [DISABLED]         }
+        // [DISABLED]     };
+        // [DISABLED]     if should_send {
+        // [DISABLED]         let ack_msg = self.ack_reactions_message.clone();
+        // [DISABLED]         let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
+        // [DISABLED]         let _ = self.send_text_message(target_id, params.channel_type, &ack_msg).await;
+        // [DISABLED]     }
+        // [DISABLED]     // Update last message time
+        // [DISABLED]     {
+        // [DISABLED]         let mut last_time = self.last_message_time.write().await;
+        // [DISABLED]         last_time.insert(sender_key, now);
+        // [DISABLED]     }
+        // [DISABLED] }
 
         let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
