@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
@@ -50,7 +51,7 @@ pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
     verify_token: String,
-    allowed_numbers: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     /// Compiled mention patterns for DM mention gating.
@@ -73,7 +74,7 @@ impl WhatsAppChannel {
             access_token,
             endpoint_id,
             verify_token,
-            allowed_numbers,
+            allowlist: AllowlistAspect::new(allowed_numbers),
             proxy_url: None,
             dm_mention_patterns: Vec::new(),
             group_mention_patterns: Vec::new(),
@@ -204,11 +205,6 @@ impl WhatsAppChannel {
         )
     }
 
-    /// Check if a phone number is allowed (E.164 format: +1234567890)
-    fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
-    }
-
     /// Get the verify token for webhook verification
     pub fn verify_token(&self) -> &str {
         &self.verify_token
@@ -252,7 +248,7 @@ impl WhatsAppChannel {
                         format!("+{from}")
                     };
 
-                    if !self.is_number_allowed(&normalized_from) {
+                    if !self.allowlist.is_allowed(&normalized_from) {
                         tracing::warn!(
                             "WhatsApp: ignoring message from unauthorized number: {normalized_from}. \
                             Add to channels.whatsapp.allowed_numbers in config.toml, \
@@ -471,21 +467,21 @@ mod tests {
     #[test]
     fn whatsapp_number_allowed_exact() {
         let ch = make_channel();
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(!ch.is_number_allowed("+9876543210"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+9876543210"));
     }
 
     #[test]
     fn whatsapp_number_allowed_wildcard() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(ch.is_number_allowed("+9999999999"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
     fn whatsapp_number_denied_empty() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![]);
-        assert!(!ch.is_number_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+1234567890"));
     }
 
     #[test]
@@ -1197,10 +1193,10 @@ mod tests {
                 "+3333333333".into(),
             ],
         );
-        assert!(ch.is_number_allowed("+1111111111"));
-        assert!(ch.is_number_allowed("+2222222222"));
-        assert!(ch.is_number_allowed("+3333333333"));
-        assert!(!ch.is_number_allowed("+4444444444"));
+        assert!(ch.allowlist.is_allowed("+1111111111"));
+        assert!(ch.allowlist.is_allowed("+2222222222"));
+        assert!(ch.allowlist.is_allowed("+3333333333"));
+        assert!(!ch.allowlist.is_allowed("+4444444444"));
     }
 
     #[test]
@@ -1212,9 +1208,9 @@ mod tests {
             "ver".into(),
             vec!["+1234567890".into()],
         );
-        assert!(ch.is_number_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
         // Different number should not match
-        assert!(!ch.is_number_allowed("+1234567891"));
+        assert!(!ch.allowlist.is_allowed("+1234567891"));
     }
 
     #[test]
@@ -1254,9 +1250,9 @@ mod tests {
             vec!["+111".into(), "+222".into()],
         );
         assert_eq!(ch.verify_token(), "my-verify-token");
-        assert!(ch.is_number_allowed("+111"));
-        assert!(ch.is_number_allowed("+222"));
-        assert!(!ch.is_number_allowed("+333"));
+        assert!(ch.allowlist.is_allowed("+111"));
+        assert!(ch.allowlist.is_allowed("+222"));
+        assert!(!ch.allowlist.is_allowed("+333"));
     }
 
     #[test]
