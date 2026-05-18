@@ -82,7 +82,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     // Observer fan-out is handled by create_observer + the gateway's BROADCAST_HOOK
     // (TeeObserver). Passing None here lets loop_::run() call create_observer() so
     // the configured log/Prometheus/OTel backend is preserved alongside SSE output.
-    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_broadcast_hook.
+    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_scoped_broadcast_hook.
     if config.cron.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &security, &event_tx, None).await;
     } else {
