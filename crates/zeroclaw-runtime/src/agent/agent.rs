@@ -3896,21 +3896,21 @@ mod tests {
         tools::register_skill_tools(&mut tools, &skills, security);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, &["builtin_a", "deploy.run", "deploy.status"]);
+        assert_eq!(names, &["builtin_a", "deploy__run", "deploy__status"]);
     }
 
     #[test]
     fn register_skill_tools_skips_shadowed_builtins() {
         let security = Arc::new(crate::security::SecurityPolicy::default());
         // Pre-populate with a tool whose name matches what the skill would produce.
-        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("my_skill.run"))];
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("my_skill__run"))];
 
         let skills = vec![make_skill("my_skill", &["run"])];
         tools::register_skill_tools(&mut tools, &skills, security);
 
         // Should still be just 1 tool — the duplicate was skipped.
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "my_skill.run");
+        assert_eq!(tools[0].name(), "my_skill__run");
     }
 
     #[test]
@@ -3979,7 +3979,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            &["file_read", "web_fetch", "ops.deploy", "ops.rollback"]
+            &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
         );
     }
 }

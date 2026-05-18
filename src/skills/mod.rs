@@ -21,8 +21,12 @@ pub mod skill_http {
     pub use zeroclaw_runtime::skills::skill_http::*;
 }
 
+// The lib target sees this as dead; only the bin target calls it from main.rs.
 #[allow(dead_code)]
-pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
+pub async fn handle_command(
+    command: crate::SkillCommands,
+    config: &crate::config::Config,
+) -> Result<()> {
     let workspace_dir = &config.workspace_dir;
     match command {
         crate::SkillCommands::List => {
@@ -120,6 +124,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 
             let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
                 install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    .await
                     .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
