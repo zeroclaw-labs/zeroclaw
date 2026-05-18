@@ -27,6 +27,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
@@ -182,20 +183,19 @@ mod mention {
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
 mod allowlist {
+    use super::AllowlistAspect;
+
+    /// Build the user-allowlist aspect from the raw config strings.
+    ///
     /// Matrix user IDs are spec-lowercase for the localpart, but some
     /// homeservers accept capitalised forms in the auth layer. An operator
     /// who configured `allowed_users = ["@Bot:Example.org"]` would silently
     /// see no messages on a strict byte match — the channel filters to
     /// `@bot:example.org`. ASCII case-insensitive match is the conservative
-    /// reading.
-    pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
-        if allowed_users.is_empty() {
-            return false;
-        }
-        if allowed_users.iter().any(|u| u == "*") {
-            return true;
-        }
-        allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
+    /// reading, expressed here by lowering both sides via
+    /// `with_normalizer`.
+    pub(super) fn user_allowlist(allowed_users: Vec<String>) -> AllowlistAspect {
+        AllowlistAspect::new(allowed_users).with_normalizer(|s| s.to_ascii_lowercase())
     }
 
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
@@ -1241,6 +1241,9 @@ mod inbound {
     #[derive(Clone)]
     pub(super) struct HandlerCtx {
         pub config: Arc<MatrixConfig>,
+        /// User allowlist built once from `config.allowed_users` so per-event
+        /// dispatch does not re-parse the raw `Vec<String>`.
+        pub user_allowlist: super::AllowlistAspect,
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
@@ -1365,7 +1368,7 @@ mod inbound {
             }
         }
 
-        if !allowlist::user_allowed(&ctx.config.allowed_users, sender) {
+        if !ctx.user_allowlist.is_allowed(sender) {
             debug!("matrix: drop message from non-allowed sender {sender}");
             return Ok(());
         }
@@ -2732,6 +2735,7 @@ impl Channel for MatrixChannel {
             .ok_or_else(|| anyhow!("matrix: client has no user_id after login"))?
             .to_owned();
         let ctx = inbound::HandlerCtx {
+            user_allowlist: allowlist::user_allowlist(self.config.allowed_users.clone()),
             config: self.config.clone(),
             transcription: self.transcription.clone(),
             workspace_dir: self.workspace_dir.clone(),
@@ -3282,40 +3286,39 @@ mod tests {
     }
 
     mod allowlist {
-        use super::super::allowlist::{room_allowed_static, user_allowed};
+        use super::super::AllowlistAspect;
+        use super::super::allowlist::{room_allowed_static, user_allowlist};
+
+        fn make(entries: &[&str]) -> AllowlistAspect {
+            user_allowlist(entries.iter().map(|s| (*s).to_string()).collect())
+        }
 
         #[test]
         fn empty_user_list_denies_all() {
-            assert!(!user_allowed(&[], "@a:b"));
+            assert!(!make(&[]).is_allowed("@a:b"));
         }
 
         #[test]
         fn star_user_list_allows_all() {
-            assert!(user_allowed(&["*".to_string()], "@a:b"));
+            assert!(make(&["*"]).is_allowed("@a:b"));
         }
 
         #[test]
         fn user_in_list_allowed() {
-            assert!(user_allowed(&["@a:b".to_string()], "@a:b"));
+            assert!(make(&["@a:b"]).is_allowed("@a:b"));
         }
 
         #[test]
         fn user_not_in_list_denied() {
-            assert!(!user_allowed(&["@a:b".to_string()], "@c:d"));
+            assert!(!make(&["@a:b"]).is_allowed("@c:d"));
         }
 
         #[test]
         fn user_in_list_case_insensitive() {
             // Operator-configured case shouldn't matter — Matrix MXIDs are
             // spec-lowercase but tolerated in mixed case by some servers.
-            assert!(user_allowed(
-                &["@Bot:Example.org".to_string()],
-                "@bot:example.org"
-            ));
-            assert!(user_allowed(
-                &["@bot:example.org".to_string()],
-                "@Bot:EXAMPLE.org"
-            ));
+            assert!(make(&["@Bot:Example.org"]).is_allowed("@bot:example.org"));
+            assert!(make(&["@bot:example.org"]).is_allowed("@Bot:EXAMPLE.org"));
         }
 
         #[test]
@@ -3337,6 +3340,52 @@ mod tests {
                 &["!ok:server".to_string()],
                 "!nope:server"
             ));
+        }
+
+        // ── M1 parity: AllowlistAspect must accept exactly the same set of
+        // (entries, sender) pairs that the pre-aspect user_allowed shape did.
+        #[test]
+        fn allowlist_parity_with_pre_aspect_shape() {
+            fn pre_aspect(entries: &[String], sender: &str) -> bool {
+                if entries.is_empty() {
+                    return false;
+                }
+                if entries.iter().any(|u| u == "*") {
+                    return true;
+                }
+                entries.iter().any(|u| u.eq_ignore_ascii_case(sender))
+            }
+
+            let cases: Vec<(Vec<&str>, &str)> = vec![
+                (vec![], "@a:b"),
+                (vec![], ""),
+                (vec!["*"], "@a:b"),
+                (vec!["*"], ""),
+                (vec!["@a:b"], "@a:b"),
+                (vec!["@a:b"], "@c:d"),
+                (vec!["@Bot:Example.org"], "@bot:example.org"),
+                (vec!["@bot:example.org"], "@Bot:EXAMPLE.org"),
+                (vec!["@A:B"], "@a:b"),
+                (vec!["@a:b", "@c:d"], "@c:d"),
+                (vec!["@a:b", "*"], "@zz:zz"),
+                (vec!["*", "@a:b"], "@anyone:srv"),
+                (vec!["@bot:example.org"], "@bot:example.org_"), // suffix
+                (vec!["@bot:example.org"], "_@bot:example.org"), // prefix
+                (vec!["@bot:example.org_"], "@bot:example.org"), // substring rejected
+                (vec!["@a:b"], ""),
+                (vec!["@a:b", "@c:d", "@e:f"], "@E:F"),
+            ];
+            for (entries, sender) in cases {
+                let entries_owned: Vec<String> =
+                    entries.iter().map(|s| (*s).to_string()).collect();
+                let baseline = pre_aspect(&entries_owned, sender);
+                let aspect = make(&entries);
+                assert_eq!(
+                    aspect.is_allowed(sender),
+                    baseline,
+                    "aspect drift for entries={entries:?} sender={sender:?}",
+                );
+            }
         }
     }
 
