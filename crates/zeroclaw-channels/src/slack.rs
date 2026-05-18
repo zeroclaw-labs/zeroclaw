@@ -1,4 +1,5 @@
 use anyhow::Context;
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
@@ -27,7 +28,7 @@ pub struct SlackChannel {
     bot_token: String,
     app_token: Option<String>,
     channel_ids: Vec<String>,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     thread_replies: bool,
     mention_only: bool,
     strict_mention_in_thread: bool,
@@ -171,7 +172,7 @@ impl SlackChannel {
             bot_token,
             app_token,
             channel_ids,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             thread_replies: true,
             mention_only: false,
             strict_mention_in_thread: false,
@@ -504,13 +505,6 @@ impl SlackChannel {
         }
 
         Ok(())
-    }
-
-    /// Check if a Slack user ID is in the allowlist.
-    /// Empty list means deny everyone until explicitly configured.
-    /// `"*"` means allow everyone.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     fn is_group_sender_trigger_enabled(&self, user_id: &str) -> bool {
@@ -2767,7 +2761,7 @@ impl SlackChannel {
                                 .get("user")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
-                            if !user.is_empty() && self.is_user_allowed(user) {
+                            if !user.is_empty() && self.allowlist.is_allowed(user) {
                                 let item = event.get("item");
                                 let item_channel = item
                                     .and_then(|i| i.get("channel"))
@@ -2841,7 +2835,7 @@ impl SlackChannel {
                 if user.is_empty() || user == bot_user_id {
                     continue;
                 }
-                if !self.is_user_allowed(user) {
+                if !self.allowlist.is_allowed(user) {
                     tracing::warn!("Slack: ignoring message from unauthorized user: {user}");
                     continue;
                 }
@@ -3859,7 +3853,7 @@ impl Channel for SlackChannel {
                         }
 
                         // Sender validation
-                        if !self.is_user_allowed(user) {
+                        if !self.allowlist.is_allowed(user) {
                             tracing::warn!(
                                 "Slack: ignoring message from unauthorized user: {user}"
                             );
@@ -3963,7 +3957,7 @@ impl Channel for SlackChannel {
                     if user.is_empty() || user == bot_user_id {
                         continue;
                     }
-                    if !self.is_user_allowed(user) {
+                    if !self.allowlist.is_allowed(user) {
                         continue;
                     }
 
@@ -4318,14 +4312,14 @@ mod tests {
     #[test]
     fn empty_allowlist_denies_everyone() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec![]);
-        assert!(!ch.is_user_allowed("U12345"));
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("U12345"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["*".into()]);
-        assert!(ch.is_user_allowed("U12345"));
+        assert!(ch.allowlist.is_allowed("U12345"));
     }
 
     #[test]
@@ -4726,29 +4720,29 @@ mod tests {
             vec![],
             vec!["U111".into(), "U222".into()],
         );
-        assert!(ch.is_user_allowed("U111"));
-        assert!(ch.is_user_allowed("U222"));
-        assert!(!ch.is_user_allowed("U333"));
+        assert!(ch.allowlist.is_allowed("U111"));
+        assert!(ch.allowlist.is_allowed("U222"));
+        assert!(!ch.allowlist.is_allowed("U333"));
     }
 
     #[test]
     fn allowlist_exact_match_not_substring() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
-        assert!(!ch.is_user_allowed("U1111"));
-        assert!(!ch.is_user_allowed("U11"));
+        assert!(!ch.allowlist.is_allowed("U1111"));
+        assert!(!ch.allowlist.is_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
-        assert!(!ch.is_user_allowed(""));
+        assert!(!ch.allowlist.is_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, vec![], vec!["U111".into()]);
-        assert!(ch.is_user_allowed("U111"));
-        assert!(!ch.is_user_allowed("u111"));
+        assert!(ch.allowlist.is_allowed("U111"));
+        assert!(!ch.allowlist.is_allowed("u111"));
     }
 
     #[test]
@@ -4759,8 +4753,8 @@ mod tests {
             vec![],
             vec!["U111".into(), "*".into()],
         );
-        assert!(ch.is_user_allowed("U111"));
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("U111"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     // ── Message ID edge cases ─────────────────────────────────────
