@@ -1,6 +1,6 @@
 # DaemonClaw Access Matrix
 
-Reference document for the `daemonclaw-install` crate. Every file and directory the installer creates must match this matrix exactly. If a permission can't be expressed in this table, it shouldn't exist on disk.
+Reference document for `daemonclaw service install`. Every file and directory the installer creates must match this matrix exactly. If a permission can't be expressed in this table, it shouldn't exist on disk.
 
 ---
 

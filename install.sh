@@ -1,66 +1,213 @@
-#!/bin/sh
+#!/usr/bin/env sh
+# DaemonClaw installer
+# POSIX preamble: ensure bash is available, then re-exec under bash.
 set -eu
 
-# ── DaemonClaw installer ───────────────────────────────────────────
-# Builds and installs DaemonClaw from source.
-# All feature lists and version info read from Cargo.toml — nothing hardcoded.
-# POSIX sh — no bash required. Works on Alpine, Debian, macOS, everywhere.
+_have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-REPO_URL="https://github.com/DeliveryBoyTech/daemonclaw.git"
+_run_privileged() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"
+  elif _have_cmd sudo; then sudo "$@"
+  else echo "error: sudo is required to install missing dependencies." >&2; exit 1; fi
+}
 
-# ── Output helpers (terminal-aware) ──────────────────────────────
+_is_container_runtime() {
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ] && return 0
+  [ -r /proc/1/cgroup ] && grep -Eq '(docker|containerd|kubepods|podman|lxc)' /proc/1/cgroup && return 0
+  return 1
+}
 
-if [ -t 1 ]; then
-  BOLD='\033[1m' GREEN='\033[32m' YELLOW='\033[33m' RED='\033[31m' RESET='\033[0m'
-else
-  BOLD='' GREEN='' YELLOW='' RED='' RESET=''
+_ensure_bash() {
+  _have_cmd bash && return 0
+  echo "==> bash not found; attempting to install it"
+  if _have_cmd apk; then _run_privileged apk add --no-cache bash
+  elif _have_cmd apt-get; then _run_privileged apt-get update -qq && _run_privileged apt-get install -y bash
+  elif _have_cmd dnf; then _run_privileged dnf install -y bash
+  elif _have_cmd pacman; then
+    if _is_container_runtime; then
+      _PACMAN_CFG="$(mktemp /tmp/daemonclaw-pacman.XXXXXX.conf)"
+      cp /etc/pacman.conf "$_PACMAN_CFG"
+      grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$_PACMAN_CFG" || printf '\nDisableSandboxSyscalls\n' >> "$_PACMAN_CFG"
+      _run_privileged pacman --config "$_PACMAN_CFG" -Sy --noconfirm
+      _run_privileged pacman --config "$_PACMAN_CFG" -S --noconfirm --needed bash
+      rm -f "$_PACMAN_CFG"
+    else
+      _run_privileged pacman -Sy --noconfirm
+      _run_privileged pacman -S --noconfirm --needed bash
+    fi
+  else echo "error: unsupported package manager; install bash manually and retry." >&2; exit 1; fi
+}
+
+# If not already running under bash, ensure bash exists and re-exec.
+if [ -z "${BASH_VERSION:-}" ]; then
+  _ensure_bash
+  exec bash "$0" "$@"
 fi
 
-info()  { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
-warn()  { printf "  ${YELLOW}⚠${RESET} %s\n" "$*" >&2; }
-die()   { printf "  ${RED}✗${RESET} %s\n" "$*" >&2; exit 1; }
-bold()  { printf "${BOLD}%s${RESET}" "$*"; }
+# --- From here on, we are running under bash ---
+set -euo pipefail
 
-# ── Parse Cargo.toml (source of truth) ────────────────────────────
+# --- Color and styling ---
+if [[ -t 1 ]]; then
+  BLUE='\033[0;34m'
+  BOLD_BLUE='\033[1;34m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  RED='\033[0;31m'
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  RESET='\033[0m'
+else
+  BLUE='' BOLD_BLUE='' GREEN='' YELLOW='' RED='' BOLD='' DIM='' RESET=''
+fi
 
+CRAB="🦀"
+
+info() {
+  echo -e "${BLUE}${CRAB}${RESET} ${BOLD}$*${RESET}"
+}
+
+step_ok() {
+  echo -e "  ${GREEN}✓${RESET} $*"
+}
+
+step_dot() {
+  echo -e "  ${DIM}·${RESET} $*"
+}
+
+step_fail() {
+  echo -e "  ${RED}✗${RESET} $*"
+}
+
+warn() {
+  echo -e "${YELLOW}!${RESET} $*" >&2
+}
+
+error() {
+  echo -e "${RED}✗${RESET} ${RED}$*${RESET}" >&2
+}
+
+# --- Usage ---
+usage() {
+  cat <<'USAGE'
+DaemonClaw installer — guided bootstrap
+
+Usage:
+  ./install.sh [options]
+
+The installer builds DaemonClaw, configures your provider and API key,
+installs the system service, and starts the daemon — all in one step.
+
+Options:
+  --guided                   Run interactive guided installer (default on Linux TTY)
+  --no-guided                Disable guided installer
+  --install-system-deps      Install build dependencies (Linux/macOS)
+  --install-rust             Install Rust via rustup if missing
+  --prebuilt                 Download pre-built binary (fast, no Rust required)
+  --source                   Build from source (custom features, latest code)
+  --minimal                  Build kernel only (~6.6MB, source only)
+  --features X,Y             Select specific features (source only, comma-separated)
+  --list-features            Print all available features and exit
+  --api-key <key>            API key (skips interactive prompt)
+  --provider <id>            Provider ID (skips interactive prompt)
+  --model <id>               Model override (optional)
+  --skip-onboard             Skip provider/API key configuration
+  --skip-build               Skip build step
+  --skip-install             Skip cargo install step
+  --prefix PATH              Install prefix (default: $HOME)
+  --dry-run                  Show what would happen without changes
+  --uninstall                Remove DaemonClaw binary and optionally config/data
+  -h, --help                 Show help
+  -V, --version              Show version from Cargo.toml
+
+Examples:
+  # One-click install (interactive)
+  curl -fsSL https://daemonclaw.dev/install.sh | bash
+
+  # Non-interactive with API key
+  ./install.sh --api-key "sk-..." --provider anthropic
+
+  # Prebuilt binary (fastest)
+  ./install.sh --prebuilt --api-key "sk-..."
+
+  # Build from source with custom features
+  ./install.sh --source --features agent-runtime,channel-discord
+
+  # Build only, configure later
+  ./install.sh --skip-onboard
+
+  # Isolated test install
+  ./install.sh --prefix /tmp/dc-test --skip-onboard
+
+Environment:
+  DAEMONCLAW_API_KEY           Used when --api-key is not provided
+  DAEMONCLAW_PROVIDER          Used when --provider is not provided
+  DAEMONCLAW_MODEL             Used when --model is not provided
+  DAEMONCLAW_INSTALL_DIR       Source checkout override
+  DAEMONCLAW_CARGO_FEATURES    Extra cargo features (legacy; prefer --features)
+USAGE
+}
+
+# --- Utility functions ---
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+version_gte() {
+  local IFS=.
+  set -- $1 $2
+  local a1="${1:-0}" a2="${2:-0}" a3="${3:-0}"
+  shift 3 2>/dev/null || shift $#
+  local b1="${1:-0}" b2="${2:-0}" b3="${3:-0}"
+  [[ "$a1" -gt "$b1" ]] 2>/dev/null && return 0
+  [[ "$a1" -lt "$b1" ]] 2>/dev/null && return 1
+  [[ "$a2" -gt "$b2" ]] 2>/dev/null && return 0
+  [[ "$a2" -lt "$b2" ]] 2>/dev/null && return 1
+  [[ "$a3" -gt "$b3" ]] 2>/dev/null && return 0
+  [[ "$a3" -lt "$b3" ]] 2>/dev/null && return 1
+  return 0
+}
+
+bool_to_word() {
+  if [[ "$1" == true ]]; then echo "yes"; else echo "no"; fi
+}
+
+# --- Parse Cargo.toml ---
 parse_cargo_toml() {
   local toml="$1"
-  [ -f "$toml" ] || die "Cargo.toml not found at $toml"
+  [[ -f "$toml" ]] || { error "Cargo.toml not found at $toml"; exit 1; }
 
   VERSION=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{split($0,a,"\"");print a[2]}' "$toml")
   MSRV=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^rust-version *=/{split($0,a,"\"");print a[2]}' "$toml")
   EDITION=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^edition *=/{split($0,a,"\"");print a[2]}' "$toml")
 
   DEFAULT_FEATURES=$(awk '/^default *= *\[/,/\]/{s=$0; while(match(s,/"[^"]+"/)){print substr(s,RSTART+1,RLENGTH-2); s=substr(s,RSTART+RLENGTH)}}' "$toml" | paste -sd, -)
-
   ALL_FEATURES=$(awk '/^\[features\]/{p=1;next} /^\[/{p=0} p && /^[a-z][a-z0-9_-]* *=/{sub(/ *=.*/,"");print}' "$toml")
 }
 
-# ── Feature validation ────────────────────────────────────────────
-
+# --- Feature validation ---
 validate_feature() {
   case "$1" in
-    fantoccini) warn "'fantoccini' is deprecated — use 'browser-native'" ; return 0 ;;
-    landlock)   warn "'landlock' is deprecated — use 'sandbox-landlock'" ; return 0 ;;
-    metrics)    warn "'metrics' is deprecated — use 'observability-prometheus'" ; return 0 ;;
+    fantoccini) warn "'fantoccini' is deprecated — use 'browser-native'"; return 0 ;;
+    landlock)   warn "'landlock' is deprecated — use 'sandbox-landlock'"; return 0 ;;
+    metrics)    warn "'metrics' is deprecated — use 'observability-prometheus'"; return 0 ;;
   esac
   echo "$ALL_FEATURES" | grep -qx "$1" && return 0
-  die "Unknown feature '$1'. Run: $0 --list-features"
+  error "Unknown feature '$1'. Run: $0 --list-features"
+  exit 1
 }
-
-# ── List features ─────────────────────────────────────────────────
 
 list_features() {
   parse_cargo_toml "$1"
   echo
-  printf "%s — available build features\n" "$(bold "DaemonClaw v${VERSION}")"
+  echo -e "${BOLD}DaemonClaw v${VERSION}${RESET} — available build features"
   echo
 
-  printf "  %s\n" "$(bold "Default") (included unless --minimal):"
-  printf "    %s\n" "$DEFAULT_FEATURES"
+  echo -e "  ${BOLD}Default${RESET} (included unless --minimal):"
+  echo -e "    $DEFAULT_FEATURES"
   echo
 
-  channels="" observability="" platform="" other=""
+  local channels="" observability="" platform="" other=""
   for feat in $ALL_FEATURES; do
     case "$feat" in
       default|ci-all|fantoccini|landlock|metrics) continue ;;
@@ -72,39 +219,19 @@ list_features() {
     esac
   done
 
-  [ -n "$channels" ]      && printf "  %s\n    %s\n\n" "$(bold "Channels:")" "$channels"
-  [ -n "$observability" ] && printf "  %s\n    %s\n\n" "$(bold "Observability:")" "$observability"
-  [ -n "$platform" ]      && printf "  %s\n    %s\n\n" "$(bold "Platform:")" "$platform"
-  [ -n "$other" ]         && printf "  %s\n    %s\n\n" "$(bold "Other:")" "$other"
+  [[ -n "$channels" ]]      && echo -e "  ${BOLD}Channels:${RESET}\n    $channels\n"
+  [[ -n "$observability" ]] && echo -e "  ${BOLD}Observability:${RESET}\n    $observability\n"
+  [[ -n "$platform" ]]      && echo -e "  ${BOLD}Platform:${RESET}\n    $platform\n"
+  [[ -n "$other" ]]         && echo -e "  ${BOLD}Other:${RESET}\n    $other\n"
 
-  printf "  %s\n" "$(bold "Build profiles:")"
-  printf "    %s                                        # full (default features)\n" "$0"
-  printf "    %s --minimal                              # kernel only (~6.6MB)\n" "$0"
-  printf "    %s --minimal --features agent-runtime,channel-discord\n" "$0"
+  echo -e "  ${BOLD}Build profiles:${RESET}"
+  echo -e "    $0                                        # full (default features)"
+  echo -e "    $0 --minimal                              # kernel only (~6.6MB)"
+  echo -e "    $0 --minimal --features agent-runtime,channel-discord"
   echo
 }
 
-# ── Version comparison ────────────────────────────────────────────
-
-version_gte() {
-  # Returns 0 if $1 >= $2 (dot-separated version strings)
-  local IFS=.
-  set -- $1 $2
-  local a1="${1:-0}" a2="${2:-0}" a3="${3:-0}"
-  shift 3 2>/dev/null || shift $#
-  local b1="${1:-0}" b2="${2:-0}" b3="${3:-0}"
-
-  [ "$a1" -gt "$b1" ] 2>/dev/null && return 0
-  [ "$a1" -lt "$b1" ] 2>/dev/null && return 1
-  [ "$a2" -gt "$b2" ] 2>/dev/null && return 0
-  [ "$a2" -lt "$b2" ] 2>/dev/null && return 1
-  [ "$a3" -gt "$b3" ] 2>/dev/null && return 0
-  [ "$a3" -lt "$b3" ] 2>/dev/null && return 1
-  return 0
-}
-
-# ── Detect user's shell ──────────────────────────────────────────
-
+# --- Shell detection ---
 detect_shell_profile() {
   local shell_name
   shell_name=$(basename "${SHELL:-/bin/bash}")
@@ -124,15 +251,18 @@ shell_export_syntax() {
   esac
 }
 
-# ── Platform / target triple detection ───────────────────────────
-
+# --- Platform detection ---
 detect_target_triple() {
   local os arch
   os=$(uname -s)
   arch=$(uname -m)
-
   case "$os" in
-    Darwin) echo "aarch64-apple-darwin" ;;   # presume M-series
+    Darwin)
+      case "$arch" in
+        arm64|aarch64) echo "aarch64-apple-darwin" ;;
+        x86_64)        echo "x86_64-apple-darwin" ;;
+        *)             echo "" ;;
+      esac ;;
     Linux)
       case "$arch" in
         x86_64)          echo "x86_64-unknown-linux-gnu" ;;
@@ -145,220 +275,664 @@ detect_target_triple() {
   esac
 }
 
-# ── Pre-built binary install ──────────────────────────────────────
+# --- Guided input helpers ---
+guided_open_input() {
+  if [[ -t 0 ]]; then
+    GUIDED_FD=0
+    return 0
+  fi
+  exec {GUIDED_FD}</dev/tty 2>/dev/null || return 1
+}
+
+guided_read() {
+  local __target_var="$1"
+  local __prompt="$2"
+  local __silent="${3:-false}"
+  local __value=""
+
+  [[ -n "${GUIDED_FD:-}" ]] || guided_open_input || return 1
+
+  if [[ "$__silent" == true ]]; then
+    read -r -s -u "$GUIDED_FD" -p "$__prompt" __value || return 1
+    echo
+  else
+    read -r -u "$GUIDED_FD" -p "$__prompt" __value || return 1
+  fi
+
+  printf -v "$__target_var" '%s' "$__value"
+  return 0
+}
+
+prompt_yes_no() {
+  local question="$1"
+  local default_answer="$2"
+  local prompt="" answer=""
+
+  if [[ "$default_answer" == "yes" ]]; then
+    prompt="[Y/n]"
+  else
+    prompt="[y/N]"
+  fi
+
+  while true; do
+    if ! guided_read answer "$question $prompt "; then
+      error "guided installer input was interrupted."
+      exit 1
+    fi
+    answer="${answer:-$default_answer}"
+    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *)     echo "Please answer yes or no." ;;
+    esac
+  done
+}
+
+# --- System deps ---
+install_system_deps() {
+  step_dot "Installing system dependencies"
+
+  case "$(uname -s)" in
+    Linux)
+      if have_cmd apk; then
+        run_privileged apk add --no-cache bash build-base pkgconf git curl openssl-dev perl ca-certificates
+      elif have_cmd apt-get; then
+        run_privileged apt-get update -qq
+        run_privileged apt-get install -y build-essential pkg-config git curl libssl-dev
+      elif have_cmd dnf; then
+        run_privileged dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl openssl-devel perl
+      elif have_cmd pacman; then
+        run_pacman -Sy --noconfirm
+        run_pacman -S --noconfirm --needed gcc make pkgconf git curl openssl perl ca-certificates
+      else
+        warn "Unsupported Linux distribution. Install compiler toolchain + pkg-config + git + curl + OpenSSL headers manually."
+      fi
+      ;;
+    Darwin)
+      if ! xcode-select -p >/dev/null 2>&1; then
+        step_dot "Installing Xcode Command Line Tools"
+        xcode-select --install || true
+        echo "Please complete the Xcode Command Line Tools installation dialog, then re-run."
+        exit 0
+      fi
+      if ! have_cmd git; then
+        warn "git is not available. Install git (e.g., Homebrew) and re-run."
+      fi
+      ;;
+    *)
+      warn "Unsupported OS for automatic dependency install. Continuing."
+      ;;
+  esac
+}
+
+run_privileged() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif have_cmd sudo; then
+    sudo "$@"
+  else
+    error "sudo is required to install system dependencies."
+    return 1
+  fi
+}
+
+run_pacman() {
+  if ! have_cmd pacman; then
+    error "pacman is not available."
+    return 1
+  fi
+  if ! _is_container_runtime; then
+    run_privileged pacman "$@"
+    return $?
+  fi
+  local pacman_cfg_tmp=""
+  pacman_cfg_tmp="$(mktemp /tmp/daemonclaw-pacman.XXXXXX.conf)"
+  cp /etc/pacman.conf "$pacman_cfg_tmp"
+  if ! grep -Eq '^[[:space:]]*DisableSandboxSyscalls([[:space:]]|$)' "$pacman_cfg_tmp"; then
+    printf '\nDisableSandboxSyscalls\n' >> "$pacman_cfg_tmp"
+  fi
+  run_privileged pacman --config "$pacman_cfg_tmp" "$@"
+  local rc=$?
+  rm -f "$pacman_cfg_tmp"
+  return "$rc"
+}
+
+# --- Rust toolchain ---
+install_rust_toolchain() {
+  if have_cmd cargo && have_cmd rustc; then
+    step_ok "Rust already installed: $(rustc --version)"
+    return
+  fi
+
+  if ! have_cmd curl; then
+    error "curl is required to install Rust via rustup."
+    exit 1
+  fi
+
+  step_dot "Installing Rust via rustup"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+
+  if [[ -f "$CARGO_HOME/env" ]]; then
+    source "$CARGO_HOME/env"
+  elif [[ -f "$HOME/.cargo/env" ]]; then
+    source "$HOME/.cargo/env"
+  fi
+
+  if ! have_cmd cargo; then
+    error "Rust installation completed but cargo is still unavailable in PATH."
+    exit 1
+  fi
+}
+
+# --- Pre-built binary ---
+resolve_asset_url() {
+  local asset_name="$1"
+  local api_url="https://api.github.com/repos/DeliveryBoyTech/daemonclaw/releases"
+  local releases_json download_url
+
+  releases_json="$(curl -fsSL "${api_url}?per_page=10" 2>/dev/null || true)"
+  if [[ -z "$releases_json" ]]; then
+    return 1
+  fi
+
+  download_url="$(printf '%s\n' "$releases_json" \
+    | tr ',' '\n' \
+    | grep '"browser_download_url"' \
+    | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
+    | grep "/${asset_name}\$" \
+    | head -n 1)"
+
+  if [[ -z "$download_url" ]]; then
+    return 1
+  fi
+
+  echo "$download_url"
+}
 
 install_prebuilt() {
-  local triple version asset_name asset_url sha256_url tmp_dir
-  triple=$(detect_target_triple)
+  local triple asset_name asset_url sha256_url tmp_dir expected actual
 
-  if [ -z "$triple" ]; then
+  if ! have_cmd curl; then
+    warn "curl is required for pre-built binary installation."
+    return 1
+  fi
+  if ! have_cmd tar; then
+    warn "tar is required for pre-built binary installation."
+    return 1
+  fi
+
+  triple=$(detect_target_triple)
+  if [[ -z "$triple" ]]; then
     warn "No pre-built binary for this platform — falling back to source build"
     return 1
   fi
 
-  # Resolve latest release version via GitHub API
-  version=$(curl -fsSL "https://api.github.com/repos/DeliveryBoyTech/daemonclaw/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+  asset_name="daemonclaw-${triple}.tar.gz"
 
-  if [ -z "$version" ]; then
-    warn "Could not resolve latest release — falling back to source build"
+  asset_url="$(resolve_asset_url "$asset_name" || true)"
+  if [[ -z "$asset_url" ]]; then
+    asset_url="https://github.com/DeliveryBoyTech/daemonclaw/releases/latest/download/${asset_name}"
+  fi
+
+  sha256_url="${asset_url%/*}/SHA256SUMS"
+  tmp_dir="$(mktemp -d -t daemonclaw-prebuilt-XXXXXX)"
+
+  step_dot "Downloading pre-built binary for: $triple"
+  if ! curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name"; then
+    warn "Download failed — falling back to source build"
+    rm -rf "$tmp_dir"
     return 1
   fi
 
-  asset_name="daemonclaw-${triple}.tar.gz"
-  asset_url="https://github.com/DeliveryBoyTech/daemonclaw/releases/download/${version}/${asset_name}"
-  sha256_url="https://github.com/DeliveryBoyTech/daemonclaw/releases/download/${version}/SHA256SUMS"
-
-  echo
-  printf "%s\n" "$(bold "Installing DaemonClaw ${version} (pre-built)")"
-  info "Platform: $triple"
-  info "Source:   $asset_url"
-  echo
-
-  if [ "$DRY_RUN" = true ]; then
-    info "[dry-run] Would download $asset_url"
-    info "[dry-run] Would install to $CARGO_HOME/bin/daemonclaw"
-    return 0
+  # Verify checksum
+  if curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
+    expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
+    if [[ -n "$expected" ]]; then
+      if have_cmd sha256sum; then
+        actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
+      elif have_cmd shasum; then
+        actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
+      else
+        warn "No checksum tool — skipping verification"
+        actual="$expected"
+      fi
+      if [[ "$actual" != "$expected" ]]; then
+        error "Checksum mismatch — download may be corrupt."
+        rm -rf "$tmp_dir"
+        return 1
+      fi
+      step_ok "Checksum verified"
+    fi
   fi
-
-  tmp_dir=$(mktemp -d)
-  trap 'rm -rf "$tmp_dir"' EXIT
-
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" \
-    || { warn "Download failed — falling back to source build"; rm -rf "$tmp_dir"; return 1; }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
-  if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
-    warn "Could not fetch SHA256SUMS — falling back to source build"
-    rm -rf "$tmp_dir"; return 1
-  fi
-
-  expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
-  if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
-    rm -rf "$tmp_dir"; return 1
-  fi
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
-  elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
-  else
-    warn "No checksum tool available (sha256sum/shasum) — falling back to source build"
-    rm -rf "$tmp_dir"; return 1
-  fi
-
-  if [ "$actual" != "$expected" ]; then
-    die "Checksum mismatch — download may be corrupt. Expected: $expected  Got: $actual"
-  fi
-  info "Checksum verified"
 
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
-  mkdir -p "$CARGO_HOME/bin"
-  install -m 755 "$tmp_dir/daemonclaw" "$CARGO_HOME/bin/daemonclaw"
 
+  local extracted_bin="$tmp_dir/daemonclaw"
+  if [[ ! -x "$extracted_bin" ]]; then
+    extracted_bin="$(find "$tmp_dir" -maxdepth 2 -type f -name daemonclaw -perm -u+x | head -n 1 || true)"
+  fi
+  if [[ -z "$extracted_bin" || ! -x "$extracted_bin" ]]; then
+    warn "Archive did not contain an executable binary."
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  mkdir -p "$CARGO_HOME/bin"
+  install -m 0755 "$extracted_bin" "$CARGO_HOME/bin/daemonclaw"
   rm -rf "$tmp_dir"
-  trap - EXIT
+
+  step_ok "Installed pre-built binary to $CARGO_HOME/bin/daemonclaw"
   return 0
 }
 
-# ── Usage ─────────────────────────────────────────────────────────
+# --- Provider selection ---
+prompt_provider() {
+  local provider_input=""
+  echo
+  echo -e "  ${BOLD}Select your AI provider${RESET}"
+  echo
+  echo -e "  ${BOLD_BLUE}1)${RESET} ZAI ${DIM}(DaemonClaw native inference)${RESET}"
+  echo -e "  ${BOLD_BLUE}2)${RESET} Anthropic ${DIM}(Claude)${RESET}"
+  echo -e "  ${BOLD_BLUE}3)${RESET} OpenAI ${DIM}(GPT)${RESET}"
+  echo -e "  ${BOLD_BLUE}4)${RESET} OpenRouter ${DIM}(multi-model gateway)${RESET}"
+  echo -e "  ${BOLD_BLUE}5)${RESET} Gemini ${DIM}(Google)${RESET}"
+  echo -e "  ${BOLD_BLUE}6)${RESET} Ollama ${DIM}(local, no API key needed)${RESET}"
+  echo -e "  ${BOLD_BLUE}7)${RESET} Groq ${DIM}(fast inference)${RESET}"
+  echo -e "  ${BOLD_BLUE}8)${RESET} Venice ${DIM}(privacy-focused)${RESET}"
+  echo -e "  ${BOLD_BLUE}9)${RESET} Other ${DIM}(enter provider ID manually)${RESET}"
+  echo
 
-usage() {
-  cat <<EOF
-$(bold "DaemonClaw installer")
+  if ! guided_read provider_input "  Provider: "; then
+    error "input was interrupted."
+    exit 1
+  fi
 
-Usage: $0 [options]
-
-Options:
-  --prebuilt           Download and install a pre-built binary (default when asked)
-  --source             Build from source (skips the pre-built prompt)
-  --minimal            Build kernel only — source only (config + providers + memory, ~6.6MB)
-  --features X,Y       Select specific features — source only (comma-separated)
-  --list-features      Print all available features and exit
-  --prefix PATH        Install everything under PATH (default: \$HOME)
-                       Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
-  --dry-run            Show what would happen without building or installing
-  --skip-onboard       Skip the setup wizard after install
-  --uninstall          Remove DaemonClaw binary and optionally config/data
-  -h, --help           Show this help
-  -V, --version        Show version from Cargo.toml
-
-Examples:
-  $0                                           # interactive: asks prebuilt or source
-  $0 --prebuilt                                # download pre-built binary (fast)
-  $0 --source                                  # always build from source
-  $0 --source --minimal                        # smallest possible binary
-  $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --skip-onboard                            # install only, configure later
-  $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
-  $0 --dry-run --prebuilt                      # preview without installing
-  $0 --uninstall                               # remove DaemonClaw
-
-Environment:
-  DAEMONCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.daemonclaw/src)
-  DAEMONCLAW_CARGO_FEATURES  Extra cargo features (legacy; prefer --features)
-EOF
+  case "${provider_input}" in
+    1) PROVIDER="zai" ;;
+    2) PROVIDER="anthropic" ;;
+    3) PROVIDER="openai" ;;
+    4) PROVIDER="openrouter" ;;
+    5) PROVIDER="gemini" ;;
+    6) PROVIDER="ollama" ;;
+    7) PROVIDER="groq" ;;
+    8) PROVIDER="venice" ;;
+    9)
+      if ! guided_read provider_input "  Provider ID: "; then
+        error "input was interrupted."
+        exit 1
+      fi
+      if [[ -n "$provider_input" ]]; then
+        PROVIDER="$provider_input"
+      fi
+      ;;
+    *)
+      if [[ -n "$provider_input" ]]; then
+        PROVIDER="$provider_input"
+      else
+        error "No provider selected. Please pick a number (1-9)."
+        exit 1
+      fi
+      ;;
+  esac
 }
 
-# ── Uninstall ─────────────────────────────────────────────────────
+prompt_api_key() {
+  local api_key_input=""
 
+  if [[ "$PROVIDER" == "ollama" ]]; then
+    step_ok "Ollama selected — no API key required"
+    return 0
+  fi
+
+  echo
+  if [[ -n "$API_KEY" ]]; then
+    step_ok "API key provided via environment/flag"
+    return 0
+  fi
+
+  echo -e "  ${BOLD}Enter your ${PROVIDER} API key${RESET}"
+  echo -e "  ${DIM}(input is hidden; leave empty to configure later)${RESET}"
+  echo
+
+  if ! guided_read api_key_input "  API key: " true; then
+    echo
+    error "input was interrupted."
+    exit 1
+  fi
+  echo
+
+  if [[ -n "$api_key_input" ]]; then
+    API_KEY="$api_key_input"
+    step_ok "API key set"
+  else
+    warn "No API key entered — you can configure it later with daemonclaw onboard"
+    SKIP_ONBOARD=true
+  fi
+}
+
+prompt_model() {
+  local model_input=""
+  echo -e "  ${DIM}Model (press Enter for provider default):${RESET}"
+  if ! guided_read model_input "  Model [default]: "; then
+    error "input was interrupted."
+    exit 1
+  fi
+  if [[ -n "$model_input" ]]; then
+    MODEL="$model_input"
+  fi
+}
+
+# --- Guided installer ---
+run_guided_installer() {
+  local os_name="$1"
+
+  if ! guided_open_input >/dev/null; then
+    error "guided installer requires an interactive terminal."
+    error "Run from a terminal, or pass --no-guided with explicit flags."
+    exit 1
+  fi
+
+  echo
+  echo -e "  ${BOLD_BLUE}${CRAB} DaemonClaw Guided Installer${RESET}"
+  echo -e "  ${DIM}Answer a few questions, then the installer will handle everything.${RESET}"
+  echo
+
+  # --- System dependencies ---
+  if [[ "$os_name" == "Linux" ]]; then
+    if prompt_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
+      INSTALL_SYSTEM_DEPS=true
+    fi
+  elif [[ "$os_name" == "Darwin" ]]; then
+    if prompt_yes_no "Install system dependencies for macOS?" "no"; then
+      INSTALL_SYSTEM_DEPS=true
+    fi
+  fi
+
+  # --- Rust toolchain ---
+  if have_cmd cargo && have_cmd rustc; then
+    step_ok "Detected Rust toolchain: $(rustc --version)"
+  else
+    if prompt_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
+      INSTALL_RUST=true
+    fi
+  fi
+
+  # --- Install method ---
+  local triple
+  triple=$(detect_target_triple)
+  if [[ -n "$triple" ]]; then
+    echo
+    echo -e "  ${BOLD}How would you like to install DaemonClaw?${RESET}"
+    echo -e "  ${BOLD_BLUE}P)${RESET} Pre-built binary  — fast, no Rust required"
+    echo -e "  ${BOLD_BLUE}S)${RESET} Build from source — custom features, latest code"
+    echo
+    local install_choice=""
+    if ! guided_read install_choice "  Choice [P/s]: "; then
+      error "input was interrupted."
+      exit 1
+    fi
+    case "${install_choice}" in
+      [Ss]*) INSTALL_MODE="source" ;;
+      *)     INSTALL_MODE="prebuilt" ;;
+    esac
+  else
+    INSTALL_MODE="source"
+  fi
+
+  # --- Provider + API key ---
+  prompt_provider
+  prompt_api_key
+  prompt_model
+
+  # --- Install plan summary ---
+  echo
+  echo -e "${BOLD}Install plan${RESET}"
+  step_dot "OS: $(echo "$os_name" | tr '[:upper:]' '[:lower:]')"
+  step_dot "Install system deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
+  step_dot "Install Rust: $(bool_to_word "$INSTALL_RUST")"
+  step_dot "Install method: ${INSTALL_MODE}"
+  step_dot "Provider: ${PROVIDER}"
+  if [[ -n "$MODEL" ]]; then
+    step_dot "Model: ${MODEL}"
+  fi
+  if [[ -n "$API_KEY" ]]; then
+    step_ok "API key: configured"
+  else
+    step_dot "API key: not set (configure later)"
+  fi
+
+  echo
+  if ! prompt_yes_no "Proceed with this install plan?" "yes"; then
+    info "Installation canceled by user."
+    exit 0
+  fi
+}
+
+# --- Workspace scaffold ---
+ensure_default_config_and_workspace() {
+  local config_dir="$1"
+  local workspace_dir="$2"
+
+  mkdir -p "$config_dir" "$workspace_dir"
+
+  # Workspace scaffold
+  local subdirs=(sessions memory state cron skills)
+  for dir in "${subdirs[@]}"; do
+    mkdir -p "$workspace_dir/$dir"
+  done
+
+  local user_name="${USER:-User}"
+  local agent_name="DaemonClaw"
+
+  _write_if_missing() {
+    local filepath="$1"
+    local content="$2"
+    if [[ ! -f "$filepath" ]]; then
+      printf '%s\n' "$content" > "$filepath"
+    fi
+  }
+
+  _write_if_missing "$workspace_dir/IDENTITY.md" \
+"# IDENTITY.md — Who Am I?
+
+- **Name:** ${agent_name}
+- **Creature:** A Rust-forged AI daemon — fast, lean, and relentless
+- **Vibe:** Sharp, direct, resourceful. Not corporate. Not a chatbot.
+
+---
+
+Update this file as you evolve. Your identity is yours to shape."
+
+  _write_if_missing "$workspace_dir/USER.md" \
+"# USER.md — Who You're Helping
+
+## About You
+- **Name:** ${user_name}
+- **Timezone:** UTC
+- **Languages:** English
+
+## Preferences
+- (Add your preferences here)
+
+## Work Context
+- (Add your work context here)
+
+---
+*Update this anytime. The more ${agent_name} knows, the better it helps.*"
+
+  _write_if_missing "$workspace_dir/MEMORY.md" \
+"# MEMORY.md — Long-Term Memory
+
+## Key Facts
+(Add important facts here)
+
+## Decisions & Preferences
+(Record decisions and preferences here)
+
+## Lessons Learned
+(Document mistakes and insights here)
+
+## Open Loops
+(Track unfinished tasks and follow-ups here)"
+
+  _write_if_missing "$workspace_dir/AGENTS.md" \
+"# AGENTS.md — ${agent_name} Personal Assistant
+
+## Every Session (required)
+
+Before doing anything else:
+
+1. Read SOUL.md — this is who you are
+2. Read USER.md — this is who you're helping
+3. Use memory_recall for recent context
+
+---
+*Add your own conventions, style, and rules.*"
+
+  _write_if_missing "$workspace_dir/SOUL.md" \
+"# SOUL.md — Who You Are
+
+## Core Truths
+
+**Be genuinely helpful, not performatively helpful.**
+**Have opinions.** You're allowed to disagree.
+**Be resourceful before asking.** Try to figure it out first.
+**Earn trust through competence.**
+
+## Identity
+
+You are **${agent_name}**. Built in Rust. Zero bloat. All teeth.
+
+---
+*This file is yours to evolve.*"
+
+  step_ok "Workspace scaffold ready at $workspace_dir"
+  unset -f _write_if_missing
+}
+
+# --- Uninstall ---
 do_uninstall() {
   echo
-  printf "%s\n" "$(bold "Uninstalling DaemonClaw")"
+  echo -e "${BOLD}Uninstalling DaemonClaw${RESET}"
   echo
 
   local bin="$CARGO_HOME/bin/daemonclaw"
 
-  if [ -f "$bin" ]; then
+  if [[ -f "$bin" ]]; then
     "$bin" service stop 2>/dev/null || true
     "$bin" service uninstall 2>/dev/null || true
     rm -f "$bin"
-    info "Removed $bin"
+    step_ok "Removed $bin"
   else
     warn "Binary not found at $bin"
   fi
 
+  # System service artifacts
+  if [[ -f /etc/systemd/system/daemonclaw.service ]]; then
+    run_privileged systemctl stop daemonclaw.service 2>/dev/null || true
+    run_privileged systemctl disable daemonclaw.service 2>/dev/null || true
+    run_privileged rm -f /etc/systemd/system/daemonclaw.service
+    run_privileged rm -f /etc/systemd/system/daemonclaw-backup.timer
+    run_privileged rm -f /etc/systemd/system/daemonclaw-backup.service
+    run_privileged rm -f /etc/tmpfiles.d/daemonclaw-backups.conf
+    run_privileged systemctl daemon-reload 2>/dev/null || true
+    step_ok "Removed systemd service files"
+  fi
+
+  if [[ -f /usr/local/bin/daemonclaw ]]; then
+    run_privileged rm -f /usr/local/bin/daemonclaw
+    step_ok "Removed /usr/local/bin/daemonclaw"
+  fi
+
   local config_dir="$PREFIX/.daemonclaw"
-  if [ -d "$config_dir" ]; then
-    if [ -t 0 ]; then
+  if [[ -d "$config_dir" ]]; then
+    if [[ -t 0 ]]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
-      read confirm
+      local confirm=""
+      read -r confirm
       case "$confirm" in
-        [Yy]*) rm -rf "$config_dir"; info "Removed $config_dir" ;;
-        *)     info "Config preserved at $config_dir" ;;
+        [Yy]*) rm -rf "$config_dir"; step_ok "Removed $config_dir" ;;
+        *)     step_ok "Config preserved at $config_dir" ;;
       esac
     else
-      info "Config preserved at $config_dir (non-interactive — use rm -rf to remove)"
+      step_ok "Config preserved at $config_dir (non-interactive — use rm -rf to remove)"
     fi
   fi
 
-  # Check if another daemonclaw still lurks in PATH
-  local other_bin
-  other_bin=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
-  if [ -n "$other_bin" ]; then
-    local other_version
-    other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-    echo
-    warn "Another daemonclaw found at $other_bin (v$other_version)"
-    warn "Remove it manually if you want a full uninstall"
-  fi
-
   echo
-  info "DaemonClaw uninstalled"
+  step_ok "DaemonClaw uninstalled"
   exit 0
 }
 
 # ── Parse arguments ───────────────────────────────────────────────
 
+GUIDED_MODE="auto"
+INSTALL_SYSTEM_DEPS=false
+INSTALL_RUST=false
+INSTALL_MODE=""
 MINIMAL=false
 USER_FEATURES=""
 SKIP_ONBOARD=false
+SKIP_BUILD=false
+SKIP_INSTALL=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
-INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
+API_KEY="${DAEMONCLAW_API_KEY:-}"
+PROVIDER="${DAEMONCLAW_PROVIDER:-}"
+MODEL="${DAEMONCLAW_MODEL:-}"
+ORIGINAL_ARG_COUNT=$#
 
-# Support legacy env var
-if [ -n "${DAEMONCLAW_CARGO_FEATURES:-}" ]; then
+# Legacy env var
+if [[ -n "${DAEMONCLAW_CARGO_FEATURES:-}" ]]; then
   USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$DAEMONCLAW_CARGO_FEATURES"
 fi
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
-    --minimal)        MINIMAL=true ;;
+    --guided)              GUIDED_MODE="on"; shift ;;
+    --no-guided)           GUIDED_MODE="off"; shift ;;
+    --install-system-deps) INSTALL_SYSTEM_DEPS=true; shift ;;
+    --install-rust)        INSTALL_RUST=true; shift ;;
+    --prebuilt)            INSTALL_MODE="prebuilt"; shift ;;
+    --source)              INSTALL_MODE="source"; shift ;;
+    --minimal)             MINIMAL=true; shift ;;
     --features)
-      if [ $# -lt 2 ]; then
-        die "Missing value for --features. Expected: --features X,Y"
-      fi
-      shift; USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$1" ;;
-    --list-features)  LIST_FEATURES=true ;;
+      [[ $# -ge 2 ]] || { error "--features requires a value"; exit 1; }
+      shift; USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$1"; shift ;;
+    --list-features)       LIST_FEATURES=true; shift ;;
+    --api-key)
+      [[ $# -ge 2 ]] || { error "--api-key requires a value"; exit 1; }
+      shift; API_KEY="$1"; shift ;;
+    --provider)
+      [[ $# -ge 2 ]] || { error "--provider requires a value"; exit 1; }
+      shift; PROVIDER="$1"; shift ;;
+    --model)
+      [[ $# -ge 2 ]] || { error "--model requires a value"; exit 1; }
+      shift; MODEL="$1"; shift ;;
+    --skip-onboard)        SKIP_ONBOARD=true; shift ;;
+    --skip-build)          SKIP_BUILD=true; shift ;;
+    --skip-install)        SKIP_INSTALL=true; shift ;;
     --prefix)
-      if [ $# -lt 2 ]; then
-        die "Missing value for --prefix. Expected: --prefix /path"
-      fi
-      shift; PREFIX=$(echo "$1" | sed 's|/*$||') ;;
-    --dry-run)        DRY_RUN=true ;;
-    --skip-onboard)   SKIP_ONBOARD=true ;;
-    --prebuilt)       INSTALL_MODE="prebuilt" ;;
-    --source)         INSTALL_MODE="source" ;;
-    --uninstall)      UNINSTALL=true ;;
-    -h|--help)        usage; exit 0 ;;
+      [[ $# -ge 2 ]] || { error "--prefix requires a value"; exit 1; }
+      shift; PREFIX="${1%/}"; shift ;;
+    --dry-run)             DRY_RUN=true; shift ;;
+    --uninstall)           UNINSTALL=true; shift ;;
+    -h|--help)             usage; exit 0 ;;
     -V|--version)
-      if [ -f "Cargo.toml" ]; then
+      if [[ -f "Cargo.toml" ]]; then
         parse_cargo_toml "Cargo.toml"
         echo "install.sh for DaemonClaw v$VERSION"
       else
         echo "install.sh (version unknown — not in repo)"
       fi
       exit 0 ;;
-    *) die "Unknown option: $1. Run: $0 --help" ;;
+    *) error "Unknown option: $1. Run: $0 --help"; exit 1 ;;
   esac
-  shift
 done
 
-# ── Derive paths from prefix ─────────────────────────────────────
+# ── Derive paths ─────────────────────────────────────────────────
 
 CARGO_HOME="${CARGO_HOME:-$PREFIX/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$PREFIX/.rustup}"
@@ -367,306 +941,383 @@ ORIGINAL_PATH="$PATH"
 PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_HOME RUSTUP_HOME PATH
 
-[ "$UNINSTALL" = true ] && do_uninstall
+[[ "$UNINSTALL" == true ]] && do_uninstall
 
-# ── List features (can run without cloning if in repo) ────────────
+# ── List features ────────────────────────────────────────────────
 
-if [ "$LIST_FEATURES" = true ]; then
-  if [ -f "Cargo.toml" ]; then
+if [[ "$LIST_FEATURES" == true ]]; then
+  if [[ -f "Cargo.toml" ]]; then
     list_features "Cargo.toml"
-  elif [ -f "$INSTALL_DIR/Cargo.toml" ]; then
+  elif [[ -f "$INSTALL_DIR/Cargo.toml" ]]; then
     list_features "$INSTALL_DIR/Cargo.toml"
   else
-    die "No Cargo.toml found. Clone the repo first or run from the repo root."
+    error "No Cargo.toml found. Clone the repo first or run from the repo root."
+    exit 1
   fi
   exit 0
 fi
 
-# ── Decide: pre-built or source ───────────────────────────────────
+# ── Auto-detect guided mode ─────────────────────────────────────
 
-# --minimal or --features imply source
-if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ]; then
+OS_NAME="$(uname -s)"
+if [[ "$GUIDED_MODE" == "auto" ]]; then
+  if [[ "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
+    GUIDED_MODE="on"
+  else
+    GUIDED_MODE="off"
+  fi
+fi
+
+if [[ "$GUIDED_MODE" == "on" ]]; then
+  run_guided_installer "$OS_NAME"
+fi
+
+# ── Decide install mode if not set ───────────────────────────────
+
+if [[ "$MINIMAL" == true || -n "$USER_FEATURES" ]]; then
   INSTALL_MODE="source"
 fi
 
-if [ "$INSTALL_MODE" = "" ]; then
-  triple=$(detect_target_triple)
-  if [ -n "$triple" ]; then
-    if [ -t 0 ]; then
-      echo
-      printf "  %s\n" "$(bold "How would you like to install DaemonClaw?")"
-      printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
-      printf "  [s] Build from source — custom features, latest code\n"
-      printf "\n  Choice [P/s]: "
-      read install_choice
-      case "$install_choice" in
-        [Ss]*) INSTALL_MODE="source" ;;
-        *)     INSTALL_MODE="prebuilt" ;;
-      esac
+if [[ -z "$INSTALL_MODE" ]]; then
+  _triple=$(detect_target_triple)
+  if [[ -n "$_triple" ]]; then
+    INSTALL_MODE="prebuilt"
+  else
+    INSTALL_MODE="source"
+  fi
+fi
+
+# ── Banner ───────────────────────────────────────────────────────
+
+echo
+echo -e "  ${BOLD_BLUE}${CRAB} DaemonClaw Installer${RESET}"
+echo -e "  ${DIM}Build it, run it, trust it.${RESET}"
+echo
+
+# Detect existing installation
+EXISTING_VERSION=""
+INSTALL_TYPE="fresh"
+if have_cmd daemonclaw; then
+  EXISTING_VERSION="$(daemonclaw --version 2>/dev/null | awk '{print $NF}' || true)"
+  INSTALL_TYPE="upgrade"
+elif [[ -x "$CARGO_HOME/bin/daemonclaw" ]]; then
+  EXISTING_VERSION="$("$CARGO_HOME/bin/daemonclaw" --version 2>/dev/null | awk '{print $NF}' || true)"
+  INSTALL_TYPE="upgrade"
+fi
+
+if [[ "$INSTALL_TYPE" == "upgrade" && -n "$EXISTING_VERSION" ]]; then
+  step_dot "Upgrading from v${EXISTING_VERSION}"
+fi
+
+# ── [1/4] Preparing environment ─────────────────────────────────
+
+echo
+echo -e "${BOLD_BLUE}[1/4]${RESET} ${BOLD}Preparing environment${RESET}"
+
+if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
+  install_system_deps
+  step_ok "System dependencies installed"
+else
+  step_ok "System dependencies satisfied"
+fi
+
+if [[ "$INSTALL_RUST" == true ]]; then
+  install_rust_toolchain
+fi
+
+if have_cmd cargo && have_cmd rustc; then
+  step_ok "Rust $(rustc --version | awk '{print $2}') found"
+else
+  if [[ "$INSTALL_MODE" == "source" ]]; then
+    error "cargo is not installed. Run with --install-rust or install Rust first."
+    exit 1
+  fi
+  step_dot "Rust not detected (using pre-built binary)"
+fi
+
+if have_cmd git; then
+  step_ok "Git available"
+else
+  step_dot "Git not found"
+fi
+
+# ── [2/4] Installing DaemonClaw ──────────────────────────────────
+
+echo
+echo -e "${BOLD_BLUE}[2/4]${RESET} ${BOLD}Installing DaemonClaw${RESET}"
+
+PREBUILT_OK=false
+
+if [[ "$INSTALL_MODE" == "prebuilt" ]]; then
+  if [[ "$DRY_RUN" == true ]]; then
+    step_dot "[dry-run] Would download pre-built binary"
+  else
+    if install_prebuilt; then
+      PREBUILT_OK=true
     else
-      # Non-interactive (curl | bash): default to pre-built silently
-      INSTALL_MODE="prebuilt"
-    fi
-  else
-    INSTALL_MODE="source"
-  fi
-fi
-
-if [ "$INSTALL_MODE" = "prebuilt" ]; then
-  if install_prebuilt; then
-    PREBUILT_OK=true
-  else
-    warn "Pre-built install failed — continuing with source build"
-    INSTALL_MODE="source"
-    PREBUILT_OK=false
-  fi
-fi
-
-[ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
-  BIN="$CARGO_HOME/bin/daemonclaw"
-  if [ -f "$BIN" ]; then
-    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
-    SIZE=$(du -h "$BIN" | awk '{print $1}')
-    echo
-    info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
-  fi
-}
-
-# ── Locate source ─────────────────────────────────────────────────
-
-[ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + onboard
-  SOURCE_SKIPPED=true
-}
-
-if [ "${SOURCE_SKIPPED:-false}" != true ]; then
-
-echo
-printf "%s\n" "$(bold "DaemonClaw — source install")"
-if [ "$PREFIX" != "$HOME" ]; then
-  printf "  prefix: %s\n" "$(bold "$PREFIX")"
-fi
-echo
-
-if [ -f "Cargo.toml" ] && grep -q "daemonclaw" "Cargo.toml" 2>/dev/null; then
-  INSTALL_DIR="$(pwd)"
-  info "Building from $(pwd)"
-elif [ -d "$INSTALL_DIR/.git" ]; then
-  info "Updating source in $INSTALL_DIR"
-  git -C "$INSTALL_DIR" pull --ff-only --quiet 2>/dev/null || {
-    warn "Fast-forward pull failed — resetting to origin/master"
-    git -C "$INSTALL_DIR" fetch origin master --quiet
-    git -C "$INSTALL_DIR" reset --hard origin/master --quiet
-  }
-  cd "$INSTALL_DIR"
-else
-  info "Cloning into $INSTALL_DIR"
-  mkdir -p "$(dirname "$INSTALL_DIR")"
-  git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
-  cd "$INSTALL_DIR"
-fi
-
-# ── Parse Cargo.toml ──────────────────────────────────────────────
-
-parse_cargo_toml "Cargo.toml"
-
-printf "  Version: %s (MSRV: %s, edition: %s)\n" "$(bold "$VERSION")" "$MSRV" "$EDITION"
-
-# ── Preflight: Rust ───────────────────────────────────────────────
-
-NEED_RUST=false
-if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
-  NEED_RUST=true
-elif [ "$PREFIX" != "$HOME" ] && [ ! -d "$RUSTUP_HOME/toolchains" ]; then
-  NEED_RUST=true
-fi
-
-if [ "$NEED_RUST" = true ]; then
-  if [ "$DRY_RUN" = true ]; then
-    warn "[dry-run] Would install Rust via rustup into $RUSTUP_HOME"
-  else
-    warn "Installing Rust via rustup into $CARGO_HOME"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-      --no-modify-path --default-toolchain stable
-    . "$CARGO_HOME/env"
-  fi
-fi
-
-if [ "$DRY_RUN" != true ]; then
-  RUST_VERSION=$(rustc --version | awk '{print $2}')
-  if ! version_gte "$RUST_VERSION" "$MSRV"; then
-    die "Rust $RUST_VERSION is too old. DaemonClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
-  fi
-  info "Rust $RUST_VERSION (>= $MSRV)"
-fi
-
-# ── Preflight: 32-bit ARM ────────────────────────────────────────
-
-case "$(uname -m)" in
-  armv7l|armv6l|armhf)
-    die "32-bit ARM detected — the default feature 'observability-prometheus'
-requires 64-bit atomics and will not compile on this architecture.
-
-Example (full agent without prometheus):
-  $0 --minimal --features agent-runtime,schema-export
-
-See all available features:
-  $0 --list-features"
-    ;;
-esac
-
-# ── Build feature flags ──────────────────────────────────────────
-
-CARGO_FLAGS=""
-
-if [ "$MINIMAL" = true ]; then
-  CARGO_FLAGS="--no-default-features"
-fi
-
-if [ -n "$USER_FEATURES" ]; then
-  # Normalize: treat commas, spaces, tabs as delimiters; deduplicate; trim empty
-  USER_FEATURES=$(printf '%s' "$USER_FEATURES" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd, - || true)
-
-  if [ -n "$USER_FEATURES" ]; then
-    # Validate each feature
-    OLD_IFS="$IFS"
-    IFS=','
-    for feat in $USER_FEATURES; do
-      [ -n "$feat" ] && validate_feature "$feat"
-    done
-    IFS="$OLD_IFS"
-    CARGO_FLAGS="$CARGO_FLAGS --features $USER_FEATURES"
-  fi
-fi
-
-# ── Detect existing installs ──────────────────────────────────────
-
-PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
-if [ -n "$PATH_BIN" ]; then
-  PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-  TARGET_BIN="$CARGO_HOME/bin/daemonclaw"
-  if [ "$PATH_BIN" != "$TARGET_BIN" ]; then
-    warn "daemonclaw found at $PATH_BIN (v$PATH_VERSION)"
-    warn "This install targets $TARGET_BIN"
-    warn "The old binary will shadow the new one unless removed or PATH is reordered"
-  else
-    warn "Existing install: $PATH_BIN (v$PATH_VERSION)"
-  fi
-  if [ "$MINIMAL" = true ] && [ "$DRY_RUN" != true ]; then
-    if [ -t 0 ]; then
-      printf "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] "
-      read confirm
-      case "$confirm" in
-        [Nn]*) echo "Aborted."; exit 0 ;;
-      esac
+      warn "Pre-built install failed — falling back to source build"
+      INSTALL_MODE="source"
     fi
   fi
 fi
 
-# ── Dry run ───────────────────────────────────────────────────────
+if [[ "$PREBUILT_OK" == false && "$INSTALL_MODE" == "source" ]]; then
+  # Locate source
+  WORK_DIR=""
+  TEMP_CLONE=false
+  TEMP_DIR=""
 
-if [ "$DRY_RUN" = true ]; then
-  echo
-  printf "%s\n" "$(bold "Dry run — nothing will be built or installed")"
-  echo
-  info "Source:   $INSTALL_DIR"
-  info "Binary:   $CARGO_HOME/bin/daemonclaw"
-  info "Config:   $PREFIX/.daemonclaw/"
-  info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
-  echo
-  if [ -n "$CARGO_FLAGS" ]; then
-    info "cargo install --path . --locked --force $CARGO_FLAGS"
+  if [[ -f "Cargo.toml" ]] && grep -q "daemonclaw" "Cargo.toml" 2>/dev/null; then
+    WORK_DIR="$(pwd)"
+    step_dot "Building from $(pwd)"
+  elif [[ -d "$INSTALL_DIR/.git" ]]; then
+    step_dot "Updating source in $INSTALL_DIR"
+    git -C "$INSTALL_DIR" pull --ff-only --quiet 2>/dev/null || {
+      warn "Fast-forward pull failed — resetting to origin/master"
+      git -C "$INSTALL_DIR" fetch origin master --quiet
+      git -C "$INSTALL_DIR" reset --hard origin/master --quiet
+    }
+    WORK_DIR="$INSTALL_DIR"
   else
-    info "cargo install --path . --locked --force"
+    step_dot "Cloning repository"
+    mkdir -p "$(dirname "$INSTALL_DIR")"
+    git clone --depth 1 "https://github.com/DeliveryBoyTech/daemonclaw.git" "$INSTALL_DIR"
+    WORK_DIR="$INSTALL_DIR"
+    TEMP_CLONE=true
   fi
 
-  EXPORT_LINE=$(shell_export_syntax)
-  PROFILE=$(detect_shell_profile)
-  echo
-  printf "  %s (%s):\n" "$(bold "Shell profile")" "$PROFILE"
-  printf "    %s\n" "$EXPORT_LINE"
-  echo
-  exit 0
+  if [[ -n "$WORK_DIR" ]]; then
+    parse_cargo_toml "$WORK_DIR/Cargo.toml"
+    step_dot "Version: v${VERSION} (MSRV: ${MSRV}, edition: ${EDITION})"
+
+    if [[ "$DRY_RUN" == true ]]; then
+      step_dot "[dry-run] Would build and install"
+    else
+      # Validate Rust version
+      RUST_VERSION=$(rustc --version | awk '{print $2}')
+      if ! version_gte "$RUST_VERSION" "$MSRV"; then
+        error "Rust $RUST_VERSION is too old. DaemonClaw requires $MSRV+. Run: rustup update stable"
+        exit 1
+      fi
+
+      # Build feature flags
+      CARGO_FLAGS=""
+      if [[ "$MINIMAL" == true ]]; then
+        CARGO_FLAGS="--no-default-features"
+      fi
+      if [[ -n "$USER_FEATURES" ]]; then
+        USER_FEATURES=$(printf '%s' "$USER_FEATURES" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd, - || true)
+        if [[ -n "$USER_FEATURES" ]]; then
+          OLD_IFS="$IFS"
+          IFS=','
+          for feat in $USER_FEATURES; do
+            [[ -n "$feat" ]] && validate_feature "$feat"
+          done
+          IFS="$OLD_IFS"
+          CARGO_FLAGS="$CARGO_FLAGS --features $USER_FEATURES"
+        fi
+      fi
+
+      if [[ "$SKIP_BUILD" == false ]]; then
+        step_dot "Building release binary"
+        # shellcheck disable=SC2086
+        (cd "$WORK_DIR" && cargo build --release --locked $CARGO_FLAGS)
+        step_ok "Release binary built"
+      fi
+
+      if [[ "$SKIP_INSTALL" == false ]]; then
+        step_dot "Installing to $CARGO_HOME/bin"
+        # shellcheck disable=SC2086
+        (cd "$WORK_DIR" && cargo install --path . --locked --force $CARGO_FLAGS)
+        step_ok "DaemonClaw installed"
+      fi
+    fi
+  fi
 fi
 
-# ── Build and install ─────────────────────────────────────────────
-
-echo
-printf "%s\n" "$(bold "Building DaemonClaw v$VERSION")"
-if [ -n "$CARGO_FLAGS" ]; then
-  info "Feature flags: $CARGO_FLAGS"
-else
-  info "Feature flags: (defaults)"
-fi
-echo
-
-# shellcheck disable=SC2086
-cargo install --path . --locked --force $CARGO_FLAGS
-
-# ── Summary ───────────────────────────────────────────────────────
-
+# Show installed binary info
 BIN="$CARGO_HOME/bin/daemonclaw"
-if [ -f "$BIN" ]; then
+if [[ -f "$BIN" && "$DRY_RUN" != true ]]; then
+  NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
   SIZE=$(du -h "$BIN" | awk '{print $1}')
-  NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
-  echo
-  info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
-
-  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v daemonclaw 2>/dev/null || true)
-  if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
-    ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-    echo
-    warn "$(bold "WARNING:") daemonclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
-    warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
-    warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
-  fi
-else
-  warn "Binary not found at expected path: $BIN"
+  step_ok "Binary: $BIN (v$NEW_VERSION, $SIZE)"
 fi
 
-fi  # end source build block
+# Web dashboard build
+if [[ "$DRY_RUN" == false && "$SKIP_BUILD" == false && -n "${WORK_DIR:-}" && -d "$WORK_DIR/web" ]]; then
+  if have_cmd node && have_cmd npm; then
+    step_dot "Building web dashboard"
+    if (cd "$WORK_DIR/web" && npm ci --ignore-scripts 2>/dev/null && npm run build 2>/dev/null); then
+      step_ok "Web dashboard built"
+    else
+      warn "Web dashboard build failed — dashboard will not be available"
+    fi
+  else
+    step_dot "node/npm not found — skipping web dashboard build"
+  fi
+fi
 
-BIN="$CARGO_HOME/bin/daemonclaw"
+# ── [3/4] Configuring ────────────────────────────────────────────
 
-# ── PATH guidance ─────────────────────────────────────────────────
+echo
+echo -e "${BOLD_BLUE}[3/4]${RESET} ${BOLD}Configuring${RESET}"
 
+if [[ "$DRY_RUN" == true ]]; then
+  step_dot "[dry-run] Would configure provider and workspace"
+elif [[ "$SKIP_ONBOARD" == true ]]; then
+  step_dot "Skipping configuration (run daemonclaw onboard later)"
+elif [[ -f "$BIN" ]]; then
+  if [[ -n "$API_KEY" && -n "$PROVIDER" ]]; then
+    step_dot "Configuring provider: ${PROVIDER}"
+    ONBOARD_CMD=("$BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
+    if [[ -n "$MODEL" ]]; then
+      ONBOARD_CMD+=(--model "$MODEL")
+    fi
+    if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+      step_ok "Provider configured"
+    else
+      step_fail "Provider configuration failed — run 'daemonclaw onboard' to retry"
+    fi
+  elif [[ "$PROVIDER" == "ollama" ]]; then
+    step_dot "Configuring Ollama (no API key needed)"
+    if "$BIN" onboard --provider ollama 2>/dev/null; then
+      step_ok "Ollama configured"
+    else
+      step_fail "Ollama configuration failed — run 'daemonclaw onboard' to retry"
+    fi
+  elif [[ -t 0 && -t 1 && -z "$PROVIDER" ]]; then
+    echo
+    echo -e "  ${BOLD}Running setup wizard...${RESET}"
+    echo
+    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'daemonclaw onboard' manually"
+  elif [[ -n "$PROVIDER" ]]; then
+    step_dot "No API key — skipping provider configuration"
+  else
+    step_dot "No provider specified — run 'daemonclaw onboard' to configure"
+  fi
+fi
+
+# Workspace scaffold
+_native_config_dir="${HOME}/.daemonclaw"
+_native_workspace_dir="${_native_config_dir}/workspace"
+ensure_default_config_and_workspace "$_native_config_dir" "$_native_workspace_dir"
+
+# ── [4/4] Finalizing ────────────────────────────────────────────
+
+echo
+echo -e "${BOLD_BLUE}[4/4]${RESET} ${BOLD}Finalizing${RESET}"
+
+if [[ "$DRY_RUN" == true ]]; then
+  step_dot "[dry-run] Would install and start system service"
+  step_dot "[dry-run] Would run doctor check"
+elif [[ -f "$BIN" ]]; then
+  # Service install (requires root)
+  step_dot "Installing system service"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    if "$BIN" service install 2>/dev/null; then
+      step_ok "System service installed and started"
+    else
+      step_fail "Service install failed — run 'sudo daemonclaw service install' manually"
+    fi
+  elif have_cmd sudo; then
+    if sudo "$BIN" service install 2>/dev/null; then
+      step_ok "System service installed and started"
+    else
+      step_fail "Service install failed — run 'sudo daemonclaw service install' manually"
+    fi
+  else
+    step_dot "Not root and no sudo — skipping service install"
+    step_dot "Run 'sudo daemonclaw service install' to install the system service"
+  fi
+
+  # Doctor check
+  step_dot "Running doctor check"
+  if "$BIN" doctor 2>/dev/null; then
+    step_ok "Doctor complete"
+  else
+    warn "Doctor reported issues — run 'daemonclaw doctor' to investigate"
+  fi
+fi
+
+# PATH guidance
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
 SHOW_PATH_HELP=false
-if [ "$PREFIX" != "$HOME" ]; then
+if [[ "$PREFIX" != "$HOME" ]]; then
   SHOW_PATH_HELP=true
-elif [ -f "$PROFILE" ] && ! grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
-  SHOW_PATH_HELP=true
-elif [ ! -f "$PROFILE" ]; then
+elif [[ -f "$BIN" ]] && ! have_cmd daemonclaw; then
   SHOW_PATH_HELP=true
 fi
 
-if [ "$SHOW_PATH_HELP" = true ]; then
+if [[ "$SHOW_PATH_HELP" == true ]]; then
   echo
-  printf "  %s (%s):\n" "$(bold "Add to your shell profile")" "$PROFILE"
-  echo
-  printf "    %s\n" "$EXPORT_LINE"
-  echo
-  printf "  Then reload:\n"
-  echo
-  printf "    source %s\n" "$PROFILE"
-  echo
+  warn "$CARGO_HOME/bin is not in PATH for this shell."
+  step_dot "Add to $PROFILE:"
+  echo -e "    ${DIM}${EXPORT_LINE}${RESET}"
 fi
 
-# ── Onboard ───────────────────────────────────────────────────────
+# ── Success banner ───────────────────────────────────────────────
 
-if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
-  if [ -t 0 ]; then
-    echo
-    printf "%s\n" "$(bold "Running setup wizard...")"
-    echo
-    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'daemonclaw onboard' manually"
-  else
-    info "Non-interactive — skipping onboard wizard. Run 'daemonclaw onboard' to configure."
-  fi
+INSTALLED_VERSION=""
+if [[ -f "$BIN" ]]; then
+  INSTALLED_VERSION="$("$BIN" --version 2>/dev/null | awk '{print $NF}' || true)"
 fi
 
 echo
-info "Done. Run $(bold "daemonclaw agent") to start chatting."
+if [[ -n "$INSTALLED_VERSION" ]]; then
+  echo -e "${BOLD_BLUE}${CRAB} DaemonClaw installed successfully (v${INSTALLED_VERSION})!${RESET}"
+else
+  echo -e "${BOLD_BLUE}${CRAB} DaemonClaw installed successfully!${RESET}"
+fi
+
+if [[ "$INSTALL_TYPE" == "upgrade" ]]; then
+  step_dot "Upgrade complete"
+fi
+
+# Dashboard URL
+GATEWAY_PORT=42617
+DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
+echo
+echo -e "${BOLD}Dashboard:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
+
+# Copy to clipboard
+if [[ -t 1 ]]; then
+  case "$OS_NAME" in
+    Darwin)
+      if have_cmd pbcopy; then
+        printf '%s' "$DASHBOARD_URL" | pbcopy 2>/dev/null && step_ok "Copied to clipboard"
+      fi ;;
+    Linux)
+      if have_cmd xclip; then
+        printf '%s' "$DASHBOARD_URL" | xclip -selection clipboard 2>/dev/null && step_ok "Copied to clipboard"
+      elif have_cmd xsel; then
+        printf '%s' "$DASHBOARD_URL" | xsel --clipboard 2>/dev/null && step_ok "Copied to clipboard"
+      elif have_cmd wl-copy; then
+        printf '%s' "$DASHBOARD_URL" | wl-copy 2>/dev/null && step_ok "Copied to clipboard"
+      fi ;;
+  esac
+fi
+
+# Open in browser
+if [[ -t 1 ]]; then
+  case "$OS_NAME" in
+    Darwin)
+      if have_cmd open; then
+        open "$DASHBOARD_URL" 2>/dev/null && step_ok "Opened in your browser"
+      fi ;;
+    Linux)
+      if have_cmd xdg-open; then
+        xdg-open "$DASHBOARD_URL" 2>/dev/null && step_ok "Opened in your browser"
+      fi ;;
+  esac
+fi
+
+echo
+echo -e "${BOLD}Next steps:${RESET}"
+echo -e "  ${DIM}daemonclaw status${RESET}"
+echo -e "  ${DIM}daemonclaw agent -m \"Hello, DaemonClaw!\"${RESET}"
+echo -e "  ${DIM}systemctl status daemonclaw${RESET}"
+echo
+echo -e "${BOLD}Docs:${RESET} ${BLUE}https://github.com/DeliveryBoyTech/daemonclaw${RESET}"
 echo

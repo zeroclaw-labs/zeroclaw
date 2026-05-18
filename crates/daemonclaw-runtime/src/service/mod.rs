@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use daemonclaw_config::schema::{Config, SandboxBackend};
+use daemonclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.daemonclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "DaemonClaw Daemon";
@@ -113,8 +113,7 @@ pub fn is_running() -> bool {
 }
 
 fn is_running_linux() -> bool {
-    // Try systemd first, then OpenRC — mirrors detect_init_system() order
-    if run_capture(Command::new("systemctl").args(["--user", "is-active", "daemonclaw.service"]))
+    if run_capture(Command::new("systemctl").args(["is-active", "daemonclaw.service"]))
         .map(|out| out.trim() == "active")
         .unwrap_or(false)
     {
@@ -125,16 +124,15 @@ fn is_running_linux() -> bool {
         .unwrap_or(false)
 }
 
-pub fn install(config: &Config, init_system: InitSystem) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        install_macos(config)
-    } else if cfg!(target_os = "linux") {
+pub fn install(init_system: InitSystem, dry_run: bool) -> Result<()> {
+    if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        install_linux(config, resolved)
-    } else if cfg!(target_os = "windows") {
-        install_windows(config)
+        install_linux(resolved, dry_run)
     } else {
-        anyhow::bail!("Service management is supported on macOS and Linux only");
+        bail!(
+            "daemonclaw service install currently supports Linux only. \
+             macOS and Windows support is disabled."
+        );
     }
 }
 
@@ -170,8 +168,8 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
 fn start_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "daemonclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["daemon-reload"]))?;
+            run_checked(Command::new("systemctl").args(["start", "daemonclaw.service"]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["daemonclaw", "start"]))?;
@@ -213,7 +211,7 @@ fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "daemonclaw.service"]));
+                run_checked(Command::new("systemctl").args(["stop", "daemonclaw.service"]));
         }
         InitSystem::Openrc => {
             let _ = run_checked(Command::new("rc-service").args(["daemonclaw", "stop"]));
@@ -250,8 +248,8 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 fn restart_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "daemonclaw.service"]))?;
+            run_checked(Command::new("systemctl").args(["daemon-reload"]))?;
+            run_checked(Command::new("systemctl").args(["restart", "daemonclaw.service"]))?;
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["daemonclaw", "restart"]))?;
@@ -311,17 +309,16 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+fn status_linux(_config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             let out = run_capture(Command::new("systemctl").args([
-                "--user",
                 "is-active",
                 "daemonclaw.service",
             ]))
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: {}", linux_service_file(config)?.display());
+            println!("Unit: /etc/systemd/system/daemonclaw.service");
         }
         InitSystem::Openrc => {
             let out = run_capture(Command::new("rc-service").args(["daemonclaw", "status"]))
@@ -404,7 +401,6 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
     match init_system {
         InitSystem::Systemd => {
             let mut args = vec![
-                "--user".to_string(),
                 "-u".to_string(),
                 "daemonclaw.service".to_string(),
                 "-n".to_string(),
@@ -548,15 +544,15 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+fn uninstall_linux(_config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let file = linux_service_file(config)?;
+            let file = Path::new("/etc/systemd/system/daemonclaw.service");
             if file.exists() {
-                fs::remove_file(&file)
+                fs::remove_file(file)
                     .with_context(|| format!("Failed to remove {}", file.display()))?;
             }
-            let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
+            let _ = run_checked(Command::new("systemctl").args(["daemon-reload"]));
             println!("✅ Service uninstalled ({})", file.display());
         }
         InitSystem::Openrc => {
@@ -619,6 +615,7 @@ fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
     prefix.map(|p| p.join("var").join("daemonclaw"))
 }
 
+#[allow(dead_code)]
 fn install_macos(config: &Config) -> Result<()> {
     let file = macos_service_file()?;
     if let Some(parent) = file.parent() {
@@ -711,71 +708,588 @@ fn install_macos(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+fn install_linux(init_system: InitSystem, dry_run: bool) -> Result<()> {
     match init_system {
-        InitSystem::Systemd => install_linux_systemd(config),
-        InitSystem::Openrc => install_linux_openrc(config),
+        InitSystem::Systemd => install_linux_systemd(dry_run),
+        InitSystem::Openrc => {
+            bail!("daemonclaw service install supports systemd only.");
+        }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
 }
 
-fn install_linux_systemd(config: &Config) -> Result<()> {
-    let file = linux_service_file(config)?;
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)?;
+// ── Access-matrix-compliant systemd installer ────────────────────────
+// See ACCESS_MATRIX.md for the authoritative specification.
+// Every ownership, mode, ACL, and systemd directive here maps to a
+// specific row in that document.
+
+const AGENTS_GROUP: &str = "agents";
+const ADMIN_GROUP: &str = "daemonclaw-admin";
+const SERVICE_USER: &str = "daemonclaw";
+const HOME_DIR: &str = "/var/lib/daemonclaw";
+const ETC_DIR: &str = "/etc/daemonclaw";
+const BACKUP_DIR: &str = "/var/backups/daemonclaw";
+
+fn run_install_cmd(cmd: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run {cmd}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{cmd} {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(())
+}
+
+fn group_exists_check(name: &str) -> bool {
+    Command::new("getent")
+        .args(["group", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn user_exists_check(name: &str) -> bool {
+    Command::new("id")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn set_owner(path: &Path, owner: &str, group: &str) -> Result<()> {
+    run_install_cmd("chown", &[&format!("{owner}:{group}"), &path.to_string_lossy()])
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {:04o} {}", mode, path.display()))?;
+    }
+    Ok(())
+}
+
+fn mkdir_owned(path: &Path, mode: u32, owner: &str, group: &str, dry_run: bool) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if dry_run {
+        println!("  [dry-run] [dir] would create {} ({owner}:{group} {:04o})", path.display(), mode);
+        return Ok(());
+    }
+    fs::create_dir_all(path)
+        .with_context(|| format!("mkdir {}", path.display()))?;
+    set_mode(path, mode)?;
+    set_owner(path, owner, group)?;
+    println!("  [dir] {} ({owner}:{group} {:04o})", path.display(), mode);
+    Ok(())
+}
+
+fn install_linux_systemd(dry_run: bool) -> Result<()> {
+    if !dry_run && !is_root() {
+        bail!(
+            "daemonclaw service install requires root.\n\
+             Run with: sudo daemonclaw service install"
+        );
     }
 
-    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    if !dry_run {
+        let _ = Command::new("systemctl")
+            .args(["stop", "daemonclaw.service"])
+            .output();
+    }
 
-    // Rootless Podman requires syscalls that @system-service blocks by default.
-    // Inject an extended SystemCallFilter when Podman is used at either layer:
-    // runtime.kind = "podman" OR security.sandbox.backend = "podman"/auto.
-    let podman_installed = || {
-        Command::new("podman")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    let home = Path::new(HOME_DIR);
+    let etc = Path::new(ETC_DIR);
+
+    // ── Groups ──
+    for name in [AGENTS_GROUP, ADMIN_GROUP] {
+        if !group_exists_check(name) {
+            if dry_run {
+                println!("[dry-run] would create group: {name}");
+            } else {
+                run_install_cmd("groupadd", &["--system", name])?;
+                println!("Created system group: {name}");
+            }
+        }
+    }
+
+    // ── Service user ──
+    if !user_exists_check(SERVICE_USER) {
+        if dry_run {
+            println!("[dry-run] would create user: {SERVICE_USER}");
+        } else {
+            run_install_cmd("useradd", &[
+                "--system",
+                "--gid", AGENTS_GROUP,
+                "--home-dir", HOME_DIR,
+                "--create-home",
+                "--shell", "/usr/sbin/nologin",
+                SERVICE_USER,
+            ])?;
+            println!("Created system user: {SERVICE_USER}");
+        }
+    }
+
+    // ── Config directory ──
+    if !etc.exists() {
+        if dry_run {
+            println!("[dry-run] would create {}", etc.display());
+        } else {
+            fs::create_dir_all(etc)
+                .with_context(|| format!("mkdir {}", etc.display()))?;
+            set_mode(etc, 0o750)?;
+            set_owner(etc, "root", AGENTS_GROUP)?;
+            println!("Created directory: {}", etc.display());
+        }
+    }
+
+    // ── Config file (migrate, validate existing, or generate fresh) ──
+    let etc_config = etc.join("config.toml");
+    let needs_config = if etc_config.exists() {
+        let raw = fs::read_to_string(&etc_config)
+            .with_context(|| format!("read {}", etc_config.display()))?;
+        daemonclaw_config::migration::migrate_file(&raw).is_err()
+    } else {
+        true
     };
-    let needs_podman_filter = config.runtime.kind == "podman"
-        || matches!(&config.security.sandbox.backend, SandboxBackend::Podman)
-        || (matches!(&config.security.sandbox.backend, SandboxBackend::Auto) && podman_installed());
-    let syscall_filter_line = if needs_podman_filter {
-        "# Rootless Podman requires these syscalls beyond @system-service defaults.\n\
-         SystemCallFilter=@system-service clone3 unshare setns pivot_root mount umount2\n\
-         "
+    if needs_config {
+        if dry_run {
+            println!("[dry-run] would write {}", etc_config.display());
+        } else {
+            if etc_config.exists() {
+                let bak = etc.join("config.toml.bak");
+                fs::rename(&etc_config, &bak)
+                    .with_context(|| format!("backup {}", etc_config.display()))?;
+                println!("Backed up broken config to {}", bak.display());
+            }
+            let content = match resolve_invoking_user_config() {
+                Some(source) => {
+                    let c = fs::read_to_string(&source)
+                        .with_context(|| format!("read {}", source.display()))?;
+                    println!("Migrated config from {}", source.display());
+                    c
+                }
+                None => {
+                    let c = generate_install_config();
+                    println!("Generated default config");
+                    c
+                }
+            };
+            fs::write(&etc_config, &content)
+                .with_context(|| format!("write {}", etc_config.display()))?;
+            set_mode(&etc_config, 0o640)?;
+            set_owner(&etc_config, "root", AGENTS_GROUP)?;
+            run_install_cmd("setfacl", &["-m", &format!("g:{ADMIN_GROUP}:rw-"), &etc_config.to_string_lossy()])?;
+        }
+    }
+
+    // ── Home directory structure ──
+    let dirs: &[(&str, u32)] = &[
+        (".daemonclaw",                    0o750),
+        (".daemonclaw/workspace",          0o750),
+        (".daemonclaw/workspace/github",   0o750),
+        (".daemonclaw/workspace/skills",   0o750),
+        (".daemonclaw/workspace/memory",   0o700),
+        (".daemonclaw/workspace/sessions", 0o700),
+        (".daemonclaw/state",              0o750),
+        (".daemonclaw/state/backups",      0o750),
+        (".daemonclaw/logs",               0o750),
+        ("tmp",                            0o700),
+    ];
+    for (rel, mode) in dirs {
+        let path = home.join(rel);
+        if !path.exists() {
+            if dry_run {
+                println!("[dry-run] would create {}", path.display());
+            } else {
+                fs::create_dir_all(&path)
+                    .with_context(|| format!("mkdir {}", path.display()))?;
+                set_mode(&path, *mode)?;
+                set_owner(&path, SERVICE_USER, AGENTS_GROUP)?;
+            }
+        }
+    }
+
+    // ── Default ACLs on logs/ and state/ ──
+    if !dry_run {
+        for rel in [".daemonclaw/logs", ".daemonclaw/state"] {
+            let full = home.join(rel);
+            let acl = format!("default:group:{AGENTS_GROUP}:r--");
+            run_install_cmd("setfacl", &["-m", &acl, &full.to_string_lossy()])?;
+        }
+    }
+
+    // ── Secret key ──
+    let key_path = home.join(".daemonclaw/.secret_key");
+    if !key_path.exists() {
+        if dry_run {
+            println!("[dry-run] would generate secret key");
+        } else {
+            let output = Command::new("openssl")
+                .args(["rand", "-hex", "32"])
+                .output()
+                .context("Failed to run openssl rand")?;
+            if !output.status.success() {
+                bail!("openssl rand failed");
+            }
+            let key_hex = String::from_utf8_lossy(&output.stdout);
+            fs::write(&key_path, key_hex.trim())
+                .with_context(|| format!("write {}", key_path.display()))?;
+            set_mode(&key_path, 0o600)?;
+            set_owner(&key_path, SERVICE_USER, AGENTS_GROUP)?;
+            run_install_cmd("chattr", &["+i", &key_path.to_string_lossy()])?;
+        }
+    }
+
+    // ── Config symlink ──
+    let symlink_path = home.join(".daemonclaw/config.toml");
+    if !symlink_path.exists() && !symlink_path.is_symlink() {
+        if dry_run {
+            println!("[dry-run] would symlink config");
+        } else {
+            std::os::unix::fs::symlink(&etc_config, &symlink_path)
+                .with_context(|| format!("symlink {}", symlink_path.display()))?;
+        }
+    }
+
+    // ── systemd unit ──
+    let exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let target_bin = Path::new("/usr/local/bin/daemonclaw");
+
+    let podman_installed = Command::new("podman")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let syscall_filter_line = if podman_installed {
+        "SystemCallFilter=@system-service clone3 unshare setns pivot_root mount umount2\n"
     } else {
         ""
     };
 
     let unit = format!(
-        "[Unit]\n\
-         Description=DaemonClaw daemon\n\
-         After=network.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart={exe} daemon\n\
-         Restart=always\n\
-         RestartSec=3\n\
-         # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
-         Environment=HOME=%h\n\
-         # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
-         # so graphical/headless browsers can function correctly.\n\
-         PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
-         {syscall_filter_line}\
-         [Install]\n\
-         WantedBy=default.target\n",
-        exe = exe.display(),
-        syscall_filter_line = syscall_filter_line,
+        r#"[Unit]
+Description=DaemonClaw AI Agent
+Documentation=https://github.com/DeliveryBoyTech/daemonclaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={agents}
+WorkingDirectory={home}
+
+ExecStart={target_bin} daemon
+
+Restart=on-failure
+RestartSec=5
+WatchdogSec=120
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+{syscall_filter}
+# Network: outbound only
+SocketBindDeny=any
+
+# Paths
+ReadWritePaths={home}
+ReadOnlyPaths=/proc /sys /etc/os-release /etc/hostname /etc/resolv.conf {etc}
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=64
+LimitFSIZE=1073741824
+
+# Environment
+Environment=RUST_LOG=info
+Environment=HOME={home}
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daemonclaw
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        user = SERVICE_USER,
+        agents = AGENTS_GROUP,
+        home = HOME_DIR,
+        etc = ETC_DIR,
+        target_bin = target_bin.display(),
+        syscall_filter = syscall_filter_line,
     );
 
-    fs::write(&file, unit)?;
-    let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "daemonclaw.service"]));
-    println!("✅ Installed systemd user service: {}", file.display());
-    println!("   Start with: daemonclaw service start");
+    let unit_path = Path::new("/etc/systemd/system/daemonclaw.service");
+    let timer_path = Path::new("/etc/systemd/system/daemonclaw-backup.timer");
+    let backup_svc_path = Path::new("/etc/systemd/system/daemonclaw-backup.service");
+    let tmpfiles_path = Path::new("/etc/tmpfiles.d/daemonclaw-backups.conf");
+
+    if dry_run {
+        println!("[dry-run] would write systemd units and backup infrastructure");
+        println!("[dry-run] would copy binary to {}", target_bin.display());
+        println!();
+        println!("[dry-run] No changes were made.");
+    } else {
+        fs::write(unit_path, &unit)
+            .with_context(|| format!("write {}", unit_path.display()))?;
+
+        // Backup timer
+        if !Path::new(BACKUP_DIR).exists() {
+            fs::create_dir_all(BACKUP_DIR)
+                .with_context(|| format!("mkdir {}", BACKUP_DIR))?;
+            set_mode(Path::new(BACKUP_DIR), 0o750)?;
+            set_owner(Path::new(BACKUP_DIR), "root", AGENTS_GROUP)?;
+        }
+
+        let timer = "[Unit]\nDescription=DaemonClaw state backup\n\n\
+                     [Timer]\nOnCalendar=hourly\nPersistent=true\n\n\
+                     [Install]\nWantedBy=timers.target\n";
+        fs::write(timer_path, timer)
+            .with_context(|| format!("write {}", timer_path.display()))?;
+
+        let backup_svc = format!(
+            "[Unit]\nDescription=DaemonClaw state backup\n\n\
+             [Service]\nType=oneshot\n\
+             ExecStart=/bin/bash -c 'ts=$(date +%%Y%%m%%d-%%H%%M%%S) && \
+             tar czf {backup}/state-${{ts}}.tar.gz -C {home}/.daemonclaw state/'\n\
+             User=root\nGroup={agents}\n",
+            backup = BACKUP_DIR, home = HOME_DIR, agents = AGENTS_GROUP,
+        );
+        fs::write(backup_svc_path, &backup_svc)
+            .with_context(|| format!("write {}", backup_svc_path.display()))?;
+
+        let tmpfiles = format!(
+            "d {backup} 0750 root {agents} - -\ne {backup} - - - 30d -\n",
+            backup = BACKUP_DIR, agents = AGENTS_GROUP,
+        );
+        fs::write(tmpfiles_path, &tmpfiles)
+            .with_context(|| format!("write {}", tmpfiles_path.display()))?;
+
+        // Enable units
+        run_install_cmd("systemctl", &["daemon-reload"])?;
+        run_install_cmd("systemctl", &["enable", "daemonclaw.service"])?;
+        run_install_cmd("systemctl", &["enable", "daemonclaw-backup.timer"])?;
+        run_install_cmd("systemctl", &["start", "daemonclaw-backup.timer"])?;
+
+        // Copy binary
+        if exe.to_string_lossy() != target_bin.to_string_lossy() {
+            fs::copy(&exe, target_bin)
+                .with_context(|| format!("copy binary to {}", target_bin.display()))?;
+            set_mode(target_bin, 0o755)?;
+        }
+
+        run_install_cmd("systemctl", &["start", "daemonclaw.service"])?;
+
+        println!("Installed daemonclaw system service: {}", unit_path.display());
+        println!("   Config: {}", etc_config.display());
+        println!("   Status: systemctl status daemonclaw");
+    }
+
     Ok(())
+}
+
+fn resolve_invoking_user_config() -> Option<PathBuf> {
+    let sudo_user = std::env::var("SUDO_USER")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "root");
+
+    if let Some(user) = sudo_user {
+        if let Ok(output) = Command::new("getent").args(["passwd", &user]).output() {
+            if output.status.success() {
+                let entry = String::from_utf8_lossy(&output.stdout);
+                let fields: Vec<&str> = entry.trim().split(':').collect();
+                if fields.len() >= 6 {
+                    let path = PathBuf::from(fields[5]).join(".daemonclaw/config.toml");
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn generate_install_config() -> String {
+    r#"# DaemonClaw configuration — generated by daemonclaw service install
+# See https://github.com/DeliveryBoyTech/daemonclaw for documentation.
+
+# api_key = "your-api-key-here"
+default_provider = "zai"
+default_model = "glm-5-turbo"
+default_temperature = 0.7
+provider_timeout_secs = 120
+model_routes = []
+embedding_routes = []
+
+[model_providers]
+
+[extra_headers]
+
+[observability]
+backend = "none"
+runtime_trace_mode = "full"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 1000
+
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = [
+    "git", "ls", "cat", "grep", "find", "echo", "pwd", "cd",
+    "wc", "head", "tail", "date",
+    "mkdir", "cp", "mv", "rm", "touch", "ln", "readlink", "realpath", "chmod",
+    "sed", "awk", "diff", "patch", "sort", "uniq", "tr", "cut", "xargs",
+    "tee", "less", "file", "stat", "basename", "dirname",
+    "tar", "gzip", "gunzip", "zip", "unzip",
+    "curl", "wget",
+    "sh", "bash",
+    "python", "python3", "pip", "pip3",
+    "node", "npm", "npx", "yarn", "pnpm",
+    "rustc", "rustup", "cargo",
+    "go", "deno", "bun",
+    "make", "cmake", "gcc", "cc", "g++", "ld", "pkg-config",
+    "apt", "apt-get", "dpkg", "dpkg-query", "snap",
+    "gh", "docker", "docker-compose", "podman",
+    "lsb_release", "systemctl", "journalctl",
+    "test", "true", "false", "which", "type", "env",
+    "uname", "uptime", "free", "df", "du", "ps", "id", "whoami",
+    "hostname", "nproc", "lscpu", "lsmem", "lsblk", "lsof",
+    "ss", "netstat", "ip", "ping", "traceroute", "nslookup", "dig",
+    "sudo",
+]
+forbidden_paths = [
+    "/etc/shadow", "/etc/gshadow",
+    "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/pam.d", "/etc/polkit-1",
+    "/etc/ssh",
+    "~/.ssh", "~/.gnupg", "~/.aws",
+    "/root", "/home",
+    "~/.daemonclaw/.secret_key",
+    "~/.daemonclaw/workspace/memory",
+    "~/.daemonclaw/workspace/sessions",
+    "~/.daemonclaw/workspace/devices.db",
+]
+max_actions_per_hour = 240
+max_cost_per_day_cents = 2500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "CARGO_HOME", "RUSTUP_HOME"]
+auto_approve = [
+    "file_read", "file_write", "file_edit",
+    "memory_recall",
+    "web_search_tool", "web_fetch",
+    "calculator",
+    "glob_search", "content_search",
+    "image_info", "weather",
+    "shell",
+]
+always_ask = []
+allowed_roots = [
+    "~/.cargo",
+    "~/.rustup",
+    "~/.npm",
+    "~/.local",
+    "/tmp",
+    "/proc", "/sys",
+    "/etc/os-release",
+    "/etc/hostname",
+    "~/.gitconfig",
+    "~/.config/gh",
+]
+non_cli_excluded_tools = []
+
+[security.sandbox]
+backend = "none"
+firejail_args = []
+
+[security.resources]
+max_memory_mb = 8192
+max_cpu_time_seconds = 1800
+max_subprocesses = 64
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 100
+sign_events = false
+
+[security.otp]
+enabled = false
+
+[security.estop]
+enabled = false
+
+[backup]
+enabled = true
+max_keep = 10
+include_dirs = ["config", "memory", "audit", "knowledge", "skills"]
+destination_dir = "state/backups"
+compress = true
+encrypt = false
+
+[data_retention]
+enabled = false
+retention_days = 90
+
+[runtime]
+kind = "native"
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+fallback_providers = []
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+
+[agent]
+compact_context = true
+max_tool_iterations = 100
+max_history_messages = 150
+max_context_tokens = 200000
+parallel_tools = false
+tool_dispatcher = "auto"
+
+[agent.context_compression]
+enabled = false
+
+[agent.thinking]
+default_level = "medium"
+
+[skills]
+open_skills_enabled = true
+allow_scripts = true
+
+# [channels.telegram]
+# enabled = true
+# bot_token = "your-telegram-bot-token"
+# allowed_users = []
+"#.to_string()
 }
 
 /// Check if the current process is running as root (Unix only)
@@ -1311,6 +1825,7 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let logs_dir = config
@@ -1370,6 +1885,7 @@ fn macos_service_file() -> Result<PathBuf> {
         .join(format!("{SERVICE_LABEL}.plist")))
 }
 
+#[allow(dead_code)]
 fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())

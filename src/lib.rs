@@ -181,7 +181,11 @@ Examples:
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
-    Install,
+    Install {
+        /// Print what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Start daemon service
     Start,
     /// Stop daemon service

@@ -1124,6 +1124,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Service install is a provisioning tool — it must NOT load config or
+    // initialize a workspace. Intercept it before the config-load path.
+    if let Commands::Service {
+        service_command: ServiceCommands::Install { dry_run },
+        service_init,
+    } = &cli.command
+    {
+        let init_system = service_init.parse()?;
+        return service::install(init_system, *dry_run);
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     config.apply_env_overrides();

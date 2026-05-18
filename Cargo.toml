@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daemonclaw-config", "crates/daemonclaw-providers", "crates/daemonclaw-memory", "crates/daemonclaw-channels", "crates/daemonclaw-tools", "crates/daemonclaw-runtime", "crates/daemonclaw-tui", "crates/daemonclaw-plugins", "crates/daemonclaw-gateway", "crates/daemonclaw-hardware", "crates/daemonclaw-tool-call-parser", "crates/daemonclaw-install", "crates/robot-kit", "crates/aardvark-sys", "crates/daemonclaw-macros", "apps/tauri"]
+members = [".", "crates/daemonclaw-api", "crates/daemonclaw-infra", "crates/daemonclaw-config", "crates/daemonclaw-providers", "crates/daemonclaw-memory", "crates/daemonclaw-channels", "crates/daemonclaw-tools", "crates/daemonclaw-runtime", "crates/daemonclaw-tui", "crates/daemonclaw-plugins", "crates/daemonclaw-gateway", "crates/daemonclaw-hardware", "crates/daemonclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/daemonclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]

@@ -10,7 +10,9 @@ pub fn handle_command(
     init_system: InitSystem,
 ) -> Result<()> {
     match command {
-        crate::ServiceCommands::Install => install(config, init_system),
+        crate::ServiceCommands::Install { .. } => {
+            unreachable!("Install is handled before config loading in main.rs")
+        }
         crate::ServiceCommands::Start => start(config, init_system),
         crate::ServiceCommands::Stop => stop(config, init_system),
         crate::ServiceCommands::Restart => restart(config, init_system),
