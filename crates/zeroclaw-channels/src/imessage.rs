@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
@@ -70,25 +71,17 @@ fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8
 /// Polls the Messages database for new messages and sends replies via `osascript`.
 #[derive(Clone)]
 pub struct IMessageChannel {
-    allowed_contacts: Vec<String>,
+    allowlist: AllowlistAspect,
     poll_interval_secs: u64,
 }
 
 impl IMessageChannel {
     pub fn new(allowed_contacts: Vec<String>) -> Self {
         Self {
-            allowed_contacts,
+            allowlist: AllowlistAspect::new(allowed_contacts)
+                .with_normalizer(|s| s.to_ascii_lowercase()),
             poll_interval_secs: 3,
         }
-    }
-
-    fn is_contact_allowed(&self, sender: &str) -> bool {
-        if self.allowed_contacts.iter().any(|u| u == "*") {
-            return true;
-        }
-        self.allowed_contacts
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(sender))
     }
 }
 
@@ -274,7 +267,7 @@ end tell"#
                             last_rowid = rowid;
                         }
 
-                        if !self.is_contact_allowed(&sender) {
+                        if !self.allowlist.is_allowed(&sender) {
                             continue;
                         }
 
@@ -390,50 +383,50 @@ mod tests {
     #[test]
     fn creates_with_contacts() {
         let ch = IMessageChannel::new(vec!["+1234567890".into()]);
-        assert_eq!(ch.allowed_contacts.len(), 1);
+        assert!(ch.allowlist.is_allowed("+1234567890"));
         assert_eq!(ch.poll_interval_secs, 3);
     }
 
     #[test]
     fn creates_with_empty_contacts() {
         let ch = IMessageChannel::new(vec![]);
-        assert!(ch.allowed_contacts.is_empty());
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_anyone() {
         let ch = IMessageChannel::new(vec!["*".into()]);
-        assert!(ch.is_contact_allowed("+1234567890"));
-        assert!(ch.is_contact_allowed("random@icloud.com"));
-        assert!(ch.is_contact_allowed(""));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("random@icloud.com"));
+        assert!(ch.allowlist.is_allowed(""));
     }
 
     #[test]
     fn specific_contact_allowed() {
         let ch = IMessageChannel::new(vec!["+1234567890".into(), "user@icloud.com".into()]);
-        assert!(ch.is_contact_allowed("+1234567890"));
-        assert!(ch.is_contact_allowed("user@icloud.com"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("user@icloud.com"));
     }
 
     #[test]
     fn unknown_contact_denied() {
         let ch = IMessageChannel::new(vec!["+1234567890".into()]);
-        assert!(!ch.is_contact_allowed("+9999999999"));
-        assert!(!ch.is_contact_allowed("hacker@evil.com"));
+        assert!(!ch.allowlist.is_allowed("+9999999999"));
+        assert!(!ch.allowlist.is_allowed("hacker@evil.com"));
     }
 
     #[test]
     fn contact_case_insensitive() {
         let ch = IMessageChannel::new(vec!["User@iCloud.com".into()]);
-        assert!(ch.is_contact_allowed("user@icloud.com"));
-        assert!(ch.is_contact_allowed("USER@ICLOUD.COM"));
+        assert!(ch.allowlist.is_allowed("user@icloud.com"));
+        assert!(ch.allowlist.is_allowed("USER@ICLOUD.COM"));
     }
 
     #[test]
     fn empty_allowlist_denies_all() {
         let ch = IMessageChannel::new(vec![]);
-        assert!(!ch.is_contact_allowed("+1234567890"));
-        assert!(!ch.is_contact_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
@@ -445,14 +438,14 @@ mod tests {
     #[test]
     fn wildcard_among_others_still_allows_all() {
         let ch = IMessageChannel::new(vec!["+111".into(), "*".into(), "+222".into()]);
-        assert!(ch.is_contact_allowed("totally-unknown"));
+        assert!(ch.allowlist.is_allowed("totally-unknown"));
     }
 
     #[test]
     fn contact_with_spaces_exact_match() {
         let ch = IMessageChannel::new(vec!["  spaced  ".into()]);
-        assert!(ch.is_contact_allowed("  spaced  "));
-        assert!(!ch.is_contact_allowed("spaced"));
+        assert!(ch.allowlist.is_allowed("  spaced  "));
+        assert!(!ch.allowlist.is_allowed("spaced"));
     }
 
     // ══════════════════════════════════════════════════════════
