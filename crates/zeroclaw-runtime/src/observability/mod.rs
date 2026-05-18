@@ -39,26 +39,79 @@ use zeroclaw_config::schema::ObservabilityConfig;
 /// Uses `parking_lot::RwLock` so the event-recording path never has to handle
 /// lock poisoning: a panic inside a hook would not silently disable the entire
 /// observability channel on subsequent calls.
-static BROADCAST_HOOK: OnceLock<RwLock<Option<Arc<dyn Observer>>>> = OnceLock::new();
+static BROADCAST_HOOK: OnceLock<RwLock<BroadcastHookState>> = OnceLock::new();
 
-fn broadcast_hook_slot() -> &'static RwLock<Option<Arc<dyn Observer>>> {
-    BROADCAST_HOOK.get_or_init(|| RwLock::new(None))
+struct BroadcastHookEntry {
+    scoped_id: Option<u64>,
+    observer: Arc<dyn Observer>,
+}
+
+#[derive(Default)]
+struct BroadcastHookState {
+    next_scoped_id: u64,
+    entries: Vec<BroadcastHookEntry>,
+}
+
+impl BroadcastHookState {
+    fn current(&self) -> Option<Arc<dyn Observer>> {
+        self.entries.last().map(|entry| entry.observer.clone())
+    }
+}
+
+fn broadcast_hook_slot() -> &'static RwLock<BroadcastHookState> {
+    BROADCAST_HOOK.get_or_init(|| RwLock::new(BroadcastHookState::default()))
 }
 
 /// Install a process-wide observer that will receive every event recorded
 /// through observers built by [`create_observer`]. Calling this again replaces
 /// the previous hook.
 pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
-    *broadcast_hook_slot().write() = Some(observer);
+    let mut slot = broadcast_hook_slot().write();
+    slot.entries.clear();
+    slot.entries.push(BroadcastHookEntry {
+        scoped_id: None,
+        observer,
+    });
+}
+
+/// Guard returned by [`set_scoped_broadcast_hook`].
+///
+/// Dropping the guard removes the hook it installed, but only if a later caller
+/// has not already replaced the process-wide hook. If multiple scoped hooks are
+/// live at once, dropping the newest hook restores the previous still-live hook.
+#[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
+pub struct BroadcastHookGuard {
+    scoped_id: u64,
+}
+
+impl Drop for BroadcastHookGuard {
+    fn drop(&mut self) {
+        let mut slot = broadcast_hook_slot().write();
+        slot.entries
+            .retain(|entry| entry.scoped_id != Some(self.scoped_id));
+    }
+}
+
+/// Install a process-wide observer and return a guard that clears it on drop.
+#[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
+pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGuard {
+    let mut slot = broadcast_hook_slot().write();
+    let scoped_id = slot.next_scoped_id;
+    slot.next_scoped_id = slot.next_scoped_id.wrapping_add(1);
+    slot.entries.push(BroadcastHookEntry {
+        scoped_id: Some(scoped_id),
+        observer,
+    });
+    BroadcastHookGuard { scoped_id }
 }
 
 /// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
 pub fn clear_broadcast_hook() {
-    *broadcast_hook_slot().write() = None;
+    broadcast_hook_slot().write().entries.clear();
 }
 
 fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
-    broadcast_hook_slot().read().clone()
+    broadcast_hook_slot().read().current()
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
@@ -385,6 +438,87 @@ mod tests {
         // No hook installed; recording must not panic and must be a no-op.
         observer.record_event(&ObserverEvent::HeartbeatTick);
         observer.record_metric(&ObserverMetric::TokensUsed(1));
+    }
+
+    #[test]
+    fn scoped_broadcast_hook_guard_clears_installed_hook_on_drop() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        let broadcast_guard = set_scoped_broadcast_hook(hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: "noop".into(),
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(hook.events.load(Ordering::SeqCst), 1);
+
+        drop(broadcast_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn scoped_broadcast_hook_guard_preserves_replacement_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let old_hook = Arc::new(CountingObserver::default());
+        let old_guard = set_scoped_broadcast_hook(old_hook.clone());
+
+        let new_hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(new_hook.clone());
+        drop(old_guard);
+
+        let cfg = ObservabilityConfig {
+            backend: "noop".into(),
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let old_hook = Arc::new(CountingObserver::default());
+        let old_guard = set_scoped_broadcast_hook(old_hook.clone());
+
+        let new_hook = Arc::new(CountingObserver::default());
+        let new_guard = set_scoped_broadcast_hook(new_hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: "noop".into(),
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        drop(new_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        drop(old_guard);
+        observer.record_event(&ObserverEvent::HeartbeatTick);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
+
+        clear_broadcast_hook();
     }
 
     #[test]

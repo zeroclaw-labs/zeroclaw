@@ -4298,18 +4298,29 @@ mod tests {
 
     struct RecordingProvider {
         requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        capabilities: ProviderCapabilities,
     }
 
     impl RecordingProvider {
         fn new() -> Self {
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                capabilities: ProviderCapabilities::default(),
             }
+        }
+
+        fn with_vision_support(mut self) -> Self {
+            self.capabilities.vision = true;
+            self
         }
     }
 
     #[async_trait]
     impl Provider for RecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities.clone()
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -4897,11 +4908,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-        };
+    async fn run_tool_call_loop_skips_oversized_image_payload() {
+        let provider = RecordingProvider::new().with_vision_support();
+        let recorded_requests = Arc::clone(&provider.requests);
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
         let mut history = vec![ChatMessage::user(format!(
@@ -4917,7 +4926,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4947,13 +4956,21 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("oversized payload must fail");
+        .expect("oversized payload should be skipped and continue as text-only");
 
+        assert_eq!(result, "done");
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].len(), 1);
         assert!(
-            err.to_string()
-                .contains("multimodal image size limit exceeded")
+            requests[0][0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!requests[0][0].content.contains("[IMAGE:"));
+        assert!(!requests[0][0].content.contains(&oversized_payload));
     }
 
     #[tokio::test]
