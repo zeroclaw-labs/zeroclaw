@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
@@ -16,7 +17,7 @@ const DEDUP_CAPACITY: usize = 10_000;
 pub struct MochatChannel {
     api_url: String,
     api_token: String,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     poll_interval_secs: u64,
     /// Message deduplication set.
     dedup: Arc<RwLock<HashSet<String>>>,
@@ -32,7 +33,7 @@ impl MochatChannel {
         Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_token,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             poll_interval_secs,
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -40,10 +41,6 @@ impl MochatChannel {
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.mochat")
-    }
-
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     /// Check and insert message ID for deduplication.
@@ -166,7 +163,7 @@ impl Channel for MochatChannel {
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("unknown");
 
-                            if !self.is_user_allowed(sender) {
+                            if !self.allowlist.is_allowed(sender) {
                                 tracing::debug!(
                                     "Mochat: ignoring message from unauthorized user: {sender}"
                                 );
@@ -266,7 +263,7 @@ mod tests {
     #[test]
     fn test_user_allowed_wildcard() {
         let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec!["*".into()], 5);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
@@ -277,14 +274,14 @@ mod tests {
             vec!["user123".into()],
             5,
         );
-        assert!(ch.is_user_allowed("user123"));
-        assert!(!ch.is_user_allowed("other"));
+        assert!(ch.allowlist.is_allowed("user123"));
+        assert!(!ch.allowlist.is_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
         let ch = MochatChannel::new("https://m.test".into(), "tok".into(), vec![], 5);
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[tokio::test]
