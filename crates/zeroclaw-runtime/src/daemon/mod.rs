@@ -226,23 +226,16 @@ pub async fn run(
 
     // Wire up MQTT SOP listener if configured and referenced by an enabled agent
     if let Some(mqtt_start) = subsystems.mqtt_start {
-        if let Some(ref mqtt_config) = config.channels.mqtt {
-            if mqtt_config.enabled {
-                let mqtt_cfg = mqtt_config.clone();
-                let mqtt_start = std::sync::Arc::new(mqtt_start);
-                handles.push(spawn_component_supervisor(
-                    "mqtt",
-                    initial_backoff,
-                    max_backoff,
-                    move || {
-                        let cfg = mqtt_cfg.clone();
-                        let start = mqtt_start.clone();
-                        async move { start(cfg).await }
-                    },
-                ));
-            } else {
-                tracing::info!("MQTT channel configured but disabled (enabled = false)");
-                crate::health::mark_component_ok("mqtt");
+        let active_mqtt: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect();
+        let mut mqtt_started = false;
+        for (alias, mqtt_config) in &config.channels.mqtt {
+            if !active_mqtt.contains(&format!("mqtt.{alias}")) {
+                continue;
             }
             let mqtt_cfg = mqtt_config.clone();
             let mqtt_start = std::sync::Arc::new(mqtt_start);
@@ -388,7 +381,13 @@ where
             match run_component().await {
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
-                    tracing::warn!("Daemon component '{name}' exited unexpectedly");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                        "Daemon component '' exited unexpectedly"
+                    );
                     // Clean exit — reset backoff since the component ran successfully
                     backoff = initial_backoff_secs.max(1);
                 }
@@ -420,13 +419,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     };
     use std::sync::Arc;
 
+    let agent_alias = config.heartbeat.agent.trim().to_string();
+    if agent_alias.is_empty() {
+        anyhow::bail!(
+            "heartbeat worker requires `[heartbeat] agent = \"<alias>\"` naming a configured agent"
+        );
+    }
+    if config.agent(&agent_alias).is_none() {
+        anyhow::bail!(
+            "[heartbeat] agent = {agent_alias:?} is not configured ([agents.{agent_alias}] missing)"
+        );
+    }
+
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
+    let engine = HeartbeatEngine::new(config.heartbeat.clone(), config.data_dir.clone(), observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
@@ -554,6 +561,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -686,6 +694,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(

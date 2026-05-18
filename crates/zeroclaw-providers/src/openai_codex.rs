@@ -769,10 +769,8 @@ fn process_responses_stream_event(
             if let Some(item) = event.get("item") {
                 record_responses_output_item(state, item.clone());
                 match item.get("type").and_then(Value::as_str) {
-                    Some("message") if !state.saw_text_delta => {
-                        if state.fallback_text.is_none() {
-                            state.fallback_text = response_output_text_from_event_item(item);
-                        }
+                    Some("message") if !state.saw_text_delta && state.fallback_text.is_none() => {
+                        state.fallback_text = response_output_text_from_event_item(item);
                     }
                     Some("function_call") => {
                         if let Some(name) = item.get("name").and_then(Value::as_str) {

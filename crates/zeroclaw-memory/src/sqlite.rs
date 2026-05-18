@@ -2832,7 +2832,7 @@ mod tests {
             let barrier = barrier.clone();
             handles.push(tokio::task::spawn_blocking(move || {
                 barrier.wait();
-                SqliteMemory::new(&dir)
+                SqliteMemory::new("test", &dir)
             }));
         }
 

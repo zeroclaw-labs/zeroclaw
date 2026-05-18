@@ -158,11 +158,48 @@ pub async fn handle_api_status(
         .map(String::from)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
+    // Per-agent resolution when `?agent=<alias>` is supplied. Falls back
+    // to the install-wide first-of-each view when the alias is unknown
+    // (so the dashboard's old shape still renders during onboarding,
+    // before any agent exists).
+    let agent_alias = query.agent.as_deref().filter(|s| !s.trim().is_empty());
+    let (model_provider, model, temperature, memory_backend) =
+        match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
+            Some((alias, agent)) => {
+                let provider_ref = if agent.model_provider.is_empty() {
+                    None
+                } else {
+                    Some(agent.model_provider.as_str().to_string())
+                };
+                let resolved = config.resolved_model_provider_for_agent(alias);
+                let model = resolved
+                    .as_ref()
+                    .and_then(|(_, _, cfg)| cfg.model.clone())
+                    .unwrap_or_default();
+                let temperature: Option<f64> =
+                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+                let backend_kind = agent.memory.backend;
+                let backend = serde_json::to_value(backend_kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase());
+                (provider_ref, model, temperature, backend)
+            }
+            None => (
+                config.first_model_provider_alias(),
+                state.model.clone(),
+                state.temperature,
+                state.mem.name().to_string(),
+            ),
+        };
+
+    let process = zeroclaw_runtime::process_stats::sample();
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "provider": config.providers.fallback,
-        "model": state.model,
-        "temperature": state.temperature,
+        "model_provider": model_provider,
+        "model": model,
+        "temperature": temperature,
         "uptime_seconds": health.uptime_seconds,
         "daemon_started_at": zeroclaw_runtime::health::daemon_started_at(),
         "gateway_port": config.gateway.port,

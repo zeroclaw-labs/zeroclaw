@@ -2278,135 +2278,30 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    overrides: AgentRunOverrides,
 ) -> Result<String> {
-    // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
-    let runtime: Arc<dyn platform::RuntimeAdapter> =
-        Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-
-    let fallback_provider_loop = config.providers.fallback_provider();
-
-    // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-    )?);
-    tracing::info!(backend = mem.name(), "Memory initialized");
-
-    // ── Peripherals (merge peripheral tools into registry) ─
-    if !peripheral_overrides.is_empty() {
-        tracing::info!(
-            peripherals = ?peripheral_overrides,
-            "Peripheral overrides from CLI (config boards take precedence)"
-        );
-    }
-
-    // ── Tools (including memory tools and peripherals) ────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let (
-        mut tools_registry,
-        delegate_handle,
-        _reaction_handle,
-        _channel_map_handle,
-        _ask_user_handle,
-        _escalate_handle,
-    ) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        &config,
-        None,
-    );
-
-    let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-        f(config.peripherals.clone()).await.unwrap_or_default()
-    } else {
-        vec![]
-    };
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
-
-    // ── Capability-based tool access control ─────────────────────
-    // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
-    // those tools whose name appears in the list. Unknown names are silently
-    // ignored. When `None`, all tools remain available (backward compatible).
-    if let Some(ref allow_list) = allowed_tools {
-        tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
-        tracing::info!(
-            allowed = allow_list.len(),
-            retained = tools_registry.len(),
-            "Applied capability-based tool access filter"
-        );
-    }
-
-    // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
-    // NOTE: MCP tools are injected after built-in tool filtering
-    // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-    // MCP servers are user-declared external integrations; the built-in allow/deny
-    // filter is not appropriate for them and would silently drop all MCP tools when
-    // a restrictive allowlist is configured. Keep this block after any such filter call.
-    //
-    // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
-    // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
-    // fetch schemas on demand. This reduces context window waste.
-    let mut deferred_section = String::new();
-    let mut activated_handle: Option<
-        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-    > = None;
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    // Deferred path: build stubs and register tool_search
-                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::tools::ActivatedToolSet::new(),
-                    ));
-                    activated_handle = Some(std::sync::Arc::clone(&activated));
-                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
+    use ::zeroclaw_log::Instrument;
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+    let memory_composite = {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        match agent.memory.backend {
+            MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
+            MemoryBackendKind::None => "none".to_string(),
+            _ => {
+                let raw = config.memory.backend.trim();
+                if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+                    "none".to_string()
                 } else {
                     let (kind, alias) = raw.split_once('.').unwrap_or((raw, "default"));
                     format!("{kind}.{alias}")
@@ -3659,97 +3554,28 @@ pub async fn process_message(
     message: &str,
     session_id: Option<&str>,
 ) -> Result<String> {
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
-    let runtime: Arc<dyn platform::RuntimeAdapter> =
-        Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let fallback_provider_pm = config.providers.fallback_provider();
-    let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
-    let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.providers.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-    )?);
-
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let (
-        mut tools_registry,
-        delegate_handle_pm,
-        _reaction_handle_pm,
-        _channel_map_handle_pm,
-        _ask_user_handle_pm,
-        _escalate_handle_pm,
-    ) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
-        &config,
-        None,
-    );
-    let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-        f(config.peripherals.clone()).await.unwrap_or_default()
-    } else {
-        vec![]
-    };
-    tools_registry.extend(peripheral_tools);
-
-    // ── Wire MCP tools (non-fatal) — process_message path ────────
-    // NOTE: Same ordering contract as the CLI path above — MCP tools must be
-    // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
-    // tool allow/deny filtering) to avoid MCP tools being silently dropped.
-    let mut deferred_section = String::new();
-    let mut activated_handle_pm: Option<
-        std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-    > = None;
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
-            config.mcp.servers.len()
-        );
-        match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    tracing::info!(
-                        "MCP deferred: {} tool stub(s) from {} server(s)",
-                        deferred_set.len(),
-                        registry.server_count()
-                    );
-                    deferred_section = crate::tools::build_deferred_tools_section(&deferred_set);
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::tools::ActivatedToolSet::new(),
-                    ));
-                    activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                    tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
+    use ::zeroclaw_log::Instrument;
+    let agent = config
+        .agent(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?
+        .clone();
+    let risk_profile = config
+        .risk_profile_for_agent(agent_alias)
+        .with_context(|| {
+            format!(
+                "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
+            )
+        })?
+        .clone();
+    let memory_composite = {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        match agent.memory.backend {
+            MemoryBackendKind::Markdown => format!("markdown.{agent_alias}"),
+            MemoryBackendKind::None => "none".to_string(),
+            _ => {
+                let raw = config.memory.backend.trim();
+                if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+                    "none".to_string()
                 } else {
                     let (kind, alias) = raw.split_once('.').unwrap_or((raw, "default"));
                     format!("{kind}.{alias}")

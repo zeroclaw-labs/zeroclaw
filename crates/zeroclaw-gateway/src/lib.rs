@@ -1944,7 +1944,7 @@ async fn run_gateway_chat_with_tools(
         let response = Box::pin(
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, message, session_id),
+                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
             ),
         )
         .await?;
