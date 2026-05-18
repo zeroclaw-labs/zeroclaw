@@ -152,7 +152,7 @@ Verified endpoints:
 | DeepSeek | `https://api.deepseek.com` | `deepseek-chat`, `deepseek-reasoner` |
 | Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-32k` |
 | Z.AI / GLM | `https://open.bigmodel.cn/api/paas` | `glm-4-plus` |
-| MiniMax | `https://api.minimax.chat` | `abab6.5s-chat` |
+| MiniMax | `https://api.minimaxi.com/v1` | `MiniMax-M2.7` |
 | Qianfan | `https://qianfan.baidubce.com/v2` | per model |
 | Venice | `https://api.venice.ai/api` | per model |
 | Vercel AI Gateway | `https://gateway.ai.vercel.app` | per model |
