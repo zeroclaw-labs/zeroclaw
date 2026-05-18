@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -7,15 +8,15 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 /// through a configurable callback URL that WeCom posts to.
 pub struct WeComChannel {
     webhook_key: String,
-    #[allow(dead_code)] // used by is_user_allowed which is WIP
-    allowed_users: Vec<String>,
+    #[allow(dead_code)] // used by allowlist which is WIP
+    allowlist: AllowlistAspect,
 }
 
 impl WeComChannel {
     pub fn new(webhook_key: String, allowed_users: Vec<String>) -> Self {
         Self {
             webhook_key,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
         }
     }
 
@@ -28,11 +29,6 @@ impl WeComChannel {
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={}",
             self.webhook_key
         )
-    }
-
-    #[cfg(test)]
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 }
 
@@ -131,20 +127,20 @@ mod tests {
     #[test]
     fn test_user_allowed_wildcard() {
         let ch = WeComChannel::new("key".into(), vec!["*".into()]);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
         let ch = WeComChannel::new("key".into(), vec!["user123".into()]);
-        assert!(ch.is_user_allowed("user123"));
-        assert!(!ch.is_user_allowed("other"));
+        assert!(ch.allowlist.is_allowed("user123"));
+        assert!(!ch.allowlist.is_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
         let ch = WeComChannel::new("key".into(), vec![]);
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
