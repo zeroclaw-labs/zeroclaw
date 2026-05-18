@@ -471,6 +471,7 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             enabled: true,
@@ -497,7 +498,7 @@ mod tests {
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -515,6 +516,7 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             enabled: true,
@@ -544,7 +546,7 @@ mod tests {
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -588,6 +590,7 @@ mod tests {
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             enabled: true,

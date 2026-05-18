@@ -69,6 +69,9 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Override the default 60s execution timeout (seconds).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -1089,7 +1092,7 @@ pub fn skills_to_prompt_with_mode(
             if !registered.is_empty() {
                 let _ = writeln!(
                     prompt,
-                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}__{{}}) instead of using shell.\">"
                 );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
@@ -1097,7 +1100,7 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}.{}", skill.name, tool.name),
+                        &format!("{}__{}", skill.name, tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
