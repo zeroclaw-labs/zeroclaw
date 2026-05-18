@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -15,7 +16,7 @@ use zeroclaw_memory::{Memory, MemoryCategory};
 pub struct DiscordHistoryChannel {
     bot_token: String,
     guild_id: Option<String>,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Channel IDs to watch. Empty = watch all channels.
     channel_ids: Vec<String>,
     /// Dedicated discord.db memory backend.
@@ -38,10 +39,19 @@ impl DiscordHistoryChannel {
         store_dms: bool,
         respond_to_dms: bool,
     ) -> Self {
+        // Discord-history's pre-aspect semantics: empty list = allow-all
+        // (logging channel default-open). Canonicalize at the config boundary
+        // to ["*"] so the standard AllowlistAspect (empty = deny-all) preserves
+        // the original presence-gate behavior without aspect-rs API growth.
+        let canonical_users = if allowed_users.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            allowed_users
+        };
         Self {
             bot_token,
             guild_id,
-            allowed_users,
+            allowlist: AllowlistAspect::new(canonical_users),
             channel_ids,
             discord_memory,
             typing_handles: Mutex::new(HashMap::new()),
@@ -61,13 +71,6 @@ impl DiscordHistoryChannel {
             "channel.discord_history",
             self.proxy_url.as_deref(),
         )
-    }
-
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        if self.allowed_users.is_empty() {
-            return true; // default open for logging channel
-        }
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     fn is_channel_watched(&self, channel_id: &str) -> bool {
@@ -411,7 +414,7 @@ impl Channel for DiscordHistoryChannel {
                         continue;
                     }
 
-                    if !self.is_user_allowed(author_id) {
+                    if !self.allowlist.is_allowed(author_id) {
                         continue;
                     }
 
