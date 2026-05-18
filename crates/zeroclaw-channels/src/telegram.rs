@@ -36,6 +36,54 @@ enum IncomingAttachmentKind {
     Photo,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+/// Telegram Bot API allows at most 100 commands via setMyCommands.
+const TELEGRAM_MAX_BOT_COMMANDS: usize = 100;
+/// Telegram command names: 1-32 lowercase a-z, 0-9, and underscore.
+const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
+/// Telegram command descriptions nominally allow up to 256 characters per the API docs,
+/// but empirical testing shows the API returns errors for descriptions substantially
+/// longer than 100 characters. This conservative cap avoids that in practice.
+const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
+
+/// Sanitize a skill name into a valid Telegram command name.
+/// Telegram commands must be 1-32 characters, lowercase a-z, 0-9, underscore only.
+fn sanitize_telegram_command_name(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
+            result.push(lower);
+        } else if !result.ends_with('_') {
+            // Replace non-alphanumeric with underscore, collapsing consecutive runs.
+            result.push('_');
+        }
+    }
+
+    let trimmed = result.trim_matches('_');
+    if trimmed.len() <= TELEGRAM_COMMAND_NAME_MAX_LEN {
+        trimmed.to_string()
+    } else {
+        trimmed[..TELEGRAM_COMMAND_NAME_MAX_LEN]
+            .trim_end_matches('_')
+            .to_string()
+    }
+}
+
+/// Truncate a description to the conservative `TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN` cap.
+/// The API nominally supports 256 characters, but empirical testing shows errors occur
+/// for descriptions substantially longer than 100 characters.
+fn truncate_telegram_command_description(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN {
+        return trimmed.to_string();
+    }
+    let mut truncated: String = trimmed
+        .chars()
+        .take(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN - 1)
+        .collect();
+    truncated.push('…');
+    truncated
+}
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -340,6 +388,8 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Pre-computed tool command specs (name, description) for bot command registration.
+    tool_command_specs: Vec<(String, String)>,
     /// Pending approval requests: callback_data key → oneshot sender.
     /// `listen()` resolves these when a matching `callback_query` arrives.
     pending_approvals: Arc<
@@ -398,6 +448,7 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
         }
@@ -418,6 +469,12 @@ impl TelegramChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Store pre-computed tool command specs for bot command registration.
+    pub fn with_tool_command_specs(mut self, specs: Vec<(String, String)>) -> Self {
+        self.tool_command_specs = specs;
         self
     }
 
@@ -620,6 +677,221 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    /// Register the bot's slash commands with Telegram via `setMyCommands`.
+    /// Called once at startup so that users see a command menu when pressing `/`.
+    /// Includes built-in runtime commands, user-installed skill commands, and
+    /// enabled tool commands from the configuration.
+    async fn register_bot_commands(&self) {
+        let mut commands: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
+            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
+            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
+            serde_json::json!({ "command": "models", "description": "List available providers or switch provider" }),
+            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
+        ];
+
+        // Track registered names to deduplicate across skills and tools.
+        let mut used_names: std::collections::HashSet<String> = commands
+            .iter()
+            .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+
+        // Collect commands from installed skills.
+        if let Some(ref workspace_dir) = self.workspace_dir {
+            let skills = zeroclaw_runtime::skills::load_skills(workspace_dir);
+
+            for skill in &skills {
+                let sanitized = sanitize_telegram_command_name(&skill.name);
+                if sanitized.is_empty() {
+                    tracing::debug!(
+                        "Skipping skill '{}': name produces empty Telegram command",
+                        skill.name
+                    );
+                    continue;
+                }
+                if used_names.contains(&sanitized) {
+                    tracing::debug!(
+                        "Skipping skill '{}': command /{sanitized} conflicts with an existing command",
+                        skill.name
+                    );
+                    continue;
+                }
+                let description = if skill.description.is_empty() {
+                    format!("Run the {name} skill", name = skill.name)
+                } else {
+                    truncate_telegram_command_description(&skill.description)
+                };
+                used_names.insert(sanitized.clone());
+                commands.push(serde_json::json!({
+                    "command": sanitized,
+                    "description": description,
+                }));
+            }
+        }
+
+        // Collect commands from enabled tools.
+        for (name, description) in &self.tool_command_specs {
+            let sanitized = sanitize_telegram_command_name(name);
+            if sanitized.is_empty() || used_names.contains(&sanitized) {
+                continue;
+            }
+            used_names.insert(sanitized.clone());
+            commands.push(serde_json::json!({
+                "command": sanitized,
+                "description": truncate_telegram_command_description(description),
+            }));
+        }
+
+        // Telegram allows at most 100 commands.
+        let total_before_cap = commands.len();
+        commands.truncate(TELEGRAM_MAX_BOT_COMMANDS);
+        if total_before_cap > TELEGRAM_MAX_BOT_COMMANDS {
+            tracing::warn!(
+                "Telegram limits bots to {TELEGRAM_MAX_BOT_COMMANDS} commands; \
+                 {total_before_cap} configured, registering first {TELEGRAM_MAX_BOT_COMMANDS}. \
+                 Reduce installed skills to expose more commands."
+            );
+        }
+
+        let url = self.api_url("setMyCommands");
+        let body = serde_json::json!({ "commands": commands });
+
+        match self.http_client().post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(
+                    "Telegram bot commands registered successfully ({} commands)",
+                    commands.len()
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!("Failed to register Telegram bot commands: {status} — {text}");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to register Telegram bot commands: {e}");
+            }
+        }
+    }
+
+    /// Check whether a voice reply should be queued for the given recipient and
+    /// content. Shared between `send()` and `finalize_draft()` so the TTS
+    /// voice-reply path works regardless of `stream_mode`.
+    ///
+    /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
+    /// debounce is skipped and `synthesize_and_send_voice` is called directly,
+    /// since the text is already the final response.
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
+        let is_voice_chat = self
+            .voice_chats
+            .lock()
+            .map(|vs| vs.contains(recipient))
+            .unwrap_or(false);
+
+        if !is_voice_chat || self.tts_config.is_none() {
+            return;
+        }
+
+        // Only queue substantive natural-language replies for voice.
+        // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
+        let is_substantive = content.len() > 40
+            && !content.starts_with("http")
+            && !content.starts_with('{')
+            && !content.starts_with('[')
+            && !content.starts_with("Error")
+            && !content.contains("```")
+            && !content.contains("tool_call")
+            && !content.contains("wttr.in");
+
+        if !is_substantive {
+            return;
+        }
+
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let voice_chats = self.voice_chats.clone();
+        let api_base = self.api_base.clone();
+        let bot_token = self.bot_token.clone();
+        let tts_config = self.tts_config.clone().unwrap();
+
+        if immediate {
+            // Finalize path: text is already the final answer — no debounce.
+            let text = content.to_string();
+            let recipient = recipient.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            });
+            return;
+        }
+
+        // Send path: debounce to coalesce multi-part tool-chain responses.
+        if let Ok(mut pv) = self.pending_voice.lock() {
+            pv.insert(
+                recipient.to_string(),
+                (content.to_string(), std::time::Instant::now()),
+            );
+        }
+
+        let pending = self.pending_voice.clone();
+        let recipient = recipient.to_string();
+        tokio::spawn(async move {
+            // Wait 10 seconds — long enough for the agent to finish its
+            // full tool chain and send the final answer.
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            // Atomic check-and-remove: only one task gets the value
+            let to_voice = pending.lock().ok().and_then(|mut pv| {
+                if let Some((_, ts)) = pv.get(&recipient)
+                    && ts.elapsed().as_secs() >= 8
+                {
+                    return pv.remove(&recipient).map(|(text, _)| text);
+                }
+                None
+            });
+
+            if let Some(text) = to_voice {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
     async fn synthesize_and_send_voice(
         api_base: &str,
@@ -795,6 +1067,43 @@ impl TelegramChannel {
             .and_then(|t| t.as_str())
             .map(|t| t == "group" || t == "supergroup")
             .unwrap_or(false)
+    }
+
+    /// Apply the `mention_only` gate to a non-text update (photo / document /
+    /// voice) using its caption as the channel for the mention.
+    ///
+    /// Returns:
+    /// - `Some(None)` — gate does not apply (DM, or `mention_only = false`,
+    ///   or the message is not in a group). The caller should use the raw
+    ///   caption / transcript as-is.
+    /// - `Some(Some(normalized))` — caption mentions the bot; the mention
+    ///   has been stripped and the resulting text is suitable for use as
+    ///   message content.
+    /// - `None` — gated and rejected; the caller must drop the update
+    ///   without performing any expensive work (no download, no
+    ///   transcription).
+    ///
+    /// Voice notes typically arrive without a caption, so under
+    /// `mention_only = true` they are rejected here before transcription
+    /// runs. If a future change wants to honor a verbal mention inside the
+    /// transcript, this gate would need to be split into a pre-download and
+    /// a post-transcription stage. See #6229.
+    fn check_media_mention_gate(
+        &self,
+        message: &serde_json::Value,
+        caption: Option<&str>,
+    ) -> Option<Option<String>> {
+        let is_group = Self::is_group_message(message);
+        if !self.mention_only || !is_group {
+            return Some(caption.map(String::from));
+        }
+        let bot_username_guard = self.bot_username.lock();
+        let bot_username = bot_username_guard.as_ref()?;
+        let caption = caption?;
+        if !Self::contains_bot_mention(caption, bot_username) {
+            return None;
+        }
+        Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
     fn is_user_allowed(&self, username: &str) -> bool {
@@ -1097,6 +1406,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
+        // Apply mention_only gate before downloading. Photo / document
+        // updates carry no `text` field, so the text-only gate in
+        // `parse_update_message` can never see them and they used to slip
+        // through unconditionally. See #6229.
+        let gated_caption =
+            self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -1169,7 +1485,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // pipeline validates vision capability. Non-image files always get
         // [Document:] format regardless of Telegram's classification.
         let mut content = format_attachment_content(attachment.kind, &local_filename, &local_path);
-        if let Some(caption) = &attachment.caption
+        // `gated_caption` is the caption with any bot mention stripped when
+        // `mention_only` applied; otherwise the raw caption (or None).
+        if let Some(caption) = gated_caption.as_deref()
             && !caption.is_empty()
         {
             use std::fmt::Write;
@@ -1231,6 +1549,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if !self.is_any_user_allowed(identities.iter().copied()) {
             return None;
         }
+
+        // Apply mention_only gate before downloading + transcribing. Voice
+        // notes typically have no caption, so under `mention_only = true`
+        // they are rejected here — the bot has no reliable way to know it
+        // was mentioned without first transcribing, and we don't want to
+        // pay that cost for messages that will likely be dropped. See #6229.
+        // The transcription itself is discarded; we only care whether the
+        // gate returns Some (allowed) vs None (rejected).
+        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
+        self.check_media_mention_gate(message, voice_caption)?;
 
         let chat_id = message
             .get("chat")
@@ -1392,6 +1720,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Extract reply context from a Telegram `reply_to_message`, if present.
     fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
+
+        // Skip the auto-injected topic-root reference Telegram adds to every
+        // message in a non-General forum topic. Its message_id equals the
+        // parent message's message_thread_id. Treating it as a real reply
+        // produces a spurious `> @user:\n> [Message]` blockquote prefix that
+        // downstream reply-intent classification reads as "user is replying
+        // to someone else" and rejects.
+        let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+        if let (Some(rmid), Some(tid)) = (reply_mid, thread_id)
+            && rmid == tid
+        {
+            return None;
+        }
 
         let reply_sender = reply
             .get("from")
@@ -2504,6 +2848,9 @@ impl Channel for TelegramChannel {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
+        // Queue TTS voice reply — immediate mode since text is already final
+        self.try_queue_voice_reply(recipient, text, true);
+
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -2699,80 +3046,7 @@ impl Channel for TelegramChannel {
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Text in → text out. Voice in → text + voice out.
-        let is_voice_chat = self
-            .voice_chats
-            .lock()
-            .map(|vs| vs.contains(&message.recipient))
-            .unwrap_or(false);
-
-        if is_voice_chat && self.tts_config.is_some() {
-            // Only queue substantive natural-language replies for voice.
-            // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
-
-            if is_substantive {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
-                let pending = self.pending_voice.clone();
-                let voice_chats = self.voice_chats.clone();
-                let api_base = self.api_base.clone();
-                let bot_token = self.bot_token.clone();
-                let chat_id_owned = chat_id.to_string();
-                let thread_id_owned = thread_id.map(str::to_string);
-                let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
-                tokio::spawn(async move {
-                    // Wait 10 seconds — long enough for the agent to finish its
-                    // full tool chain and send the final answer.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-                    // Atomic check-and-remove: only one task gets the value
-                    let to_voice = pending.lock().ok().and_then(|mut pv| {
-                        if let Some((_, ts)) = pv.get(&recipient)
-                            && ts.elapsed().as_secs() >= 8
-                        {
-                            return pv.remove(&recipient).map(|(text, _)| text);
-                        }
-                        None
-                    });
-
-                    if let Some(text) = to_voice {
-                        if let Ok(mut vc) = voice_chats.lock() {
-                            vc.remove(&recipient);
-                        }
-                        match Self::synthesize_and_send_voice(
-                            &api_base,
-                            &bot_token,
-                            &chat_id_owned,
-                            thread_id_owned.as_deref(),
-                            &text,
-                            &tts_config,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
-                            }
-                            Err(e) => {
-                                tracing::warn!("Telegram: TTS voice reply failed: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        self.try_queue_voice_reply(&message.recipient, &content, false);
 
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
@@ -2878,6 +3152,8 @@ impl Channel for TelegramChannel {
         }
 
         tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
+
+        self.register_bot_commands().await;
 
         loop {
             if self.mention_only {
@@ -3116,8 +3392,10 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Parse recipient for chat_id (may contain ":thread_id" suffix).
-        let chat_id = recipient.split_once(':').map_or(recipient, |(c, _)| c);
+        // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
+        let (chat_id, thread_id) = recipient
+            .split_once(':')
+            .map_or((recipient, None), |(c, t)| (c, Some(t)));
 
         // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -3139,12 +3417,15 @@ Ensure only one `zeroclaw` process is using this bot token."
             ]]
         });
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "reply_markup": reply_markup,
         });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
@@ -4260,6 +4541,124 @@ mod tests {
         assert!(!ch_disabled.mention_only);
     }
 
+    fn group_message_with_caption(caption: Option<&str>) -> serde_json::Value {
+        let mut msg = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": -1, "type": "group" }
+        });
+        if let Some(c) = caption {
+            msg["caption"] = serde_json::Value::String(c.to_string());
+        }
+        msg
+    }
+
+    /// Regression test for #6229 — when `mention_only = true` and a group
+    /// photo/document arrives without any caption mentioning the bot, the
+    /// gate must reject it. Before the fix, photo/document updates skipped
+    /// the gate entirely (the gate only inspected `message.text`) and the
+    /// bot replied to every photo posted in a group.
+    #[test]
+    fn check_media_mention_gate_rejects_group_media_without_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let no_caption = group_message_with_caption(None);
+        assert!(
+            ch.check_media_mention_gate(&no_caption, None).is_none(),
+            "no caption + mention_only group ⇒ reject"
+        );
+        let unrelated_caption = group_message_with_caption(Some("nice photo"));
+        assert!(
+            ch.check_media_mention_gate(&unrelated_caption, Some("nice photo"))
+                .is_none(),
+            "caption without bot mention + mention_only group ⇒ reject"
+        );
+        let other_bot_caption = group_message_with_caption(Some("hey @otherbot look"));
+        assert!(
+            ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look"))
+                .is_none(),
+            "caption mentioning a different bot ⇒ reject"
+        );
+    }
+
+    /// When the caption mentions the bot, the gate passes and returns the
+    /// caption with the mention stripped — matching the text-message
+    /// behavior of `normalize_incoming_content`.
+    #[test]
+    fn check_media_mention_gate_accepts_and_strips_caption_mention() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let msg = group_message_with_caption(Some("@mybot describe this"));
+        let result = ch.check_media_mention_gate(&msg, Some("@mybot describe this"));
+        assert_eq!(
+            result,
+            Some(Some("describe this".to_string())),
+            "mention should be stripped, remaining caption preserved"
+        );
+    }
+
+    /// `mention_only = true` only applies to groups. DMs always pass with
+    /// the caption preserved verbatim.
+    #[test]
+    fn check_media_mention_gate_passes_dm_unchanged() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        let dm = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" },
+            "caption": "hello"
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm, Some("hello")),
+            Some(Some("hello".to_string())),
+            "DM media must always pass with caption verbatim"
+        );
+        let dm_no_caption = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" }
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm_no_caption, None),
+            Some(None),
+            "DM media with no caption must pass"
+        );
+    }
+
+    /// When `mention_only = false` the gate is a no-op even in groups.
+    #[test]
+    fn check_media_mention_gate_passes_when_mention_only_disabled() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let group_no_caption = group_message_with_caption(None);
+        assert_eq!(
+            ch.check_media_mention_gate(&group_no_caption, None),
+            Some(None),
+            "mention_only off ⇒ all media pass"
+        );
+    }
+
+    /// Edge case: `mention_only = true` and the bot username has not yet
+    /// been resolved (e.g., `/getMe` hasn't completed). The gate must
+    /// reject in groups rather than fail-open, matching the existing text
+    /// path's behavior at telegram.rs:1640.
+    #[test]
+    fn check_media_mention_gate_rejects_group_when_bot_username_unknown() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true);
+        // Do NOT set bot_username — leave it None.
+        let group = group_message_with_caption(Some("@somebody hi"));
+        assert!(
+            ch.check_media_mention_gate(&group, Some("@somebody hi"))
+                .is_none(),
+            "missing bot_username in group must fail closed"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // TG6: Channel platform limit edge cases for Telegram (4096 char limit)
     // Prevents: Pattern 6 — issues #574, #499
@@ -4470,6 +4869,43 @@ mod tests {
             "text": "just a regular message"
         });
         assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_skips_topic_root() {
+        // Telegram auto-injects a reply_to_message pointing at the topic-root
+        // message on every message in a non-General forum topic. The injected
+        // reply's message_id equals the parent's message_thread_id. It is
+        // not a real reply and must not produce a blockquote prefix.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "hello in topic",
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "alice" },
+                "forum_topic_created": { "name": "General Discussion", "icon_color": 0 }
+            }
+        });
+        assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_real_reply_in_topic() {
+        // A genuine reply inside a forum topic (reply.message_id differs from
+        // the parent's message_thread_id) should still produce a blockquote.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "I agree",
+            "reply_to_message": {
+                "message_id": 100,
+                "from": { "username": "alice" },
+                "text": "What do you think?"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @alice:\n> What do you think?");
     }
 
     #[test]
@@ -5283,6 +5719,228 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_sends_correct_payload() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",    "description": "Start a new conversation session" },
+                { "command": "stop",   "description": "Cancel the current in-flight task" },
+                { "command": "model",  "description": "Show or switch the current model" },
+                { "command": "models", "description": "List available providers or switch provider" },
+                { "command": "config", "description": "Show current configuration" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri());
+
+        ch.register_bot_commands().await;
+
+        // Mock expectation assert happens on MockServer drop
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_handles_failure_gracefully() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(
+                serde_json::json!({ "ok": false, "description": "Internal Server Error" }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri());
+
+        // Should not panic — errors are logged, not propagated.
+        ch.register_bot_commands().await;
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_basic() {
+        assert_eq!(sanitize_telegram_command_name("hello"), "hello");
+        assert_eq!(sanitize_telegram_command_name("Hello"), "hello");
+        assert_eq!(sanitize_telegram_command_name("my-skill"), "my_skill");
+        assert_eq!(sanitize_telegram_command_name("my skill"), "my_skill");
+        assert_eq!(
+            sanitize_telegram_command_name("My Cool Skill!"),
+            "my_cool_skill"
+        );
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_trims_underscores() {
+        assert_eq!(sanitize_telegram_command_name("_leading"), "leading");
+        assert_eq!(sanitize_telegram_command_name("trailing_"), "trailing");
+        assert_eq!(sanitize_telegram_command_name("__both__"), "both");
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_collapses_double_underscores() {
+        assert_eq!(sanitize_telegram_command_name("a--b"), "a_b");
+        assert_eq!(sanitize_telegram_command_name("a---b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_truncates_to_32_chars() {
+        let long = "a".repeat(50);
+        let result = sanitize_telegram_command_name(&long);
+        assert!(result.len() <= TELEGRAM_COMMAND_NAME_MAX_LEN);
+        assert_eq!(result.len(), 32);
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_empty_input() {
+        assert_eq!(sanitize_telegram_command_name(""), "");
+        assert_eq!(sanitize_telegram_command_name("---"), "");
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_short() {
+        assert_eq!(
+            truncate_telegram_command_description("Short desc"),
+            "Short desc"
+        );
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_at_limit() {
+        let exact = "a".repeat(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert_eq!(truncate_telegram_command_description(&exact), exact);
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_over_limit() {
+        let long = "a".repeat(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN + 10);
+        let result = truncate_telegram_command_description(&long);
+        assert!(result.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_multibyte_within_char_limit() {
+        // Multibyte string within Telegram's 100-character description limit
+        // but well over 100 bytes in UTF-8 encoding. The function must use
+        // character count (not byte count) to decide whether to truncate, so
+        // a string like this should pass through unchanged with no trailing
+        // ellipsis. Construction is deterministic via `repeat` so the byte
+        // arithmetic is verifiable from the source: 31 ASCII bytes + 30 × 4
+        // bytes (`🌧` is U+1F327, 4 bytes UTF-8) = 151 bytes, 61 chars.
+        let desc = format!("Multibyte weather description: {}", "🌧".repeat(30));
+        assert!(desc.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert!(desc.len() > TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        let result = truncate_telegram_command_description(&desc);
+        assert!(
+            !result.ends_with('…'),
+            "should not append ellipsis when within char limit"
+        );
+        assert_eq!(result, desc.trim());
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_includes_skills() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = workspace.path().join("skills").join("weather");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: weather\ndescription: Check the weather forecast\n---\n# Weather\n",
+        )
+        .unwrap();
+
+        let mock_server = MockServer::start().await;
+
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",     "description": "Start a new conversation session" },
+                { "command": "stop",    "description": "Cancel the current in-flight task" },
+                { "command": "model",   "description": "Show or switch the current model" },
+                { "command": "models",  "description": "List available providers or switch provider" },
+                { "command": "config",  "description": "Show current configuration" },
+                { "command": "weather", "description": "Check the weather forecast" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+        ch.register_bot_commands().await;
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_includes_tools_from_config() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",       "description": "Start a new conversation session" },
+                { "command": "stop",      "description": "Cancel the current in-flight task" },
+                { "command": "model",     "description": "Show or switch the current model" },
+                { "command": "models",    "description": "List available providers or switch provider" },
+                { "command": "config",    "description": "Show current configuration" },
+                { "command": "test_tool", "description": "A test tool" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let specs = vec![("test_tool".to_string(), "A test tool".to_string())];
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri())
+            .with_tool_command_specs(specs);
+
+        ch.register_bot_commands().await;
     }
 
     // ── Approval inline keyboard tests ────────────────────────

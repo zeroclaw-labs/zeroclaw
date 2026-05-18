@@ -38,6 +38,7 @@ async fn agent_handles_tool_call_with_empty_arguments() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Tool with empty args executed"),
     ]));
@@ -55,6 +56,7 @@ async fn agent_handles_nonexistent_tool_gracefully() {
             id: "tc1".into(),
             name: "absolutely_nonexistent_tool".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Recovered from unknown tool"),
     ]));
@@ -79,6 +81,7 @@ async fn agent_handles_failing_tool() {
             id: "tc1".into(),
             name: "failing_tool".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Tool failed but I recovered"),
     ]));
@@ -100,11 +103,13 @@ async fn agent_handles_mixed_tool_success_and_failure() {
                 id: "tc1".into(),
                 name: "echo".into(),
                 arguments: r#"{"message": "success"}"#.into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "failing_tool".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("Mixed results processed"),
@@ -132,6 +137,7 @@ async fn agent_respects_max_tool_iterations() {
                 id: format!("tc_{i}"),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }])
         })
         .collect();
@@ -207,6 +213,7 @@ async fn agent_handles_unicode_tool_arguments() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "こんにちは世界 🌍"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Unicode tool executed"),
     ]));
@@ -224,6 +231,7 @@ async fn agent_handles_nested_json_tool_arguments() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "{\"nested\": true, \"deep\": {\"level\": 3}}"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Nested JSON tool executed"),
     ]));
@@ -241,6 +249,7 @@ async fn agent_handles_sequential_tool_then_text() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "step 1"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Final answer after tool"),
     ]));

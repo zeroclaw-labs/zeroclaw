@@ -78,7 +78,7 @@ pub struct AuditEvent {
     /// Monotonically increasing sequence number.
     #[serde(default)]
     pub sequence: u64,
-    /// SHA-256 hash of the previous entry (genesis uses [`GENESIS_PREV_HASH`]).
+    /// SHA-256 hash of the previous entry (genesis uses `GENESIS_PREV_HASH`).
     #[serde(default)]
     pub prev_hash: String,
     /// SHA-256 hash of (`prev_hash` || canonical JSON of this entry's content fields).

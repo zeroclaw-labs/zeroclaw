@@ -99,11 +99,7 @@ impl LinkedInClient {
                     "LINKEDIN_CLIENT_ID" => client_id = Some(value),
                     "LINKEDIN_CLIENT_SECRET" => client_secret = Some(value),
                     "LINKEDIN_ACCESS_TOKEN" => access_token = Some(value),
-                    "LINKEDIN_REFRESH_TOKEN" => {
-                        if !value.is_empty() {
-                            refresh_token = Some(value);
-                        }
-                    }
+                    "LINKEDIN_REFRESH_TOKEN" if !value.is_empty() => refresh_token = Some(value),
                     "LINKEDIN_PERSON_ID" => person_id = Some(value),
                     _ => {}
                 }

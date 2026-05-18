@@ -14,7 +14,7 @@ use zeroclaw_config::schema::IdentityConfig;
 /// AIEOS v1.1 identity structure.
 ///
 /// This follows the AIEOS schema for defining AI agent identity, personality,
-/// and behavior. See https://aieos.org for the full specification.
+/// and behavior. See <https://aieos.org> for the full specification.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AieosIdentity {
     /// Core identity: names, bio, origin, residence

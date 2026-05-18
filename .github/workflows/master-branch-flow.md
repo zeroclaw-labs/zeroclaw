@@ -4,8 +4,8 @@ How code moves from a PR to a shipped release.
 
 Use with:
 
-- [`docs/contributing/ci-map.md`](../../docs/contributing/ci-map.md)
-- [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+- [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
+- [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
 Last updated: **May 2026** (post-v0.7.4 cleanup).
 
@@ -35,7 +35,7 @@ Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (full lint + test + build + strict delta) |
+| PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
@@ -51,15 +51,15 @@ deliberate tag push.
 
 1. Contributor opens or updates a PR targeting `master`.
 2. `ci.yml` runs:
-   - `lint` — `cargo fmt --all -- --check`, `cargo clippy -D warnings`,
-     `cargo check --features ci-all`, strict delta lint on changed lines
+   - `lint` — `cargo fmt --all -- --check`, `cargo clippy --workspace
+     --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
      (PRs only).
    - `build` — matrix across `x86_64-unknown-linux-gnu`,
      `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
    - `check` — matrix: all features + no default features.
    - `check-32bit` — `i686-unknown-linux-gnu`, no default features.
    - `bench` — benchmarks compile check.
-   - `test` — `cargo nextest run --locked` on `ubuntu-latest`.
+   - `test` — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security` — `cargo deny check`.
    - `CI Required Gate` — composite job; branch protection requires this.
 3. Maintainer reviews and merges once the gate is green and review policy is
@@ -67,7 +67,7 @@ deliberate tag push.
 
 ### 2) Stable Release (manual)
 
-See [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+See [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 for the full procedure. In summary:
 
 1. Maintainer verifies CI is green on the version bump PR.
@@ -109,8 +109,8 @@ for the full procedure. In summary:
 ```mermaid
 flowchart TD
   A["PR opened or updated → master"] --> B["ci.yml"]
-  B --> L["lint\nfmt · clippy · check-features · strict-delta"]
-  L --> T["test\ncargo nextest"]
+  B --> L["lint\nfmt · clippy"]
+  L --> T["test\ncargo nextest --workspace"]
   L --> BLD["build\nLinux · macOS · Windows"]
   L --> CHK["check\nall features · no default features"]
   L --> C32["check-32bit\ni686-unknown-linux-gnu"]

@@ -5,12 +5,33 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
+use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-/// Wait for shutdown signal (SIGINT or SIGTERM).
-/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
-async fn wait_for_shutdown_signal() -> Result<()> {
+/// Why the daemon's main loop returned.
+///
+/// `Shutdown`: process exits cleanly. `Reload`: caller (typically `src/main.rs`)
+/// re-reads the config from disk and calls `daemon::run` again. The PID stays
+/// the same; only the in-process subsystems get torn down and re-instantiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonExit {
+    Shutdown,
+    Reload,
+}
+
+/// Wait for either a shutdown signal (SIGINT / SIGTERM / Ctrl+C) or an
+/// in-process reload signal (the gateway's `/admin/reload` writes `true`
+/// on the watch channel). Returns the reason so the outer loop can decide
+/// whether to re-init or exit. SIGHUP is ignored on Unix so the daemon
+/// survives terminal / SSH disconnects.
+///
+/// The reload trigger is a tokio watch channel (not an OS signal) so it
+/// works identically on Linux, macOS, and Windows. The Sender is owned by
+/// the daemon (created in `run`) and cloned to the gateway for AppState.
+async fn wait_for_exit_signal(
+    mut reload_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<DaemonExit> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -23,14 +44,27 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             tokio::select! {
                 _ = sigint.recv() => {
                     tracing::info!("Received SIGINT, shutting down...");
-                    break;
+                    return Ok(DaemonExit::Shutdown);
                 }
                 _ = sigterm.recv() => {
                     tracing::info!("Received SIGTERM, shutting down...");
-                    break;
+                    return Ok(DaemonExit::Shutdown);
                 }
                 _ = sighup.recv() => {
                     tracing::info!("Received SIGHUP, ignoring (daemon stays running)");
+                }
+                changed = reload_rx.changed() => {
+                    if changed.is_err() {
+                        // Sender dropped — treat as shutdown (shouldn't
+                        // happen in normal operation; the gateway holds a
+                        // clone for the lifetime of the daemon).
+                        tracing::warn!("Reload sender dropped; shutting down");
+                        return Ok(DaemonExit::Shutdown);
+                    }
+                    if *reload_rx.borrow_and_update() {
+                        tracing::info!("Reload requested via /admin/reload");
+                        return Ok(DaemonExit::Reload);
+                    }
                 }
             }
         }
@@ -38,11 +72,26 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("Received Ctrl+C, shutting down...");
+        loop {
+            tokio::select! {
+                res = tokio::signal::ctrl_c() => {
+                    res?;
+                    tracing::info!("Received Ctrl+C, shutting down...");
+                    return Ok(DaemonExit::Shutdown);
+                }
+                changed = reload_rx.changed() => {
+                    if changed.is_err() {
+                        tracing::warn!("Reload sender dropped; shutting down");
+                        return Ok(DaemonExit::Shutdown);
+                    }
+                    if *reload_rx.borrow_and_update() {
+                        tracing::info!("Reload requested via /admin/reload");
+                        return Ok(DaemonExit::Reload);
+                    }
+                }
+            }
+        }
     }
-
-    Ok(())
 }
 
 /// Optional subsystem start functions injected by the binary crate.
@@ -50,6 +99,8 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[allow(clippy::type_complexity)]
 pub struct DaemonSubsystems {
     /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
+    /// The fifth argument is the reload sender — the gateway hands it to its
+    /// AppState so /admin/reload can signal the daemon to re-init.
     pub gateway_start: Option<
         Box<
             dyn Fn(
@@ -57,6 +108,7 @@ pub struct DaemonSubsystems {
                     u16,
                     Config,
                     Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+                    Option<tokio::sync::watch::Sender<bool>>,
                 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
@@ -87,7 +139,7 @@ pub async fn run(
     host: String,
     port: u16,
     subsystems: DaemonSubsystems,
-) -> Result<()> {
+) -> Result<DaemonExit> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -108,21 +160,28 @@ pub async fn run(
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // Reload channel: gateway's /admin/reload writes here; our wait loop
+    // (below) selects on it alongside OS signals. Cross-platform.
+    let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+
     if let Some(gateway_start) = subsystems.gateway_start {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
+        let gateway_reload_tx = reload_tx.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
+                let reload = gateway_reload_tx.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx)).await }
+                async move { start(host, port, cfg, Some(tx), Some(reload)).await }
             },
         ));
     }
@@ -135,6 +194,7 @@ pub async fn run(
                 "channels",
                 initial_backoff,
                 max_backoff,
+                Some(event_tx.clone()),
                 move || {
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
@@ -160,6 +220,7 @@ pub async fn run(
                     "mqtt",
                     initial_backoff,
                     max_backoff,
+                    Some(event_tx.clone()),
                     move || {
                         let cfg = mqtt_cfg.clone();
                         let start = mqtt_start.clone();
@@ -183,6 +244,7 @@ pub async fn run(
             "heartbeat",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -197,6 +259,7 @@ pub async fn run(
             "scheduler",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
@@ -216,9 +279,30 @@ pub async fn run(
     }
     println!("   Ctrl+C or SIGTERM to stop");
 
-    // Wait for shutdown signal (SIGINT or SIGTERM)
-    wait_for_shutdown_signal().await?;
-    crate::health::mark_component_error("daemon", "shutdown requested");
+    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
+    let exit = wait_for_exit_signal(reload_rx).await?;
+    // Broadcast daemon lifecycle event so SSE clients know without checking tracing output.
+    match exit {
+        DaemonExit::Reload => {
+            let _ = event_tx.send(serde_json::json!({
+                "type": "daemon_reload",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+        DaemonExit::Shutdown => {
+            let _ = event_tx.send(serde_json::json!({
+                "type": "daemon_shutdown",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+    }
+    crate::health::mark_component_error(
+        "daemon",
+        match exit {
+            DaemonExit::Shutdown => "shutdown requested",
+            DaemonExit::Reload => "reload requested",
+        },
+    );
 
     for handle in &handles {
         handle.abort();
@@ -227,7 +311,7 @@ pub async fn run(
         let _ = handle.await;
     }
 
-    Ok(())
+    Ok(exit)
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -265,6 +349,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -281,7 +366,6 @@ where
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     tracing::warn!("Daemon component '{name}' exited unexpectedly");
-                    // Clean exit — reset backoff since the component ran successfully
                     backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
@@ -291,8 +375,15 @@ where
             }
 
             crate::health::bump_component_restart(name);
+            // Broadcast component restart so SSE clients know without checking tracing output.
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(serde_json::json!({
+                    "type": "component_restart",
+                    "component": name,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }));
+            }
             tokio::time::sleep(Duration::from_secs(backoff)).await;
-            // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
@@ -304,12 +395,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     };
     use std::sync::Arc;
 
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+    // Use the full configured observer (log / Prometheus / OTel + SSE via BROADCAST_HOOK)
+    // for the engine so HeartbeatTick/Error events reach the primary backend.
+    // The agent::run() calls below pass None so loop_::run() calls create_observer()
+    // internally, preserving the configured backend alongside the gateway's SSE hook.
+    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_scoped_broadcast_hook.
     let engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
-        observer,
+        std::sync::Arc::from(crate::observability::create_observer(&config.observability)),
     );
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
@@ -349,7 +443,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         continue;
                     };
                     let delivery_fut = crate::cron::scheduler::deliver_announcement(
-                        &dm_config, &channel, &target, &alert,
+                        &dm_config, &channel, &target, None, &alert,
                     );
                     match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
                         Ok(Err(e)) => {
@@ -418,6 +512,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 0.0,
                 vec![],
                 false,
+                None,
                 None,
                 None,
             ));
@@ -513,7 +608,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         if ctx.is_empty() {
                             None
                         } else {
-                            Some(format!("[Memory context]\n{ctx}\n"))
+                            Some(format!(
+                                "{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n"
+                            ))
                         }
                     }
                     _ => None,
@@ -541,6 +638,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 temp,
                 vec![],
                 false,
+                None,
                 None,
                 None,
             ));
@@ -615,6 +713,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                 &config,
                                 channel,
                                 target,
+                                None,
                                 &announcement,
                             ),
                         )
@@ -992,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
+        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, None, || async {
             anyhow::bail!("boom")
         });
 
@@ -1014,7 +1113,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let handle =
+            spawn_component_supervisor("daemon-test-exit", 1, 1, None, || async { Ok(()) });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -1110,6 +1210,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1242,7 +1344,8 @@ mod tests {
         use libc;
         use tokio::time::{Duration, timeout};
 
-        let handle = tokio::spawn(wait_for_shutdown_signal());
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
 
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1254,7 +1357,26 @@ mod tests {
         let result = timeout(Duration::from_millis(200), handle).await;
         assert!(
             result.is_err(),
-            "wait_for_shutdown_signal should not return after SIGHUP"
+            "wait_for_exit_signal should not return after SIGHUP"
         );
+    }
+
+    /// In-process reload channel returns DaemonExit::Reload so the outer
+    /// loop can re-init. Cross-platform — works on Linux, macOS, Windows.
+    #[tokio::test]
+    async fn reload_channel_returns_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reload_tx.send(true).expect("send reload");
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("wait_for_exit_signal should return after reload signal")
+            .expect("task should not panic")
+            .expect("signal handler should not error");
+        assert_eq!(result, DaemonExit::Reload);
     }
 }

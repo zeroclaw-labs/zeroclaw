@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from "react";
 import {
   Cpu,
   Clock,
@@ -12,13 +12,19 @@ import {
   MessageSquare,
   ChevronRight,
   Wifi,
-} from 'lucide-react';
-import type { StatusResponse, CostSummary, Session, ChannelDetail } from '@/types/api';
-import { getStatus, getCost, getSessions, getChannels } from '@/lib/api';
-import { useSSE } from '@/hooks/useSSE';
-import { t } from '@/lib/i18n';
+  Tag,
+} from "lucide-react";
+import type {
+  StatusResponse,
+  CostSummary,
+  Session,
+  ChannelDetail,
+} from "@/types/api";
+import { getStatus, getCost, getSessions, getChannels } from "@/lib/api";
+import { useSSE } from "@/hooks/useSSE";
+import { t } from "@/lib/i18n";
 
-type TabId = 'overview' | 'sessions' | 'channels';
+type TabId = "overview" | "sessions" | "channels";
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -59,43 +65,43 @@ function formatRelative(iso: string): string {
 
 function healthColor(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'var(--color-status-success)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'var(--color-status-warning)';
+    case "ok":
+    case "healthy":
+      return "var(--color-status-success)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "var(--color-status-warning)";
     default:
-      return 'var(--color-status-error)';
+      return "var(--color-status-error)";
   }
 }
 
 function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.2)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.2)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.2)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.2)";
     default:
-      return 'rgba(255, 68, 102, 0.2)';
+      return "rgba(255, 68, 102, 0.2)";
   }
 }
 
 function healthBg(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.05)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.05)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.05)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.05)";
     default:
-      return 'rgba(255, 68, 102, 0.05)';
+      return "rgba(255, 68, 102, 0.05)";
   }
 }
 
@@ -129,12 +135,19 @@ const STATUS_CARDS = [
     getSub: (s: StatusResponse) =>
       `${t("dashboard.paired")}: ${s.paired ? t("dashboard.paired_yes") : t("dashboard.paired_no")}`,
   },
+  {
+    icon: Tag,
+    accent: "#fb923c",
+    labelKey: "dashboard.version",
+    getValue: (s: StatusResponse) => (s.version ? `v${s.version}` : "\u2014"),
+    getSub: () => "",
+  },
 ];
 
 const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
-  { id: 'overview', labelKey: 'dashboard.tab_overview', icon: LayoutDashboard },
-  { id: 'sessions', labelKey: 'dashboard.tab_sessions', icon: Users },
-  { id: 'channels', labelKey: 'dashboard.tab_channels', icon: Wifi },
+  { id: "overview", labelKey: "dashboard.tab_overview", icon: LayoutDashboard },
+  { id: "sessions", labelKey: "dashboard.tab_sessions", icon: Users },
+  { id: "channels", labelKey: "dashboard.tab_channels", icon: Wifi },
 ];
 
 // ---------------------------------------------------------------------------
@@ -156,33 +169,64 @@ function OverviewTab({
     cost.session_cost_usd,
     cost.daily_cost_usd,
     cost.monthly_cost_usd,
-    0.001
+    0.001,
   );
 
   return (
     <>
       {/* Status Cards Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
-          <div key={labelKey} className="card p-5 animate-slide-in-up">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent, }}>
-                <Icon className="h-5 w-5" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 stagger-children">
+        {STATUS_CARDS.map(
+          ({ icon: Icon, accent, labelKey, getValue, getSub }) => (
+            <div key={labelKey} className="card p-5 animate-slide-in-up">
+              <div className="flex items-center gap-3 mb-3">
+                <div
+                  className="p-2 rounded-2xl"
+                  style={{
+                    background: `rgba(var(--pc-accent-rgb), 0.08)`,
+                    color: accent,
+                  }}
+                >
+                  <Icon className="h-5 w-5" />
+                </div>
+                <span
+                  className="text-xs uppercase tracking-wider font-medium"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
+                  {t(labelKey)}
+                </span>
               </div>
-              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
+              <p
+                className="text-lg font-semibold truncate capitalize"
+                style={{ color: "var(--pc-text-primary)" }}
+              >
+                {getValue(status)}
+              </p>
+              <p
+                className="text-sm truncate"
+                style={{ color: "var(--pc-text-muted)" }}
+              >
+                {getSub(status)}
+              </p>
             </div>
-            <p className="text-lg font-semibold truncate capitalize" style={{ color: "var(--pc-text-primary)" }}>{getValue(status)}</p>
-            <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>{getSub(status)}</p>
-          </div>
-        ))}
+          ),
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
         {/* Cost Widget */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
-            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--pc-text-primary)" }}>{t("dashboard.cost_overview")}</h2>
+            <DollarSign
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.cost_overview")}
+            </h2>
           </div>
           <div className="space-y-4">
             {[
@@ -234,7 +278,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.total_tokens_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.total_tokens.toLocaleString()}
             </span>
           </div>
@@ -242,7 +289,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.requests_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.request_count.toLocaleString()}
             </span>
           </div>
@@ -290,60 +340,75 @@ function OverviewTab({
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
               </p>
-            ) : (() => {
-              const entries = Object.entries(status.channels).filter(
-                ([, active]) => showAllChannels || active
-              );
-              if (entries.length === 0) {
-                return (
-                  <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-                    {t("dashboard.no_active_channels")}
-                  </p>
+            ) : (
+              (() => {
+                const entries = Object.entries(status.channels).filter(
+                  ([, active]) => showAllChannels || active,
                 );
-              }
-              return entries.map(([name, active]) => (
-                <div
-                  key={name}
-                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all"
-                  style={{ background: "var(--pc-bg-elevated)" }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.background = "var(--pc-hover)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "var(--pc-bg-elevated)";
-                  }}
-                >
-                  <span
-                    className="text-sm font-medium capitalize"
-                    style={{ color: "var(--pc-text-primary)" }}
+                if (entries.length === 0) {
+                  return (
+                    <p
+                      className="text-sm"
+                      style={{ color: "var(--pc-text-faint)" }}
+                    >
+                      {t("dashboard.no_active_channels")}
+                    </p>
+                  );
+                }
+                return entries.map(([name, active]) => (
+                  <div
+                    key={name}
+                    className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all"
+                    style={{ background: "var(--pc-bg-elevated)" }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = "var(--pc-hover)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background =
+                        "var(--pc-bg-elevated)";
+                    }}
                   >
-                    {name}
-                  </span>
-                  <div className="flex items-center gap-2">
                     <span
-                      className="status-dot"
-                      style={
-                        active
-                          ? {
-                              background: "var(--color-status-success)",
-                              boxShadow: "0 0 6px var(--color-status-success)",
-                            }
-                          : { background: "var(--pc-text-faint)" }
-                      }
-                    />
-                    <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-                      {active ? t("dashboard.active") : t("dashboard.inactive")}
+                      className="text-sm font-medium capitalize"
+                      style={{ color: "var(--pc-text-primary)" }}
+                    >
+                      {name}
                     </span>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="status-dot"
+                        style={
+                          active
+                            ? {
+                                background: "var(--color-status-success)",
+                                boxShadow:
+                                  "0 0 6px var(--color-status-success)",
+                              }
+                            : { background: "var(--pc-text-faint)" }
+                        }
+                      />
+                      <span
+                        className="text-xs"
+                        style={{ color: "var(--pc-text-muted)" }}
+                      >
+                        {active
+                          ? t("dashboard.active")
+                          : t("dashboard.inactive")}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              ));
-            })()}
+                ));
+              })()
+            )}
           </div>
         </div>
 
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <Activity
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
             <h2
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
@@ -352,7 +417,8 @@ function OverviewTab({
             </h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            {Object.entries(status.health.components).length === 0 ? (
+            {!status.health?.components ||
+            Object.entries(status.health.components).length === 0 ? (
               <p
                 className="text-sm col-span-2"
                 style={{ color: "var(--pc-text-faint)" }}
@@ -390,7 +456,10 @@ function OverviewTab({
                       {name}
                     </span>
                   </div>
-                  <p className="text-xs capitalize" style={{ color: "var(--pc-text-muted)" }}>
+                  <p
+                    className="text-xs capitalize"
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
                     {comp.status}
                   </p>
                   {comp.restart_count > 0 && (
@@ -422,7 +491,7 @@ function SessionsTab() {
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['session_update', 'session_created', 'session_closed'],
+    filterTypes: ["session_update", "session_created", "session_closed"],
     autoConnect: true,
   });
 
@@ -454,7 +523,10 @@ function SessionsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)" }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
             {t("dashboard.loading_sessions")}
@@ -468,7 +540,11 @@ function SessionsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
+        }}
       >
         {t("dashboard.load_sessions_error")}: {error}
       </div>
@@ -489,14 +565,20 @@ function SessionsTab() {
           </h2>
           <span
             className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full"
-            style={{ background: "rgba(var(--pc-accent-rgb), 0.1)", color: "var(--pc-accent)" }}
+            style={{
+              background: "rgba(var(--pc-accent-rgb), 0.1)",
+              color: "var(--pc-accent)",
+            }}
           >
             {sessions.length}
           </span>
         </div>
 
         {sessions.length === 0 ? (
-          <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
+          <p
+            className="text-sm py-8 text-center"
+            style={{ color: "var(--pc-text-faint)" }}
+          >
             {t("dashboard.no_sessions")}
           </p>
         ) : (
@@ -507,12 +589,14 @@ function SessionsTab() {
                 onClick={() => setSelectedSession(session)}
                 className="w-full text-left flex items-center justify-between py-3 px-4 rounded-xl transition-all"
                 style={{
-                  background: selectedSession?.session_id === session.session_id
-                    ? "rgba(var(--pc-accent-rgb), 0.08)"
-                    : "var(--pc-bg-elevated)",
-                  border: selectedSession?.session_id === session.session_id
-                    ? "1px solid rgba(var(--pc-accent-rgb), 0.2)"
-                    : "1px solid transparent",
+                  background:
+                    selectedSession?.session_id === session.session_id
+                      ? "rgba(var(--pc-accent-rgb), 0.08)"
+                      : "var(--pc-bg-elevated)",
+                  border:
+                    selectedSession?.session_id === session.session_id
+                      ? "1px solid rgba(var(--pc-accent-rgb), 0.2)"
+                      : "1px solid transparent",
                 }}
                 onMouseEnter={(e) => {
                   if (selectedSession?.session_id !== session.session_id) {
@@ -534,7 +618,10 @@ function SessionsTab() {
                       {session.session_id.slice(0, 8)}...
                     </span>
                   </div>
-                  <div className="flex items-center gap-3 text-xs" style={{ color: "var(--pc-text-muted)" }}>
+                  <div
+                    className="flex items-center gap-3 text-xs"
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
                     <span className="flex items-center gap-1">
                       <MessageSquare className="h-3 w-3" />
                       {session.message_count}
@@ -567,13 +654,28 @@ function SessionsTab() {
         {selectedSession ? (
           <div className="space-y-4">
             {[
-              { label: t("dashboard.session_id"), value: selectedSession.session_id },
-              { label: t("dashboard.session_started"), value: formatTime(selectedSession.created_at) },
-              { label: t("dashboard.session_last_activity"), value: formatRelative(selectedSession.last_activity) },
-              { label: t("dashboard.session_messages"), value: String(selectedSession.message_count) },
+              {
+                label: t("dashboard.session_id"),
+                value: selectedSession.session_id,
+              },
+              {
+                label: t("dashboard.session_started"),
+                value: formatTime(selectedSession.created_at),
+              },
+              {
+                label: t("dashboard.session_last_activity"),
+                value: formatRelative(selectedSession.last_activity),
+              },
+              {
+                label: t("dashboard.session_messages"),
+                value: String(selectedSession.message_count),
+              },
             ].map(({ label, value }) => (
               <div key={label}>
-                <p className="text-xs uppercase tracking-wider mb-1" style={{ color: "var(--pc-text-faint)" }}>
+                <p
+                  className="text-xs uppercase tracking-wider mb-1"
+                  style={{ color: "var(--pc-text-faint)" }}
+                >
                   {label}
                 </p>
                 <p
@@ -586,7 +688,10 @@ function SessionsTab() {
             ))}
           </div>
         ) : (
-          <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
+          <p
+            className="text-sm py-8 text-center"
+            style={{ color: "var(--pc-text-faint)" }}
+          >
             {t("dashboard.session_history")}
           </p>
         )}
@@ -605,7 +710,7 @@ function ChannelsTab() {
   const [error, setError] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['channel_update', 'channel_status'],
+    filterTypes: ["channel_update", "channel_status"],
     autoConnect: true,
   });
 
@@ -637,7 +742,10 @@ function ChannelsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)" }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
             {t("dashboard.loading_channels")}
@@ -651,7 +759,11 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
+        }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -661,7 +773,10 @@ function ChannelsTab() {
   if (channels.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
+        <p
+          className="text-sm py-8 text-center"
+          style={{ color: "var(--pc-text-faint)" }}
+        >
           {t("dashboard.no_channels_detail")}
         </p>
       </div>
@@ -692,7 +807,10 @@ function ChannelsTab() {
             <div className="flex items-center gap-3">
               <div
                 className="p-2 rounded-2xl"
-                style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: "var(--pc-accent)" }}
+                style={{
+                  background: `rgba(var(--pc-accent-rgb), 0.08)`,
+                  color: "var(--pc-accent)",
+                }}
               >
                 <Radio className="h-5 w-5" />
               </div>
@@ -703,7 +821,10 @@ function ChannelsTab() {
                 >
                   {channel.name}
                 </h3>
-                <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+                <span
+                  className="text-xs"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
                   {channel.type}
                 </span>
               </div>
@@ -722,16 +843,18 @@ function ChannelsTab() {
             <span
               className="text-[10px] uppercase font-medium px-2 py-0.5 rounded-full"
               style={{
-                background: channel.status === 'active'
-                  ? 'rgba(0, 230, 138, 0.1)'
-                  : channel.status === 'error'
-                    ? 'rgba(255, 68, 102, 0.1)'
-                    : 'rgba(var(--pc-accent-rgb), 0.08)',
-                color: channel.status === 'active'
-                  ? '#34d399'
-                  : channel.status === 'error'
-                    ? '#f87171'
-                    : 'var(--pc-text-muted)',
+                background:
+                  channel.status === "active"
+                    ? "rgba(0, 230, 138, 0.1)"
+                    : channel.status === "error"
+                      ? "rgba(255, 68, 102, 0.1)"
+                      : "rgba(var(--pc-accent-rgb), 0.08)",
+                color:
+                  channel.status === "active"
+                    ? "#34d399"
+                    : channel.status === "error"
+                      ? "#f87171"
+                      : "var(--pc-text-muted)",
               }}
             >
               {channel.status}
@@ -740,12 +863,14 @@ function ChannelsTab() {
               className="text-[10px] uppercase font-medium px-2 py-0.5 rounded-full"
               style={{
                 background: channel.enabled
-                  ? 'rgba(0, 230, 138, 0.1)'
-                  : 'rgba(255, 68, 102, 0.1)',
-                color: channel.enabled ? '#34d399' : '#f87171',
+                  ? "rgba(0, 230, 138, 0.1)"
+                  : "rgba(255, 68, 102, 0.1)",
+                color: channel.enabled ? "#34d399" : "#f87171",
               }}
             >
-              {channel.enabled ? t("dashboard.channel_enabled") : t("dashboard.channel_disabled")}
+              {channel.enabled
+                ? t("dashboard.channel_enabled")
+                : t("dashboard.channel_disabled")}
             </span>
           </div>
 
@@ -755,20 +880,37 @@ function ChannelsTab() {
             style={{ borderColor: "var(--pc-border)" }}
           >
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.channel_messages")}</span>
-              <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+              <span style={{ color: "var(--pc-text-muted)" }}>
+                {t("dashboard.channel_messages")}
+              </span>
+              <span
+                className="font-mono"
+                style={{ color: "var(--pc-text-primary)" }}
+              >
                 {channel.message_count.toLocaleString()}
               </span>
             </div>
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.channel_last_message")}</span>
-              <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
-                {channel.last_message_at ? formatRelative(channel.last_message_at) : t("dashboard.never")}
+              <span style={{ color: "var(--pc-text-muted)" }}>
+                {t("dashboard.channel_last_message")}
+              </span>
+              <span
+                className="font-mono"
+                style={{ color: "var(--pc-text-primary)" }}
+              >
+                {channel.last_message_at
+                  ? formatRelative(channel.last_message_at)
+                  : t("dashboard.never")}
               </span>
             </div>
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.health")}</span>
-              <span className="capitalize" style={{ color: healthColor(channel.health) }}>
+              <span style={{ color: "var(--pc-text-muted)" }}>
+                {t("dashboard.health")}
+              </span>
+              <span
+                className="capitalize"
+                style={{ color: healthColor(channel.health) }}
+              >
                 {channel.health}
               </span>
             </div>
@@ -788,7 +930,7 @@ export default function Dashboard() {
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabId>('overview');
+  const [activeTab, setActiveTab] = useState<TabId>("overview");
 
   useEffect(() => {
     Promise.all([getStatus(), getCost()])
@@ -802,7 +944,14 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171", }}>
+        <div
+          className="rounded-2xl border p-4"
+          style={{
+            background: "var(--color-status-error-alpha-08)",
+            borderColor: "var(--color-status-error-alpha-20)",
+            color: "var(--color-status-error)",
+          }}
+        >
           {t("dashboard.load_error")}: {error}
         </div>
       </div>
@@ -812,7 +961,13 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)", }}/>
+        <div
+          className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
+        />
       </div>
     );
   }
@@ -859,7 +1014,7 @@ export default function Dashboard() {
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'overview' && (
+      {activeTab === "overview" && (
         <OverviewTab
           status={status}
           cost={cost}
@@ -867,8 +1022,8 @@ export default function Dashboard() {
           setShowAllChannels={setShowAllChannels}
         />
       )}
-      {activeTab === 'sessions' && <SessionsTab />}
-      {activeTab === 'channels' && <ChannelsTab />}
+      {activeTab === "sessions" && <SessionsTab />}
+      {activeTab === "channels" && <ChannelsTab />}
     </div>
   );
 }

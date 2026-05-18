@@ -24,8 +24,11 @@ pub struct PluginManifest {
     pub description: Option<String>,
     /// Author name or organization
     pub author: Option<String>,
-    /// Path to the .wasm file (relative to manifest)
-    pub wasm_path: String,
+    /// Path to the .wasm file (relative to manifest).
+    /// Required for tool/channel/memory/observer plugins; optional (and ignored)
+    /// for skill-only plugins, which carry no WASM payload.
+    #[serde(default)]
+    pub wasm_path: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests
@@ -52,6 +55,8 @@ pub enum PluginCapability {
     Memory,
     /// Provides an observer/metrics backend
     Observer,
+    /// Provides one or more agentskills.io-format skills under `skills/`
+    Skill,
 }
 
 /// Permissions a plugin may request.
@@ -80,6 +85,7 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub capabilities: Vec<PluginCapability>,
     pub permissions: Vec<PluginPermission>,
-    pub wasm_path: PathBuf,
+    /// Resolved path to the WASM file. `None` for skill-only plugins.
+    pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
 }

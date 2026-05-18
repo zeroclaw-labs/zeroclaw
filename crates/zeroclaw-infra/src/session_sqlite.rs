@@ -66,6 +66,12 @@ impl SqliteSessionBackend {
              CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
                 INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
                 VALUES ('delete', old.id, old.session_key, old.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                VALUES ('delete', old.id, old.session_key, old.content);
+                INSERT INTO sessions_fts(rowid, session_key, content)
+                VALUES (new.id, new.session_key, new.content);
              END;",
         )
         .context("Failed to initialize session schema")?;
@@ -239,6 +245,44 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// Efficiently update the last message in-place (single UPDATE instead of
+    /// DELETE + INSERT). Used for incremental persistence during streaming.
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+
+        let last_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let Some(id) = last_id else {
+            return Ok(false);
+        };
+
+        conn.execute(
+            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+            params![message.role, message.content, id],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // NOTE: FTS index becomes stale here (no UPDATE trigger, only
+        // INSERT/DELETE triggers). This is acceptable — update_last is
+        // used for transient streaming snapshots. The final content will
+        // be correct in the sessions table for load().
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        Ok(true)
+    }
+
     fn list_sessions(&self) -> Vec<String> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -323,6 +367,28 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        let count = conn.changes() as usize;
+
+        if count > 0 {
+            conn.execute(
+                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+                params![Utc::now().to_rfc3339(), session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+
+        Ok(count)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
@@ -375,6 +441,39 @@ impl SessionBackend for SqliteSessionBackend {
             |row| row.get(0),
         )
         .map_err(std::io::Error::other)
+    }
+
+    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT session_key, created_at, last_activity, message_count, name
+             FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let key: String = row.get(0)?;
+                let created_str: String = row.get(1)?;
+                let activity_str: String = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let name: Option<String> = row.get(4)?;
+
+                let created = DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let activity = DateTime::parse_from_rfc3339(&activity_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(SessionMetadata {
+                    key,
+                    name,
+                    created_at: created,
+                    last_activity: activity,
+                    message_count: count as usize,
+                })
+            },
+        )
+        .ok()
     }
 
     fn set_session_state(
@@ -664,6 +763,49 @@ mod tests {
     }
 
     #[test]
+    fn fts5_update_trigger_syncs_index() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("chat", &ChatMessage::user("hello world"))
+            .unwrap();
+
+        // Verify initial content is searchable
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
+
+        // Directly update the session content (simulates update_last behavior)
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE sessions SET content = ?1 WHERE session_key = ?2",
+                params!["goodbye world", "chat"],
+            )
+            .unwrap();
+        }
+
+        // Old keyword should no longer match
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert!(results.is_empty());
+
+        // New keyword should match after UPDATE trigger syncs FTS index
+        let results = backend.search(&SessionQuery {
+            keyword: Some("goodbye".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
+    }
+
+    #[test]
     fn cleanup_stale_removes_old_sessions() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -692,6 +834,62 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    #[test]
+    fn clear_messages_removes_rows_keeps_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.set_session_name("s1", "My Session").unwrap();
+
+        let cleared = backend.clear_messages("s1").unwrap();
+        assert_eq!(cleared, 2);
+        assert!(backend.load("s1").is_empty());
+        // Session still exists in metadata with name preserved
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].message_count, 0);
+        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn clear_messages_empty_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.clear_messages("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_messages_does_not_affect_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s2", &ChatMessage::user("world")).unwrap();
+
+        backend.clear_messages("s1").unwrap();
+        assert!(backend.load("s1").is_empty());
+        assert_eq!(backend.load("s2").len(), 1);
+    }
+
+    #[test]
+    fn clear_messages_then_append_works() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("old")).unwrap();
+        backend.clear_messages("s1").unwrap();
+        backend.append("s1", &ChatMessage::user("new")).unwrap();
+
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "new");
+        // Metadata count should reflect the new message
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].message_count, 1);
     }
 
     #[test]
@@ -921,5 +1119,48 @@ mod tests {
 
         let meta = backend.list_sessions_with_metadata();
         assert!(meta[0].name.is_none());
+    }
+
+    // ── get_session_metadata tests ─────────────────────────────────
+
+    #[test]
+    fn get_session_metadata_returns_full_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.set_session_name("s1", "My Chat").unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.key, "s1");
+        assert_eq!(meta.name.as_deref(), Some("My Chat"));
+        assert_eq!(meta.message_count, 2);
+    }
+
+    #[test]
+    fn get_session_metadata_returns_none_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(backend.get_session_metadata("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_session_metadata_matches_list() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("a")).unwrap();
+        backend.append("s1", &ChatMessage::user("b")).unwrap();
+        backend.append("s2", &ChatMessage::user("c")).unwrap();
+
+        let single = backend.get_session_metadata("s1").unwrap();
+        let all = backend.list_sessions_with_metadata();
+        let from_list = all.iter().find(|m| m.key == "s1").unwrap();
+
+        assert_eq!(single.message_count, from_list.message_count);
+        assert_eq!(single.name, from_list.name);
+        assert_eq!(single.created_at, from_list.created_at);
+        assert_eq!(single.last_activity, from_list.last_activity);
     }
 }

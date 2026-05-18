@@ -76,7 +76,7 @@ impl Clone for ActionTracker {
 ///
 /// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
 /// its own independent [`ActionTracker`] bucket. When no sender is in scope
-/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+/// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
 ///
 /// Note: sender buckets accumulate for the daemon lifetime with no eviction.
 /// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
@@ -181,7 +181,7 @@ pub struct SecurityPolicy {
 
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     #[allow(unused_mut)]
     let mut cmds = vec![
         "git".into(),
@@ -218,7 +218,7 @@ fn default_allowed_commands() -> Vec<String> {
 /// Includes both native Windows commands and their Unix equivalents
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     vec![
         // Cross-platform tools
         "git".into(),
@@ -255,7 +255,7 @@ fn default_allowed_commands() -> Vec<String> {
 
 /// Default forbidden paths for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "/etc".into(),
         "/root".into(),
@@ -280,7 +280,7 @@ fn default_forbidden_paths() -> Vec<String> {
 
 /// Default forbidden paths for Windows platforms.
 #[cfg(target_os = "windows")]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "C:\\Windows".into(),
         "C:\\Windows\\System32".into(),
@@ -341,6 +341,24 @@ fn expand_user_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+/// Returns `true` if `path` is exactly the OS null device.
+///
+/// `/dev/null` is unconditionally permitted because redirecting output
+/// there is a common, harmless shell pattern. The rest of `/dev` remains
+/// blocked by the default forbidden-path list.
+fn is_null_device(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        path == Path::new("/dev/null")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        let lower = s.to_ascii_lowercase();
+        lower == "nul" || lower == r"\\.\nul"
+    }
 }
 
 fn rootless_path(path: &Path) -> Option<PathBuf> {
@@ -548,10 +566,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
-                    '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
-                        }
+                    // This must consume the second '&' so `&&` is not later
+                    // re-read as a lone trailing '&'.
+                    '&' if chars.next_if_eq(&'&').is_none() => {
+                        return true;
                     }
                     _ => {}
                 }
@@ -624,7 +642,11 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
         // non-operator character after the device name prevents the match —
         // blocking bypasses like `2>/dev/stderr.log` or `>/dev/zero/path`.
         // The terminator is captured and preserved in the replacement.
-        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\s|[;&|)]|$)").unwrap()
+        Regex::new(&format!(
+            r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
+            safe_device_redirect_names_pattern()
+        ))
+        .unwrap()
     });
 
     let safe = re.replace_all(command, "$2").to_string();
@@ -758,18 +780,52 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn redirection_target(token: &str) -> Option<&str> {
-    let marker_idx = token.find(['<', '>'])?;
+enum RedirectionArgument<'a> {
+    Target { prefix: &'a str, target: &'a str },
+    NeedsNextToken { prefix: &'a str },
+    FdOnly { prefix: &'a str },
+    None,
+}
+
+fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
+    let Some(marker_idx) = token.find(['<', '>']) else {
+        return RedirectionArgument::None;
+    };
+    let prefix = token[..marker_idx].trim();
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
+    if let Some(after_amp) = rest.strip_prefix('&') {
+        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
+        if remaining.is_empty() {
+            return RedirectionArgument::FdOnly { prefix };
+        }
+    }
     rest = rest.trim_start_matches('&');
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        None
+        RedirectionArgument::NeedsNextToken { prefix }
     } else {
-        Some(trimmed)
+        RedirectionArgument::Target {
+            prefix,
+            target: trimmed,
+        }
     }
+}
+
+const SAFE_DEVICE_REDIRECT_TARGETS: [&str; 4] =
+    ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/zero"];
+
+fn safe_device_redirect_names_pattern() -> String {
+    SAFE_DEVICE_REDIRECT_TARGETS
+        .iter()
+        .map(|target| target.trim_start_matches("/dev/"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn is_safe_device_redirect_target(target: &str) -> bool {
+    SAFE_DEVICE_REDIRECT_TARGETS.contains(&strip_wrapping_quotes(target).trim())
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -1162,9 +1218,13 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
+            // Validate arguments for the command.
+            // Both case-preserved and lowercased argument lists are provided:
+            //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
+            //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
+            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
             }
         }
@@ -1186,7 +1246,7 @@ impl SecurityPolicy {
     /// - ZeptoClaw GHSA-5wp8-q9mx-8jx8 (CVSS 9.8): same vulnerability class
     /// - OpenClaw strictInlineEval: blocks python -c, node -e, etc.
     /// - OWASP OS Command Injection Defense Cheat Sheet
-    fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
+    fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
@@ -1195,14 +1255,18 @@ impl SecurityPolicy {
             }
             "git" => {
                 // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
-                !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
-                })
+                // (e.g. git config core.editor "rm -rf /").
+                // NOTE: `-c` (lowercase) is compared case-sensitively against
+                // `args_cased` because git's `-C` (uppercase, change directory)
+                // is a distinct, benign option that must not be conflated with
+                // `-c` (set config override). See #5809.
+                !args_cased.iter().any(|arg| arg == "-c")
+                    && !args.iter().any(|arg| {
+                        arg == "config"
+                            || arg.starts_with("config.")
+                            || arg == "alias"
+                            || arg.starts_with("alias.")
+                    })
             }
             "python" | "python3" => {
                 // -c executes arbitrary code from argument string
@@ -1267,6 +1331,26 @@ impl SecurityPolicy {
                 None
             }
         };
+        let forbidden_non_redirect_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if candidate.starts_with('-') {
+                if let Some((_, value)) = candidate.split_once('=')
+                    && let Some(blocked) = forbidden_candidate(value)
+                {
+                    return Some(blocked);
+                }
+                if let Some(value) = attached_short_option_value(candidate)
+                    && let Some(blocked) = forbidden_candidate(value)
+                {
+                    return Some(blocked);
+                }
+                return None;
+            }
+            forbidden_candidate(candidate)
+        };
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
@@ -1275,42 +1359,78 @@ impl SecurityPolicy {
                 continue;
             };
 
+            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
+            let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
-            if let Some(target) = redirection_target(strip_wrapping_quotes(executable))
-                && let Some(blocked) = forbidden_candidate(target)
-            {
-                return Some(blocked);
+            match executable_redirect {
+                RedirectionArgument::Target { target, .. } => {
+                    if !is_safe_device_redirect_target(target)
+                        && let Some(blocked) = forbidden_candidate(target)
+                    {
+                        return Some(blocked);
+                    }
+                }
+                RedirectionArgument::NeedsNextToken { .. } => {
+                    next_is_redirect_target = true;
+                }
+                RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
             for token in words {
                 let candidate = strip_wrapping_quotes(token).trim();
-                if candidate.is_empty() || candidate.contains("://") {
+                if candidate.is_empty() {
                     continue;
                 }
 
-                if let Some(target) = redirection_target(candidate)
-                    && let Some(blocked) = forbidden_candidate(target)
-                {
-                    return Some(blocked);
+                if next_is_redirect_target {
+                    next_is_redirect_target = false;
+                    if is_safe_device_redirect_target(candidate) {
+                        continue;
+                    }
+                    if let Some(blocked) = forbidden_candidate(candidate) {
+                        return Some(blocked);
+                    }
+                    continue;
+                }
+
+                if candidate.contains("://") {
+                    continue;
+                }
+
+                match parse_redirection_argument(candidate) {
+                    RedirectionArgument::Target { prefix, target } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        if is_safe_device_redirect_target(target) {
+                            continue;
+                        }
+                        if let Some(blocked) = forbidden_candidate(target) {
+                            return Some(blocked);
+                        }
+                    }
+                    RedirectionArgument::NeedsNextToken { prefix } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        next_is_redirect_target = true;
+                        continue;
+                    }
+                    RedirectionArgument::FdOnly { prefix } => {
+                        if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
+                            return Some(blocked);
+                        }
+                        continue;
+                    }
+                    RedirectionArgument::None => {}
                 }
 
                 // Handle option assignment forms like `--file=/etc/passwd`.
-                if candidate.starts_with('-') {
-                    if let Some((_, value)) = candidate.split_once('=')
-                        && let Some(blocked) = forbidden_candidate(value)
-                    {
-                        return Some(blocked);
-                    }
-                    if let Some(value) = attached_short_option_value(candidate)
-                        && let Some(blocked) = forbidden_candidate(value)
-                    {
-                        return Some(blocked);
-                    }
-                    continue;
-                }
-
-                if let Some(blocked) = forbidden_candidate(candidate) {
+                if let Some(blocked) = forbidden_non_redirect_candidate(candidate) {
                     return Some(blocked);
+                }
+                if candidate.starts_with('-') {
+                    continue;
                 }
             }
         }
@@ -1354,6 +1474,12 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
+        // The null device is always permitted regardless of workspace or
+        // forbidden-path config; the rest of /dev remains blocked as usual.
+        if is_null_device(&expanded_path) {
+            return true;
+        }
+
         // When workspace_only is set and the path is absolute, only allow it
         // if it falls within the workspace directory or an explicit allowed
         // root.  The workspace/allowed-root check runs BEFORE the forbidden
@@ -1392,6 +1518,10 @@ impl SecurityPolicy {
     /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if is_null_device(resolved) {
+            return true;
+        }
+
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
@@ -1707,6 +1837,14 @@ mod tests {
 
     fn default_policy() -> SecurityPolicy {
         SecurityPolicy::default()
+    }
+
+    fn unix_forbidden_path_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            workspace_dir: PathBuf::from("/workspace"),
+            forbidden_paths: vec!["/dev".into(), "/etc".into()],
+            ..SecurityPolicy::default()
+        }
     }
 
     fn readonly_policy() -> SecurityPolicy {
@@ -2634,6 +2772,26 @@ mod tests {
     }
 
     #[test]
+    fn git_dash_c_uppercase_is_allowed() {
+        // Regression test for #5809: git -C (change directory) must not be
+        // conflated with git -c (set config override) after arg lowercasing.
+        let p = default_policy();
+        assert!(
+            p.is_command_allowed("git -C /home/user/repo status --short"),
+            "git -C is benign and should be allowed"
+        );
+        assert!(
+            p.is_command_allowed("git -C /home/user/repo log --oneline -1"),
+            "git -C with log should be allowed"
+        );
+        // git -c (lowercase) is still blocked — config override injection
+        assert!(
+            !p.is_command_allowed("git -c core.editor=\"rm -rf /\" commit"),
+            "git -c must remain blocked"
+        );
+    }
+
+    #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
         // find -exec is a common bypass
@@ -2689,7 +2847,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_absolute_path() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("cat /etc/passwd"),
             Some("/etc/passwd".into())
@@ -2718,7 +2876,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_option_assignment_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
             Some("/etc/passwd".into())
@@ -2740,7 +2898,7 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_short_option_attached_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
             Some("/etc/passwd".into())
@@ -2776,13 +2934,80 @@ mod tests {
 
     #[test]
     fn forbidden_path_argument_detects_input_redirection_paths() {
-        let p = default_policy();
+        let p = unix_forbidden_path_policy();
         assert_eq!(
             p.forbidden_path_argument("cat </etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
             p.forbidden_path_argument("cat</etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_device_redirect_targets() {
+        let p = unix_forbidden_path_policy();
+        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
+        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
+        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
+        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
+        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
+        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
+        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
+        let p = unix_forbidden_path_policy();
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi > /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            Some("/dev/stderr.log".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            Some("/dev/stderr.log".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            Some("/dev/zero/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            Some("/dev/null/../../etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd>&2"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
     }

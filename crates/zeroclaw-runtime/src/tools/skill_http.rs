@@ -25,11 +25,15 @@ pub struct SkillHttpTool {
 impl SkillHttpTool {
     /// Create a new skill HTTP tool.
     ///
-    /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
+    /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
+    ///
+    /// Note: `timeout_secs` from the manifest is intentionally ignored here;
+    /// HTTP tools use the fixed `HTTP_TIMEOUT_SECS` client timeout. Per-tool
+    /// HTTP timeout support is tracked as a follow-up.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
-            tool_name: format!("{}.{}", skill_name, tool.name),
+            tool_name: format!("{}__{}", skill_name, tool.name),
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -167,13 +171,14 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
     #[test]
     fn skill_http_tool_name_is_prefixed() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
-        assert_eq!(tool.name(), "weather_skill.get_weather");
+        assert_eq!(tool.name(), "weather_skill__get_weather");
     }
 
     #[test]
@@ -203,7 +208,7 @@ mod tests {
     fn skill_http_tool_spec_roundtrip() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let spec = tool.spec();
-        assert_eq!(spec.name, "weather_skill.get_weather");
+        assert_eq!(spec.name, "weather_skill__get_weather");
         assert_eq!(spec.description, "Fetch weather for a city");
         assert_eq!(spec.parameters["type"], "object");
     }
@@ -216,6 +221,7 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

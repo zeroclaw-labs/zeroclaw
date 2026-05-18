@@ -79,9 +79,11 @@ impl MattermostChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
+        zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
             "channel.mattermost",
             self.proxy_url.as_deref(),
+            30,
+            10,
         )
     }
 

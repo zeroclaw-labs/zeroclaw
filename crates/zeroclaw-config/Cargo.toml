@@ -10,6 +10,8 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
 anyhow = "1.0"
+# OnboardUi needs dyn-compat; native AFIT isn't dyn-safe. Already built for api/channels/runtime.
+async-trait = "0.1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"

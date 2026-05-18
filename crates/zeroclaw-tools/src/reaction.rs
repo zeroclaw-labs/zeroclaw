@@ -3,7 +3,7 @@
 //! Exposes `add_reaction` and `remove_reaction` from the [`Channel`] trait as an
 //! agent-callable tool. The tool holds a late-binding channel map handle that is
 //! populated once channels are initialized (after tool construction). This mirrors
-//! the pattern used by [`DelegateTool`] for its parent-tools handle.
+//! the pattern used by `DelegateTool` for its parent-tools handle.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -26,8 +26,7 @@ pub struct ReactionTool {
 
 impl ReactionTool {
     /// Create a new reaction tool with an empty channel map.
-    /// Call [`populate`] or write to the returned [`ChannelMapHandle`] once channels
-    /// are available.
+    /// Write to the returned [`ChannelMapHandle`] once channels are available.
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),

@@ -9,6 +9,15 @@
 use zeroclaw::providers::create_provider;
 use zeroclaw::providers::traits::ChatMessage;
 
+/// Near-zero temperature for the single-word sanity check; we ask for "one
+/// word" and just assert the response is non-empty, so a near-deterministic
+/// value avoids verbose sampling artifacts.
+const ZAI_SANITY_TEMPERATURE: f64 = 0.1;
+
+/// Zero = greedy sampling; the multi-turn test asserts the exact secret
+/// word ("banana") appears in the reply, so determinism is required.
+const ZAI_RECALL_TEMPERATURE: f64 = 0.0;
+
 /// Sends a simple chat request to Z.AI with JWT auth and verifies a 200 response.
 #[tokio::test]
 #[ignore = "requires live ZAI_API_KEY"]
@@ -21,7 +30,7 @@ async fn live_zai_jwt_auth_chat() {
             Some("Reply in exactly one word."),
             "What color is the sky?",
             "glm-5-turbo",
-            0.1,
+            Some(ZAI_SANITY_TEMPERATURE),
         )
         .await;
 
@@ -51,7 +60,7 @@ async fn live_zai_jwt_auth_multi_turn() {
     ];
 
     let result = provider
-        .chat_with_history(&messages, "glm-5-turbo", 0.0)
+        .chat_with_history(&messages, "glm-5-turbo", Some(ZAI_RECALL_TEMPERATURE))
         .await;
 
     match &result {

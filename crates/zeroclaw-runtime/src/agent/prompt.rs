@@ -1,5 +1,4 @@
 use crate::agent::personality;
-use crate::i18n::ToolDescriptions;
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -18,9 +17,9 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
-    /// Locale-aware tool descriptions. When present, tool descriptions in
-    /// prompts are resolved from the locale file instead of hardcoded values.
-    pub tool_descriptions: Option<&'a ToolDescriptions>,
+    /// True when the provider request carries native tool specs. In that mode
+    /// the prompt must not duplicate the same tool catalog in prose.
+    pub sends_native_tool_specs: bool,
     /// Pre-rendered security policy summary for inclusion in the Safety
     /// prompt section.  When present, the LLM sees the concrete constraints
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
@@ -127,7 +126,11 @@ impl PromptSection for ToolHonestySection {
         "tool_honesty"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+
         Ok(
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
@@ -144,12 +147,17 @@ impl PromptSection for ToolsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+        if ctx.sends_native_tool_specs {
+            return Ok(ctx.dispatcher_instructions.to_string());
+        }
+
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
-            let desc = ctx
-                .tool_descriptions
-                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
-                .unwrap_or_else(|| tool.description());
+            let i18n_description = crate::i18n::get_tool_description(tool.name());
+            let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
@@ -355,7 +363,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -386,7 +395,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -394,6 +404,56 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn prompt_builder_skips_tools_section_for_native_tool_specs() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: true,
+
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("test_tool"));
+        assert!(prompt.contains("## Safety"));
+    }
+
+    #[test]
+    fn prompt_builder_omits_tool_sections_when_no_tools_available() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## CRITICAL: Tool Honesty"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(!prompt.contains("<tool_call>"));
+        assert!(prompt.contains("## Project Context"));
+        assert!(prompt.contains("## Workspace"));
+        assert!(prompt.contains("## Runtime"));
     }
 
     #[test]
@@ -411,6 +471,7 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: None,
@@ -424,7 +485,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -435,7 +497,7 @@ mod tests {
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -453,6 +515,7 @@ mod tests {
                 kind: "shell".into(),
                 command: "echo ok".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
@@ -466,7 +529,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -480,7 +544,7 @@ mod tests {
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -494,7 +558,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -523,6 +588,7 @@ mod tests {
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -535,7 +601,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -569,7 +636,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -604,7 +672,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -631,7 +700,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
         };
@@ -666,7 +736,8 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,7 +15,10 @@ use zip::ZipArchive;
 pub mod audit;
 pub mod creator;
 pub mod improver;
+mod suggestions;
 pub mod testing;
+
+pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -64,12 +67,22 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Override the default 60s execution timeout (seconds).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillManifest {
     skill: SkillMeta,
+    /// SkillForge-emitted provenance metadata. Lives in a top-level `[forge]`
+    /// table so that `SkillMeta` (the canonical skill-identity contract) is
+    /// not coupled to the SkillForge integrator's emit format. Hand-authored
+    /// SKILL.toml files omit this; auto-integrated skills carry it. See
+    /// #6210 for the architectural rationale (FND-001 §4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forge: Option<ForgeMetadata>,
     #[serde(default)]
     tools: Vec<SkillTool>,
     #[serde(default)]
@@ -77,6 +90,7 @@ struct SkillManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkillMeta {
     name: String,
     description: String,
@@ -86,6 +100,49 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    prompts: Vec<String>,
+}
+
+/// Provenance metadata emitted by the SkillForge integrator (see
+/// `crates/zeroclaw-runtime/src/skillforge/integrate.rs`). Lives at the
+/// top level of SKILL.toml under `[forge]`, kept separate from
+/// `[skill]` so the canonical skill identity stays decoupled from the
+/// integrator's emit format. Strict by design: a typo here is just as
+/// bad as a typo in `[skill]` (silent misconfiguration of provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgeMetadata {
+    /// Upstream URL the skill was integrated from.
+    #[serde(default)]
+    source: Option<String>,
+    /// Upstream owner (GitHub user / org).
+    #[serde(default)]
+    owner: Option<String>,
+    /// Primary language reported by the source (or `"unknown"`).
+    #[serde(default)]
+    language: Option<String>,
+    /// `true` if the upstream repo carries a license file.
+    #[serde(default)]
+    license: Option<bool>,
+    /// Upstream star count at integration time.
+    #[serde(default)]
+    stars: Option<u64>,
+    /// Upstream `updated_at` timestamp formatted `YYYY-MM-DD`, or
+    /// `"unknown"` if the integrator could not resolve one.
+    #[serde(default)]
+    updated_at: Option<String>,
+    /// Runtime/version requirements declared by the integrator.
+    #[serde(default)]
+    requirements: BTreeMap<String, toml::Value>,
+    /// Free-form integrator metadata (e.g. `auto_integrated`,
+    /// `forge_timestamp`). **This is the intended extension point** for
+    /// future SkillForge metadata: prefer adding new keys under
+    /// `[forge.metadata.X]` over new top-level `[forge]` fields, which
+    /// would require a coordinated `ForgeMetadata` schema bump and break
+    /// strict parsing for anyone running an older runtime.
+    #[serde(default)]
+    metadata: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,6 +156,96 @@ struct SkillMarkdownMeta {
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+/// Trust tier of a skill listed in the `zeroclaw-skills` registry.
+///
+/// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
+/// "no recognized tier tag" fallback and is treated like `Community` for trust
+/// purposes when displaying the install banner.
+///
+/// `Featured` is intentionally kept as a distinct variant even though it
+/// renders identically to `Community` today: the registry's `Featured` tag is
+/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
+/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
+/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
+/// Keeping the variant now avoids a churn-y enum extension once that copy
+/// lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTier {
+    Official,
+    Community,
+    Featured,
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryIndex {
+    #[serde(default)]
+    skills: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEntry {
+    name: String,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn tier_from_tags(tags: &[String]) -> SkillTier {
+    let has = |needle: &str| tags.iter().any(|t| t.eq_ignore_ascii_case(needle));
+    if has("Official") {
+        SkillTier::Official
+    } else if has("Community") {
+        SkillTier::Community
+    } else if has("Featured") {
+        SkillTier::Featured
+    } else {
+        SkillTier::Unknown
+    }
+}
+
+/// Look up a skill in `<registry_dir>/registry.json` and return its trust tier
+/// and version. Returns `(SkillTier::Unknown, None)` if the index file is
+/// missing, malformed, or does not list the skill.
+pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier, Option<String>) {
+    let path = registry_dir.join("registry.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Ok(index) = serde_json::from_str::<RegistryIndex>(&data) else {
+        return (SkillTier::Unknown, None);
+    };
+    let Some(entry) = index.skills.into_iter().find(|e| e.name == name) else {
+        return (SkillTier::Unknown, None);
+    };
+    (tier_from_tags(&entry.tags), entry.version)
+}
+
+/// Build the install-time tier banner. `Official` skills get a single
+/// informational line; everything else (including `Featured` and the
+/// missing-tag fallback) gets the Community warn block.
+pub fn build_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) -> String {
+    let version_label = version.unwrap_or("?");
+    let args = [("name", name), ("version", version_label)];
+    let key = match tier {
+        SkillTier::Official => "cli-skills-install-tier-official",
+        SkillTier::Community | SkillTier::Featured | SkillTier::Unknown => {
+            "cli-skills-install-tier-community"
+        }
+    };
+    let mut banner = crate::i18n::get_required_cli_string_with_args(key, &args);
+    if !banner.ends_with('\n') {
+        banner.push('\n');
+    }
+    banner
+}
+
+/// Print the install-time tier banner to stdout.
+pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillTier) {
+    print!("{}", build_install_tier_banner(name, version, tier));
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
@@ -169,12 +316,18 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    #[allow(unused_mut)]
+    let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+
+    #[cfg(feature = "plugins-wasm")]
+    skills.extend(load_plugin_skills_from_config(config));
+
+    skills
 }
 
 /// Load skills using explicit open-skills settings.
@@ -182,12 +335,13 @@ pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
     open_skills_enabled: bool,
     open_skills_dir: Option<&str>,
+    allow_scripts: bool,
 ) -> Vec<Skill> {
     load_skills_with_open_skills_config(
         workspace_dir,
         Some(open_skills_enabled),
         open_skills_dir,
-        None,
+        Some(allow_scripts),
     )
 }
 
@@ -265,9 +419,18 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(skill);
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(skill);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %toml_path.display(),
+                        err  = %e,
+                        "failed to load SKILL.toml — skill directory skipped",
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_skill_md(&md_path, &path)
@@ -338,9 +501,18 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
         };
 
         if let Some(toml_path) = toml_path {
-            if let Ok(skill) = load_skill_toml(&toml_path) {
-                warn_metadata_drift(&path, &skill, &md_path);
-                skills.push(finalize_open_skill(skill));
+            match load_skill_toml(&toml_path) {
+                Ok(skill) => {
+                    warn_metadata_drift(&path, &skill, &md_path);
+                    skills.push(finalize_open_skill(skill));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %toml_path.display(),
+                        err  = %e,
+                        "failed to load SKILL.toml — skill directory skipped",
+                    );
+                }
             }
         } else if md_path.exists()
             && let Ok(skill) = load_open_skill_md(&md_path)
@@ -596,6 +768,13 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
+    // Merge prompts from both locations: inside the [skill] table (natural
+    // location for per-skill prompts) and at the manifest root (historical
+    // location). Previously, prompts placed inside [skill] were silently
+    // dropped because SkillMeta had no `prompts` field. Fixes #5721.
+    let mut prompts = manifest.skill.prompts;
+    prompts.extend(manifest.prompts);
+
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
@@ -603,7 +782,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
-        prompts: manifest.prompts,
+        prompts,
         location: Some(path.to_path_buf()),
     })
 }
@@ -925,7 +1104,7 @@ pub fn skills_to_prompt_with_mode(
             if !registered.is_empty() {
                 let _ = writeln!(
                     prompt,
-                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}__{{}}) instead of using shell.\">"
                 );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
@@ -933,7 +1112,7 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}.{}", skill.name, tool.name),
+                        &format!("{}__{}", skill.name, tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -976,9 +1155,13 @@ pub fn skills_to_tools(
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::skills::skill_tool::SkillShellTool::new(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new(
                         &skill.name,
                         tool,
+                        security.clone(),
+                    );
+                    tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
+                        inner,
                         security.clone(),
                     )));
                 }
@@ -1355,7 +1538,7 @@ pub fn install_git_skill_source(
     }
 }
 
-pub fn install_clawhub_skill_source(
+pub async fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
@@ -1371,13 +1554,14 @@ pub fn install_clawhub_skill_source(
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
 
     let resp = client
         .get(&download_url)
         .send()
+        .await
         .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1387,7 +1571,7 @@ pub fn install_clawhub_skill_source(
         anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
     }
 
-    let bytes = resp.bytes()?.to_vec();
+    let bytes = resp.bytes().await?.to_vec();
     if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
         anyhow::bail!(
             "ClawhHub zip rejected: too large ({} bytes > {})",
@@ -1581,6 +1765,7 @@ pub fn install_registry_skill_source(
     allow_scripts: bool,
     workspace_dir: &Path,
     registry_url: Option<&str>,
+    suppress_tier_banner: bool,
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
@@ -1596,6 +1781,11 @@ pub fn install_registry_skill_source(
         );
     }
 
+    if !suppress_tier_banner {
+        let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
+        print_install_tier_banner(source, version.as_deref(), tier);
+    }
+
     install_local_skill_source(
         skill_dir.to_str().with_context(|| {
             format!("registry path is not valid UTF-8: {}", skill_dir.display())
@@ -1603,6 +1793,74 @@ pub fn install_registry_skill_source(
         skills_path,
         allow_scripts,
     )
+}
+
+// ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
+
+/// Load skills from skill-capable plugins discovered by the plugin host.
+///
+/// Each plugin's `skills/` directory is fed to the existing skill loader, and
+/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
+/// collisions with user-authored skills and between bundles. The `plugin:<name>`
+/// tag is also added so prompts can distinguish plugin skills.
+#[cfg(feature = "plugins-wasm")]
+pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+    if !config.plugins.enabled {
+        return Vec::new();
+    }
+
+    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
+    let parent = match plugins_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+
+    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
+
+    let host = match zeroclaw_plugins::host::PluginHost::with_security(
+        &parent,
+        signature_mode,
+        trusted_keys,
+    ) {
+        Ok(host) => host,
+        Err(err) => {
+            tracing::warn!("failed to discover plugin skills: {err}");
+            return Vec::new();
+        }
+    };
+
+    let allow_scripts = config.skills.allow_scripts;
+    let mut skills = Vec::new();
+    for (manifest, skills_dir) in host.skill_plugin_details() {
+        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+            skills.push(namespace_plugin_skill(&manifest.name, raw));
+        }
+    }
+    skills
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
+    if let Some(rest) = plugins_dir.strip_prefix("~/")
+        && let Some(dirs) = UserDirs::new()
+    {
+        return dirs.home_dir().join(rest);
+    }
+    PathBuf::from(plugins_dir)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
+    let qualified = format!("plugin:{}/{}", plugin_name, skill.name);
+    skill.name = qualified;
+    let plugin_tag = format!("plugin:{plugin_name}");
+    if !skill.tags.iter().any(|t| t == &plugin_tag) {
+        skill.tags.push(plugin_tag);
+    }
+    skill
 }
 
 #[cfg(test)]
@@ -1658,5 +1916,511 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_official() {
+        assert_eq!(
+            tier_from_tags(&["Official".into(), "Featured".into()]),
+            SkillTier::Official
+        );
+        // Case-insensitive match.
+        assert_eq!(tier_from_tags(&["official".into()]), SkillTier::Official);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_community() {
+        assert_eq!(tier_from_tags(&["Community".into()]), SkillTier::Community);
+    }
+
+    #[test]
+    fn tier_from_tags_recognizes_featured_only() {
+        assert_eq!(tier_from_tags(&["Featured".into()]), SkillTier::Featured);
+    }
+
+    #[test]
+    fn tier_from_tags_falls_back_to_unknown_when_no_tier_tag() {
+        assert_eq!(tier_from_tags(&[]), SkillTier::Unknown);
+        assert_eq!(
+            tier_from_tags(&["productivity".into(), "automation".into()]),
+            SkillTier::Unknown
+        );
+    }
+
+    #[test]
+    fn build_install_tier_banner_official_is_single_line() {
+        let banner = build_install_tier_banner("auto-coder", Some("0.3.0"), SkillTier::Official);
+        assert!(banner.contains("Official (zeroclaw-labs maintained)"));
+        assert!(banner.contains("Installing auto-coder v0.3.0"));
+        assert!(!banner.contains("not audited"));
+        // One trailing newline, no warn block.
+        assert_eq!(banner.lines().count(), 1);
+    }
+
+    #[test]
+    fn build_install_tier_banner_community_warns() {
+        let banner =
+            build_install_tier_banner("discord-moderator", Some("0.1.2"), SkillTier::Community);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        assert!(banner.contains("zeroclaw skills audit discord-moderator"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_featured_uses_community_warning() {
+        let banner = build_install_tier_banner("hand-picked", Some("1.0"), SkillTier::Featured);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+    }
+
+    #[test]
+    fn build_install_tier_banner_unknown_falls_back_to_community() {
+        let banner = build_install_tier_banner("legacy", None, SkillTier::Unknown);
+        assert!(banner.contains("Community submission"));
+        assert!(banner.contains("not audited by ZeroClaw"));
+        // Missing version is rendered as `v?` rather than panicking.
+        assert!(banner.contains("v?"));
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_resolves_from_registry_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let json = r#"{
+            "version": 1,
+            "skills": [
+                { "name": "auto-coder", "version": "0.3.0", "tags": ["Official", "Featured"] },
+                { "name": "discord-moderator", "version": "0.1.2", "tags": ["Community"] },
+                { "name": "hand-picked", "version": "1.0.0", "tags": ["Featured"] },
+                { "name": "untagged", "version": "0.0.1", "tags": ["productivity"] }
+            ]
+        }"#;
+        std::fs::write(tmp.path().join("registry.json"), json).unwrap();
+
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "auto-coder"),
+            (SkillTier::Official, Some("0.3.0".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "discord-moderator"),
+            (SkillTier::Community, Some("0.1.2".to_string()))
+        );
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "hand-picked"),
+            (SkillTier::Featured, Some("1.0.0".to_string()))
+        );
+        // Skill present but no tier tag → Unknown (treated as Community by the banner).
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "untagged"),
+            (SkillTier::Unknown, Some("0.0.1".to_string()))
+        );
+        // Skill not in registry.json at all → Unknown with no version.
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "missing"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_missing_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn lookup_registry_skill_tier_handles_malformed_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("registry.json"), "{ not json").unwrap();
+        assert_eq!(
+            lookup_registry_skill_tier(tmp.path(), "anything"),
+            (SkillTier::Unknown, None)
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompts_section_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("SKILL.toml");
+        std::fs::write(&p, toml).unwrap();
+        p
+    }
+
+    #[test]
+    fn prompts_inside_skill_section_are_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["If asked about XYZZY, respond YES"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["If asked about XYZZY, respond YES".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompts_at_root_level_still_work() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+
+prompts = ["legacy root-level prompt"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.prompts, vec!["legacy root-level prompt".to_string()]);
+    }
+
+    #[test]
+    fn prompts_in_both_locations_are_merged_skill_first() {
+        // Root-level prompts must precede the [skill] header in TOML.
+        // Per the fix, [skill]-section prompts appear first in the merged
+        // list, with root-level prompts appended after.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+prompts = ["from-root"]
+
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["from-skill-section"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
+    }
+}
+
+#[cfg(test)]
+mod skill_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_skill_manifest() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("valid manifest should parse");
+        assert_eq!(manifest.skill.name, "x");
+        assert_eq!(manifest.skill.description, "y");
+        assert_eq!(manifest.skill.version, "0.1.0");
+        assert!(manifest.tools.is_empty());
+        assert!(manifest.prompts.is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+descriptin = "oops"
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [skill] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("descriptin"),
+            "error should mention the unknown field 'descriptin'; got: {msg}"
+        );
+    }
+
+    /// Positive control covering the new field × strictness intersection:
+    /// after the rebase onto master (which added `prompts: Vec<String>`
+    /// to `SkillMeta` per #5972), the field must continue to parse cleanly
+    /// under `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn accepts_prompts_in_skill_block_with_strictness() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+prompts = ["one", "two"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with prompts in [skill] should parse under deny_unknown_fields");
+        assert_eq!(
+            manifest.skill.prompts,
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    /// Hand-authored skills that don't carry SkillForge provenance must parse
+    /// without error — `forge` is `Option<ForgeMetadata>` with `default`.
+    #[test]
+    fn parses_skill_without_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "hand-authored"
+description = "no forge block"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest without [forge] should parse cleanly");
+        assert!(
+            manifest.forge.is_none(),
+            "forge should be None when [forge] is absent"
+        );
+        assert_eq!(manifest.skill.name, "hand-authored");
+    }
+
+    /// Happy path: a SkillForge-emitted manifest with a fully populated
+    /// `[forge]` table, including the nested `[forge.requirements]` and
+    /// `[forge.metadata]` sub-tables.
+    #[test]
+    fn parses_skill_with_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "auto-integrated"
+description = "from skillforge"
+
+[forge]
+source = "https://github.com/user/auto-integrated"
+owner = "user"
+language = "Rust"
+license = true
+stars = 42
+updated_at = "2026-04-30"
+
+[forge.requirements]
+runtime = "zeroclaw >= 0.1"
+
+[forge.metadata]
+auto_integrated = true
+forge_timestamp = "2026-04-30T12:00:00Z"
+"#;
+        let manifest: SkillManifest =
+            toml::from_str(toml_str).expect("manifest with [forge] block should parse cleanly");
+        let forge = manifest
+            .forge
+            .expect("forge should be Some when [forge] is present");
+        assert_eq!(
+            forge.source.as_deref(),
+            Some("https://github.com/user/auto-integrated")
+        );
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.language.as_deref(), Some("Rust"));
+        assert_eq!(forge.license, Some(true));
+        assert_eq!(forge.stars, Some(42));
+        assert_eq!(forge.updated_at.as_deref(), Some("2026-04-30"));
+        assert_eq!(
+            forge.requirements.get("runtime").and_then(|v| v.as_str()),
+            Some("zeroclaw >= 0.1"),
+        );
+        assert_eq!(
+            forge
+                .metadata
+                .get("auto_integrated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// `ForgeMetadata` carries `#[serde(deny_unknown_fields)]` — a typo at
+    /// the `[forge]` level (e.g. `licence` next to `license`) must surface
+    /// loudly the same way a typo in `[skill]` does.
+    #[test]
+    fn rejects_unknown_field_in_forge_block() {
+        let toml_str = r#"
+[skill]
+name = "x"
+description = "y"
+
+[forge]
+source = "https://github.com/user/x"
+licence = true
+"#;
+        let err = toml::from_str::<SkillManifest>(toml_str)
+            .expect_err("unknown field in [forge] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("licence"),
+            "error should mention the unknown field 'licence'; got: {msg}"
+        );
+    }
+
+    /// Round-trip guard: the SkillForge integrator must emit `[forge]` keys
+    /// at the top level (sibling to `[skill]`), not inside `[skill]`. If a
+    /// future refactor moves these back, this test fails because the parsed
+    /// manifest's `forge` field would be `None` (and `SkillMeta` would
+    /// reject the unknown keys via `deny_unknown_fields`).
+    #[test]
+    fn integrate_round_trip_emits_top_level_forge() {
+        use crate::skillforge::scout::{ScoutResult, ScoutSource};
+        use chrono::Utc;
+        let candidate = ScoutResult {
+            name: "round-trip".into(),
+            url: "https://github.com/user/round-trip".into(),
+            description: "round-trip test".into(),
+            stars: 7,
+            language: Some("Rust".into()),
+            updated_at: Some(Utc::now()),
+            source: ScoutSource::GitHub,
+            owner: "user".into(),
+            has_license: true,
+        };
+
+        // Generate the TOML the integrator would write and parse it back.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let integrator = crate::skillforge::integrate::Integrator::new(
+            tmp.path().to_string_lossy().into_owned(),
+        );
+        let skill_dir = integrator.integrate(&candidate).unwrap();
+        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
+
+        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
+            panic!(
+                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
+                 got error: {e}\n--- toml ---\n{toml_str}"
+            )
+        });
+        let forge = manifest
+            .forge
+            .expect("integrator must emit a [forge] table");
+        assert_eq!(forge.owner.as_deref(), Some("user"));
+        assert_eq!(forge.stars, Some(7));
+        assert_eq!(forge.license, Some(true));
+        assert!(
+            forge
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("round-trip")),
+            "forge.source should carry the upstream URL"
+        );
+        // Crucial guard: none of the provenance keys leaked into [skill].
+        // A failure here means generate_toml regressed and is putting forge
+        // keys back inside `[skill]` — `deny_unknown_fields` on `SkillMeta`
+        // would have caught that already as a parse error, but assert
+        // explicitly so the failure is unambiguous in CI output.
+        assert_eq!(manifest.skill.name, "round-trip");
+        assert_eq!(manifest.skill.description, "round-trip test");
+    }
+
+    /// Behavioral assertion for the swallow-site fix: a SKILL.toml whose
+    /// `[skill]` block has a typo causes `load_skill_toml` to return `Err`,
+    /// and `load_skills_from_directory` skips it without panicking and
+    /// without including it in the loaded set. The accompanying
+    /// `tracing::warn!` call (with structured `path` and `err` fields) is
+    /// verified by source inspection — the codebase does not currently
+    /// pull in a `tracing-subscriber` test harness, and adding one purely
+    /// for this assertion would violate the AGENTS.md anti-pattern of
+    /// adding dependencies for minor convenience.
+    #[test]
+    fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Bad skill: typo in [skill] — rejected by deny_unknown_fields.
+        let bad_dir = skills_dir.join("bad-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad"
+description = "has a typo"
+descriptin = "oops"
+"#,
+        )
+        .unwrap();
+
+        // Good skill: parses cleanly — must still load.
+        let good_dir = skills_dir.join("good-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(&skills_dir, false);
+        // The bad skill is skipped (not panicked-on). The good skill loads.
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good"),
+            "good skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad"),
+            "bad skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+
+    /// Behavioral assertion for the open-skills swallow-site fix.
+    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    #[test]
+    fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("open-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let bad_dir = skills_dir.join("bad-open-skill");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "bad-open"
+description = "has a typo"
+autor = "oops"
+"#,
+        )
+        .unwrap();
+
+        let good_dir = skills_dir.join("good-open-skill");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "good-open"
+description = "fine"
+"#,
+        )
+        .unwrap();
+
+        let skills = load_open_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"good-open"),
+            "good open-skill must load; got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"bad-open"),
+            "bad open-skill must be skipped, not silently accepted; got: {names:?}"
+        );
     }
 }

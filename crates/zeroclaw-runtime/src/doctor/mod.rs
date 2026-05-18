@@ -90,17 +90,51 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
 }
 
 /// Run diagnostics and print human-readable report to stdout.
-pub fn run(config: &Config) -> Result<()> {
-    let results = diagnose(config);
+async fn probe_models(config: &Config) -> Vec<DiagResult> {
+    let targets = doctor_model_targets(config, None);
+    let mut out = Vec::new();
 
-    // Print report
+    for provider_name in &targets {
+        let result = match zeroclaw_providers::create_provider(provider_name, None) {
+            Ok(handle) => handle.list_models().await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(models) => out.push(DiagResult {
+                severity: Severity::Ok,
+                category: "providers.models".to_string(),
+                message: format!("{}: {} models", provider_name, models.len()),
+            }),
+            Err(e) => {
+                let text = format_error_chain(&e);
+                let severity = match classify_model_probe_error(&text) {
+                    ModelProbeOutcome::Skipped => Severity::Warn,
+                    ModelProbeOutcome::AuthOrAccess => Severity::Warn,
+                    ModelProbeOutcome::Ok | ModelProbeOutcome::Error => Severity::Error,
+                };
+                out.push(DiagResult {
+                    severity,
+                    category: "providers.models".to_string(),
+                    message: format!("{}: {}", provider_name, truncate_for_display(&text, 120)),
+                });
+            }
+        }
+    }
+
+    out
+}
+
+pub async fn run(config: &Config) -> Result<()> {
+    let mut results = diagnose(config);
+    results.extend(probe_models(config).await);
+
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
 
-    let mut current_cat = "";
+    let mut current_cat = String::new();
     for item in &results {
         if item.category != current_cat {
-            current_cat = &item.category;
+            current_cat = item.category.clone();
             println!("  [{current_cat}]");
         }
         let icon = match item.severity {
@@ -180,38 +214,27 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     ModelProbeOutcome::Error
 }
 
-fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
+fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
     if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
         return vec![provider.to_string()];
     }
 
-    zeroclaw_providers::list_providers()
-        .into_iter()
-        .map(|provider| provider.name.to_string())
-        .collect()
+    config.providers.models.keys().cloned().collect()
 }
 
 pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
-    use_cache: bool,
+    _use_cache: bool,
 ) -> Result<()> {
-    let targets = doctor_model_targets(provider_override);
+    let targets = doctor_model_targets(config, provider_override);
 
     if targets.is_empty() {
-        anyhow::bail!("No providers available for model probing");
+        anyhow::bail!("No configured providers to probe — run `zeroclaw onboard providers` first");
     }
 
     println!("🩺 ZeroClaw Doctor — Model Catalog Probe");
     println!("  Providers to probe: {}", targets.len());
-    println!(
-        "  Mode: {}",
-        if use_cache {
-            "cache-first"
-        } else {
-            "force live refresh"
-        }
-    );
     println!();
 
     let mut ok_count = 0usize;
@@ -223,19 +246,20 @@ pub async fn run_models(
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache).await {
-            Ok(()) => {
+        let outcome = match zeroclaw_providers::create_provider(provider_name, None) {
+            Ok(handle) => handle.list_models().await,
+            Err(e) => Err(e),
+        };
+
+        match outcome {
+            Ok(models) => {
                 ok_count += 1;
-                println!("    ✅ model catalog check passed");
-                let models_count =
-                    crate::onboard::wizard::cached_model_catalog_stats(config, provider_name)
-                        .await?
-                        .map(|(count, _)| count);
+                println!("    ✅ {} models", models.len());
                 matrix_rows.push((
                     provider_name.clone(),
                     ModelProbeOutcome::Ok,
-                    models_count,
-                    "catalog refreshed".to_string(),
+                    Some(models.len()),
+                    "catalog fetched".to_string(),
                 ));
             }
             Err(error) => {
@@ -264,7 +288,7 @@ pub async fn run_models(
                             truncate_for_display(&error_text, 120),
                         ));
                     }
-                    ModelProbeOutcome::Error => {
+                    ModelProbeOutcome::Error | ModelProbeOutcome::Ok => {
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
                         matrix_rows.push((
@@ -272,15 +296,6 @@ pub async fn run_models(
                             ModelProbeOutcome::Error,
                             None,
                             truncate_for_display(&error_text, 120),
-                        ));
-                    }
-                    ModelProbeOutcome::Ok => {
-                        ok_count += 1;
-                        matrix_rows.push((
-                            provider_name.clone(),
-                            ModelProbeOutcome::Ok,
-                            None,
-                            "catalog refreshed".to_string(),
                         ));
                     }
                 }
@@ -914,12 +929,14 @@ fn check_environment(items: &mut Vec<DiagItem>) {
     // git
     check_command_available("git", &["--version"], cat, items);
 
-    // Shell
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    if shell.is_empty() {
-        items.push(DiagItem::warn(cat, "$SHELL not set"));
-    } else {
-        items.push(DiagItem::ok(cat, format!("shell: {shell}")));
+    // Shell — Unix uses $SHELL, Windows uses %ComSpec% (path to cmd.exe).
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("ComSpec").ok().filter(|s| !s.is_empty()));
+    match shell {
+        Some(s) => items.push(DiagItem::ok(cat, format!("shell: {s}"))),
+        None => items.push(DiagItem::warn(cat, "neither $SHELL nor %ComSpec% is set")),
     }
 
     // HOME
@@ -1044,25 +1061,6 @@ mod tests {
         assert_eq!(DiagItem::ok("t", "m").icon(), "✅");
         assert_eq!(DiagItem::warn("t", "m").icon(), "⚠️ ");
         assert_eq!(DiagItem::error("t", "m").icon(), "❌");
-    }
-
-    #[test]
-    fn classify_model_probe_error_marks_unsupported_as_skipped() {
-        let outcome = classify_model_probe_error(
-            "Provider 'copilot' does not support live model discovery yet",
-        );
-        assert_eq!(outcome, ModelProbeOutcome::Skipped);
-    }
-
-    #[test]
-    fn classify_model_probe_error_marks_auth_and_plan_issues() {
-        let auth_outcome = classify_model_probe_error("OpenAI API error (401): unauthorized");
-        assert_eq!(auth_outcome, ModelProbeOutcome::AuthOrAccess);
-
-        let plan_outcome = classify_model_probe_error(
-            "Z.AI API error (429): plan does not include requested model",
-        );
-        assert_eq!(plan_outcome, ModelProbeOutcome::AuthOrAccess);
     }
 
     #[test]

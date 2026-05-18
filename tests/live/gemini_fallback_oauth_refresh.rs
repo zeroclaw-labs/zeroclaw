@@ -18,6 +18,11 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use serde_json::Value;
+
+/// Moderate temperature for the verification call; the test only checks the
+/// response is non-empty, so any plausible default works and 0.7 matches the
+/// long-standing codebase default for assistant-style replies.
+const VERIFICATION_TEMPERATURE: f64 = 0.7;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -192,7 +197,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
             Some("You are a concise assistant. Reply in one short sentence."),
             "Say 'OAuth refresh works'",
             "gemini-2.5-pro",
-            0.7,
+            Some(VERIFICATION_TEMPERATURE),
         )
         .await;
 

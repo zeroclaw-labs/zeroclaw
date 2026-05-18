@@ -122,7 +122,7 @@ impl SkillImprover {
 }
 
 /// Validate skill content: must be non-empty, valid UTF-8 (already a &str),
-/// and contain parseable TOML front-matter with a [skill] section.
+/// and contain parseable TOML front-matter with a `[skill]` section.
 pub fn validate_skill_content(content: &str) -> Result<()> {
     if content.trim().is_empty() {
         bail!("Skill content is empty");

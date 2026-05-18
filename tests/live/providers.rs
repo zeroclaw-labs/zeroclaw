@@ -6,6 +6,11 @@
 use zeroclaw::providers::ProviderRuntimeOptions;
 use zeroclaw::providers::traits::{ChatMessage, Provider};
 
+/// Zero = greedy sampling; the multi-turn recall test asserts the exact
+/// secret word ("zephyr") appears in the reply, so deterministic output is
+/// required to keep the test stable across runs.
+const RECALL_TEMPERATURE: f64 = 0.0;
+
 /// Sends a real multi-turn conversation to OpenAI Codex and verifies
 /// the model retains context from earlier messages.
 ///
@@ -25,7 +30,7 @@ async fn e2e_live_openai_codex_multi_turn() {
         ChatMessage::user("The secret word is \"zephyr\". Just confirm you noted it."),
     ];
     let response1 = provider
-        .chat_with_history(&messages_turn1, model, 0.0)
+        .chat_with_history(&messages_turn1, model, Some(RECALL_TEMPERATURE))
         .await;
     assert!(response1.is_ok(), "Turn 1 failed: {:?}", response1.err());
     let r1 = response1.unwrap();
@@ -39,7 +44,7 @@ async fn e2e_live_openai_codex_multi_turn() {
         ChatMessage::user("What is the secret word?"),
     ];
     let response2 = provider
-        .chat_with_history(&messages_turn2, model, 0.0)
+        .chat_with_history(&messages_turn2, model, Some(RECALL_TEMPERATURE))
         .await;
     assert!(response2.is_ok(), "Turn 2 failed: {:?}", response2.err());
     let r2 = response2.unwrap().to_lowercase();

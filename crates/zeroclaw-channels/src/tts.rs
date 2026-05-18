@@ -368,7 +368,7 @@ impl EdgeTtsProvider {
     /// Create a new Edge TTS provider from config.
     ///
     /// `binary_path` must be a bare command name (no path separators) matching
-    /// one of [`Self::ALLOWED_BINARIES`]. This prevents arbitrary executable
+    /// one of `ALLOWED_BINARIES`. This prevents arbitrary executable
     /// paths like `/tmp/malicious/edge-tts` from passing the basename check.
     pub fn new(config: &zeroclaw_config::schema::EdgeTtsConfig) -> Result<Self> {
         let path = &config.binary_path;

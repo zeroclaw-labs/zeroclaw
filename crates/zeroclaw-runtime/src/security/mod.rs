@@ -52,6 +52,7 @@ pub mod workspace_boundary;
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
+pub use detect::linux_memcg_available;
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};

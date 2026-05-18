@@ -1,281 +1,466 @@
-# Changelog — v0.6.9 → v0.7.3
+# Changelog — v0.7.4 → v0.7.5
 
-> Changes since the **v0.6.9** stable release. This release represents the largest
-> structural overhaul in ZeroClaw's history: the entire codebase has been split into a
-> proper Cargo workspace of focused crates, a new config schema has shipped with a live
-> migration path, and a wave of channel, provider, and security improvements have landed
-> on top of that foundation.
+> v0.7.5 is a substantial follow-on to v0.7.4. The headline is in-browser
+> onboarding and configuration: a schema-driven `/onboard` flow, a per-property
+> gateway CRUD surface backed by an OpenAPI 3.1 spec and a typed CLI, a
+> three-surface personality editor (CLI / TUI / web), and live drift detection
+> for hand-edited config files. ACP picks up real cancellation and a
+> tool-approval back-channel, per-provider pricing finally makes cost tracking
+> accurate, the installer ships presets and a TTY feature picker, and the web
+> dashboard learns hot model switching plus a stop button. Around 71 commits
+> from 24 contributors.
 
 ---
 
 ## Highlights
 
-- **Workspace split complete** — ZeroClaw is now a multi-crate Cargo workspace. The
-  monolithic source tree has been decomposed into 12+ focused crates
-  (`zeroclaw-api`, `zeroclaw-runtime`, `zeroclaw-gateway`, `zeroclaw-channels`,
-  `zeroclaw-tools`, `zeroclaw-memory`, `zeroclaw-providers`, `zeroclaw-infra`,
-  `zeroclaw-config`, `zeroclaw-tui`, `zeroclaw-plugins`, `zeroclaw-hardware`).
-  The foundation binary now builds at **6.6 MB** with `--no-default-features`.
+- **Web onboarding, per-property config CRUD, and a personality editor — all
+  schema-driven.** A new `/onboard` route renders the full first-run flow in
+  the browser (Workspace, Providers, Channels, Memory, Hardware, Tunnel,
+  Personality), driven by per-property `OPTIONS`/`GET`/`PUT`/`DELETE`/`PATCH`
+  endpoints under `/api/config/*` that share their core (`Config::set_prop`)
+  with the CLI and any third-party tool. The runtime emits an OpenAPI 3.1 spec
+  at `/api/openapi.json` (Scalar explorer at `/api/docs`), the dashboard
+  TypeScript client is generated from it via `openapi-typescript`, and the CLI
+  picks up matching `config patch`, `config docs`, `config schema --path`, and
+  `--json` envelopes on the existing `get`/`set`/`init`/`migrate` commands. A
+  drift banner surfaces hand-edits to `config.toml` with per-row in-memory vs
+  on-disk diffs and a one-click reload, and a personality system lets each of
+  the seven runtime markdown files (`SOUL.md`, `IDENTITY.md`, `USER.md`,
+  `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`) be edited from CLI
+  (`$EDITOR`), TUI, or the web UI's CodeMirror editor (#6179).
 
-- **Config V2 schema with automatic migration** — Provider config has moved to a cleaner
-  layout. Running `zeroclaw config migrate` upgrades your existing config in-place,
-  preserving comments. The old `props` subcommand still works but is now deprecated in
-  favour of `zeroclaw config`.
+- **ACP gets cancellation, a tool-approval back-channel, and concurrency
+  safety.** ACP protocol v1 now exposes `session/cancel` to abort an in-flight
+  turn (#6374), the gateway WebSocket carries tool approvals over a dedicated
+  back-channel (#6387), and concurrent `session/prompt` requests are rejected
+  with a clear error instead of racing (#6408).
 
-- **OpenRouter streaming** — OpenRouterProvider now streams responses token-by-token
-  instead of waiting for the full response, matching the experience of native providers.
+- **Live model switching and a real stop button in the web dashboard.** Pick a
+  different model from the chat dropdown without losing context (#6101), open
+  the agent chat directly from a memory row (#6217), trigger any cron job from
+  the UI (#6164), and use the new chat-input lock plus running indicator and
+  stop button while a turn is in flight (#6220). OpenRouter free models are
+  flagged in the dropdown (#6218) and themes/sessions/CSS tokens behave
+  consistently across pages (#5207).
 
-- **Web dashboard decoupled from the binary** — The dashboard is now built separately
-  and embedded at release time. `cargo install` and AUR/Homebrew packages include it.
-  A new **voice mode** and **plugins page** have been added to the dashboard.
+- **Per-provider pricing makes cost tracking real.** `ModelProviderConfig` now
+  carries pricing per provider profile (#6357), the gateway records cost and
+  token usage on every turn (#6159), and missing pricing logs a single WARN per
+  `(provider, model)` pair instead of spamming the log (#6356).
 
-- **LINE channel** — LINE Messaging API is now a supported channel.
+- **Installer overhaul.** `zeroclaw install` learns preset and gateway flags, a
+  TTY-driven feature picker, web/dist building, and an onboarding gate (#6385);
+  Linux MUSL static binaries are back in the release artifacts (#6411); the web
+  dashboard installs to platform-correct data directories on macOS and Windows
+  (78d2cd6c0); and the prebuilt path correctly extracts the dashboard again
+  (821fbfcfc, a2c1e2bb2).
 
-- **Matrix improvements** — Mention-only filtering (the agent only responds when
-  mentioned), encrypted media download restored, outbound attachment support added, and
-  onboarding wizard preservation.
-
-- **GitHub Copilot onboarding** — GitHub Copilot is now selectable as a provider
-  through the onboarding wizard and `zeroclaw config` flow (#5321).
-
-- **Authenticated OTLP exporters** — New `otel_headers` config key lets you pass
-  custom headers (e.g. `Authorization: Bearer …`) to protected OTLP endpoints (#5700).
+- **HMAC tool receipts wired up end-to-end.** The receipt-signing path stripped
+  out of #5168 is now active (#6214), giving each tool result a verifiable HMAC
+  trail when the feature is enabled.
 
 ---
 
 ## What's New
 
-### Architecture & Workspace
-
-- Extracted 12 workspace crates from the monolith, implementing the microkernel RFC
-  roadmap (RFC D1–D5). Every subsystem — providers, channels, tools, memory, infra,
-  config, gateway, TUI, plugins, hardware — now lives in its own crate with explicit
-  dependency boundaries enforced by the compiler.
-- Foundation binary (`--no-default-features`) compiles clean at 6.6 MB.
-- `agent-runtime` feature flag gates the full agent loop; the kernel binary builds
-  without it.
-- Switched TLS from `aws-lc-rs` to `ring` and stripped `.eh_frame` sections, reducing
-  binary size further.
-- `schemars` is now optional behind a `schema-export` feature flag — no longer a
-  mandatory compile dependency.
-- 28 per-channel feature flags with forwarding chains so unused channels add zero
-  compile time.
-- Workspace-wide `[workspace.dependencies]` and `[workspace.package]` inheritance
-  eliminates version duplication across `Cargo.toml` files.
-- RFC Rev 2 compliance: stability tiers, versioning policy, and release profile are now
-  wired into the workspace.
-
-### Providers
-
-- **OpenRouterProvider** now supports streaming (#5717). Responses appear token-by-token
-  instead of arriving all at once.
-- **GitHub Copilot** is now available as a selectable provider in the onboarding wizard
-  and `zeroclaw config` interactive flow (#5321).
-- Fixed: native tool-call messages are now stripped before sending to providers that
-  have `native_tool_calling = false`, preventing provider errors (#5762).
-- Fixed: `tool_stream` events are no longer forwarded to non-Z.AI providers in the
-  streaming path, preventing unexpected provider errors (#5806).
-- Fixed: DeepSeek V3.2 system prompt escaping and token estimation corrected (#5454).
-
 ### Channels
 
-- **LINE Messaging API** channel added (#5642).
-- **Matrix**: mention-only filtering — the agent can be configured to respond only when
-  directly mentioned. Encrypted media download restored. Outbound attachment support
-  added. Onboarding wizard settings now preserved across restarts (#5166, #5727).
-- **Telegram**: tool approval requests now include `inline_keyboard` markup, giving
-  users interactive approve/deny buttons instead of plain text (#5790).
-- Sender user ID is now propagated into the channel system prompt, giving the agent
-  context about who it is talking to (#5526).
-- Email and VoiceCall channels now have an `enabled` field and are correctly wired into
-  the orchestrator (#5659).
-- `<think>` tags are stripped from streaming draft updates before they reach the client
-  (#5505).
-- Fixed: missing channels in `build_channel_by_id` caused `sessions_send` to silently
-  fail for some channel types (#5506).
-- Telegram and Matrix implementations moved out of the orchestrator into their own
-  modules (#5639).
-
-### Configuration
-
-- **Config V2 schema** with a new provider layout (`providers.models`,
-  `providers.fallback`, `model_routes`, `embedding_routes`).
-- `zeroclaw config migrate` upgrades a V1 config to V2 in-place, preserving comments
-  and formatting.
-- `zeroclaw config` replaces `zeroclaw props`. The old `props` subcommand is deprecated
-  but still functional.
-- Onboarding wizard updated to write V2 provider format directly.
-- Fixed: false "Unknown config key" warnings for `Option<T>` fields and config aliases
-  (#5510).
-- Fixed: `providers.fallback` now emits a warning if it references a key that does not
-  exist in `providers.models`.
-- Fixed: temperature validation restored in the `providers.models` loop.
-- Slack config: `channel_id` deprecated in favour of `channel_ids` (plural) for V2.
-- Nostr, WhatsApp Web, and hardware wizard sections wired into the onboarding flow
-  (#5640).
-
-### Observability
-
-- **`otel_headers`** — new config key for passing arbitrary HTTP headers to OTLP
-  endpoints. Enables authenticated exporters (e.g. Grafana Cloud, Honeycomb) without
-  environment variable workarounds (#5700).
+- **ACP (Agent Client Protocol):** `session/cancel` aborts in-flight turns
+  (#6374); concurrent `session/prompt` requests are rejected rather than
+  raced (#6408); ACP protocol v1 picks up tool-call permission and a back-channel
+  for structured prompts (#6167).
+- **Matrix:** attachments are uploaded when finalizing partial drafts (#6200);
+  device identity is derived from the `whoami` response when an access token is
+  used directly (242ef2404), and access-token sessions now require an explicit
+  device identity (21d0c5d6b).
+- **WhatsApp:** `fromMe` replies are scoped to self-chat or trigger prefixes
+  (#6353); LID→phone resolution failures are logged so debugging session
+  drops is possible (#6354).
+- **Discord:** inbound image attachments are preserved through the provider
+  pipeline (#6184).
+- **Jira:** API v2 server mode is supported alongside cloud (#6116).
 
 ### Web Dashboard
 
-- Voice mode added to the dashboard.
-- Plugins management page added.
-- Theme mode switch fixed — light/dark selection now applies correctly on load (#5724).
-- Visual preview swatches added to the theme mode selector (#5767).
-- Dashboard is now decoupled from the main binary — built separately and embedded at
-  release time. Included in binary releases, AUR, Homebrew, and `cargo install`
-  (#5675, #5665).
-- Web build logic moved into the gateway crate; no-op recompiles (previously ~1 minute)
-  eliminated.
+- **Schema-driven `/onboard` flow** — first-run users complete provider auth,
+  channels, memory, hardware, tunnel, and personality entirely in the browser,
+  with forms rendered from `GET /api/config/list`'s `kind` / `type_hint` /
+  `enum_variants` (no value-sniffing). Fresh installs auto-redirect from `/`
+  to `/onboard` (#6179).
+- **Schema-driven config editor** at `/config` with per-section forms, drift
+  banner, and per-row drift diff (in-memory vs on-disk; secrets surface only
+  the *fact* of drift). One-click "Restart daemon to apply" reloads via the
+  in-process watch channel (#6179).
+- **Live model switching with chat context preserved on navigation** (#6101).
+- **Chat input lock, running indicator, and stop button** while a turn is
+  active (#6220), with `tool_call`/`tool_result` rendering off by default and a
+  toolbar toggle to opt back in (#6388).
+- **Open agent chat directly from a memory row** when `session_id` is present
+  (#6217).
+- **OpenRouter free models marked** in the default-model dropdown (#6218).
+- **Manual cron trigger** from the web UI (#6164).
+- **Theme switching, session crash, and CSS token consistency fixes** unify the
+  visual surface across pages (#5207).
+- **Agent tool button height** matches sibling controls (#6369).
+
+### Providers
+
+- **Anthropic:** `base_url` is honored for the default provider (#6314).
+- **Bedrock:** `credential_process` support enables enterprise-friendly auth
+  flows (#6168).
+- **Groq:** per-profile `native_tools` override on `ModelProviderConfig`
+  (#6380).
+- **StepFun:** new `stepfun-intl` endpoint (#6310).
+- **xAI:** model listing is restored (9bd95a0c9).
+- **OpenAI-compatible:** `tool_call` `extra_content` is preserved so Gemini's
+  `thoughtSignature` survives round-tripping (#6264); model id normalization
+  has test coverage (cc8f0e7bd).
+
+### Configuration
+
+- **Per-property gateway CRUD** under `/api/config/*` (`GET`/`PUT`/`DELETE`/
+  `PATCH`/`OPTIONS`/`list`/`init`/`migrate`/`drift`). Comment-preserving PATCH
+  attaches a per-op `comment` field to the on-disk TOML key; PATCH/PUT are
+  validator-gated with snapshot revert on failure; structured `ConfigApiError`
+  surfaces stable codes for invalid range, enum variant, format, dangling
+  reference, and required-field-empty (#6179).
+- **Drift detection** compares in-memory state to on-disk `config.toml` via
+  server-side SHA-256 hashing (secrets never leave the server). 409
+  `config_changed_externally` blocks a write against a drifted path; explicit
+  `X-ZeroClaw-Override-Drift: true` overrides (#6179).
+- **OpenAPI 3.1 spec** at `/api/openapi.json`, Scalar explorer at `/api/docs`,
+  committed snapshot at `crates/zeroclaw-gateway/openapi.json` regenerated by
+  `cargo xtask gen-openapi` and CI-checked for staleness (#6179).
+- **TypeScript client codegen** for the dashboard via `openapi-typescript`
+  (`npm run gen-api`, wired into `npm run build`); tsc fails when the generated
+  shape stops matching consumers (#6179).
+- **CLI parity:** `zeroclaw config patch` (JSON Patch over the same core),
+  `config docs`, `config schema --path <prop>`, `set --comment`, `--json`
+  envelopes on `get`/`set`/`init`/`migrate` matching HTTP shapes (#6179).
+- **Per-provider pricing** on `ModelProviderConfig` (#6357).
+- **Dotted provider map keys preserved** across config round-trips (#6317).
+- **Encrypted-secret mismatch surfaced clearly** when `.secret_key` doesn't
+  match the encrypted blob (#6379).
 
 ### Agent & Runtime
 
-- CLI channel factory now registered for interactive mode — `zeroclaw` interactive
-  sessions work again after the workspace split (#5802).
-- Duplicate `ToolCall` events in `turn_streamed` deduplicated; clients no longer see the
-  same tool call reported twice (#5746).
-- Empty successful tool output is now normalised before being returned to the provider,
-  preventing downstream parse errors on blank responses (#5565).
-- Session integrity improvements: streaming refactor and history pruning for long
-  conversations (#5167).
-- Cron agent jobs no longer trigger `auto_save`, preventing runaway memory consolidation
-  on scheduled tasks (#5664).
-- Fixed: `cron_run` tool output was not being delivered to configured channels.
-- Windows: the shell console window is now hidden when running as a background process
-  (#5563).
+- **Cost and token usage recorded on every gateway turn** (#6159).
+- **Cost-pricing WARN once per `(provider, model)`** instead of per-turn
+  (#6356).
+- **Conversation memories excluded from `build_context` recall** to keep prior
+  conversation chunks from leaking into recall results (#6316, follow-up to
+  #5415).
+- **Autosaved conversation memories recalled on subsequent turns** (#6363).
+- **Reasoning content captured from streaming responses** (#6107).
+- **Image markers stripped** from non-vision context-compression payloads
+  (#6189).
+- **Wildcard memory recall** is treated as a recent-memory query (#6296).
+- **Daemon canvas store shared across subsystems** (gateway, channels, daemon)
+  (#6221).
+- **Cancel-tokens evicted when sessions are deleted mid-turn** to prevent stale
+  approval state (#6216).
+- **Session backend unified behind one factory** across runtime and channels
+  (#6384).
 
-### Skills (Claude Code)
+### Tools
 
-- `github-issue-triage` skill added — automates structured triage of GitHub issues using
-  Claude Code (#5780).
-- `squash-merge` skill added — preserves clean commit history when merging upstream
-  changes (#5782).
+- **`zeroclaw memory reindex` CLI** for rebuilding the embedding index in place
+  (#6046).
+- **Tavily search backend** for `tools/web_search`, with bearer-header
+  authentication and encrypted-key support (3205f0a, 46cb4510c, 3014e355c).
+- **`tool_timeout_secs` honoured for HTTP SSE tool calls** (#5945) and used to
+  derive the HTTP client timeout (#6397).
+- **`allow_scripts` plumbed through `ReadSkillTool`** to the skill loader so
+  declared scripts can actually run (#5981, closes #5697).
+- **DockerSandbox bind-mount support** for workspace mounts (#5905, closes
+  #5720).
+
+### Personality
+
+- **Three-surface personality editor** for the seven runtime markdown files
+  (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`,
+  `MEMORY.md`) the runtime injects into the system prompt. CLI uses `$EDITOR`,
+  TUI suspends and hands off to `$EDITOR`, web UI ships a CodeMirror 6 editor
+  (one-dark theme + markdown grammar) with Edit/Preview toggle, per-tab Insert
+  / Replace template buttons, char counter, and 409 `personality_disk_drift`
+  resolution UX (`take theirs` / `keep mine`). Backed by a 7-file backend
+  allowlist enforced in `crates/zeroclaw-gateway/src/api_personality.rs` —
+  `BOOTSTRAP.md` is intentionally excluded as a first-run scaffold (#6179).
+
+### Gateway
+
+- **Tool-approval back-channel** via `WsApprovalChannel` so approvals don't
+  fight the main message stream (#6387).
+- **Fail-loud model resolution** at request time across gateway and channels
+  (#6215, refined in #6493 to keep `/onboard` reachable on fresh installs).
+  Misconfigured providers surface a clear error on the first chat call rather
+  than silently substituting a vendor default.
+- **Daemon boots without a configured model** so the browser onboarding flow
+  at `/onboard` is reachable on fresh installs and partially-configured
+  states. The gateway logs a `WARN` pointing at `/onboard` and chat dispatch
+  refuses with a structured `needs_onboarding` marker until at least one
+  `[providers.models.<name>] model = "..."` is set; `POST /webhook` returns
+  `503 {"error":"needs_onboarding","url":"/onboard"}` instead of a generic
+  `500`, and the WhatsApp / Linq / WATI / Nextcloud Talk channel handlers
+  send a Fluent-localized "agent isn't fully set up yet" reply rather than
+  the generic LLM-error fallback. The channels supervisor exits cleanly
+  instead of restart-looping (#6493).
+- **Connect-time `cwd` parameter** on the WebSocket pins the per-session
+  security sandbox root (#6179, follow-on to #6167).
 
 ### Security
 
-- Dangerous interpreter arguments (e.g. `-e`, `--eval`, `-c` on interpreters) are now
-  blocked by the command security policy (#5702).
-- Heredocs and safe shell redirects (`<<EOF`, `>`, `>>`) are explicitly allowed (#5160).
+- **HMAC tool receipts activated** — the wiring stripped out of #5168 is now
+  live and verifying receipts end-to-end (#6214).
+- **`git -C` vs `git -c` distinction in the security policy** — case-preserved
+  argument lists prevent legitimate `git -C <dir>` invocations from being
+  blocked as `-c` config overrides (0bc0dc676, closes #5809).
 
 ### Installation & Distribution
 
-- `install.sh` rewritten from scratch for the workspace split — correctly handles the
-  new crate layout and binary paths (#5666).
-- AUR package migrated from `zeroclaw` to `zeroclawlabs` (#5544).
-- Daemon supervisor and onboarding launch checks now include the webhook channel (#5799).
+- **Installer presets, gateway flags, TTY feature picker, web/dist build,
+  onboarding gate** (#6385). The TTY feature picker now writes its prompts
+  to stderr so command substitution doesn't capture them and freeze the
+  terminal (#6496).
+- **MUSL static binaries restored** for the Linux release artifacts (#6411).
+- **Platform-correct web data directory** on macOS and Windows (78d2cd6c0).
+- **Web dashboard extraction restored** in the prebuilt install path
+  (821fbfcfc, a2c1e2bb2).
+- **Workspace-member resolution** unbroken in `Dockerfile` and
+  `Dockerfile.debian` (#6305).
+- **`xtask:web` re-runs `npm install`** when `node_modules` is stale relative
+  to the lockfile (#6355).
 
-### Dependencies & Security Advisories
+### Internationalization
 
-- `rustls-webpki` and `rumqttc` bumped to resolve RUSTSEC-2026-0098 and
-  RUSTSEC-2026-0099 (#5786).
+- **Translations synced** for fr, ja, es, with new zh-CN coverage (#6170).
+- **Chinese WeChat CLI strings** added (#6242).
 
-### Deployment
+### Documentation
 
-- Sample Kubernetes and OpenShift deployment manifests added in `deploy-k8s/` with
-  hardened security context (`runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` caps,
-  `seccompProfile: RuntimeDefault`) and pairing auth enabled by default (#5880).
+- **Raspberry Pi setup guide** (25e77cc52, closes #4704).
+- **Hardware page revisions:** Podman recommendation now justifies its memory
+  budget (f595de532); macOS cross-compile recipe and install destination fixed
+  per #6203 review (96a7f0018, dd535fb72).
+- **Custom OpenAI-compatible provider syntax** clarified (#6300).
+- **YOLO config examples** updated (#6194).
+- **Philosophy page** links the RFCs and Fluent (#6232).
+
+### Improvements
+
+- **Integrations registry refactored** to a single schema-driven for-loop
+  (#6386).
+- **Doctor self-test** now reports both the configured host and the probed
+  loopback so port-binding issues are easier to diagnose (#6219).
+- **Workspace `default-run` set** to keep docs CI green (46235824e).
 
 ---
 
-## Bug Fixes (summary)
+## Bug Fixes
 
 | Area | Fix |
-|------|-----|
-| Provider | Strip native tool messages for non-native-tool-calling providers |
-| Provider | `tool_stream` events forwarded to non-Z.AI providers in streaming path |
-| Provider | DeepSeek V3.2 system prompt escaping and token estimation |
-| Agent | CLI channel factory missing in interactive mode |
-| Agent | Duplicate ToolCall events in streaming turns |
-| Agent | Normalize empty successful tool output |
-| Matrix | Encrypted media download; outbound attachments |
-| Channels | Missing Arc Provider forwarding methods |
-| Channels | `<think>` tag leaking into streaming draft updates |
-| Telegram | `inline_keyboard` missing from tool approval requests |
-| Cron | `cron_run` tool output not delivered to configured channels |
-| Config | False "Unknown config key" warnings on Option fields |
-| Config | Temperature validation missing from providers loop |
-| Config | Fallback key references nonexistent provider — now warns |
-| Session | Integrity, streaming refactor, history pruning |
-| Cron | auto_save causing recursive memory bloat on scheduled jobs |
-| Security | Dangerous interpreter flags not blocked |
-| Install | install.sh broken after workspace split |
-| Runtime | Windows console window visible in background mode |
-| Distribution | Web dashboard missing from AUR and cargo install builds |
-| Docker | Workspace crate manifests missing from multi-stage build after workspace split (#5879) |
-| Agent | Streamed reasoning content lost during tool replay (#5606) |
-| Web | Theme mode switch not applying light/dark correctly |
-| Web | Theme mode selector missing visual preview swatches |
+|---|---|
+| ACP | Reject concurrent `session/prompt` requests instead of racing them (#6408). |
+| Agent / runtime | Exclude Conversation memories from `build_context` recall (#6316). |
+| Agent / runtime | Capture `reasoning_content` from streaming responses (#6107). |
+| Agent / runtime | Strip image markers from non-vision context compression (#6189). |
+| Agent / runtime | Treat bare-wildcard recall as a recent-memory query (#6296). |
+| Channels | Recall autosaved conversation memories on subsequent turns (#6363). |
+| Channels (Discord) | Preserve inbound image attachments for providers (#6184). |
+| Channels (Jira) | Support API v2 server mode (#6116). |
+| Channels (Matrix) | Require explicit device identity for access-token sessions (21d0c5d6b); derive identity from `whoami` (242ef2404). |
+| Channels (WhatsApp) | Scope `fromMe` replies to self-chat or trigger prefixes (#6353); surface LID→phone resolution failures in logs (#6354). |
+| CI / docs build | Track `lang-switcher.js.tpl`, generate `.js` at build time (#6395); set workspace `default-run` to unblock docs CI (46235824e); remove the obsolete `CHANGELOG-next.md` cleanup step (#6265). |
+| Config | Preserve dotted provider map keys (#6317); surface `.secret_key` mismatch on enc2 decrypt (#6379). |
+| Docker | Unbreak workspace-member resolution in `Dockerfile` and `Dockerfile.debian` (#6305). |
+| Gateway | Record cost and token usage on every turn (#6159); evict `cancel_tokens` when a session is deleted mid-turn (#6216); fail-loud model resolution mirrored across gateway and channels (#6215); daemon boots without a configured model so `/onboard` stays reachable on fresh installs and partially-configured states, with `POST /webhook` returning `503 needs_onboarding` and channel handlers sending a Fluent-localized reply (#6493). |
+| Installation | Use platform-correct web data directory on macOS and Windows (78d2cd6c0); restore web-dashboard extraction in prebuilt install (821fbfcfc, a2c1e2bb2); installer feature picker no longer freezes the terminal (prompts now go to stderr instead of being captured by `$()`) (#6496). |
+| Providers (Anthropic) | Respect `base_url` config for the default provider (#6314). |
+| Providers (compatible) | Preserve `tool_call` `extra_content` so Gemini `thoughtSignature` round-trips cleanly (#6264). |
+| Providers (xAI) | Restore model listing (9bd95a0c9). |
+| Runtime / channels | Unify session backend behind one factory (#6384); share canvas store across daemon subsystems (#6221). |
+| Runtime / cost | WARN once per `(provider, model)` for missing pricing (#6356). |
+| Security | Distinguish `git -C` from `git -c` in security policy (0bc0dc676). |
+| Skills (config) | Reject unknown fields in `[skill]` block to surface silent typo drops (#6128); relocate SkillForge provenance to a sibling `[forge]` table and surface `SKILL.toml` parse failures via `tracing::warn` instead of swallowing them silently (#6210). |
+| Tools | Honour `tool_timeout_secs` for HTTP SSE tool calls (#5945); derive HTTP client timeout from `tool_timeout_secs` (#6397); pass `allow_scripts` through `ReadSkillTool` to the skill loader (#5981). |
+| Tools (web_search) | Authenticate Tavily via Bearer header rather than body (46cb4510c). |
+| Web | Fix theme switching, session crash, and CSS token consistency (#5207); agent tool button height (#6369); default `tool_call`/`tool_result` rendering off with toolbar toggle (#6388). |
+| xtask:web | Re-run `npm install` when `node_modules` is stale vs lockfile (#6355). |
+| Doctor | Self-test report shows configured host alongside probed loopback (#6219). |
 
 ---
 
 ## Breaking Changes
 
-### Config schema (V1 → V2)
+### Ollama provider sends explicit `num_ctx` / `num_predict` on every request
 
-The provider section of `config.toml` has a new layout. V1 configs are still loaded and
-automatically understood, but the recommended path is to run the migration:
+The Ollama provider now stamps `num_ctx=8192` and `num_predict=2048` into the
+`options` block of every `/api/chat` request body. Previously these fields were
+unset on the wire, defaulting to Ollama's server-side `num_ctx=2048` and
+`num_predict=128` — which silently truncated prompts and responses on any
+structured tool-calling workflow (200 OK with garbage rather than an error).
 
-```sh
-zeroclaw config migrate
+For most deployments this is strictly an improvement. **Operators on tight VRAM
+budgets** should be aware that jumping from server-default `num_ctx=2048` to
+the new `8192` increases the model's context-allocation footprint and can OOM
+the GPU on small cards. Pin lower values via the new optional fields under
+`[providers.models.<name>]` if needed:
+
+```toml
+[providers.models.my-ollama-llama3]
+kind = "ollama"
+ollama_num_ctx = 4096           # default 8192
+ollama_num_predict = 1024       # default 2048
+ollama_temperature_override = 0.1   # optional; when unset, per-call temperature wins
 ```
 
-This rewrites your config to V2 in-place. The old format will continue to work in this
-release but will not be supported indefinitely.
+The new defaults are sent on every `/api/chat` request unless lower numeric
+values are pinned via `ollama_num_ctx` / `ollama_num_predict` as shown above.
+There is no in-config way to omit these keys from the wire body in this
+release: VRAM-constrained operators (or operators whose server caps these
+values lower than `8192` / `2048`) should pin lower supported numerics via
+the fields above. Operators running an Ollama build old enough to outright
+reject the keys themselves will need to upgrade Ollama or wait on a
+follow-up that introduces a true omit mode. (`ollama_temperature_override`
+is the one knob with a true `None` semantic — when it is unset, the
+per-call temperature passed through `Provider::chat_with_system` wins and
+`temperature` on the wire continues to reflect the call site rather than
+this config.)
 
-### `zeroclaw props` deprecated
+---
 
-Use `zeroclaw config` instead. The `props` subcommand still works and will not be
-removed in this release, but it will emit a deprecation notice.
+## Behavior Changes
 
-### Slack `channel_id` deprecated
+### Tool outputs that mention local image paths are now uploaded to the provider
 
-Use `channel_ids` (a list) in the Slack config block. `channel_id` (singular) still
-works but is deprecated in V2.
+Tool results — including `shell` and skill output — that print real local
+image paths (e.g. `ls /pictures`, `find . -name '*.png'`, an image-generation
+tool that prints the saved file path) are now canonicalized into
+`[IMAGE:...]` markers before history replay and base64-inlined into the next
+provider request. This is the fix for #6097 (local image reading failed) and
+#5453 (WebSocket `/ws/chat` did not process `[IMAGE:]` markers), and brings
+the agent and provider sides of the multimodal pipeline back into parity.
 
-### Workspace crate boundaries
+The behavior shift is real and worth flagging: image bytes that previously
+stayed on the local filesystem when surfaced by a shell-style tool are now
+uploaded to whichever provider the next turn dispatches to. Only paths where
+`Path::is_file()` returns `true` and the extension is one of `png`, `jpg`,
+`jpeg`, `webp`, `gif`, `bmp` are wrapped, and existing `[IMAGE:...]` markers
+are not double-wrapped, but operators running shell tools over directories
+of personal or sensitive images should be aware.
 
-If you have any code that depends directly on internal ZeroClaw crate paths (e.g. for
-embedding or testing), the crate structure has changed significantly. Refer to
-`AGENTS.md` for the current crate map and stability tiers. `zeroclaw-api` is the stable
-extension point — all other crates are Beta or Experimental.
+The per-request image budget (`max_images`, default `4`) and the LRU
+`trim_old_images` policy bound the cumulative upload cost — older images are
+dropped before the cap is exceeded — but the privacy posture has shifted.
+See `docs/book/src/contributing/privacy.md` and the new doc note on
+`MultimodalConfig.max_images` for the current upload semantics. Operators
+who do not want this behavior can keep tool outputs free of literal image
+paths, or scope shell tools away from image-bearing directories. (#6183)
+
+---
+
+### `[skill]` block in SKILL.toml rejects unknown fields; SkillForge provenance moves to `[forge]`
+
+Three coordinated changes that ship together so the strictness in #6128 is
+safe for users with `auto_integrate = true`:
+
+**1. `[skill]` is strict.** The `SkillMeta` struct backing the `[skill]` block of
+`SKILL.toml` now carries `#[serde(deny_unknown_fields)]`. Previously, unrecognised
+keys inside `[skill]` were silently dropped during deserialization — a typo in a
+field name would be accepted without error while the intended value was ignored.
+This is the bug class tracked in #6128, identified as a follow-up to the
+`SkillManifest` parsing refactor in #5972.
+
+Any `SKILL.toml` whose `[skill]` block contains a key not defined in the current
+schema will now fail to load with a descriptive serde error. Example:
+
+```toml
+[skill]
+name = "my-skill"
+descriptin = "Fixes a common issue"  # typo — was silently ignored, now an error
+```
+
+There is no per-field opt-out. The strictness is intentional: a skill that loads
+with a silently-dropped typo is harder to debug than one that fails loudly.
+Operators must correct or remove unrecognised fields from the `[skill]` block of
+their `SKILL.toml` before upgrading.
+
+**2. SkillForge provenance moves to a top-level `[forge]` table.** The SkillForge
+integrator (`auto_integrate = true`) previously emitted `source`, `owner`,
+`language`, `license`, `stars`, `updated_at` and the sub-tables
+`[skill.requirements]` / `[skill.metadata]` directly inside `[skill]`. With
+`SkillMeta` now strict, those keys would be rejected — every auto-integrated
+skill would fail to load. The integrator now emits a sibling top-level `[forge]`
+table instead, with `[forge.requirements]` and `[forge.metadata]` underneath.
+This keeps the runtime's canonical skill identity contract (`SkillMeta`) decoupled
+from the integrator's emit format (FND-001 §4.2 dependency rule). `[forge]` is
+optional on hand-authored skills and also strict (`deny_unknown_fields`) so
+typos in the provenance namespace surface the same way typos in `[skill]` do.
+
+**3. `SKILL.toml` parse failures are now logged.** The skill loader at both
+`load_skills_from_directory` and `load_open_skills_from_directory` previously
+swallowed every error from `load_skill_toml` silently. With `[skill]` now strict,
+that swallow would have flipped the failure mode from "field value silently
+ignored" to "skill silently never loads." Both sites now emit a structured
+`tracing::warn!` with `path` and `err` fields when a `SKILL.toml` fails to
+deserialize, so an operator running `RUST_LOG=warn zeroclaw` can identify the
+offending file.
+
+#### Migration for users with `auto_integrate = true`
+
+If you have `SKILL.toml` files on disk that were generated by SkillForge before
+this release, run the bundled migration script to move the provenance fields
+from `[skill]` into the new `[forge]` table layout. The script is idempotent —
+re-running it on already-migrated files is a no-op. Dry-run by default; pass
+`--apply` to write changes:
+
+```sh
+# Inspect the planned changes (dry-run):
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills
+
+# Apply the migration in place:
+python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills --apply
+```
+
+The script can also target a single file (`scripts/migrate-skill-toml.py
+path/to/skill/SKILL.toml --apply`) and uses standard library only (Python 3.8+,
+no `tomli` / `tomli_w` required). Hand-authored `SKILL.toml` files without
+SkillForge provenance are left untouched.
+
+If you do not run the migration before upgrading, auto-integrated skills will
+fail to load and the failure will surface as a `tracing::warn` line naming the
+offending path.
 
 ---
 
 ## Contributors
 
-Thank you to everyone who contributed to this release:
-
-- @abhijeet117
+- @abhinavmathur-atlan
 - @aliasliao
+- @aredridel
 - @ArgenisDLR
 - @Audacity88
-- @c98
-- @DaBlitzStein
-- @freeekanayaka
-- @guitaripod
+- @dahungkee
+- @donut-wenzhang
+- @drbparadise
 - @ilteoood
 - @JordanTheJet
-- @kunalk16
-- @markuman
-- @micookie
-- @nayrosk
-- @niedbalski
-- @ninenox
-- @pavelanni
+- @jscholz
+- @MestreY0d4-Uninter
+- @nanyuantingfeng
+- @nebullii
+- @nxajh
+- @patrickzzz
+- @perlowja
 - @singlerider
+- @songchao0421
 - @theonlyhennygod
-- @titulus
-- @tompro
-- @UtopiaX
-- @vernonstinebaker
+- @tidux
+- @tredondo
 - @WareWolf-MoonWall
-- @wlh320
-- @zavertiaev
+- @xiongzubiao
 
 ---
 
-*Full diff: `git log v0.6.9..HEAD --oneline`*
+*Full diff: `git log v0.7.4..v0.7.5 --oneline`*

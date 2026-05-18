@@ -27,7 +27,7 @@ use zeroclaw_api::tool::Tool;
 
 /// A successfully loaded plugin, ready for registration.
 pub struct LoadedPlugin {
-    /// Tool name from the manifest (unique key in [`ToolRegistry`]).
+    /// Tool name from the manifest (unique key in `ToolRegistry`).
     pub name: String,
     /// Semantic version string from the manifest.
     pub version: String,

@@ -1,6 +1,7 @@
-use crate::cron::{
-    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
+use super::cron_common::{
+    AT_DESCRIPTION, CRON_TZ_DESCRIPTION, cron_add_output, deserialize_schedule_arg,
 };
+use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -18,6 +19,21 @@ impl CronAddTool {
         Self { config, security }
     }
 
+    fn plain_string_schedule_error(raw: &str) -> Option<String> {
+        let schedule = raw.trim();
+        if schedule.starts_with('{') {
+            return None;
+        }
+
+        let got = serde_json::to_string(schedule).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+        Some(format!(
+            "Invalid schedule: expected a JSON object with a \"kind\" field, got plain string {got}. \
+             Use one of: {{\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}}, \
+             {{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}}, or \
+             {{\"kind\":\"every\",\"every_ms\":3600000}}"
+        ))
+    }
+
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
         if !self.security.can_act() {
             return Some(ToolResult {
@@ -29,21 +45,8 @@ impl CronAddTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         None
     }
@@ -58,8 +61,10 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ, Webhook), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
+         For webhook deliveries that must thread through the originating conversation, also set \
+         delivery.thread_id=\"<reply_target>\". \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
 
@@ -84,16 +89,16 @@ impl Tool for CronAddTool {
                             "properties": {
                                 "kind": { "type": "string", "enum": ["cron"] },
                                 "expr": { "type": "string", "description": "Standard 5-field cron expression, e.g. '*/5 * * * *'" },
-                                "tz": { "type": "string", "description": "Optional IANA timezone name, e.g. 'America/New_York'. Defaults to UTC." }
+                                "tz": { "type": "string", "description": CRON_TZ_DESCRIPTION }
                             },
                             "required": ["kind", "expr"]
                         },
                         {
                             "type": "object",
-                            "description": "One-shot schedule at a specific UTC datetime. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
+                            "description": "One-shot schedule at a specific RFC3339 timestamp with explicit Z or offset. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
                             "properties": {
                                 "kind": { "type": "string", "enum": ["at"] },
-                                "at": { "type": "string", "description": "ISO 8601 UTC datetime string, e.g. '2025-12-31T23:59:00Z'" }
+                                "at": { "type": "string", "description": AT_DESCRIPTION }
                             },
                             "required": ["kind", "at"]
                         },
@@ -146,12 +151,16 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
                             "type": "string",
-                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, webhook recipient, etc."
+                        },
+                        "thread_id": {
+                            "type": "string",
+                            "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
                         },
                         "best_effort": {
                             "type": "boolean",
@@ -183,13 +192,33 @@ impl Tool for CronAddTool {
         }
 
         let schedule = match args.get("schedule") {
-            Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
-                Ok(schedule) => schedule,
-                Err(e) => {
+            Some(v @ serde_json::Value::String(raw)) => {
+                if let Some(error) = Self::plain_string_schedule_error(raw) {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Invalid schedule: {e}")),
+                        error: Some(error),
+                    });
+                }
+
+                match deserialize_schedule_arg(v) {
+                    Ok(schedule) => schedule,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
+            Some(v) => match deserialize_schedule_arg(v) {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(error),
                     });
                 }
             },
@@ -354,15 +383,7 @@ impl Tool for CronAddTool {
         match result {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "id": job.id,
-                    "name": job.name,
-                    "job_type": job.job_type,
-                    "schedule": job.schedule,
-                    "next_run": job.next_run,
-                    "enabled": job.enabled,
-                    "allowed_tools": job.allowed_tools
-                }))?,
+                output: serde_json::to_string_pretty(&cron_add_output(&job))?,
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -416,6 +437,57 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn output_includes_timezone_confirmation_fields_for_explicit_cron_timezone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 9 * * 1-5", "tz": "America/New_York" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["next_run"], output["next_run_utc"]);
+        assert_eq!(output["schedule_timezone"], "America/New_York");
+        assert_eq!(output["timezone_source"], "explicit");
+        assert!(
+            output["next_run_local"]
+                .as_str()
+                .is_some_and(|value| value.contains("T09:00:00")),
+            "next_run_local should display the next run in the explicit schedule timezone: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_identifies_runtime_local_fallback_when_cron_timezone_is_omitted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["timezone_source"], "runtime_local");
+        assert_eq!(output["schedule_timezone"], "runtime local timezone");
+        assert!(
+            output["next_run_local"].as_str().is_some(),
+            "next_run_local should be present for runtime-local cron schedules: {output}"
+        );
     }
 
     #[tokio::test]
@@ -505,39 +577,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocks_add_when_rate_limited() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.autonomy.level = AutonomyLevel::Full;
-        config.autonomy.max_actions_per_hour = 0;
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
-
-        let result = tool
-            .execute(json!({
-                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
-                "job_type": "shell",
-                "command": "echo ok"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("Rate limit exceeded")
-        );
-        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn medium_risk_shell_command_requires_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
@@ -601,6 +640,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_plain_string_schedule_with_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": "0 9 * * 1-5",
+                "job_type": "shell",
+                "command": "echo bad-schedule"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("expected a JSON object"));
+        assert!(error.contains("\"kind\""));
+        assert!(error.contains("plain string \"0 9 * * 1-5\""));
+        assert!(error.contains("{\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}"));
+        assert!(error.contains("{\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}"));
+        assert!(error.contains("{\"kind\":\"every\",\"every_ms\":3600000}"));
+        assert!(!error.contains("internally tagged enum"));
+    }
+
+    #[tokio::test]
     async fn accepts_stringified_interval_schedule() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -658,6 +723,31 @@ mod tests {
                 .unwrap_or_default()
                 .contains("every_ms must be > 0")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_at_timestamp_without_explicit_offset_with_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": "2026-05-18T09:00:00" },
+                "job_type": "shell",
+                "command": "echo at"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("RFC3339 timestamp with explicit Z or offset"),
+            "error should explain the explicit offset requirement: {error}"
+        );
+        assert!(error.contains("2026-05-18T09:00:00Z"));
+        assert!(error.contains("2026-05-18T09:00:00-04:00"));
     }
 
     #[tokio::test]
@@ -749,6 +839,63 @@ mod tests {
         assert!(values.iter().any(|value| value == "matrix"));
     }
 
+    #[tokio::test]
+    async fn delivery_schema_includes_webhook_and_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+
+        let channel_enum = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            channel_enum.iter().any(|value| value == "webhook"),
+            "delivery.channel enum must include webhook"
+        );
+
+        let delivery_props = schema["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("delivery must have properties");
+        assert!(
+            delivery_props.contains_key("thread_id"),
+            "delivery schema must expose thread_id so the webhook channel can route callbacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_announce_job_persists_thread_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "webhook",
+                    "to": "user-42",
+                    "thread_id": "conv-99",
+                    "best_effort": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("webhook"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("user-42"));
+        assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("conv-99"));
+        assert!(jobs[0].delivery.best_effort);
+    }
+
     #[test]
     fn schedule_schema_is_oneof_with_cron_at_every_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -814,5 +961,37 @@ mod tests {
                 _ => panic!("unexpected kind: {kind}"),
             }
         }
+
+        let cron_variant = one_of
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "cron")
+            .expect("cron variant");
+        let cron_tz_description = cron_variant["properties"]["tz"]["description"]
+            .as_str()
+            .expect("cron tz description");
+        assert!(
+            cron_tz_description.contains("runtime local timezone"),
+            "cron tz description must match scheduler fallback: {cron_tz_description}"
+        );
+        assert!(
+            cron_tz_description.contains("explicit IANA timezone"),
+            "cron tz description should recommend explicit IANA timezones: {cron_tz_description}"
+        );
+        assert!(
+            !cron_tz_description.contains("Defaults to UTC"),
+            "cron tz description must not claim a UTC default"
+        );
+
+        let at_variant = one_of
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "at")
+            .expect("at variant");
+        let at_description = at_variant["properties"]["at"]["description"]
+            .as_str()
+            .expect("at description");
+        assert!(
+            at_description.contains("RFC3339 timestamp with explicit Z or offset"),
+            "at description should require explicit Z or offset: {at_description}"
+        );
     }
 }

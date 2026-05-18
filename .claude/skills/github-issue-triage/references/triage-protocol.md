@@ -33,7 +33,7 @@ Only create labels that are actually needed in the current run.
 
 ### Non-English issues
 
-The project has contributors filing issues in Chinese, Japanese, Russian, Vietnamese, and French (supported locales per `docs/contributing/docs-contract.md`). When triaging a non-English issue:
+The project has contributors filing issues in non-English locales (the supported set is defined in `locales.toml` at the repo root). When triaging a non-English issue:
 
 - Classify and label it the same as any English issue — language does not affect priority or validity.
 - Respond in the same language the reporter used if you can do so accurately. If you cannot, respond in English.

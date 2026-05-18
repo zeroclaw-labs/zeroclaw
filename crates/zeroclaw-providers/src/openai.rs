@@ -7,6 +7,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
+/// OpenAI's public API endpoint.
+const BASE_URL: &str = "https://api.openai.com/v1";
+
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
@@ -186,7 +189,7 @@ impl OpenAiProvider {
         Self {
             base_url: base_url
                 .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                .unwrap_or_else(|| BASE_URL.to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
         }
@@ -326,6 +329,7 @@ impl OpenAiProvider {
                 id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
+                extra_content: None,
             })
             .collect::<Vec<_>>();
 
@@ -348,17 +352,23 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    // ── Provider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
 
         let mut messages = Vec::new();
@@ -408,12 +418,13 @@ impl Provider for OpenAiProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
 
         let tools = Self::convert_tools(request.tools);
@@ -464,12 +475,13 @@ impl Provider for OpenAiProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -533,6 +545,12 @@ impl Provider for OpenAiProvider {
         }
         Ok(())
     }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // OpenAI's /v1/models requires a credential. models.dev is the no-auth
+        // path onboard uses before the user has entered a key.
+        crate::models_dev::list_models_for("openai").await
+    }
 }
 
 #[cfg(test)]
@@ -560,7 +578,7 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = OpenAiProvider::new(None);
-        let result = p.chat_with_system(None, "hello", "gpt-4o", 0.7).await;
+        let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
@@ -569,7 +587,7 @@ mod tests {
     async fn chat_with_system_fails_without_key() {
         let p = OpenAiProvider::new(None);
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", 0.5)
+            .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
         assert!(result.is_err());
     }
@@ -726,7 +744,9 @@ mod tests {
                 }
             }
         })];
-        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "gpt-4o", Some(0.7))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
@@ -749,7 +769,9 @@ mod tests {
             }
         })];
 
-        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "gpt-4o", Some(0.7))
+            .await;
         assert!(result.is_err());
         assert!(
             result

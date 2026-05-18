@@ -221,8 +221,9 @@ impl Provider for ClaudeCodeProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
         let (text, _usage) = self.invoke_cli(message, model, system_prompt, true).await?;
@@ -233,8 +234,9 @@ impl Provider for ClaudeCodeProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
         let system = messages
@@ -268,8 +270,9 @@ impl Provider for ClaudeCodeProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
         let system = request
@@ -476,7 +479,7 @@ mod tests {
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
-            .chat_with_history(&messages, "default", 1.0)
+            .chat_with_history(&messages, "default", Some(1.0))
             .await
             .unwrap();
         assert_eq!(result, "hello");
@@ -491,7 +494,7 @@ mod tests {
             ChatMessage::user("hello"),
         ];
         let result = provider
-            .chat_with_history(&messages, "default", 1.0)
+            .chat_with_history(&messages, "default", Some(1.0))
             .await
             .unwrap();
         // System prompt is passed via --append-system-prompt flag (not in stdin),
@@ -510,7 +513,7 @@ mod tests {
             ChatMessage::user("And 3+3?"),
         ];
         let result = provider
-            .chat_with_history(&messages, "default", 1.0)
+            .chat_with_history(&messages, "default", Some(1.0))
             .await
             .unwrap();
         // System prompt is passed via --append-system-prompt flag, not in stdin.
@@ -531,7 +534,7 @@ mod tests {
             ChatMessage::user("bye"),
         ];
         let result = provider
-            .chat_with_history(&messages, "default", 1.0)
+            .chat_with_history(&messages, "default", Some(1.0))
             .await
             .unwrap();
         assert!(!result.contains("[system]"));
@@ -546,7 +549,7 @@ mod tests {
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("test")];
         let result = provider
-            .chat_with_history(&messages, "default", f64::NAN)
+            .chat_with_history(&messages, "default", Some(f64::NAN))
             .await;
         assert!(result.is_err());
     }

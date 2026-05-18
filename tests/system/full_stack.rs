@@ -38,6 +38,7 @@ async fn system_tool_execution_flow() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "system echo test"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Echo returned: system echo test"),
     ]));
@@ -91,6 +92,7 @@ async fn system_tool_arguments_passed_correctly() {
             id: "tc1".into(),
             name: "recorder".into(),
             arguments: r#"{"input": "test_value_42"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Tool recorded the input"),
     ]));
@@ -126,11 +128,13 @@ async fn system_parallel_tool_execution() {
                 id: "tc1".into(),
                 name: "echo".into(),
                 arguments: r#"{"message": "first"}"#.into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("Both tools completed"),

@@ -1,4 +1,4 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
@@ -30,7 +30,6 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 use crate::cost::types::BudgetCheck;
-use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -50,7 +49,9 @@ use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
+use zeroclaw_memory::{
+    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
+};
 use zeroclaw_providers::multimodal;
 use zeroclaw_providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -58,8 +59,8 @@ use zeroclaw_providers::{
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
-    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
-    record_tool_loop_cost_usage,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
+    check_tool_loop_budget, record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -73,8 +74,9 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-    load_interactive_session_history, save_interactive_session_history, trim_history,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
+    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+    normalize_system_messages, save_interactive_session_history, trim_history,
     truncate_tool_result,
 };
 
@@ -184,6 +186,7 @@ pub fn filter_by_allowed_tools(
 }
 
 // Re-export from zeroclaw-types for backwards compatibility.
+pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
 // Re-export tool call parsing from the standalone parser crate.
@@ -200,6 +203,17 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
+}
+
+/// Run a future with the session key set in task-local storage.
+/// The scope wraps the entire agent turn, so all tools invoked during
+/// the turn (including nested calls) see the same session key.
+/// SessionsCurrentTool reads this to identify the active session.
+pub async fn scope_session_key<F>(session_key: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
 }
 
 /// Computes the list of MCP tool names that should be excluded for a given turn
@@ -324,11 +338,17 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
+///
+/// `exclude_conversation` skips `MemoryCategory::Conversation` entries
+/// regardless of their key shape. Set to `true` for autonomous/scheduled
+/// runs (cron, daemon heartbeat) so chat memory cannot leak into prompts
+/// the user did not initiate. See #5415 / #5456.
 async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    exclude_conversation: bool,
 ) -> String {
     let mut context = String::new();
 
@@ -346,8 +366,16 @@ async fn build_context(
             .collect();
 
         if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
+            let mut included = false;
             for entry in &relevant {
+                // Scheduled (cron / heartbeat) runs must not see chat-origin
+                // memories. The autosave-key checks below catch the agent's
+                // own autosaves but miss Conversation entries written by
+                // channel handlers (Discord, gateway, WhatsApp, …) under
+                // their own keys. See #5415 / #5456.
+                if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
+                    continue;
+                }
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
@@ -366,12 +394,16 @@ async fn build_context(
                 if entry.content.contains("<tool_result") {
                     continue;
                 }
+                if !included {
+                    context.push_str(MEMORY_CONTEXT_OPEN);
+                    context.push('\n');
+                    included = true;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push_str("[/Memory context]\n\n");
+            if included {
+                context.push_str(MEMORY_CONTEXT_CLOSE);
+                context.push_str("\n\n");
             }
         }
     }
@@ -465,7 +497,6 @@ fn build_native_assistant_history(
     obj.to_string()
 }
 
-#[cfg(test)]
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -532,8 +563,18 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    /// Accumulated reasoning/thinking content from streaming deltas.
+    ///
+    /// Captured separately from `response_text` so it can be threaded into
+    /// `ChatResponse.reasoning_content` and ultimately persisted on the
+    /// `AssistantToolCalls` history entry. Required for providers like
+    /// DeepSeek V4 that reject follow-up requests when the assistant's
+    /// prior `reasoning_content` is missing from replayed tool-call turns
+    /// (see issue #6059).
+    reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 async fn consume_provider_streaming_response(
@@ -551,7 +592,7 @@ async fn consume_provider_streaming_response(
             tools: request_tools,
         },
         model,
-        temperature,
+        Some(temperature),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();
@@ -576,6 +617,9 @@ async fn consume_provider_streaming_response(
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
             StreamEvent::Final => break,
+            StreamEvent::Usage(usage) => {
+                outcome.usage = Some(usage);
+            }
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -586,6 +630,21 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Reasoning/thinking deltas arrive on the same `TextDelta`
+                // event as plain text but populate `chunk.reasoning` instead
+                // of `chunk.delta`. They must be captured into the outcome
+                // even when `chunk.delta` is empty — otherwise providers
+                // that require reasoning to round-trip on subsequent turns
+                // (DeepSeek V4 thinking mode; see #6059) reject the next
+                // request with a 400. Reasoning is never forwarded as a
+                // visible response delta — it is the model's internal
+                // monologue, kept for replay only.
+                if let Some(reasoning) = chunk.reasoning.as_deref()
+                    && !reasoning.is_empty()
+                {
+                    outcome.reasoning_content.push_str(reasoning);
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -791,31 +850,6 @@ fn maybe_inject_channel_delivery_defaults(
 //   • the cancellation token fires (external abort).
 
 /// Append a receipt footer to the response text if any receipts were collected.
-///
-/// Format:
-/// ```text
-/// \n\n---\nTool receipts:\n  shell: zc-receipt-...\n  web_search: zc-receipt-...
-/// ```
-pub fn append_receipt_footer(
-    response: String,
-    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-) -> String {
-    let Some(store) = collected_receipts else {
-        return response;
-    };
-    let Ok(receipts) = store.lock() else {
-        return response;
-    };
-    if receipts.is_empty() {
-        return response;
-    }
-    let mut footer = format!("{response}\n\n---\nTool receipts:");
-    for entry in receipts.iter() {
-        footer.push_str(&format!("\n  {entry}"));
-    }
-    footer
-}
-
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -937,6 +971,7 @@ pub async fn run_tool_call_loop(
         // or session history reloading.  Without this, providers like MiniMax
         // reject the request with "tool result's tool id not found" (bug #5743).
         crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1109,11 +1144,16 @@ pub async fn run_tool_call_loop(
             {
                 Ok(streamed) => {
                     streamed_live_deltas = streamed.forwarded_live_deltas;
+                    let reasoning_content = if streamed.reasoning_content.is_empty() {
+                        None
+                    } else {
+                        Some(streamed.reasoning_content)
+                    };
                     Ok(zeroclaw_providers::ChatResponse {
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
-                        usage: None,
-                        reasoning_content: None,
+                        usage: streamed.usage,
+                        reasoning_content,
                     })
                 }
                 Err(stream_err) => {
@@ -1143,7 +1183,7 @@ pub async fn run_tool_call_loop(
                                 tools: request_tools,
                             },
                             active_model,
-                            temperature,
+                            Some(temperature),
                         );
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
@@ -1165,7 +1205,7 @@ pub async fn run_tool_call_loop(
                     tools: request_tools,
                 },
                 active_model,
-                temperature,
+                Some(temperature),
             );
 
             match pacing.step_timeout_secs {
@@ -1237,24 +1277,33 @@ pub async fn run_tool_call_loop(
                     .as_ref()
                     .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
-                let response_text = resp.text_or_empty().to_string();
+                let response_text = if tool_specs.is_empty() {
+                    strip_think_tags(resp.text_or_empty())
+                } else {
+                    resp.text_or_empty().to_string()
+                };
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the provider returned no native calls —
                 // this ensures we support both native and prompt-guided models.
-                let mut calls: Vec<ParsedToolCall> = resp
-                    .tool_calls
-                    .iter()
-                    .map(|call| ParsedToolCall {
-                        name: call.name.clone(),
-                        arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-                        tool_call_id: Some(call.id.clone()),
-                    })
-                    .collect();
+                let mut calls: Vec<ParsedToolCall> = if tool_specs.is_empty() {
+                    Vec::new()
+                } else {
+                    resp.tool_calls
+                        .iter()
+                        .map(|call| ParsedToolCall {
+                            name: call.name.clone(),
+                            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::Object(serde_json::Map::new())
+                                }),
+                            tool_call_id: Some(call.id.clone()),
+                        })
+                        .collect()
+                };
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() {
+                if calls.is_empty() && !tool_specs.is_empty() {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -1262,7 +1311,11 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                let parse_issue = if tool_specs.is_empty() {
+                    None
+                } else {
+                    detect_tool_call_parse_issue(&response_text, &calls)
+                };
                 if let Some(ref issue) = parse_issue {
                     runtime_trace::record_event(
                         "tool_call_parse_issue",
@@ -1391,11 +1444,12 @@ pub async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1455,10 +1509,7 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(append_receipt_footer(
-                accumulated_display_text,
-                collected_receipts,
-            ));
+            return Ok(accumulated_display_text);
         }
 
         // Accumulate text from this iteration (tool calls present, loop continues).
@@ -1557,9 +1608,14 @@ pub async fn run_tool_call_loop(
                 channel_reply_target,
             );
 
+            super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+
             // ── Approval hook ────────────────────────────────
+            let mut approval_requirement = approval
+                .map(|mgr| mgr.approval_requirement(&tool_name))
+                .unwrap_or(ApprovalRequirement::NotRequired);
             if let Some(mgr) = approval
-                && mgr.needs_approval(&tool_name)
+                && approval_requirement == ApprovalRequirement::Prompt
             {
                 let request = ApprovalRequest {
                     tool_name: tool_name.clone(),
@@ -1644,7 +1700,16 @@ pub async fn run_tool_call_loop(
                     ));
                     continue;
                 }
+
+                if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                    approval_requirement = ApprovalRequirement::Approved;
+                }
             }
+            super::set_runtime_approved_arg(
+                &tool_name,
+                &mut tool_args,
+                approval_requirement == ApprovalRequirement::Approved,
+            );
 
             let signature = {
                 let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
@@ -1769,7 +1834,7 @@ pub async fn run_tool_call_loop(
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
-            .zip(executed_outcomes.into_iter())
+            .zip(executed_outcomes)
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -1843,16 +1908,16 @@ pub async fn run_tool_call_loop(
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                     crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
-                        // Inject a system nudge so the LLM adjusts strategy.
-                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                        append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
                         // Replace the tool output with the block message.
                         // We still continue the loop so the LLM sees the block feedback.
-                        history.push(ChatMessage::system(format!(
-                            "[Loop Detection — BLOCKED] {msg}"
-                        )));
+                        append_or_merge_system_message(
+                            history,
+                            format!("[Loop Detection — BLOCKED] {msg}"),
+                        );
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
                         runtime_trace::record_event(
@@ -1872,7 +1937,8 @@ pub async fn run_tool_call_loop(
                     }
                 }
             }
-            let mut result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
+            let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled (#4830)
             if let Some(ref receipt) = outcome.receipt {
                 tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
@@ -2002,17 +2068,17 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider.chat(summary_request, model, temperature).await {
+    match provider
+        .chat(summary_request, model, Some(temperature))
+        .await
+    {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
-            Ok(append_receipt_footer(
-                accumulated_display_text,
-                collected_receipts,
-            ))
+            Ok(accumulated_display_text)
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -2023,10 +2089,30 @@ pub async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub fn build_tool_instructions(
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+    build_tool_instructions_for_tools(tools_registry.iter().map(|tool| tool.as_ref()))
+}
+
+/// Build tool instructions for the subset of registered tools that are
+/// effective for the current prompt.
+pub fn build_tool_instructions_for_names(
     tools_registry: &[Box<dyn Tool>],
-    tool_descriptions: Option<&ToolDescriptions>,
+    effective_tool_names: &HashSet<&str>,
 ) -> String {
+    build_tool_instructions_for_tools(
+        tools_registry
+            .iter()
+            .map(|tool| tool.as_ref())
+            .filter(|tool| effective_tool_names.contains(tool.name())),
+    )
+}
+
+fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
+    let tools: Vec<&dyn Tool> = tools.into_iter().collect();
+    if tools.is_empty() {
+        return String::new();
+    }
+
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -2041,10 +2127,8 @@ pub fn build_tool_instructions(
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
-    for tool in tools_registry {
-        let desc = tool_descriptions
-            .and_then(|td| td.get(tool.name()))
-            .unwrap_or_else(|| tool.description());
+    for tool in tools {
+        let desc = tool.description();
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
@@ -2055,6 +2139,15 @@ pub fn build_tool_instructions(
     }
 
     instructions
+}
+
+fn retain_registered_tool_descriptions(
+    tool_descs: &mut Vec<(&str, &str)>,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    let registered_tool_names: HashSet<&str> =
+        tools_registry.iter().map(|tool| tool.name()).collect();
+    tool_descs.retain(|(name, _)| registered_tool_names.contains(name));
 }
 
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
@@ -2074,10 +2167,11 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let observer: Arc<dyn Observer> = observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -2288,15 +2382,14 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -2422,6 +2515,7 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2444,7 +2538,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -2465,7 +2559,10 @@ pub async fn run(
         if raw.is_empty() {
             None
         } else {
-            Some(format!("cli:{raw}"))
+            // Match the sanitized form persisted by memory backend migrations.
+            Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                "cli:{raw}"
+            )))
         }
     });
 
@@ -2473,7 +2570,7 @@ pub async fn run(
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
         crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
             .map(|tracker| {
-                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.combined_pricing()))
             });
 
     // ── Execute ──────────────────────────────────────────────────
@@ -2510,6 +2607,18 @@ pub async fn run(
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
 
+        if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+            &effective_msg,
+            &skills,
+            &config.workspace_dir,
+            config.skills.install_suggestions.enabled,
+        ) {
+            final_output = suggestion.clone();
+            println!("{suggestion}");
+            observer.record_event(&ObserverEvent::TurnComplete);
+            return Ok(final_output);
+        }
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
             && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -2526,12 +2635,16 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory + hardware RAG context into user message.
+        // For non-interactive runs (cron, daemon heartbeat), exclude
+        // Conversation-category memories so chat history does not leak
+        // into autonomous executions. See #5415 / #5456.
         let mem_context = build_context(
             mem.as_ref(),
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
+            !interactive,
         )
         .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2797,6 +2910,31 @@ pub async fn run(
                 }
             }
 
+            if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+                &effective_input,
+                &skills,
+                &config.workspace_dir,
+                config.skills.install_suggestions.enabled,
+            ) {
+                final_output = suggestion.clone();
+                if let Err(e) = zeroclaw_api::channel::Channel::send(
+                    &*cli,
+                    &zeroclaw_api::channel::SendMessage::new(format!("\n{suggestion}\n"), "user"),
+                )
+                .await
+                {
+                    eprintln!("\nError sending CLI response: {e}\n");
+                }
+                observer.record_event(&ObserverEvent::TurnComplete);
+                if thinking_params.system_prompt_prefix.is_some()
+                    && let Some(sys_msg) = history.first_mut()
+                    && sys_msg.role == "system"
+                {
+                    sys_msg.content.clone_from(&base_system_prompt);
+                }
+                continue;
+            }
+
             // Auto-save conversation turns (skip short/trivial messages)
             if config.memory.auto_save
                 && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
@@ -2813,12 +2951,15 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory + hardware RAG context into user message.
+            // Interactive REPL: keep Conversation memories (user is actively
+            // chatting in this session and may want their own history recalled).
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
+                false,
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3082,9 +3223,10 @@ pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> Result<String> {
-    let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+    let observer: Arc<dyn Observer> = observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3206,9 +3348,34 @@ pub async fn process_message(
     }
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = fallback_provider_pm
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = match fallback_provider_pm
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [[providers.models.*]] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     or define a [[model_routes]] hint.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
@@ -3236,15 +3403,14 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
@@ -3316,6 +3482,19 @@ pub async fn process_message(
             tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
         }
     }
+    let effective_tool_names: HashSet<&str> = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            config.autonomy.level == AutonomyLevel::Full
+                || !config
+                    .autonomy
+                    .non_cli_excluded_tools
+                    .iter()
+                    .any(|excluded| excluded.as_str() == *name)
+        })
+        .collect();
+    tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3337,7 +3516,10 @@ pub async fn process_message(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions_for_names(
+            &tools_registry,
+            &effective_tool_names,
+        ));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -3374,11 +3556,24 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+        effective_msg_ref,
+        &skills,
+        &config.workspace_dir,
+        config.skills.install_suggestions.enabled,
+    ) {
+        return Ok(suggestion);
+    }
+
+    // process_message is the channel entrypoint (Discord, Telegram, gateway,
+    // etc.) — recall is scoped to the channel's session_id, so retrieving the
+    // user's own Conversation history within their session is intended.
     let mem_context = build_context(
         mem.as_ref(),
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
+        false,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3757,6 +3952,75 @@ mod tests {
         assert_eq!(restored[1].content, "orphan");
     }
 
+    #[test]
+    fn load_interactive_session_merges_non_leading_system_messages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("base system"),
+                ChatMessage::user("first question"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::system("late loop-detection guidance"),
+                ChatMessage::user("follow-up"),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
+            1,
+            "loaded session must not contain non-leading system messages: {:?}",
+            restored
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(restored[0].role, "system");
+        assert!(restored[0].content.contains("base system"));
+        assert!(restored[0].content.contains("late loop-detection guidance"));
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
+    }
+
+    #[test]
+    fn load_interactive_session_replaces_empty_system_messages_with_fallback() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system(""),
+                ChatMessage::user("follow-up"),
+                ChatMessage::system(""),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback system").unwrap();
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("system", "fallback system"), ("user", "follow-up")]
+        );
+    }
+
     /// Regression test for issue #5813: a persisted session whose assistant
     /// (tool_use) was lost to compaction must self-heal on load so the next
     /// API call doesn't fail with "unexpected tool_use_id found in tool_result
@@ -3913,7 +4177,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3939,7 +4203,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3949,7 +4213,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
@@ -4010,7 +4274,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in scripted provider tests");
         }
@@ -4019,7 +4283,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let mut responses = self
                 .responses
@@ -4028,6 +4292,60 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct RecordingProvider {
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        capabilities: ProviderCapabilities,
+    }
+
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                capabilities: ProviderCapabilities::default(),
+            }
+        }
+
+        fn with_vision_support(mut self) -> Self {
+            self.capabilities.vision = true;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities.clone()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in recording provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .push(request.messages.to_vec());
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
 
@@ -4056,7 +4374,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming scripted provider tests"
@@ -4067,7 +4385,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when streaming succeeds")
@@ -4081,7 +4399,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4109,6 +4427,12 @@ mod tests {
     enum NativeStreamTurn {
         ToolCall(ToolCall),
         Text(String),
+        /// Emit a single text delta with associated reasoning content. Used by
+        /// regression tests for issue #6059 (DeepSeek V4 thinking-mode replay).
+        TextWithReasoning {
+            text: String,
+            reasoning: String,
+        },
     }
 
     struct StreamingNativeToolEventProvider {
@@ -4144,7 +4468,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming native tool event provider tests"
@@ -4155,7 +4479,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when native streaming events succeed")
@@ -4173,7 +4497,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4204,6 +4528,13 @@ mod tests {
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                     Ok(StreamEvent::Final),
                 ])),
+                NativeStreamTurn::TextWithReasoning { text, reasoning } => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::TextDelta(StreamChunk::reasoning(reasoning))),
+                        Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
             }
         }
     }
@@ -4233,7 +4564,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
         }
@@ -4242,7 +4573,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when routed streaming succeeds")
@@ -4256,7 +4587,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4576,11 +4907,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-        };
+    async fn run_tool_call_loop_skips_oversized_image_payload() {
+        let provider = RecordingProvider::new().with_vision_support();
+        let recorded_requests = Arc::clone(&provider.requests);
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
         let mut history = vec![ChatMessage::user(format!(
@@ -4596,7 +4925,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -4626,13 +4955,21 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect_err("oversized payload must fail");
+        .expect("oversized payload should be skipped and continue as text-only");
 
+        assert_eq!(result, "done");
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].len(), 1);
         assert!(
-            err.to_string()
-                .contains("multimodal image size limit exceeded")
+            requests[0][0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!requests[0][0].content.contains("[IMAGE:"));
+        assert!(!requests[0][0].content.contains(&oversized_payload));
     }
 
     #[tokio::test]
@@ -5712,6 +6049,7 @@ mod tests {
                         id: "call_wait".into(),
                         name: "count_tool".into(),
                         arguments: r#"{"value":"A"}"#.into(),
+                        extra_content: None,
                     }],
                     usage: None,
                     reasoning_content: None,
@@ -5944,6 +6282,7 @@ mod tests {
                 id: "call_native_1".to_string(),
                 name: "count_tool".to_string(),
                 arguments: r#"{"value":"A"}"#.to_string(),
+                extra_content: None,
             }),
             NativeStreamTurn::Text("done".to_string()),
         ]);
@@ -6212,13 +6551,21 @@ mod tests {
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
+        let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn build_tool_instructions_empty_registry_returns_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let instructions = build_tool_instructions(&tools);
+
+        assert!(instructions.is_empty());
     }
 
     #[test]
@@ -6334,7 +6681,7 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, "status updates", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -6369,10 +6716,54 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "answers", 0.0, None).await;
+        let context = build_context(&mem, "answers", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));
+    }
+
+    /// Regression: cron / heartbeat runs must not surface chat-origin
+    /// `Conversation` memories — the leak path the #5456 prefix filter
+    /// missed because `agent::run` performs a second, unfiltered recall
+    /// inside `build_context`. See #5415.
+    #[tokio::test]
+    async fn build_context_excludes_conversation_when_flag_set() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // A Conversation entry written by a chat channel with a non-autosave
+        // key (autosave keys are already skipped by the existing filters).
+        mem.store(
+            "discord:guild:chan:msg-42",
+            "Reminder for Alice: the API key is in 1Password vault Foo.",
+            MemoryCategory::Conversation,
+            Some("discord:guild:chan"),
+        )
+        .await
+        .unwrap();
+        // A non-Conversation memory that should still surface so we know the
+        // function still does its job — only Conversation should be dropped.
+        mem.store(
+            "team_oncall",
+            "Primary on-call rotates every Monday at 09:00 UTC.",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "Alice on-call", 0.0, None, true).await;
+        assert!(
+            !context.contains("Alice"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            !context.contains("API key"),
+            "Conversation memory leaked into scheduled context: {context}"
+        );
+        assert!(
+            context.contains("team_oncall"),
+            "Non-Conversation memory should still surface: {context}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -6761,20 +7152,20 @@ Let me check the result."#;
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts. In the native path
-    /// `build_tool_instructions` is never called, so the system prompt alone
-    /// must be clean of XML tool-call protocol.
+    /// the output must contain ZERO XML protocol artifacts and must not inject
+    /// the duplicate non-native tools summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
 
+        let workspace = tempdir().unwrap();
         let tool_summaries: Vec<(&str, &str)> = vec![
             ("shell", "Execute shell commands"),
             ("file_read", "Read files"),
         ];
 
         let system_prompt = build_system_prompt_with_mode(
-            std::path::Path::new("/tmp"),
+            workspace.path(),
             "test-model",
             &tool_summaries,
             &[],  // no skills
@@ -6807,14 +7198,58 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // Positive: native prompt should still contain native-task framing.
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt should skip the duplicate tools summary"
         );
         assert!(
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
+        );
+    }
+
+    #[test]
+    fn non_native_system_prompt_with_no_tools_contains_zero_tool_protocol() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let tool_summaries: Vec<(&str, &str)> = vec![];
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &tool_summaries,
+            &[],
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            !system_prompt.contains("## Tools"),
+            "No-tools prompt must not include a Tools section"
+        );
+        assert!(
+            !system_prompt.contains("## Tool Use Protocol"),
+            "No-tools prompt must not include tool protocol"
+        );
+        assert!(
+            !system_prompt.contains("<tool_call>"),
+            "No-tools prompt must not mention XML tool calls"
+        );
+        assert!(
+            !system_prompt.contains("<tool_result>"),
+            "No-tools prompt must not mention XML tool results"
+        );
+        assert!(
+            !system_prompt.contains("Use the tools"),
+            "No-tools prompt must not instruct the model to use unavailable tools"
+        );
+        assert!(
+            system_prompt.contains("No tools are available for this turn"),
+            "No-tools prompt should explicitly describe the current capability boundary"
         );
     }
 
@@ -6920,6 +7355,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -6934,6 +7370,7 @@ Let me check the result."#;
             id: "call_1".into(),
             name: "shell".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let result = build_native_assistant_history("answer", &calls, None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -6972,6 +7409,124 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    /// Regression test for issue #6059 — DeepSeek V4 thinking-mode tool-call
+    /// replay rejected with `400` because the assistant's prior
+    /// `reasoning_content` was missing from the next request.
+    ///
+    /// Before the fix, the streaming consumer dropped reasoning chunks on the
+    /// floor (`chunk.delta.is_empty()` short-circuit + hardcoded
+    /// `reasoning_content: None` on the synthesized `ChatResponse`). After
+    /// the fix, reasoning deltas accumulate into `StreamedChatOutcome` and
+    /// surface on the response so the agent's history layer can persist them
+    /// and replay them on subsequent turns.
+    #[tokio::test]
+    async fn consume_provider_streaming_response_captures_reasoning_content() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::TextWithReasoning {
+                text: "Listing the directory now.".to_string(),
+                reasoning: "I need to call the shell tool to list files.".to_string(),
+            },
+        ]);
+        let messages = vec![ChatMessage::user(
+            "List the folders in the current directory",
+        )];
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "deepseek-v4-pro",
+            0.2,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming should succeed");
+
+        assert_eq!(outcome.response_text, "Listing the directory now.");
+        assert_eq!(
+            outcome.reasoning_content,
+            "I need to call the shell tool to list files."
+        );
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "this turn does not emit native tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_accumulates_split_reasoning_chunks() {
+        // Scripted multi-event stream: two reasoning chunks straddling a text
+        // delta. The outcome should concatenate the reasoning chunks in order
+        // and keep them out of the visible response text.
+        struct MultiChunkProvider;
+
+        #[async_trait]
+        impl Provider for MultiChunkProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning("Step 1: "))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("Hello "))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                        "consider options.",
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("there."))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = MultiChunkProvider;
+        let messages = vec![ChatMessage::user("hi")];
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "deepseek-v4-flash",
+            0.2,
+            None,
+            None,
+        )
+        .await
+        .expect("streaming should succeed");
+
+        assert_eq!(outcome.response_text, "Hello there.");
+        assert_eq!(outcome.reasoning_content, "Step 1: consider options.");
     }
 
     // ── glob_match tests ──────────────────────────────────────────────────────
@@ -7351,6 +7906,70 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn tool_loop_normalizes_non_leading_system_messages_before_provider_request() {
+        let provider = RecordingProvider::new();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("base system"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::system("late loop-detection guidance"),
+            ChatMessage::user("follow-up"),
+        ];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "recording-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        assert_eq!(result, "done");
+        let requests = requests.lock().expect("requests lock should be valid");
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        assert_eq!(sent[0].role, "system");
+        assert_eq!(
+            sent.iter().filter(|msg| msg.role == "system").count(),
+            1,
+            "provider request must not contain non-leading system messages: {:?}",
+            sent.iter().map(|msg| msg.role.as_str()).collect::<Vec<_>>()
+        );
+        assert!(sent[0].content.contains("base system"));
+        assert!(sent[0].content.contains("late loop-detection guidance"));
+        assert_eq!(
+            sent.iter().map(|msg| msg.role.as_str()).collect::<Vec<_>>(),
+            vec!["system", "user", "assistant", "user"]
+        );
+    }
+
+    #[tokio::test]
     async fn cost_tracking_enforces_budget() {
         use super::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
@@ -7489,45 +8108,5 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
-    }
-
-    // ── append_receipt_footer tests ──────────────────────────────
-
-    #[test]
-    fn receipt_footer_empty_receipts_unchanged() {
-        let store = std::sync::Mutex::new(Vec::<String>::new());
-        let result = super::append_receipt_footer("Hello world".to_string(), Some(&store));
-        assert_eq!(result, "Hello world");
-    }
-
-    #[test]
-    fn receipt_footer_none_store_unchanged() {
-        let result = super::append_receipt_footer("Hello world".to_string(), None);
-        assert_eq!(result, "Hello world");
-    }
-
-    #[test]
-    fn receipt_footer_single_receipt() {
-        let store = std::sync::Mutex::new(vec!["shell: zc-receipt-1234567890-abcdef".to_string()]);
-        let result = super::append_receipt_footer("The date is Monday.".to_string(), Some(&store));
-        assert_eq!(
-            result,
-            "The date is Monday.\n\n---\nTool receipts:\n  shell: zc-receipt-1234567890-abcdef"
-        );
-    }
-
-    #[test]
-    fn receipt_footer_multiple_receipts() {
-        let store = std::sync::Mutex::new(vec![
-            "shell: zc-receipt-100-aaa".to_string(),
-            "web_search: zc-receipt-200-bbb".to_string(),
-            "file_read: zc-receipt-300-ccc".to_string(),
-        ]);
-        let result = super::append_receipt_footer("Done.".to_string(), Some(&store));
-        let expected = "Done.\n\n---\nTool receipts:\
-            \n  shell: zc-receipt-100-aaa\
-            \n  web_search: zc-receipt-200-bbb\
-            \n  file_read: zc-receipt-300-ccc";
-        assert_eq!(result, expected);
     }
 }

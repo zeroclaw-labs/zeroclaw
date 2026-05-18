@@ -1,7 +1,7 @@
 //! Forward-only config schema migration.
 //!
 //! Old config layouts are typed structs. Migration deserializes into the legacy
-//! struct, moves field values into the new layout, and returns a clean [`Config`].
+//! struct, moves field values into the new layout, and returns a clean `Config`.
 //!
 //! The on-disk file is never rewritten by migration.
 //!
@@ -9,6 +9,24 @@
 //!
 //! Only when props are **renamed, moved, or removed**. New props with `#[serde(default)]`
 //! don't need a bump.
+//!
+//! ## How to add a new migration step
+//!
+//! 1. Bump [`CURRENT_SCHEMA_VERSION`].
+//! 2. If the legacy field was on `V1Compat`, update `migrate_providers()` (or the
+//!    relevant `V1Compat` method) to move the value into the new location.
+//! 3. For changes between V2+ layouts, add a `fn vN_to_vM(&mut Config)` and call
+//!    it from `into_config()` after the schema-version check.
+//! 4. Add a test in `tests/component/config_migration.rs`:
+//!    - Deserialize a TOML string with the old layout.
+//!    - Assert the migrated `Config` has values in the new locations.
+//!    - Assert the old locations are empty/cleared.
+//! 5. Verify with `cargo test --test component -- config_migration`.
+//!
+//! ## User-facing migration command
+//!
+//! `zeroclaw config migrate` rewrites the on-disk `config.toml` to the current
+//! schema version using `toml_edit` to preserve comments and formatting.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;

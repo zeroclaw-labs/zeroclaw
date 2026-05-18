@@ -39,4 +39,31 @@ impl ProvidersConfig {
         let name = self.fallback.clone()?;
         self.models.get_mut(&name)
     }
+
+    /// Return the first concrete `model` string available for use as a default.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. The fallback provider's `model` field, if set.
+    /// 2. The first entry in `models` (iteration order) that has `model` set.
+    ///
+    /// Returns `None` only when no provider entry has any model configured at all.
+    /// Callers should treat `None` as a configuration error and surface it rather
+    /// than silently substituting a hardcoded model identifier.
+    pub fn resolve_default_model(&self) -> Option<String> {
+        if let Some(model) = self
+            .fallback_provider()
+            .and_then(|e| e.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            return Some(model.to_string());
+        }
+
+        self.models
+            .values()
+            .filter_map(|entry| entry.model.as_deref().map(str::trim))
+            .find(|m| !m.is_empty())
+            .map(ToString::to_string)
+    }
 }

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu, Globe } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -17,6 +17,7 @@ const routeTitles: Record<string, string> = {
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
+  '/onboard': 'nav.onboard',
 };
 
 interface HeaderProps {
@@ -33,9 +34,11 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   const [langOpen, setLangOpen] = useState(false);
   const langRef = useRef<HTMLDivElement>(null);
 
-  const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
-  const pageTitle = t(titleKey);
-  const currentFlag = SUPPORTED_LOCALES.find((l) => l.code === locale)?.flag ?? '🌐';
+  // Fall back to a plain title for unknown routes rather than mislabeling
+  // them as "Dashboard" — e.g. early /onboard hits before the entry was
+  // mapped here showed "Dashboard" for the first-run flow.
+  const titleKey = routeTitles[location.pathname];
+  const pageTitle = titleKey ? t(titleKey) : '';
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -119,7 +122,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                 }
               }}
             >
-              <span>{currentFlag}</span>
+              <Globe className="h-3.5 w-3.5" />
               {locale.toUpperCase()}
               <ChevronDown className="h-3 w-3" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </button>
@@ -136,7 +139,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                   zIndex: 9999,
                 }}
               >
-                {SUPPORTED_LOCALES.map(({ code, name, flag }) => (
+                {SUPPORTED_LOCALES.map(({ code, name }) => (
                   <button
                     key={code}
                     type="button"
@@ -163,7 +166,6 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                       }
                     }}
                   >
-                    <span style={{ fontSize: '14px' }}>{flag}</span>
                     <span className="flex-1">{name}</span>
                     <span className="font-mono opacity-40">{code.toUpperCase()}</span>
                   </button>
@@ -179,8 +181,8 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
             className="h-9 px-3 rounded-xl text-xs transition-all flex items-center gap-1.5"
             style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.color = '#f87171';
-              e.currentTarget.style.background = 'rgba(239, 68, 68, 0.08)';
+              e.currentTarget.style.color = 'var(--color-status-error)';
+              e.currentTarget.style.background = 'var(--color-status-error-alpha-08)';
             }}
             onMouseLeave={(e) => {
               e.currentTarget.style.color = 'var(--pc-text-muted)';

@@ -161,16 +161,11 @@ impl Tool for ContentSearchTool {
             .unwrap_or(MAX_RESULTS)
             .min(MAX_RESULTS);
 
-        // --- Rate limit check ---
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
-        // --- Path security checks ---
+        // --- Path security checks (tool-specific formatting) ---
         // Reject absolute paths unless they fall under an explicit allowed root.
         if std::path::Path::new(search_path).is_absolute()
             && !self.security.is_under_allowed_root(search_path)
@@ -187,25 +182,6 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
-            });
-        }
-
-        if !self.security.is_path_allowed(search_path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Path '{search_path}' is not allowed by security policy."
-                )),
-            });
-        }
-
-        // Record action to consume rate limit budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -670,19 +646,6 @@ mod tests {
         })
     }
 
-    fn test_security_with(
-        workspace: PathBuf,
-        autonomy: AutonomyLevel,
-        max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            autonomy,
-            workspace_dir: workspace,
-            max_actions_per_hour,
-            ..SecurityPolicy::default()
-        })
-    }
-
     fn create_test_files(dir: &TempDir) {
         std::fs::write(
             dir.path().join("hello.rs"),
@@ -911,21 +874,9 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("Path traversal"));
     }
 
-    #[tokio::test]
-    async fn content_search_rate_limited() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("file.txt"), "test content\n").unwrap();
-
-        let tool = ContentSearchTool::new(test_security_with(
-            dir.path().to_path_buf(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
-        let result = tool.execute(json!({"pattern": "test"})).await.unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Rate limit"));
-    }
+    // Rate-limit behavior is covered by RateLimitedTool's own tests in
+    // zeroclaw-tools::wrappers; this tool delegates the concern to the wrapper
+    // at registration time.
 
     #[cfg(unix)]
     #[tokio::test]

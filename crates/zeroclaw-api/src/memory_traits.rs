@@ -107,6 +107,24 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+/// Returns true when a recall query should be interpreted as recent/time-only recall.
+///
+/// A bare "*" is intentionally equivalent to an omitted query for tool-call
+/// compatibility. Non-bare wildcard terms such as "wild*" remain keyword queries.
+pub fn is_recent_recall_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    trimmed.is_empty() || trimmed == "*"
+}
+
+/// Normalizes recent/time-only recall queries to the backend-neutral empty query.
+pub fn normalize_recent_recall_query(query: &str) -> &str {
+    if is_recent_recall_query(query) {
+        ""
+    } else {
+        query
+    }
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -123,7 +141,9 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Recall memories matching a query (keyword search), optionally scoped to a session
-    /// and time range. Time bounds use RFC 3339 / ISO 8601 format
+    /// and time range. Empty, whitespace-only, and bare "*" queries return recent/time-only
+    /// entries. Non-bare wildcard terms such as "wild*" remain keyword queries.
+    /// Time bounds use RFC 3339 / ISO 8601 format
     /// (e.g. "2025-03-01T00:00:00Z"); inclusive (created_at >= since, created_at <= until).
     async fn recall(
         &self,
@@ -166,6 +186,20 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Rebuild backend indexes: FTS tables and any missing embedding vectors.
+    ///
+    /// Intended as a manual fixup after bulk writes that didn't go through
+    /// the normal `store()` path (e.g. `zeroclaw migrate openclaw`, which
+    /// uses `NoopEmbedding` for speed and leaves `embedding = NULL` behind).
+    /// Returns the number of entries that were re-embedded; backends
+    /// without a vector index or with nothing to fill in return 0.
+    ///
+    /// Default: no-op. Overridden by backends that maintain separate
+    /// derived indexes (e.g. `SqliteMemory`).
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
 
     /// Store a conversation trace as procedural memory.
     ///

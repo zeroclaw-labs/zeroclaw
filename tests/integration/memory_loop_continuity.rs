@@ -107,26 +107,31 @@ async fn agent_completes_five_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc3".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc4".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc5".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("All 5 steps completed successfully"),
     ]));
@@ -284,12 +289,14 @@ async fn agent_handles_interleaved_tools_and_text() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "creating file"}"#.into(),
+            extra_content: None,
         }]),
         // Step 2: another tool call
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "echo".into(),
             arguments: r#"{"message": "reading file"}"#.into(),
+            extra_content: None,
         }]),
         // Step 3: final text
         text_response("File created and read successfully"),
@@ -340,6 +347,7 @@ async fn agent_survives_large_tool_output() {
             id: "tc1".into(),
             name: "large_output".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Processed the large output successfully"),
     ]));
@@ -366,16 +374,19 @@ async fn agent_handles_parallel_tool_calls() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc3".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("All three parallel tools completed"),
@@ -405,6 +416,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Step 1 complete. Counter is at 1."),
         // Turn 2: another tool + response
@@ -412,6 +424,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Step 2 complete. Counter is at 2."),
         // Turn 3: final response referencing prior turns

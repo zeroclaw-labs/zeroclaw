@@ -142,7 +142,15 @@ impl SecretStore {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
+            .map_err(|_| {
+                tracing::error!(
+                    key_path = %self.key_path.display(),
+                    "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+                     Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
+                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw onboard`."
+                );
+                anyhow::anyhow!("enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)")
+            })?;
 
         String::from_utf8(plaintext_bytes)
             .context("Decrypted secret is not valid UTF-8 — corrupt data")
@@ -469,6 +477,27 @@ mod tests {
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let result = store2.decrypt(&encrypted);
         assert!(result.is_err(), "Decrypting with a different key must fail");
+    }
+
+    #[test]
+    fn decrypt_error_message_mentions_secret_key() {
+        // Operators hitting a missing or mismatched `.secret_key` (volume wipe,
+        // container migration, backup-restore without the key file) need the
+        // error message to point at the root cause. Otherwise the failure
+        // cascades into a misleading "All providers/models failed" message
+        // with no diagnostic for the underlying decrypt failure (#6205).
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        let encrypted = store1.encrypt("secret-for-store1").unwrap();
+        let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".secret_key"),
+            "decrypt error must mention `.secret_key` so operators can diagnose missing/mismatched keys: got {msg:?}"
+        );
     }
 
     #[test]

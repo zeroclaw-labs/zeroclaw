@@ -158,9 +158,11 @@ impl Tool for LlmTaskTool {
             }
         };
 
-        // Make the LLM call (no tools, no agent loop)
+        // Make the LLM call (no tools, no agent loop). `temperature` is
+        // already resolved to an f64 (tool arg → config default), so wrap
+        // it back into Some for the provider trait's Option<f64> contract.
         let response = match provider
-            .simple_chat(&effective_prompt, model, temperature)
+            .simple_chat(&effective_prompt, model, Some(temperature))
             .await
         {
             Ok(text) => text,

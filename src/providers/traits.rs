@@ -8,6 +8,15 @@ mod tests {
     use futures_util::StreamExt;
     use futures_util::stream::{self, BoxStream};
 
+    /// Representative non-zero temperature for default-path chat tests;
+    /// mocks ignore it, so any plausible in-range value is fine — this
+    /// matches the historical default used across the codebase.
+    const TEST_DEFAULT_TEMPERATURE: f64 = 0.7;
+
+    /// Zero = greedy sampling; used by streaming tests where we want
+    /// deterministic replays from the mock stream.
+    const TEST_GREEDY_TEMPERATURE: f64 = 0.0;
+
     struct CapabilityMockProvider;
 
     #[async_trait]
@@ -25,7 +34,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".into())
         }
@@ -64,6 +73,7 @@ mod tests {
                 id: "1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -101,6 +111,7 @@ mod tests {
             id: "call_123".into(),
             name: "file_read".into(),
             arguments: r#"{"path":"test.txt"}"#.into(),
+            extra_content: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         assert!(json.contains("call_123"));
@@ -245,7 +256,7 @@ mod tests {
             _system: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("response".to_string())
         }
@@ -289,7 +300,10 @@ mod tests {
             tools: Some(&tools),
         };
 
-        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let response = provider
+            .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
+            .await
+            .unwrap();
         assert!(response.text.is_some());
     }
 
@@ -304,7 +318,10 @@ mod tests {
             tools: None,
         };
 
-        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let response = provider
+            .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
+            .await
+            .unwrap();
         assert!(response.text.is_some());
     }
 
@@ -323,7 +340,7 @@ mod tests {
             system: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(system.unwrap_or_default().to_string())
         }
@@ -348,7 +365,7 @@ mod tests {
             system: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(system.unwrap_or_default().to_string())
         }
@@ -373,7 +390,7 @@ mod tests {
             _system: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("should_not_reach".to_string())
         }
@@ -399,7 +416,10 @@ mod tests {
             tools: Some(&tools),
         };
 
-        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let response = provider
+            .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
+            .await
+            .unwrap();
         let text = response.text.unwrap_or_default();
 
         assert!(text.contains("BASE_SYSTEM_PROMPT"));
@@ -421,7 +441,10 @@ mod tests {
             tools: Some(&tools),
         };
 
-        let response = provider.chat(request, "model", 0.7).await.unwrap();
+        let response = provider
+            .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
+            .await
+            .unwrap();
         let text = response.text.unwrap_or_default();
 
         assert!(text.contains("BASE"));
@@ -443,7 +466,10 @@ mod tests {
             tools: Some(&tools),
         };
 
-        let err = provider.chat(request, "model", 0.7).await.unwrap_err();
+        let err = provider
+            .chat(request, "model", Some(TEST_DEFAULT_TEMPERATURE))
+            .await
+            .unwrap_err();
         let message = err.to_string();
 
         assert!(message.contains("non-prompt-guided"));
@@ -458,7 +484,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -471,7 +497,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
             stream::iter(vec![
@@ -491,7 +517,7 @@ mod tests {
                 tools: None,
             },
             "model",
-            0.0,
+            Some(TEST_GREEDY_TEMPERATURE),
             StreamOptions::new(true),
         );
 

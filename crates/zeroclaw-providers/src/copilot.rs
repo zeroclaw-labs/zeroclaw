@@ -423,6 +423,7 @@ impl CopilotProvider {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
+                extra_content: None,
             })
             .collect();
 
@@ -650,13 +651,20 @@ async fn write_file_secure(path: &Path, content: &str) {
 
 #[async_trait]
 impl Provider for CopilotProvider {
+    // ── Provider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(DEFAULT_API)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
+
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(ApiMessage {
@@ -683,8 +691,9 @@ impl Provider for CopilotProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let response = self
             .send_chat_request(Self::convert_messages(messages), None, model, temperature)
             .await?;
@@ -695,8 +704,9 @@ impl Provider for CopilotProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         self.send_chat_request(
             Self::convert_messages(request.messages),
             request.tools,

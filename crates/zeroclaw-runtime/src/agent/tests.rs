@@ -73,7 +73,7 @@ impl Provider for ScriptedProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -82,7 +82,7 @@ impl Provider for ScriptedProvider {
         &self,
         request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         self.requests
             .lock()
@@ -112,7 +112,7 @@ impl Provider for FailingProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         anyhow::bail!("provider error")
     }
@@ -121,7 +121,7 @@ impl Provider for FailingProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         anyhow::bail!("provider error")
     }
@@ -253,6 +253,58 @@ impl Tool for CountingTool {
     }
 }
 
+struct ToolSpecCaptureProvider {
+    tools_received: Arc<Mutex<Vec<bool>>>,
+    responses: Mutex<Vec<ChatResponse>>,
+}
+
+impl ToolSpecCaptureProvider {
+    fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<bool>>>) {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                tools_received: tools_received.clone(),
+                responses: Mutex::new(responses),
+            },
+            tools_received,
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for ToolSpecCaptureProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("fallback".into())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.tools_received
+            .lock()
+            .unwrap()
+            .push(request.tools.is_some());
+        let mut guard = self.responses.lock().unwrap();
+        if guard.is_empty() {
+            return Ok(text_response("done"));
+        }
+        Ok(guard.remove(0))
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+}
+
 fn make_memory() -> Arc<dyn Memory> {
     let cfg = MemoryConfig {
         backend: "none".into(),
@@ -378,6 +430,54 @@ async fn turn_returns_text_when_no_tools_called() {
     );
 }
 
+#[tokio::test]
+async fn turn_with_no_effective_tools_treats_xml_tool_call_as_text() {
+    let provider = Box::new(ScriptedProvider::new(vec![xml_tool_response(
+        "echo",
+        r#"{"message":"hi"}"#,
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert!(
+        response.contains("<tool_call>"),
+        "no-tools turns should preserve tool-like text instead of executing it"
+    );
+    assert!(
+        response.contains("\"name\": \"echo\""),
+        "tool-like payload should remain visible as ordinary response text"
+    );
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
+    let provider = Box::new(ScriptedProvider::new(vec![text_response(
+        "<think>hidden scratchpad</think>visible answer",
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "visible answer");
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_does_not_send_empty_native_tool_specs() {
+    let (provider, tools_received) =
+        ToolSpecCaptureProvider::new(vec![text_response("plain response")]);
+    let mut agent = build_agent_with(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "plain response");
+    assert_eq!(
+        tools_received.lock().unwrap().as_slice(),
+        &[false],
+        "native providers should receive no tools field when the effective tool list is empty"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Single tool call → final response
 // ═══════════════════════════════════════════════════════════════════════════
@@ -389,6 +489,7 @@ async fn turn_executes_single_tool_then_returns() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello from tool"}"#.into(),
+            extra_content: None,
         }]),
         text_response("I ran the tool"),
     ]));
@@ -419,16 +520,19 @@ async fn turn_handles_multi_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc3".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Done after 3 calls"),
     ]));
@@ -461,6 +565,7 @@ async fn turn_bails_out_at_max_iterations() {
             id: format!("tc{i}"),
             name: "echo".into(),
             arguments: r#"{"message": "loop"}"#.into(),
+            extra_content: None,
         }]));
     }
 
@@ -493,6 +598,7 @@ async fn turn_handles_unknown_tool_gracefully() {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("I couldn't find that tool"),
     ]));
@@ -533,6 +639,7 @@ async fn turn_recovers_from_tool_failure() {
             id: "tc1".into(),
             name: "fail".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Tool failed but I recovered"),
     ]));
@@ -557,6 +664,7 @@ async fn turn_recovers_from_tool_error() {
             id: "tc1".into(),
             name: "panicker".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("I recovered from the error"),
     ]));
@@ -782,6 +890,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
                 id: "tc1".into(),
                 name: "echo".into(),
                 arguments: r#"{"message": "hi"}"#.into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -801,9 +910,12 @@ async fn turn_preserves_text_alongside_tool_calls() {
         "Expected non-empty final response after mixed text+tool"
     );
 
-    // The intermediate text should be in history
+    // The intermediate text should be preserved with its tool calls, not as a
+    // separate assistant chat entry that would create consecutive assistants.
     let has_intermediate = agent.history().iter().any(|msg| match msg {
-        ConversationMessage::Chat(c) => c.role == "assistant" && c.content.contains("Let me check"),
+        ConversationMessage::AssistantToolCalls { text, .. } => text
+            .as_deref()
+            .is_some_and(|content| content.contains("Let me check")),
         _ => false,
     });
     assert!(has_intermediate, "Intermediate text should be in history");
@@ -823,16 +935,19 @@ async fn turn_handles_multiple_tools_in_one_response() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc3".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("All 3 done"),
@@ -915,6 +1030,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "tool-out"}"#.into(),
+            extra_content: None,
         }]),
         text_response("final answer"),
     ]));
@@ -1020,6 +1136,7 @@ async fn native_dispatcher_handles_stringified_arguments() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello"}"#.into(),
+            extra_content: None,
         }],
         usage: None,
         reasoning_content: None,
@@ -1108,6 +1225,7 @@ fn conversation_message_serialization_roundtrip() {
                 id: "tc1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: None,
         },
@@ -1188,11 +1306,19 @@ fn xml_format_results_includes_status_and_output() {
 
 #[test]
 fn native_format_results_maps_tool_call_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let results = vec![
         ToolExecutionResult {
             name: "a".into(),
-            output: "out1".into(),
+            output: format!("File: {}", image_path.display()),
             success: true,
             tool_call_id: Some("tc-001".into()),
         },
@@ -1209,12 +1335,41 @@ fn native_format_results_maps_tool_call_ids() {
         ConversationMessage::ToolResults(r) => {
             assert_eq!(r.len(), 2);
             assert_eq!(r[0].tool_call_id, "tc-001");
-            assert_eq!(r[0].content, "out1");
+            assert!(r[0].content.contains("[IMAGE:"));
+            assert!(r[0].content.contains(&image_path.display().to_string()));
             assert_eq!(r[1].tool_call_id, "tc-002");
             assert_eq!(r[1].content, "out2");
         }
         _ => panic!("Expected ToolResults"),
     }
+}
+
+#[test]
+fn xml_format_results_wraps_local_image_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("xml-generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
+    let dispatcher = XmlToolDispatcher;
+    let results = vec![ToolExecutionResult {
+        name: "shell".into(),
+        output: format!("Saved image to {}", image_path.display()),
+        success: true,
+        tool_call_id: None,
+    }];
+
+    let msg = dispatcher.format_results(&results);
+    let content = match msg {
+        ConversationMessage::Chat(c) => c.content,
+        _ => panic!("Expected Chat variant"),
+    };
+
+    assert!(content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1233,6 +1388,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
                 id: "tc1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: None,
         },
@@ -1253,11 +1409,19 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
 
 #[test]
 fn native_dispatcher_converts_tool_results_to_tool_messages() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("history.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
             tool_call_id: "tc1".into(),
-            content: "output1".into(),
+            content: format!("Saved image to {}", image_path.display()),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
@@ -1269,6 +1433,12 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
+    assert!(messages[0].content.contains("[IMAGE:"));
+    assert!(
+        messages[0]
+            .content
+            .contains(&image_path.display().to_string())
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1289,6 +1459,15 @@ fn xml_dispatcher_generates_tool_instructions() {
         !instructions.contains("echo"),
         "dispatcher should not duplicate tool listing"
     );
+}
+
+#[test]
+fn xml_dispatcher_omits_tool_instructions_without_tools() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let dispatcher = XmlToolDispatcher;
+    let instructions = dispatcher.prompt_instructions(&tools);
+
+    assert!(instructions.is_empty());
 }
 
 #[test]

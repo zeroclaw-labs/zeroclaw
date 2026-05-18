@@ -1,3 +1,4 @@
+use super::history::canonicalize_tool_result_media_markers;
 use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
@@ -119,16 +120,21 @@ impl ToolDispatcher for XmlToolDispatcher {
         let mut content = String::new();
         for result in results {
             let status = if result.success { "ok" } else { "error" };
+            let output = canonicalize_tool_result_media_markers(&result.output);
             let _ = writeln!(
                 content,
                 "<tool_result name=\"{}\" status=\"{}\">\n{}\n</tool_result>",
-                result.name, status, result.output
+                result.name, status, output
             );
         }
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
-    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
+    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
+        if tools.is_empty() {
+            return String::new();
+        }
+
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
         instructions
@@ -151,10 +157,11 @@ impl ToolDispatcher for XmlToolDispatcher {
                 ConversationMessage::ToolResults(results) => {
                     let mut content = String::new();
                     for result in results {
+                        let output = canonicalize_tool_result_media_markers(&result.content);
                         let _ = writeln!(
                             content,
                             "<tool_result id=\"{}\">\n{}\n</tool_result>",
-                            result.tool_call_id, result.content
+                            result.tool_call_id, output
                         );
                     }
                     vec![ChatMessage::user(format!("[Tool results]\n{content}"))]
@@ -200,7 +207,7 @@ impl ToolDispatcher for NativeToolDispatcher {
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                content: result.output.clone(),
+                content: canonicalize_tool_result_media_markers(&result.output),
             })
             .collect();
         ConversationMessage::ToolResults(messages)
@@ -235,7 +242,7 @@ impl ToolDispatcher for NativeToolDispatcher {
                         ChatMessage::tool(
                             serde_json::json!({
                                 "tool_call_id": result.tool_call_id,
-                                "content": result.content,
+                                "content": canonicalize_tool_result_media_markers(&result.content),
                             })
                             .to_string(),
                         )
@@ -313,6 +320,7 @@ mod tests {
                 id: "tc1".into(),
                 name: "file_read".into(),
                 arguments: "{\"path\":\"a.txt\"}".into(),
+                extra_content: None,
             }],
             usage: None,
             reasoning_content: None,
@@ -386,6 +394,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: Some("thinking step".into()),
         }];
@@ -409,6 +418,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: None,
         }];
@@ -429,6 +439,7 @@ mod tests {
                 id: "tc_1".into(),
                 name: "shell".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             }],
             reasoning_content: Some("should be ignored".into()),
         }];

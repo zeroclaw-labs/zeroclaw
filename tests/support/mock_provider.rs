@@ -28,7 +28,7 @@ impl Provider for MockProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
@@ -42,7 +42,7 @@ impl Provider for MockProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
@@ -81,7 +81,7 @@ impl Provider for RecordingProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -90,7 +90,7 @@ impl Provider for RecordingProvider {
         &self,
         request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         self.recorded_requests
             .lock()
@@ -141,7 +141,7 @@ impl Provider for TraceLlmProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -150,7 +150,7 @@ impl Provider for TraceLlmProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         let mut guard = self.steps.lock().unwrap();
         if guard.is_empty() {
@@ -186,6 +186,7 @@ impl Provider for TraceLlmProvider {
                         id: tc.id,
                         name: tc.name,
                         arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        extra_content: None,
                     })
                     .collect();
                 Ok(ChatResponse {

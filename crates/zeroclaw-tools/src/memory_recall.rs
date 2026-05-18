@@ -23,7 +23,7 @@ impl Tool for MemoryRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Supports keyword search, time-only query (since/until), or both."
+        "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance. Supports keyword search, recent recall with omitted query or bare '*', time-only query (since/until), or both."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -32,7 +32,7 @@ impl Tool for MemoryRecallTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords or phrase to search for in memory (optional if since/until provided)"
+                    "description": "Keywords or phrase to search for in memory. Omit or pass bare '*' to return recent memories; non-bare wildcard terms remain keyword searches."
                 },
                 "limit": {
                     "type": "integer",
@@ -59,16 +59,6 @@ impl Tool for MemoryRecallTool {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let since = args.get("since").and_then(|v| v.as_str());
         let until = args.get("until").and_then(|v| v.as_str());
-
-        if query.trim().is_empty() && since.is_none() && until.is_none() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    "Provide at least 'query' (keywords) or time range ('since'/'until')".into(),
-                ),
-            });
-        }
 
         // Validate date strings
         if let Some(s) = since
@@ -149,13 +139,86 @@ impl Tool for MemoryRecallTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
-    use zeroclaw_memory::{MemoryCategory, SqliteMemory};
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory, is_recent_recall_query};
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, Arc::new(mem))
+    }
+
+    struct QueryEchoMemory {
+        last_query: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Memory for QueryEchoMemory {
+        fn name(&self) -> &str {
+            "query_echo"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            *self.last_query.lock().unwrap() = Some(query.to_string());
+            if is_recent_recall_query(query) {
+                Ok(vec![MemoryEntry {
+                    id: "recent".into(),
+                    key: "recent".into(),
+                    content: "recent memory".into(),
+                    category: MemoryCategory::Core,
+                    timestamp: "2026-05-03T00:00:00Z".into(),
+                    session_id: None,
+                    score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
     }
 
     #[tokio::test]
@@ -208,12 +271,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_requires_query_or_time() {
+    async fn bare_recall_returns_recent_entries() {
         let (_tmp, mem) = seeded_mem();
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let tool = MemoryRecallTool::new(mem);
         let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("at least"));
+        assert!(result.success);
+        assert!(result.output.contains("Found 1"));
+        assert!(result.output.contains("Rust"));
+    }
+
+    #[tokio::test]
+    async fn recall_star_query_returns_recent_entries() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("tz", "Timezone is EST", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool.execute(json!({"query": "*"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 2"));
+        assert!(result.output.contains("Rust"));
+        assert!(result.output.contains("EST"));
+    }
+
+    #[tokio::test]
+    async fn recall_star_query_uses_backend_recent_query_contract() {
+        let last_query = Arc::new(Mutex::new(None));
+        let mem = Arc::new(QueryEchoMemory {
+            last_query: last_query.clone(),
+        });
+        let tool = MemoryRecallTool::new(mem);
+
+        let result = tool.execute(json!({"query": "*"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("recent memory"));
+        assert_eq!(*last_query.lock().unwrap(), Some("*".into()));
     }
 
     #[tokio::test]

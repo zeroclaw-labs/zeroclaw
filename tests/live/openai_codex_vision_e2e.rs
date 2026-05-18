@@ -14,6 +14,11 @@
 use anyhow::Result;
 use zeroclaw::providers::{ChatMessage, ChatRequest, ProviderRuntimeOptions};
 
+/// Moderate temperature for vision E2E probes; the test asserts on request
+/// shape and success rather than output determinism, so 0.7 (historical
+/// codebase default) keeps behavior matching earlier runs.
+const VISION_PROBE_TEMPERATURE: f64 = 0.7;
+
 /// Tests that provider supports vision input.
 ///
 /// This test:
@@ -90,7 +95,9 @@ async fn provider_vision_support() -> Result<()> {
 
     // Send request to provider
     println!("Using model: {}", model);
-    let result = provider.chat(request, model, 0.7).await;
+    let result = provider
+        .chat(request, model, Some(VISION_PROBE_TEMPERATURE))
+        .await;
 
     match result {
         Ok(response) => {
@@ -147,17 +154,8 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     // Create provider with profile override
     let opts = ProviderRuntimeOptions {
         auth_profile_override: Some("second".to_string()),
-        provider_api_url: None,
-        zeroclaw_dir: None,
         secrets_encrypt: false,
-        reasoning_enabled: None,
-        reasoning_effort: None,
-        provider_timeout_secs: None,
-        provider_max_tokens: None,
-        extra_headers: std::collections::HashMap::new(),
-        api_path: None,
-        merge_system_into_user: false,
-        provider_extra: None,
+        ..Default::default()
     };
 
     let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
@@ -219,7 +217,9 @@ async fn openai_codex_second_vision_support() -> Result<()> {
 
     // Send request to provider
     println!("Using model: {}", model);
-    let result = provider.chat(request, model, 0.7).await;
+    let result = provider
+        .chat(request, model, Some(VISION_PROBE_TEMPERATURE))
+        .await;
 
     match result {
         Ok(response) => {

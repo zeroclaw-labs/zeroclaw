@@ -201,7 +201,7 @@ impl Provider for RouterProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
 
@@ -221,7 +221,7 @@ impl Provider for RouterProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -234,7 +234,7 @@ impl Provider for RouterProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -246,7 +246,7 @@ impl Provider for RouterProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -278,7 +278,7 @@ impl Provider for RouterProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
@@ -290,7 +290,7 @@ impl Provider for RouterProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         let (provider_idx, resolved_model) = self.resolve(model);
@@ -300,8 +300,9 @@ impl Provider for RouterProvider {
 
     fn supports_vision(&self) -> bool {
         self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -327,6 +328,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
+        vision: bool,
     }
 
     impl MockProvider {
@@ -335,7 +337,13 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
+                vision: false,
             }
+        }
+
+        fn with_vision(mut self, vision: bool) -> Self {
+            self.vision = vision;
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -354,11 +362,15 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
 
@@ -425,7 +437,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -438,7 +450,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -476,7 +488,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -493,7 +505,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -506,6 +518,7 @@ mod tests {
                     id: "call_router_1".to_string(),
                     name: "shell".to_string(),
                     arguments: r#"{"command":"date"}"#.to_string(),
+                    extra_content: None,
                 })),
                 Ok(StreamEvent::Final),
             ])
@@ -526,7 +539,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "hint:reasoning", 0.5)
+            .simple_chat("hello", "hint:reasoning", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "smart-response");
@@ -542,7 +555,10 @@ mod tests {
             vec![("fast", "fast", "llama-3-70b")],
         );
 
-        let result = router.simple_chat("hello", "hint:fast", 0.5).await.unwrap();
+        let result = router
+            .simple_chat("hello", "hint:fast", Some(0.5))
+            .await
+            .unwrap();
         assert_eq!(result, "fast-response");
         assert_eq!(mocks[0].call_count(), 1);
         assert_eq!(mocks[0].last_model(), "llama-3-70b");
@@ -556,7 +572,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "hint:nonexistent", 0.5)
+            .simple_chat("hello", "hint:nonexistent", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "default-response");
@@ -576,7 +592,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "anthropic/claude-sonnet-4-20250514", 0.5)
+            .simple_chat("hello", "anthropic/claude-sonnet-4-20250514", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "primary-response");
@@ -637,7 +653,7 @@ mod tests {
         );
 
         let result = router
-            .chat_with_system(Some("system"), "hello", "model", 0.5)
+            .chat_with_system(Some("system"), "hello", "model", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "response");
@@ -672,7 +688,7 @@ mod tests {
         // chat_with_tools should delegate through the router to the mock.
         // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
         let result = router
-            .chat_with_tools(&messages, &tools, "model", 0.7)
+            .chat_with_tools(&messages, &tools, "model", Some(0.7))
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("tool-response"));
@@ -694,7 +710,7 @@ mod tests {
         let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
 
         let result = router
-            .chat_with_tools(&messages, &tools, "hint:reasoning", 0.5)
+            .chat_with_tools(&messages, &tools, "hint:reasoning", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("smart-tool"));
@@ -739,7 +755,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(self.response.to_string())
         }
@@ -1025,7 +1041,7 @@ mod tests {
         let mut stream = router.stream_chat_with_history(
             &messages,
             "hint:reasoning",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 
@@ -1082,7 +1098,7 @@ mod tests {
                 tools: Some(&tools),
             },
             "hint:reasoning",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 
@@ -1101,5 +1117,52 @@ mod tests {
         assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(streaming.tool_event_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    // Regression for #6589: supports_vision() must reflect the default provider,
+    // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
+    // fallback in run_tool_call_loop and the image-marker stripping in the context
+    // compressor are silently bypassed in mixed-provider configurations.
+    #[test]
+    fn supports_vision_reflects_default_provider_not_any_route() {
+        let default_provider = Box::new(MockProvider::new("nope").with_vision(false));
+        let vision_route_provider = Box::new(MockProvider::new("ok").with_vision(true));
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".into(), default_provider as Box<dyn Provider>),
+                ("vision".into(), vision_route_provider as Box<dyn Provider>),
+            ],
+            vec![(
+                "hint:vision".into(),
+                Route {
+                    provider_name: "vision".into(),
+                    model: "vision-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.supports_vision(),
+            "router with non-vision default must report supports_vision()=false even when a vision-capable route exists"
+        );
+    }
+
+    #[test]
+    fn supports_vision_true_when_default_provider_supports_vision() {
+        let default_provider = Box::new(MockProvider::new("ok").with_vision(true));
+        let aux_provider = Box::new(MockProvider::new("nope").with_vision(false));
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".into(), default_provider as Box<dyn Provider>),
+                ("aux".into(), aux_provider as Box<dyn Provider>),
+            ],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(router.supports_vision());
     }
 }

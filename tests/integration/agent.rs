@@ -5,7 +5,7 @@
 //! external service dependencies. They complement the unit tests in
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 6)
+//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
     StaticMemoryLoader, build_agent, build_agent_xml, build_recording_agent, text_response,
@@ -39,6 +39,7 @@ async fn e2e_single_tool_call_cycle() {
             id: "tc1".into(),
             name: "echo".into(),
             arguments: r#"{"message": "hello from tool"}"#.into(),
+            extra_content: None,
         }]),
         text_response("Tool executed successfully"),
     ]));
@@ -61,11 +62,13 @@ async fn e2e_multi_step_tool_chain() {
             id: "tc1".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         tool_response(vec![ToolCall {
             id: "tc2".into(),
             name: "counter".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Done after 2 tool calls"),
     ]));
@@ -136,6 +139,7 @@ async fn e2e_unknown_tool_recovery() {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }]),
         text_response("Recovered from unknown tool"),
     ]));
@@ -159,11 +163,13 @@ async fn e2e_parallel_tool_dispatch() {
                 id: "tc1".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "tc2".into(),
                 name: "counter".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ]),
         text_response("Both tools ran"),

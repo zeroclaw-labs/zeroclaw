@@ -53,6 +53,43 @@ check:
 doc:
     cargo doc --no-deps --open
 
+# Serve the docs site locally (English by default; pass LOCALE=ja for Japanese)
+docs LOCALE="en":
+    cargo mdbook serve --locale {{LOCALE}}
+
+# Build the full docs site (all locales) to docs/book/book/
+docs-build:
+    cargo mdbook build
+
+# Regenerate reference/cli.md, reference/config.md, and rustdoc API reference
+docs-refs:
+    cargo mdbook refs
+
+# Sync .po files with English source; AI-fills delta if ANTHROPIC_API_KEY is set
+docs-sync:
+    cargo mdbook sync
+
+# Sync a single locale (e.g.: just docs-sync-locale ja)
+docs-sync-locale LOCALE:
+    cargo mdbook sync --locale {{LOCALE}}
+
+# Force-retranslate everything for a quality pass (costs more — use before a release)
+# Optionally override model: FILL_MODEL=claude-opus-4-7 just docs-translate-force
+docs-translate-force:
+    cargo mdbook sync --force
+
+# Force-retranslate a single locale
+docs-translate-force-locale LOCALE:
+    cargo mdbook sync --locale {{LOCALE}} --force
+
+# Show translation status: translated/fuzzy/untranslated counts per locale
+docs-translate-stats:
+    cargo mdbook stats
+
+# Validate .po format for all locales (exits non-zero on format errors)
+docs-translate-check:
+    cargo mdbook check
+
 # Update dependencies
 update:
     cargo update

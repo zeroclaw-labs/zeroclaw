@@ -53,8 +53,8 @@ if defined FREE_RAM_MB (
 )
 
 :: Check disk space
-for /f "tokens=3" %%a in ('dir /-C "%~dp0" 2^>nul ^| findstr /C:"bytes free"') do (
-    set /a "FREE_DISK_GB=%%a / 1073741824"
+for /f %%a in ('powershell -Command "[math]::Round((Get-PSDrive $env:SystemDrive).Free / 1GB)"') do (
+    set "FREE_DISK_GB=%%a"
 )
 
 :: Check Rust
@@ -70,7 +70,7 @@ if %ERRORLEVEL% NEQ 0 (
 :: Check Node.js (optional)
 where node >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Node.js not found (optional - web dashboard will use stub).%RESET%
+    echo   %YELLOW%Node.js not found - optional, web dashboard will use stub%RESET%
 ) else (
     for /f "tokens=1" %%v in ('node --version 2^>nul') do set "NODE_VER=%%v"
     echo   %GREEN%OK%RESET% Node.js !NODE_VER! found
@@ -164,7 +164,7 @@ if not defined DOWNLOAD_URL (
 echo   Downloading from release...
 curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build (standard).%RESET%
+    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - standard%RESET%
     goto :build_standard
 )
 
@@ -185,7 +185,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo   %GREEN%OK%RESET% Binary installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
-goto :post_install
+goto verify
 
 :: ---- Minimal build ----
 :build_minimal
@@ -232,9 +232,9 @@ if %ERRORLEVEL% NEQ 0 (
     echo.
     echo   %RED%ERROR: Build failed.%RESET%
     echo   Common fixes:
-    echo   - Ensure Visual Studio Build Tools are installed (C++ workload)
+    echo   - Ensure Visual Studio Build Tools are installed - C++ workload
     echo   - Run: rustup update
-    echo   - Check disk space (6 GB needed)
+    echo   - Check disk space - 6 GB needed
     goto :error_exit
 )
 
@@ -255,10 +255,10 @@ if %ERRORLEVEL% NEQ 0 (
     echo   %GREEN%OK%RESET% Added to PATH
 )
 
-goto :post_install
+goto verify
 
 :: ---- Post install ----
-:post_install
+:verify
 echo.
 echo %BOLD%[5/5] Verifying installation...%RESET%
 
@@ -285,7 +285,7 @@ echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
-echo     2. Run: zeroclaw init
+echo     2. Run: zeroclaw onboard
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
 echo.
 echo   Alternative install via Scoop:
