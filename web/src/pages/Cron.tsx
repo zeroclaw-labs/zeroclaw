@@ -41,6 +41,23 @@ function formatDuration(ms: number | null): string {
   return `${(secs / 60).toFixed(1)}m`;
 }
 
+function browserProvidedTimezone(): string {
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof timezone === 'string' ? timezone : '';
+  } catch {
+    return '';
+  }
+}
+
+function scheduleTimezone(job: CronJob): string | null {
+  const schedule = job.schedule;
+  if (schedule.kind === 'cron' && typeof schedule.tz === 'string' && schedule.tz.trim()) {
+    return schedule.tz;
+  }
+  return null;
+}
+
 function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?: number }) {
   const [runs, setRuns] = useState<CronRun[]>([]);
   const [loading, setLoading] = useState(true);
@@ -163,6 +180,7 @@ export default function Cron() {
   // Shared form state for both add and edit
   const [formName, setFormName] = useState('');
   const [formSchedule, setFormSchedule] = useState('');
+  const [formTimezone, setFormTimezone] = useState('');
   const [formCommand, setFormCommand] = useState('');
   const [formJobType, setFormJobType] = useState<'shell' | 'agent'>('shell');
   const [formPrompt, setFormPrompt] = useState('');
@@ -177,6 +195,7 @@ export default function Cron() {
   const openAddModal = () => {
     setFormName('');
     setFormSchedule('');
+    setFormTimezone(browserProvidedTimezone());
     setFormCommand('');
     setFormJobType('shell');
     setFormPrompt('');
@@ -191,6 +210,7 @@ export default function Cron() {
     const jobType = job.job_type === 'agent' ? 'agent' : 'shell';
     setFormName(job.name ?? '');
     setFormSchedule(job.expression);
+    setFormTimezone(scheduleTimezone(job) ?? '');
     setFormJobType(jobType);
     if (jobType === 'agent') {
       setFormPrompt(job.prompt ?? '');
@@ -266,10 +286,17 @@ export default function Cron() {
 
     try {
       if (isEditing) {
-        const patch: { name?: string; schedule?: string; command?: string; prompt?: string } = {
+        const existingTimezone = scheduleTimezone(modalJob as CronJob);
+        const timezone = formTimezone.trim();
+        const patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
+        if (timezone) {
+          patch.tz = timezone;
+        } else if (existingTimezone) {
+          patch.clear_tz = true;
+        }
         if (isAgent) {
           patch.prompt = formPrompt.trim();
         } else {
@@ -286,6 +313,8 @@ export default function Cron() {
           schedule: formSchedule.trim(),
           job_type: formJobType,
         };
+        const timezone = formTimezone.trim();
+        if (timezone) body.tz = timezone;
         if (isAgent) {
           body.prompt = formPrompt.trim();
           if (formModel.trim()) body.model = formModel.trim();
@@ -505,6 +534,12 @@ export default function Cron() {
                 </label>
                 <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder="e.g. 0 0 * * * (cron expression)" className="input-electric w-full px-3 py-2.5 text-sm" />
               </div>
+              <div>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  {t('cron.timezone')}
+                </label>
+                <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder="e.g. America/New_York" className="input-electric w-full px-3 py-2.5 text-sm font-mono" />
+              </div>
 
               {/* Conditional fields based on job type */}
               {formJobType === 'shell' ? (
@@ -647,6 +682,7 @@ export default function Cron() {
                 <th>{t('cron.name')}</th>
                 <th>{t('cron.job_type')}</th>
                 <th>{t('cron.command')}</th>
+                <th>{t('cron.timezone')}</th>
                 <th>{t('cron.next_run')}</th>
                 <th>{t('cron.last_status')}</th>
                 <th>{t('cron.enabled')}</th>
@@ -691,6 +727,9 @@ export default function Cron() {
                     </td>
                     <td className="font-mono text-xs max-w-50 truncate text-center" style={{ color: 'var(--pc-text-secondary)' }}>
                       {job.prompt ?? job.command}
+                    </td>
+                    <td className="font-mono text-xs text-center" style={{ color: 'var(--pc-text-muted)' }}>
+                      {scheduleTimezone(job) ?? t('cron.runtime_local_timezone')}
                     </td>
                     <td className="text-xs text-center" style={{ color: 'var(--pc-text-muted)' }}>
                       {formatDate(job.next_run)}
@@ -763,7 +802,7 @@ export default function Cron() {
                   </tr>
                   {expandedJob === job.id && (
                     <tr>
-                      <td colSpan={8} style={{ background: 'var(--pc-bg-elevated)' }}>
+                      <td colSpan={9} style={{ background: 'var(--pc-bg-elevated)' }}>
                         <RunHistoryPanel jobId={job.id} refreshKey={runHistoryRefresh[job.id] ?? 0} />
                       </td>
                     </tr>
