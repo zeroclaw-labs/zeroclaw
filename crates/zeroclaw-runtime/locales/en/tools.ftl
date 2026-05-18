@@ -93,7 +93,7 @@ tool-screenshot = Capture a screenshot of the current screen. Returns the file p
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
-tool-shell = Execute a shell command in the workspace directory
+tool-shell = Execute a shell command in the workspace directory. On Windows the host shell is PowerShell (pwsh.exe preferred, powershell.exe fallback) — invoke cmdlets directly (Get-ChildItem, Format-Table, ...) and DO NOT wrap commands in `powershell -Command "..."` or `cmd /c ...`; the wrapper itself would then need to be in allowed_commands. On Unix the host shell is sh.
 
 tool-sop-advance = Report the result of the current SOP step and advance to the next step. Provide the run_id, whether the step succeeded or failed, and a brief output summary.
 

@@ -117,7 +117,12 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command in the workspace directory. On Windows the \
+         host shell is PowerShell (pwsh.exe preferred, powershell.exe \
+         fallback) — invoke cmdlets directly (Get-ChildItem, Format-Table, …) \
+         and DO NOT wrap commands in `powershell -Command \"…\"` or `cmd /c …`; \
+         the wrapper would itself need to be in allowed_commands. On Unix the \
+         host shell is sh."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

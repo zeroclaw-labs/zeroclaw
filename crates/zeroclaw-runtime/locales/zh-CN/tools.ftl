@@ -86,7 +86,7 @@ tool-screenshot = 捕获当前屏幕截图。返回文件路径和 Base64 编码
 
 tool-security-ops = 面向托管网络安全服务的安全运营工具。操作包括：triage_alert（告警分类与优先级排序）、run_playbook（执行事件响应流程）、parse_vulnerability（解析漏洞扫描结果）、generate_report（生成安全态势报告）、list_playbooks（列出可用 playbook）、alert_stats（汇总告警指标）。
 
-tool-shell = 在工作区目录中执行 Shell 命令
+tool-shell = 在工作区目录中执行 Shell 命令。Windows 上宿主 shell 是 PowerShell（优先 pwsh.exe，回退 powershell.exe）——直接调用 cmdlet（Get-ChildItem、Format-Table 等），不要再用 `powershell -Command "..."` 或 `cmd /c ...` 包一层；否则外层 powershell/cmd 也必须在 allowed_commands 里才能通过。Unix 上宿主 shell 是 sh。
 
 tool-sop-advance = 报告当前 SOP 步骤结果并推进到下一步。需提供 run_id、步骤成功或失败状态，以及简要输出摘要。
 
