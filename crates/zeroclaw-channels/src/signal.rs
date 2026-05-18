@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -29,7 +30,7 @@ pub struct SignalChannel {
     http_url: String,
     account: String,
     group_id: Option<String>,
-    allowed_from: Vec<String>,
+    allowlist: AllowlistAspect,
     ignore_attachments: bool,
     ignore_stories: bool,
     /// Per-channel proxy URL override.
@@ -94,7 +95,7 @@ impl SignalChannel {
             http_url,
             account,
             group_id,
-            allowed_from,
+            allowlist: AllowlistAspect::new(allowed_from),
             ignore_attachments,
             ignore_stories,
             proxy_url: None,
@@ -131,13 +132,6 @@ impl SignalChannel {
             .as_deref()
             .or(envelope.source.as_deref())
             .map(String::from)
-    }
-
-    fn is_sender_allowed(&self, sender: &str) -> bool {
-        if self.allowed_from.iter().any(|u| u == "*") {
-            return true;
-        }
-        self.allowed_from.iter().any(|u| u == sender)
     }
 
     fn is_e164(recipient: &str) -> bool {
@@ -263,7 +257,7 @@ impl SignalChannel {
         let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
         let sender = Self::sender(envelope)?;
 
-        if !self.is_sender_allowed(&sender) {
+        if !self.allowlist.is_allowed(&sender) {
             return None;
         }
 
@@ -577,7 +571,7 @@ mod tests {
         assert_eq!(ch.http_url, "http://127.0.0.1:8686");
         assert_eq!(ch.account, "+1234567890");
         assert!(ch.group_id.is_none());
-        assert_eq!(ch.allowed_from.len(), 1);
+        assert!(ch.allowlist.is_allowed("+1111111111"));
         assert!(!ch.ignore_attachments);
         assert!(!ch.ignore_stories);
     }
@@ -598,19 +592,19 @@ mod tests {
     #[test]
     fn wildcard_allows_anyone() {
         let ch = make_channel_with_group("dm");
-        assert!(ch.is_sender_allowed("+9999999999"));
+        assert!(ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
     fn specific_sender_allowed() {
         let ch = make_channel();
-        assert!(ch.is_sender_allowed("+1111111111"));
+        assert!(ch.allowlist.is_allowed("+1111111111"));
     }
 
     #[test]
     fn unknown_sender_denied() {
         let ch = make_channel();
-        assert!(!ch.is_sender_allowed("+9999999999"));
+        assert!(!ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
@@ -623,7 +617,7 @@ mod tests {
             false,
             false,
         );
-        assert!(!ch.is_sender_allowed("+1111111111"));
+        assert!(!ch.allowlist.is_allowed("+1111111111"));
     }
 
     #[test]
