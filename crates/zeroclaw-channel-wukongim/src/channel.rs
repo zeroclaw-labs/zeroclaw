@@ -665,12 +665,28 @@ impl Channel for WuKongIMChannel {
         }
         tracing::info!("WuKongIM: connected as {}", self.uid);
 
-        // 3. Process History (now that WS is connected, Agent can reply)
+        // 3. Process History (now that WS is connected, Agent can reply).
+        //    Spawn each entry: process_inbound_message awaits send_text_message
+        //    (ack reactions) etc., which depend on the live read loop below
+        //    draining RPC responses. Awaiting inline before the read loop
+        //    starts would deadlock waiting for responses no one is reading.
         for msg in history {
-            let _ = self.process_inbound_message(msg, &tx).await;
+            let self_clone = self.clone();
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.process_inbound_message(msg, &tx_clone).await {
+                    tracing::warn!("WuKongIM: history replay failed: {}", e);
+                }
+            });
         }
 
-        // 4. Start Live Listening
+        // 4. Start Live Listening.
+        //    INVARIANT: this loop must NOT await any operation that ultimately
+        //    waits on `pending_responses` — those oneshots are resolved here
+        //    (in the `frame = read.next()` arm), so blocking on one of them
+        //    inside the loop deadlocks the channel. In particular,
+        //    `process_inbound_message` is awaited in a spawned task, never
+        //    inline. See the `tokio::spawn` call below for the rationale.
         let mut hb = tokio::time::interval(PING_INTERVAL);
         let mut last_activity = Instant::now();
 
@@ -714,7 +730,21 @@ impl Channel for WuKongIMChannel {
 
                     if val.get("method").and_then(|m| m.as_str()) != Some("recv") { continue; }
                     let notif: JsonRpcNotification<RecvNotificationParams> = serde_json::from_value(val)?;
-                    let _ = self.process_inbound_message(notif.params, &tx).await;
+                    // Spawn — see SAFETY note above the listen loop. process_inbound_message
+                    // itself awaits RPC responses (send_text_message for "收到", media
+                    // downloads, etc.), and the oneshots backing those responses are
+                    // resolved by THIS read loop. Awaiting it inline would deadlock the
+                    // entire channel until each inbound message's outgoing RPCs time out.
+                    let self_clone = self.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone
+                            .process_inbound_message(notif.params, &tx_clone)
+                            .await
+                        {
+                            tracing::warn!("WuKongIM: inbound processing failed: {}", e);
+                        }
+                    });
                 }
             }
         }
