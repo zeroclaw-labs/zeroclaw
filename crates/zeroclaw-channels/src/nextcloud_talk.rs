@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
@@ -22,7 +23,7 @@ pub struct NextcloudTalkChannel {
     base_url: String,
     app_token: String,
     bot_name: String,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     client: reqwest::Client,
     /// Controls whether and how streaming draft updates are delivered.
     stream_mode: StreamMode,
@@ -53,7 +54,7 @@ impl NextcloudTalkChannel {
             base_url: base_url.trim_end_matches('/').to_string(),
             app_token,
             bot_name: bot_name.to_ascii_lowercase(),
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             client: zeroclaw_config::schema::build_channel_proxy_client(
                 "channel.nextcloud_talk",
                 proxy_url.as_deref(),
@@ -72,10 +73,6 @@ impl NextcloudTalkChannel {
         self.stream_mode = mode;
         self.draft_update_interval_ms = interval_ms;
         self
-    }
-
-    fn is_user_allowed(&self, actor_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == actor_id)
     }
 
     /// Returns true if the given name/id belongs to this bot itself.
@@ -239,7 +236,7 @@ impl NextcloudTalkChannel {
             return messages;
         }
 
-        if !self.is_user_allowed(actor_id) {
+        if !self.allowlist.is_allowed(actor_id) {
             tracing::warn!(
                 "Nextcloud Talk: ignoring message from unauthorized actor: {actor_id}. \
                 Add to channels.nextcloud_talk.allowed_users in config.toml, \
@@ -340,7 +337,7 @@ impl NextcloudTalkChannel {
             return messages;
         }
 
-        if !self.is_user_allowed(actor_id) {
+        if !self.allowlist.is_allowed(actor_id) {
             tracing::warn!(
                 "Nextcloud Talk: ignoring message from unauthorized actor: {actor_id}. \
                 Add to channels.nextcloud_talk.allowed_users in config.toml, \
@@ -820,8 +817,8 @@ mod tests {
     #[test]
     fn nextcloud_talk_user_allowlist_exact_and_wildcard() {
         let channel = make_channel();
-        assert!(channel.is_user_allowed("user_a"));
-        assert!(!channel.is_user_allowed("user_b"));
+        assert!(channel.allowlist.is_allowed("user_a"));
+        assert!(!channel.allowlist.is_allowed("user_b"));
 
         let wildcard = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
@@ -829,7 +826,7 @@ mod tests {
             "zeroclaw".into(),
             vec!["*".into()],
         );
-        assert!(wildcard.is_user_allowed("any_user"));
+        assert!(wildcard.allowlist.is_allowed("any_user"));
     }
 
     #[test]
