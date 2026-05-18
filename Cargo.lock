@@ -275,12 +275,12 @@ checksum = "9dbc3a507a82b17ba0d98f6ce8fd6954ea0c8152e98009d36a40d8dcc8ce078a"
 [[package]]
 name = "aspect-core"
 version = "0.1.0"
-source = "git+https://github.com/yijunyu/aspect-rs?rev=239ba1d#239ba1d0089dfac61fdc85319d63f20b704885b8"
+source = "git+https://github.com/yijunyu/aspect-rs?rev=c31f453#c31f453509057cdef97f880daea3c3aed5d23bb0"
 
 [[package]]
 name = "aspect-std"
 version = "0.1.0"
-source = "git+https://github.com/yijunyu/aspect-rs?rev=239ba1d#239ba1d0089dfac61fdc85319d63f20b704885b8"
+source = "git+https://github.com/yijunyu/aspect-rs?rev=c31f453#c31f453509057cdef97f880daea3c3aed5d23bb0"
 dependencies = [
  "aspect-core",
  "log",

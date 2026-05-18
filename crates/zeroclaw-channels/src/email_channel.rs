@@ -9,6 +9,7 @@
 #![allow(clippy::unnecessary_map_or)]
 
 use anyhow::{Result, anyhow};
+use aspect_std::AllowlistAspect;
 use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
@@ -38,41 +39,42 @@ pub use zeroclaw_config::scattered_types::EmailConfig;
 
 type ImapSession = Session<TlsStream<TcpStream>>;
 
+/// Email-allowlist matcher: allows an `entry` to be a full email
+/// (`"alice@example.com"`), a domain with `@` prefix (`"@example.com"`),
+/// or a bare domain (`"example.com"`). All comparisons are
+/// ASCII-case-insensitive. Used as the `.with_matcher(...)` predicate
+/// when constructing the email-channel `AllowlistAspect`.
+pub(crate) fn email_allowlist_match(entry: &str, email: &str) -> bool {
+    let email_lower = email.to_ascii_lowercase();
+    if let Some(domain) = entry.strip_prefix('@') {
+        email_lower.ends_with(&format!("@{}", domain.to_ascii_lowercase()))
+    } else if entry.contains('@') {
+        entry.eq_ignore_ascii_case(email)
+    } else {
+        email_lower.ends_with(&format!("@{}", entry.to_ascii_lowercase()))
+    }
+}
+
 /// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound
 pub struct EmailChannel {
     pub config: EmailConfig,
+    /// Centralized allowlist check (see `aspect_std::AllowlistAspect`).
+    /// Built once from `config.allowed_senders`; the matcher implements
+    /// the full-email / `@domain` / bare-domain semantics shared with
+    /// the Gmail push channel.
+    allowlist: AllowlistAspect,
     seen_messages: Arc<Mutex<HashSet<String>>>,
 }
 
 impl EmailChannel {
     pub fn new(config: EmailConfig) -> Self {
+        let allowlist = AllowlistAspect::new(config.allowed_senders.clone())
+            .with_matcher(email_allowlist_match);
         Self {
             config,
+            allowlist,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
         }
-    }
-
-    /// Check if a sender email is in the allowlist
-    pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
-            return false; // Empty = deny all
-        }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
-            return true; // Wildcard = allow all
-        }
-        let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
-            if allowed.starts_with('@') {
-                // Domain match with @ prefix: "@example.com"
-                email_lower.ends_with(&allowed.to_lowercase())
-            } else if allowed.contains('@') {
-                // Full email address match
-                allowed.eq_ignore_ascii_case(email)
-            } else {
-                // Domain match without @ prefix: "example.com"
-                email_lower.ends_with(&format!("@{}", allowed.to_lowercase()))
-            }
-        })
     }
 
     /// Strip HTML tags from content (basic)
@@ -474,7 +476,7 @@ impl EmailChannel {
 
         for email in messages {
             // Check allowlist
-            if !self.is_sender_allowed(&email.sender) {
+            if !self.allowlist.is_allowed(&email.sender) {
                 warn!("Blocked email from {}", email.sender);
                 continue;
             }
@@ -812,8 +814,8 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(!channel.is_sender_allowed("anyone@example.com"));
-        assert!(!channel.is_sender_allowed("user@test.com"));
+        assert!(!channel.allowlist.is_allowed("anyone@example.com"));
+        assert!(!channel.allowlist.is_allowed("user@test.com"));
     }
 
     #[test]
@@ -823,9 +825,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("anyone@example.com"));
-        assert!(channel.is_sender_allowed("user@test.com"));
-        assert!(channel.is_sender_allowed("random@domain.org"));
+        assert!(channel.allowlist.is_allowed("anyone@example.com"));
+        assert!(channel.allowlist.is_allowed("user@test.com"));
+        assert!(channel.allowlist.is_allowed("random@domain.org"));
     }
 
     #[test]
@@ -835,9 +837,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("allowed@example.com"));
-        assert!(!channel.is_sender_allowed("other@example.com"));
-        assert!(!channel.is_sender_allowed("allowed@other.com"));
+        assert!(channel.allowlist.is_allowed("allowed@example.com"));
+        assert!(!channel.allowlist.is_allowed("other@example.com"));
+        assert!(!channel.allowlist.is_allowed("allowed@other.com"));
     }
 
     #[test]
@@ -847,9 +849,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("user@example.com"));
-        assert!(channel.is_sender_allowed("admin@example.com"));
-        assert!(!channel.is_sender_allowed("user@other.com"));
+        assert!(channel.allowlist.is_allowed("user@example.com"));
+        assert!(channel.allowlist.is_allowed("admin@example.com"));
+        assert!(!channel.allowlist.is_allowed("user@other.com"));
     }
 
     #[test]
@@ -859,9 +861,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("user@example.com"));
-        assert!(channel.is_sender_allowed("admin@example.com"));
-        assert!(!channel.is_sender_allowed("user@other.com"));
+        assert!(channel.allowlist.is_allowed("user@example.com"));
+        assert!(channel.allowlist.is_allowed("admin@example.com"));
+        assert!(!channel.allowlist.is_allowed("user@other.com"));
     }
 
     #[test]
@@ -871,9 +873,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("allowed@example.com"));
-        assert!(channel.is_sender_allowed("ALLOWED@EXAMPLE.COM"));
-        assert!(channel.is_sender_allowed("AlLoWeD@eXaMpLe.cOm"));
+        assert!(channel.allowlist.is_allowed("allowed@example.com"));
+        assert!(channel.allowlist.is_allowed("ALLOWED@EXAMPLE.COM"));
+        assert!(channel.allowlist.is_allowed("AlLoWeD@eXaMpLe.cOm"));
     }
 
     #[test]
@@ -887,10 +889,10 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("user1@example.com"));
-        assert!(channel.is_sender_allowed("user2@test.com"));
-        assert!(channel.is_sender_allowed("anyone@allowed.com"));
-        assert!(!channel.is_sender_allowed("user3@example.com"));
+        assert!(channel.allowlist.is_allowed("user1@example.com"));
+        assert!(channel.allowlist.is_allowed("user2@test.com"));
+        assert!(channel.allowlist.is_allowed("anyone@allowed.com"));
+        assert!(!channel.allowlist.is_allowed("user3@example.com"));
     }
 
     #[test]
@@ -900,8 +902,8 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(channel.is_sender_allowed("anyone@example.com"));
-        assert!(channel.is_sender_allowed("specific@example.com"));
+        assert!(channel.allowlist.is_allowed("anyone@example.com"));
+        assert!(channel.allowlist.is_allowed("specific@example.com"));
     }
 
     #[test]
@@ -911,9 +913,9 @@ mod tests {
             ..Default::default()
         };
         let channel = EmailChannel::new(config);
-        assert!(!channel.is_sender_allowed(""));
+        assert!(!channel.allowlist.is_allowed(""));
         // "@example.com" ends with "@example.com" so it's allowed
-        assert!(channel.is_sender_allowed("@example.com"));
+        assert!(channel.allowlist.is_allowed("@example.com"));
     }
 
     // strip_html tests
@@ -1121,5 +1123,66 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("imap.debug.com"));
+    }
+
+    /// Parity oracle: the aspect-backed check must return byte-identical
+    /// results to the pre-migration shape across the full email-allowlist
+    /// truth table — full-email, `@domain`, bare-domain, mixed
+    /// wildcard, empty list, and case-insensitivity.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        // The pre-migration shape, replayed locally for the oracle.
+        fn pre_aspect(allowed: &[String], email: &str) -> bool {
+            if allowed.is_empty() {
+                return false;
+            }
+            if allowed.iter().any(|a| a == "*") {
+                return true;
+            }
+            let email_lower = email.to_lowercase();
+            allowed.iter().any(|entry| {
+                if entry.starts_with('@') {
+                    email_lower.ends_with(&entry.to_lowercase())
+                } else if entry.contains('@') {
+                    entry.eq_ignore_ascii_case(email)
+                } else {
+                    email_lower.ends_with(&format!("@{}", entry.to_lowercase()))
+                }
+            })
+        }
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice@example.com"),
+            (vec![], ""),
+            (vec!["*"], "anyone@whatever.com"),
+            (vec!["*"], ""),
+            (vec!["alice@example.com"], "alice@example.com"),
+            (vec!["alice@example.com"], "bob@example.com"),
+            (vec!["alice@example.com"], "ALICE@Example.COM"), // case-insensitive
+            (vec!["@example.com"], "anyone@example.com"),
+            (vec!["@example.com"], "anyone@other.com"),
+            (vec!["@Example.COM"], "anyone@example.com"), // domain case-insensitive
+            (vec!["example.com"], "anyone@example.com"), // bare domain
+            (vec!["example.com"], "anyone@subdomain.example.com"), // must require @
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "x@allowed.com"),
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "specific@host.com"),
+            (vec!["bare.com", "@allowed.com", "specific@host.com"], "other@host.com"),
+            (vec!["*", "specific@host.com"], "anyone@whatever.com"),
+            (vec!["@example.com"], ""), // empty email
+        ];
+        for (entries, email) in cases {
+            let allowed: Vec<String> =
+                entries.iter().map(|s| (*s).to_string()).collect();
+            let baseline = pre_aspect(&allowed, email);
+            let config = EmailConfig {
+                allowed_senders: allowed.clone(),
+                ..Default::default()
+            };
+            let channel = EmailChannel::new(config);
+            assert_eq!(
+                channel.allowlist.is_allowed(email),
+                baseline,
+                "aspect drift for entries={entries:?} email={email:?}",
+            );
+        }
     }
 }
