@@ -218,4 +218,120 @@ mod tests {
             result.error
         );
     }
+
+    // ── Depth-1 cap: subagent may not spawn its own subagent ──
+
+    #[tokio::test]
+    async fn refuses_recursive_spawn_when_caller_is_subagent() {
+        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha")
+            .with_subagent_caller(true);
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("subagent") && err.contains("depth"),
+            "expected depth-cap refusal mentioning subagent + depth, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_top_level_spawn_when_caller_is_not_subagent() {
+        // The top-level path may still fail later for unrelated reasons
+        // (e.g. no model provider configured in this minimal harness),
+        // but it MUST NOT trip the depth-cap refusal. Pin that the
+        // depth-cap error is absent.
+        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha")
+            .with_subagent_caller(false);
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            !(err.contains("subagent") && err.contains("depth")),
+            "top-level caller must not see the depth-cap refusal, got: {err:?}"
+        );
+    }
+
+    // ── risk_profile.allowed_tools gates spawn_subagent ──
+
+    fn config_with_allowed_tools(alias: &str, allowed_tools: Vec<String>) -> Config {
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                allowed_tools,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            alias.to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".to_string(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn refuses_when_risk_profile_excludes_spawn_subagent() {
+        // Parent's risk_profile.allowed_tools omits "spawn_subagent" —
+        // the tool itself refuses pre-spawn so the dispatch-site filter
+        // doesn't have to be the only line of defense.
+        let config = config_with_allowed_tools("alpha", vec!["shell".into()]);
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha");
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("risk_profile") && err.contains("spawn_subagent"),
+            "expected risk_profile-gate refusal naming spawn_subagent, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_when_risk_profile_lists_spawn_subagent() {
+        // When the parent's risk_profile.allowed_tools explicitly lists
+        // spawn_subagent, the tool does NOT short-circuit on the gate.
+        // It may still fail later for unrelated reasons; pin only that
+        // the gate refusal is absent.
+        let config =
+            config_with_allowed_tools("alpha", vec!["spawn_subagent".into(), "shell".into()]);
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha");
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            !(err.contains("risk_profile") && err.contains("spawn_subagent")),
+            "spawn_subagent in allowed_tools must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    // ── Cron path stays depth-0: AgentRunOverrides::default() ──
+    //
+    // The cron `JobType::Agent` site constructs `AgentRunOverrides`
+    // without explicit `is_subagent`, so a `false` Default is the
+    // load-bearing invariant. A future refactor flipping the default
+    // would silently turn every cron-launched agent into a depth-1
+    // subagent and break recursive-spawn guarantees from the other
+    // direction. Pin the default explicitly.
+
+    #[test]
+    fn agent_run_overrides_default_is_top_level() {
+        use crate::agent::loop_::AgentRunOverrides;
+        let overrides = AgentRunOverrides::default();
+        assert!(
+            !overrides.is_subagent,
+            "AgentRunOverrides::default().is_subagent must be false so cron paths inherit a top-level shape"
+        );
+    }
 }
