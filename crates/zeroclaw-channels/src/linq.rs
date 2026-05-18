@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -11,7 +12,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 pub struct LinqChannel {
     api_token: String,
     from_phone: String,
-    allowed_senders: Vec<String>,
+    allowlist: AllowlistAspect,
     client: reqwest::Client,
 }
 
@@ -22,14 +23,9 @@ impl LinqChannel {
         Self {
             api_token,
             from_phone,
-            allowed_senders,
+            allowlist: AllowlistAspect::new(allowed_senders),
             client: reqwest::Client::new(),
         }
-    }
-
-    /// Check if a sender phone number is allowed (E.164 format: +1234567890)
-    fn is_sender_allowed(&self, phone: &str) -> bool {
-        self.allowed_senders.iter().any(|n| n == "*" || n == phone)
     }
 
     /// Get the bot's phone number
@@ -184,7 +180,7 @@ impl LinqChannel {
         };
 
         // Check allowlist
-        if !self.is_sender_allowed(&normalized_from) {
+        if !self.allowlist.is_allowed(&normalized_from) {
             tracing::warn!(
                 "Linq: ignoring message from unauthorized sender: {normalized_from}. \
                 Add to channels.linq.allowed_senders in config.toml, \
@@ -472,21 +468,21 @@ mod tests {
     #[test]
     fn linq_sender_allowed_exact() {
         let ch = make_channel();
-        assert!(ch.is_sender_allowed("+1234567890"));
-        assert!(!ch.is_sender_allowed("+9876543210"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+9876543210"));
     }
 
     #[test]
     fn linq_sender_allowed_wildcard() {
         let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
-        assert!(ch.is_sender_allowed("+1234567890"));
-        assert!(ch.is_sender_allowed("+9999999999"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
     fn linq_sender_allowed_empty() {
         let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec![]);
-        assert!(!ch.is_sender_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+1234567890"));
     }
 
     #[test]
