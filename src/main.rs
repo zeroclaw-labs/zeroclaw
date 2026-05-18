@@ -516,11 +516,13 @@ Examples:
 Configure and manage scheduled tasks.
 
 Schedule recurring, one-shot, or interval-based tasks using cron \
-expressions, RFC 3339 timestamps, durations, or fixed intervals.
+expressions, RFC3339 timestamps with explicit Z or offsets, durations, \
+or fixed intervals.
 
 Cron expressions use the standard 5-field format: \
-'min hour day month weekday'. Timezones default to UTC; \
-override with --tz and an IANA timezone name.
+'min hour day month weekday'. When --tz is omitted, cron schedules use \
+the runtime local timezone. For user-facing schedules, pass --tz with \
+an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
@@ -4178,6 +4180,30 @@ mod tests {
         assert!(help.contains("default logging writes them to stderr"));
         assert!(help.contains("custom subscribers may route them elsewhere"));
         assert!(help.contains("May include prompts, history, and tool output"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn cron_help_describes_runtime_local_timezone_fallback() {
+        let mut cmd = Cli::command();
+        let cron = cmd
+            .find_subcommand_mut("cron")
+            .expect("cron subcommand must exist");
+        let help = cron.render_long_help().to_string();
+
+        assert!(
+            help.contains("runtime local timezone"),
+            "cron help should describe the scheduler fallback: {help}"
+        );
+        assert!(
+            help.contains("explicit IANA timezone"),
+            "cron help should recommend explicit user-facing timezones: {help}"
+        );
+        assert!(
+            !help.contains("Timezones default to UTC")
+                && !help.contains("Times are evaluated in UTC by default"),
+            "cron help must not claim a UTC default: {help}"
+        );
     }
 
     #[test]
