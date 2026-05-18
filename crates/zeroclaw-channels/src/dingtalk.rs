@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
 pub struct DingTalkChannel {
     client_id: String,
     client_secret: String,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Per-chat session webhooks for sending replies (chatID -> webhook URL).
     /// DingTalk provides a unique webhook URL with each incoming message.
     session_webhooks: Arc<RwLock<HashMap<String, String>>>,
@@ -34,7 +35,7 @@ impl DingTalkChannel {
         Self {
             client_id,
             client_secret,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             session_webhooks: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
         }
@@ -51,10 +52,6 @@ impl DingTalkChannel {
             "channel.dingtalk",
             self.proxy_url.as_deref(),
         )
-    }
-
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     fn parse_stream_data(frame: &serde_json::Value) -> Option<serde_json::Value> {
@@ -244,7 +241,7 @@ impl Channel for DingTalkChannel {
                         .and_then(|s| s.as_str())
                         .unwrap_or("unknown");
 
-                    if !self.is_user_allowed(sender_id) {
+                    if !self.allowlist.is_allowed(sender_id) {
                         tracing::warn!(
                             "DingTalk: ignoring message from unauthorized user: {sender_id}"
                         );
@@ -326,20 +323,20 @@ mod tests {
     #[test]
     fn test_user_allowed_wildcard() {
         let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
         let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["user123".into()]);
-        assert!(ch.is_user_allowed("user123"));
-        assert!(!ch.is_user_allowed("other"));
+        assert!(ch.allowlist.is_allowed("user123"));
+        assert!(!ch.allowlist.is_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
         let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
