@@ -43,6 +43,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -61,24 +62,57 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
-/// Coerce a JSON value into the string form `Config::set_prop` accepts.
-///
-/// Thin wrapper over the shared `zeroclaw_config::typed_value::coerce_for_set_prop`
-/// helper that the gateway PATCH/PUT endpoints use. Looking up a path's
-/// declared `PropKind` requires a `Config` reference, which the patch handler
-/// has — so this looks the kind up against the live config and forwards.
-fn json_value_to_setprop_string(
-    value: &serde_json::Value,
-    config: &Config,
-    path: &str,
-) -> Result<String> {
-    let kind = config
+fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
+    config
         .prop_fields()
         .into_iter()
         .find(|f| f.name == path)
-        .map(|f| f.kind);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
-        .map_err(|e| anyhow::anyhow!("{}", e.message))
+        .map(|f| f.kind)
+}
+
+fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
+    let msg = err.to_string();
+    if msg.starts_with("Unknown property") {
+        ConfigApiError::path_not_found(path).with_op_index(op_index)
+    } else {
+        ConfigApiError::from_validation(err)
+            .with_path(path)
+            .with_op_index(op_index)
+    }
+}
+
+fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
+    eprintln!("{}", serde_json::to_string_pretty(err)?);
+    std::process::exit(1);
+}
+
+fn config_patch_json_value_type_error(
+    message: impl Into<String>,
+    path: Option<String>,
+    op_index: Option<usize>,
+) -> ConfigApiError {
+    let mut err = ConfigApiError::new(ConfigApiCode::ValueTypeMismatch, message.into());
+    if let Some(path) = path {
+        err = err.with_path(path);
+    }
+    if let Some(op_index) = op_index {
+        err = err.with_op_index(op_index);
+    }
+    err
+}
+
+fn config_patch_fail_json_or_human<T>(
+    json: bool,
+    err: ConfigApiError,
+    human: impl Into<String>,
+) -> Result<T>
+where
+    T: Sized,
+{
+    if json {
+        config_patch_json_error(&err)?;
+    }
+    anyhow::bail!("{}", human.into())
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
@@ -249,6 +283,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Emit raw LLM message payload trace events for local debugging; default
+    /// logging writes them to stderr, but custom subscribers may route them
+    /// elsewhere. May include prompts, history, and tool output.
+    #[arg(long, global = true)]
+    log_llm: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -264,6 +304,10 @@ enum Commands {
         /// Skip interactive prompts; read from --api-key/--provider/--model/--memory.
         #[arg(long)]
         quick: bool,
+
+        /// Force interactive onboarding mode.
+        #[arg(long, conflicts_with = "quick")]
+        interactive: bool,
 
         /// Force the dialoguer CLI backend instead of the default ratatui TUI.
         #[arg(long)]
@@ -472,11 +516,13 @@ Examples:
 Configure and manage scheduled tasks.
 
 Schedule recurring, one-shot, or interval-based tasks using cron \
-expressions, RFC 3339 timestamps, durations, or fixed intervals.
+expressions, RFC3339 timestamps with explicit Z or offsets, durations, \
+or fixed intervals.
 
 Cron expressions use the standard 5-field format: \
-'min hour day month weekday'. Timezones default to UTC; \
-override with --tz and an IANA timezone name.
+'min hour day month weekday'. When --tz is omitted, cron schedules use \
+the runtime local timezone. For user-facing schedules, pass --tz with \
+an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
@@ -1257,26 +1303,32 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level));
+    if cli.log_llm {
+        zeroclaw_providers::reliable::set_llm_payload_tracing_enabled(true);
+        filter = filter.add_directive(
+            "zeroclaw_providers::reliable=trace"
+                .parse()
+                .expect("valid log-llm tracing directive"),
+        );
+    }
+
     let subscriber = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
+        .with_env_filter(filter)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
-    // provider flags were given, it runs the full interactive wizard; otherwise
-    // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
-    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
-    // detection fails.  This means `curl … | bash` and
-    // `zeroclaw onboard --api-key …` both take the fast path, while a bare
-    // `zeroclaw onboard` in a terminal launches the wizard.
+    // Onboard defaults to the interactive flow. Use --quick to force scriptable
+    // quick setup, or --interactive to spell the interactive path explicitly
+    // for compatibility with older invocations.
     #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         section,
         quick,
+        interactive: _interactive,
         cli: use_cli,
         tui: use_tui_deprecated,
         force,
@@ -1553,6 +1605,7 @@ async fn main() -> Result<()> {
                 peripheral,
                 true,
                 session_state_file,
+                None,
                 None,
             ))
             .await
@@ -2578,48 +2631,170 @@ async fn main() -> Result<()> {
                     None | Some("-") => {
                         use std::io::Read;
                         let mut buf = String::new();
-                        std::io::stdin()
-                            .read_to_string(&mut buf)
-                            .context("Failed to read JSON Patch from stdin")?;
+                        if let Err(err) = std::io::stdin().read_to_string(&mut buf) {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from stdin: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from stdin: {err}"),
+                            )?;
+                        }
                         buf
                     }
-                    Some(path) => tokio::fs::read_to_string(path)
-                        .await
-                        .with_context(|| format!("Failed to read JSON Patch from {path}"))?,
+                    Some(path) => match tokio::fs::read_to_string(path).await {
+                        Ok(body) => body,
+                        Err(err) => {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from {path}: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from {path}: {err}"),
+                            )?
+                        }
+                    },
                 };
 
-                let ops: Vec<serde_json::Value> = serde_json::from_str(body.trim())
-                    .context("JSON Patch body must be a JSON array of operations")?;
+                let parsed: serde_json::Value = match serde_json::from_str(body.trim()) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        let api_err = config_patch_json_value_type_error(
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                        )?
+                    }
+                };
+                let ops = match parsed.as_array() {
+                    Some(ops) => ops,
+                    None => {
+                        let api_err = config_patch_json_value_type_error(
+                            "JSON Patch body must be a JSON array of operations",
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            "JSON Patch body must be a JSON array of operations",
+                        )?
+                    }
+                };
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
-                    let op_name = op
-                        .get("op")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `op` field"))?;
-                    let raw_path = op
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `path` field"))?;
+                    let object = match op.as_object() {
+                        Some(object) => object,
+                        None => {
+                            let message = format!("JSON Patch op[{idx}] must be an object");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let op_name = match object.get("op").and_then(|v| v.as_str()) {
+                        Some(op_name) => op_name,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `op` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let raw_path = match object.get("path").and_then(|v| v.as_str()) {
+                        Some(raw_path) => raw_path,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `path` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
                     let path = if let Some(stripped) = raw_path.strip_prefix('/') {
                         stripped.replace('/', ".")
                     } else {
                         raw_path.to_string()
                     };
+                    let comment = match object.get("comment") {
+                        Some(value) => match value.as_str() {
+                            Some(comment) => Some(comment),
+                            None => {
+                                let message = format!(
+                                    "JSON Patch op[{idx}] `comment` field must be a string"
+                                );
+                                let api_err = config_patch_json_value_type_error(
+                                    message.clone(),
+                                    Some(path.clone()),
+                                    Some(idx),
+                                );
+                                config_patch_fail_json_or_human(json, api_err, message)?
+                            }
+                        },
+                        None => None,
+                    };
                     let is_secret = Config::prop_is_secret(&path);
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
-                            let value = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                )
-                            })?;
-                            let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config.set_prop(&path, &value_str).with_context(|| {
-                                format!("op[{idx}] `{op_name}` on `{path}` failed")
-                            })?;
+                            let value = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    let message =
+                                        format!("JSON Patch `{op_name}` op requires `value` field");
+                                    let err = ConfigApiError::new(
+                                        ConfigApiCode::ValueTypeMismatch,
+                                        message,
+                                    )
+                                    .with_path(&path)
+                                    .with_op_index(idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
+                                    );
+                                    config_patch_fail_json_or_human(json, err, human)?
+                                }
+                            };
+                            let value_str = match zeroclaw_config::typed_value::coerce_for_set_prop(
+                                value,
+                                config_patch_prop_kind(&config, &path),
+                            ) {
+                                Ok(value_str) => value_str,
+                                Err(err) => {
+                                    let err = err.with_path(&path).with_op_index(idx);
+                                    config_patch_fail_json_or_human(
+                                        json,
+                                        err.clone(),
+                                        err.message.clone(),
+                                    )?
+                                }
+                            };
+                            if let Err(err) = config.set_prop(&path, &value_str) {
+                                let human =
+                                    format!("op[{idx}] `{op_name}` on `{path}` failed: {err}");
+                                let api_err = config_patch_map_prop_error(err, &path, idx);
+                                config_patch_fail_json_or_human(json, api_err, human)?;
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -2635,9 +2810,11 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            if let Err(err) = config.set_prop(&path, "") {
+                                let human = format!("op[{idx}] `remove` on `{path}` failed: {err}");
+                                let api_err = config_patch_map_prop_error(err, &path, idx);
+                                config_patch_fail_json_or_human(json, api_err, human)?;
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -2654,28 +2831,66 @@ async fn main() -> Result<()> {
                         }
                         "test" => {
                             if is_secret {
-                                anyhow::bail!(
+                                let err =
+                                    ConfigApiError::secret_test_forbidden(&path).with_op_index(idx);
+                                let human = format!(
                                     "op[{idx}] `test` on `{path}`: secret_test_forbidden \
                                      \u{2014} test ops are not allowed against secret paths"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
-                            let want = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "op[{idx}] `test` on `{path}`: missing `value` field"
-                                )
-                            })?;
-                            let actual = config.get_prop(&path).with_context(|| {
-                                format!("op[{idx}] `test` on `{path}` failed to read current value")
-                            })?;
-                            let want_str = match want {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
+                            let want = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    let err = ConfigApiError::new(
+                                        ConfigApiCode::ValueTypeMismatch,
+                                        "JSON Patch `test` op requires `value` field",
+                                    )
+                                    .with_path(&path)
+                                    .with_op_index(idx);
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}`: missing `value` field"
+                                    );
+                                    config_patch_fail_json_or_human(json, err, human)?
+                                }
+                            };
+                            let actual = match config.get_prop(&path) {
+                                Ok(actual) => actual,
+                                Err(err) => {
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}` failed to read current value: {err}"
+                                    );
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    config_patch_fail_json_or_human(json, api_err, human)?
+                                }
+                            };
+                            let want_str = match zeroclaw_config::typed_value::coerce_for_set_prop(
+                                want,
+                                config_patch_prop_kind(&config, &path),
+                            ) {
+                                Ok(want_str) => want_str,
+                                Err(err) => {
+                                    let err = err.with_path(&path).with_op_index(idx);
+                                    config_patch_fail_json_or_human(
+                                        json,
+                                        err.clone(),
+                                        err.message.clone(),
+                                    )?
+                                }
                             };
                             if actual != want_str {
-                                anyhow::bail!(
-                                    "op[{idx}] `test` on `{path}` failed: \
-                                     expected {want_str}, got {actual}"
+                                let err = ConfigApiError::new(
+                                    ConfigApiCode::ValidationFailed,
+                                    format!(
+                                        "`test` op failed: expected {want_str:?}, got {actual:?}"
+                                    ),
+                                )
+                                .with_path(&path)
+                                .with_op_index(idx);
+                                let human = format!(
+                                    "op[{idx}] `test` on `{path}` failed: expected {want_str}, got {actual}"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
                             serde_json::json!({
                                 "op": "test",
@@ -2684,22 +2899,48 @@ async fn main() -> Result<()> {
                             })
                         }
                         "move" | "copy" => {
-                            anyhow::bail!(
+                            let err = ConfigApiError::op_not_supported(op_name)
+                                .with_path(&path)
+                                .with_op_index(idx);
+                            let human = format!(
                                 "op[{idx}] `{op_name}` on `{path}`: op_not_supported \
                                  \u{2014} move/copy require a reference graph that is not built yet"
                             );
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                         other => {
-                            anyhow::bail!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            let err = ConfigApiError::new(
+                                ConfigApiCode::OpNotSupported,
+                                format!("unknown JSON Patch operation `{other}`"),
+                            )
+                            .with_path(&path)
+                            .with_op_index(idx);
+                            let human = format!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                     };
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
-                config.save().await?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    config_patch_fail_json_or_human(
+                        json,
+                        api_err,
+                        "validation failed after applying patch - no changes saved",
+                    )?;
+                }
+                if let Err(err) = config.save().await {
+                    let api_err = ConfigApiError::new(
+                        ConfigApiCode::ReloadFailed,
+                        format!("save failed: {err}"),
+                    );
+                    config_patch_fail_json_or_human(
+                        json,
+                        api_err,
+                        format!("failed to save config after applying patch: {err}"),
+                    )?;
+                }
 
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
@@ -3911,6 +4152,62 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn log_llm_is_global_flag_for_agent_debugging() {
+        for args in [
+            ["zeroclaw", "--log-llm", "agent", "--message", "hello"],
+            ["zeroclaw", "agent", "--log-llm", "--message", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("--log-llm should parse globally");
+
+            assert!(
+                cli.log_llm,
+                "--log-llm should opt in to provider payload tracing"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn log_llm_help_warns_about_raw_payloads() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(help.contains("--log-llm"));
+        assert!(help.contains("Emit raw LLM message payload trace events"));
+        assert!(help.contains("default logging writes them to stderr"));
+        assert!(help.contains("custom subscribers may route them elsewhere"));
+        assert!(help.contains("May include prompts, history, and tool output"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn cron_help_describes_runtime_local_timezone_fallback() {
+        let mut cmd = Cli::command();
+        let cron = cmd
+            .find_subcommand_mut("cron")
+            .expect("cron subcommand must exist");
+        let help = cron.render_long_help().to_string();
+
+        assert!(
+            help.contains("runtime local timezone"),
+            "cron help should describe the scheduler fallback: {help}"
+        );
+        assert!(
+            help.contains("explicit IANA timezone"),
+            "cron help should recommend explicit user-facing timezones: {help}"
+        );
+        assert!(
+            !help.contains("Timezones default to UTC")
+                && !help.contains("Times are evaluated in UTC by default"),
+            "cron help must not claim a UTC default: {help}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
             gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
@@ -4021,9 +4318,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4036,6 +4338,12 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn onboard_cli_rejects_quick_with_interactive_flag() {
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--interactive"]).is_err());
     }
 
     #[test]
