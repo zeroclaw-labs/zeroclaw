@@ -120,8 +120,21 @@ pub async fn handle_api_status(
         .map(String::from)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
+    // Build a version string that is useful whether running a release or a
+    // local source build. The git vars are captured at compile time by
+    // build.rs; they fall back to "unknown"/"false" when git is unavailable
+    // (Docker layer without .git, tarball builds, crates.io installs).
+    let pkg_version = env!("CARGO_PKG_VERSION");
+    let git_sha = env!("GIT_COMMIT_SHA");
+    let git_dirty = env!("GIT_DIRTY") == "true";
+    let version = match (git_sha, git_dirty) {
+        ("unknown", _) => pkg_version.to_string(),
+        (sha, false) => format!("{pkg_version} ({sha})"),
+        (sha, true) => format!("{pkg_version} ({sha}, dirty)"),
+    };
+
     let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version,
         "provider": config.providers.fallback,
         "model": state.model,
         "temperature": state.temperature,
@@ -352,8 +365,12 @@ pub async fn handle_api_cron_run(
     };
 
     let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
+    let (mut success, output) = zeroclaw_runtime::cron::scheduler::execute_job_now(
+        &config,
+        &job,
+        Some(state.observer.clone()),
+    )
+    .await;
     let finished_at = chrono::Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
