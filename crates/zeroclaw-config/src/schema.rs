@@ -3792,6 +3792,9 @@ impl PluginsConfig {
     /// Explicit `plugins.plugins_dir` values always win. For omitted/default
     /// configs, discovery first uses the new default config-dir location, then
     /// falls back to the legacy workspace location if it contains plugins.
+    ///
+    /// This performs filesystem `read_dir` I/O to detect populated plugin
+    /// directories.
     pub fn resolved_plugins_discovery_dir(
         &self,
         config_path: &Path,
@@ -3829,6 +3832,9 @@ impl PluginsConfig {
 
 impl Config {
     /// Resolve the plugin discovery directory for this loaded config.
+    ///
+    /// This performs filesystem `read_dir` I/O to preserve legacy discovery
+    /// fallback behavior.
     pub fn resolved_plugins_discovery_dir(&self) -> PathBuf {
         self.plugins
             .resolved_plugins_discovery_dir(&self.config_path, &self.workspace_dir)

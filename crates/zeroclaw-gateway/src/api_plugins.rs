@@ -115,12 +115,11 @@ pub mod plugin_routes {
             let workspace = config_dir.join("workspace");
             write_tool_plugin(&workspace.join("plugins"), "legacy-plugin");
 
-            unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &config_dir) };
             let plugins = PluginsConfig {
                 enabled: true,
+                plugins_dir: config_dir.join("plugins").to_string_lossy().into_owned(),
                 ..PluginsConfig::default()
             };
-            unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
 
             let config = Config {
                 workspace_dir: workspace.clone(),
