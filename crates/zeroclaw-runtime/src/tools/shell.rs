@@ -22,7 +22,8 @@ const SAFE_ENV_VARS: &[&str] = &[
 ];
 
 /// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
+/// Includes Windows-specific variables needed for PowerShell, cmd.exe, and
+/// program resolution. PSModulePath lets PowerShell discover system modules.
 #[cfg(target_os = "windows")]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
@@ -40,6 +41,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "TERM",
     "LANG",
     "USERNAME",
+    "PSModulePath",
 ];
 
 /// Shell command execution tool with sandboxing

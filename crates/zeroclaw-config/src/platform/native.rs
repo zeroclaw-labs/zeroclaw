@@ -56,9 +56,17 @@ impl RuntimeAdapter for NativeRuntime {
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-            let mut process = tokio::process::Command::new("cmd.exe");
+            // PowerShell is the default on Windows so that cmdlets in the
+            // operator's `allowed_commands` (Get-ChildItem, Format-Table, …)
+            // can actually execute. cmd.exe cannot run cmdlets, which would
+            // make any PowerShell-style allowlist useless. Operators who
+            // need cmd.exe can invoke it explicitly via `cmd /c …` provided
+            // `cmd` is in their allowlist.
+            let mut process = tokio::process::Command::new("powershell.exe");
             process
-                .arg("/C")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
                 .arg(command)
                 .current_dir(workspace_dir)
                 .creation_flags(CREATE_NO_WINDOW);
