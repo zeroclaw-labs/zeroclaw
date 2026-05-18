@@ -502,4 +502,62 @@ mod tests {
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
     }
+
+    /// Regression test for #6472: gateway panic when using Postgres memory backend.
+    ///
+    /// This test verifies that constructing PostgresMemory from within a Tokio runtime
+    /// does not panic, regardless of the pgvector_enabled setting. The bug manifested
+    /// as "Cannot start a runtime from within a runtime" because the sync postgres
+    /// crate's internal block_on() conflicted with the Tokio worker thread context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_with_pgvector_disabled_does_not_panic() {
+        // This is the exact configuration from issue #6472:
+        // [memory.postgres].vector_enabled = false
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
+                "public",
+                "memories",
+                Some(1),
+                Some(false), // vector_enabled = false (the reported bug path)
+                None,
+            )
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "PostgresMemory::new with pgvector_enabled=false should not panic inside Tokio runtime"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    /// Regression test for pgvector_enabled = true path.
+    ///
+    /// Verifies that the pgvector setup code path also runs inside the OS thread
+    /// and does not cause nested runtime panics when invoked from a Tokio context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_with_pgvector_enabled_does_not_panic() {
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
+                "public",
+                "memories",
+                Some(1),
+                Some(true), // vector_enabled = true
+                Some(1536),
+            )
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "PostgresMemory::new with pgvector_enabled=true should not panic inside Tokio runtime"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
 }
