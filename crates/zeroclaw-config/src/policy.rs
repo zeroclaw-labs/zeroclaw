@@ -2383,6 +2383,62 @@ mod tests {
         SecurityPolicy::default()
     }
 
+    // ── is_tool_allowed truth table ──────────────────────────
+    //
+    // None         → unrestricted: every name allowed
+    // Some(vec![]) → deny-all: every name rejected
+    // Some(list)   → allowlist: only listed names allowed
+    // excluded_tools: subtracts from the allowed set even when allowlist matches
+
+    #[test]
+    fn is_tool_allowed_none_is_unrestricted() {
+        let mut p = SecurityPolicy::default();
+        p.allowed_tools = None;
+        p.excluded_tools = None;
+        assert!(p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("spawn_subagent"));
+        assert!(p.is_tool_allowed("anything_else"));
+    }
+
+    #[test]
+    fn is_tool_allowed_some_empty_denies_all() {
+        let mut p = SecurityPolicy::default();
+        p.allowed_tools = Some(vec![]);
+        assert!(!p.is_tool_allowed("shell"));
+        assert!(!p.is_tool_allowed("spawn_subagent"));
+    }
+
+    #[test]
+    fn is_tool_allowed_allowlist_admits_only_listed() {
+        let mut p = SecurityPolicy::default();
+        p.allowed_tools = Some(vec!["shell".into(), "memory_recall".into()]);
+        assert!(p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("memory_recall"));
+        assert!(!p.is_tool_allowed("spawn_subagent"));
+        assert!(!p.is_tool_allowed("file_write"));
+    }
+
+    #[test]
+    fn is_tool_allowed_excluded_overrides_allowlist() {
+        let mut p = SecurityPolicy::default();
+        p.allowed_tools = Some(vec!["shell".into(), "spawn_subagent".into()]);
+        p.excluded_tools = Some(vec!["spawn_subagent".into()]);
+        assert!(p.is_tool_allowed("shell"));
+        assert!(
+            !p.is_tool_allowed("spawn_subagent"),
+            "excluded_tools must subtract from allowlist"
+        );
+    }
+
+    #[test]
+    fn is_tool_allowed_excluded_alone_subtracts_from_unrestricted() {
+        let mut p = SecurityPolicy::default();
+        p.allowed_tools = None;
+        p.excluded_tools = Some(vec!["spawn_subagent".into()]);
+        assert!(p.is_tool_allowed("shell"));
+        assert!(!p.is_tool_allowed("spawn_subagent"));
+    }
+
     fn unix_forbidden_path_policy() -> SecurityPolicy {
         SecurityPolicy {
             workspace_dir: PathBuf::from("/workspace"),
