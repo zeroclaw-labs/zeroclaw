@@ -107,6 +107,65 @@ pub struct PatchResponse {
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
 }
 
+fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
+    let ops = value.as_array().ok_or_else(|| {
+        ConfigApiError::new(
+            ConfigApiCode::ValueTypeMismatch,
+            "JSON Patch body must be a JSON array of operations",
+        )
+    })?;
+
+    let mut parsed = Vec::with_capacity(ops.len());
+    for (idx, op) in ops.iter().enumerate() {
+        let object = op.as_object().ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] must be an object"),
+            )
+            .with_op_index(idx)
+        })?;
+        let op_name = object.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] requires string `op` field"),
+            )
+            .with_op_index(idx)
+        })?;
+        let path = object.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] requires string `path` field"),
+            )
+            .with_op_index(idx)
+        })?;
+        let comment = match object.get("comment") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        ConfigApiError::new(
+                            ConfigApiCode::ValueTypeMismatch,
+                            format!("JSON Patch op[{idx}] `comment` field must be a string"),
+                        )
+                        .with_path(json_pointer_to_dotted(path))
+                        .with_op_index(idx)
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        parsed.push(PatchOp {
+            op: op_name.to_string(),
+            path: path.to_string(),
+            value: object.get("value").cloned(),
+            comment,
+        });
+    }
+
+    Ok(parsed)
+}
+
 /// Response for a non-secret GET / PUT / DELETE.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -758,11 +817,16 @@ pub async fn handle_map_key(
 pub async fn handle_patch(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::Json(ops): axum::Json<Vec<PatchOp>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+
+    let ops = match parse_patch_ops(body) {
+        Ok(ops) => ops,
+        Err(e) => return error_response(e),
+    };
 
     let working = state.config.lock().clone();
 
