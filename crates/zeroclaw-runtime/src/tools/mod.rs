@@ -51,6 +51,7 @@ pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
+pub use zeroclaw_tools::channel_send::ChannelSendTool;
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
@@ -363,6 +364,7 @@ pub fn all_tools(
     ChannelMapHandle,
     Option<ChannelMapHandle>,
     Option<ChannelMapHandle>,
+    Option<ChannelMapHandle>,
 ) {
     all_tools_with_runtime(
         config,
@@ -414,6 +416,7 @@ pub fn all_tools_with_runtime(
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
     ChannelMapHandle,
+    Option<ChannelMapHandle>,
     Option<ChannelMapHandle>,
     Option<ChannelMapHandle>,
 ) {
@@ -949,6 +952,11 @@ pub fn all_tools_with_runtime(
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 
+    // Channel send tool — always registered; channel map populated later by start_channels.
+    let channel_send_tool = ChannelSendTool::new(security.clone());
+    let channel_send_handle = channel_send_tool.channel_map_handle();
+    tool_arcs.push(Arc::new(channel_send_tool));
+
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {
         let ms_cfg = &root_config.microsoft365;
@@ -985,6 +993,7 @@ pub fn all_tools_with_runtime(
                     channel_map_handle,
                     Some(ask_user_handle),
                     Some(escalate_handle),
+                    Some(channel_send_handle),
                 );
             }
 
@@ -1181,6 +1190,7 @@ pub fn all_tools_with_runtime(
         channel_map_handle,
         Some(ask_user_handle),
         Some(escalate_handle),
+        Some(channel_send_handle),
     )
 }
 
@@ -1225,7 +1235,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1271,7 +1281,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1418,7 +1428,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1455,7 +1465,7 @@ mod tests {
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1494,7 +1504,7 @@ mod tests {
         cfg.skills.prompt_injection_mode =
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -1532,7 +1542,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),

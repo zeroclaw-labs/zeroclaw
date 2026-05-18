@@ -24,6 +24,52 @@ use zeroclaw_tool_call_parser::strip_think_tags;
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// Build the configured channel targets section for system prompt injection.
+/// Returns `Some(string)` if any channels have `default_target` set, `None` otherwise.
+fn build_channel_targets(config: &Config) -> Option<String> {
+    let mut targets = Vec::new();
+    if let Some(ref tg) = config.channels.telegram
+        && let Some(ref target) = tg.default_target
+    {
+        targets.push(("telegram", target.as_str()));
+    }
+    if let Some(ref dc) = config.channels.discord
+        && let Some(ref target) = dc.default_target
+    {
+        targets.push(("discord", target.as_str()));
+    }
+    if let Some(ref sl) = config.channels.slack
+        && let Some(ref target) = sl.default_target
+    {
+        targets.push(("slack", target.as_str()));
+    }
+    if let Some(ref mm) = config.channels.mattermost
+        && let Some(ref target) = mm.default_target
+    {
+        targets.push(("mattermost", target.as_str()));
+    }
+    if let Some(ref mx) = config.channels.matrix
+        && let Some(ref target) = mx.default_target
+    {
+        targets.push(("matrix", target.as_str()));
+    }
+    if let Some(ref irc) = config.channels.irc
+        && let Some(ref target) = irc.default_target
+    {
+        targets.push(("irc", target.as_str()));
+    }
+    if targets.is_empty() {
+        None
+    } else {
+        let mut s = String::from("## Configured Channel Targets\n\n");
+        s.push_str("Use `channel_send` to deliver messages to external channels:\n\n");
+        for (name, target) in &targets {
+            s.push_str(&format!("- {}: `{}`\n", name, target));
+        }
+        Some(s)
+    }
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -59,6 +105,9 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
+    /// Configured channel targets injected into the system prompt so the agent
+    /// knows where to send messages via `channel_send`.
+    channel_targets: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
     /// Activated MCP tools for deferred loading mode.
@@ -87,20 +136,27 @@ pub struct AgentChannelHandles {
     pub reaction: Option<tools::ChannelMapHandle>,
     pub escalate: Option<tools::ChannelMapHandle>,
     pub poll: Option<tools::ChannelMapHandle>,
+    pub channel_send: Option<tools::ChannelMapHandle>,
 }
 
 impl AgentChannelHandles {
-    /// Register a channel into every populated handle so all four
-    /// channel-driven tools can resolve it by name.
+    /// Register a channel into every populated handle so all channel-driven
+    /// tools can resolve it by name.
     pub fn register_channel(
         &self,
         name: impl Into<String>,
         channel: Arc<dyn zeroclaw_api::channel::Channel>,
     ) {
         let name = name.into();
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
+        for handle in [
+            &self.ask_user,
+            &self.reaction,
+            &self.escalate,
+            &self.poll,
+            &self.channel_send,
+        ]
+        .into_iter()
+        .flatten()
         {
             handle.write().insert(name.clone(), Arc::clone(&channel));
         }
@@ -108,9 +164,15 @@ impl AgentChannelHandles {
 
     /// Remove a channel from every populated handle (used on session/stop).
     pub fn unregister_channel(&self, name: &str) {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
+        for handle in [
+            &self.ask_user,
+            &self.reaction,
+            &self.escalate,
+            &self.poll,
+            &self.channel_send,
+        ]
+        .into_iter()
+        .flatten()
         {
             handle.write().remove(name);
         }
@@ -118,9 +180,15 @@ impl AgentChannelHandles {
 
     /// Look up a registered channel by name from any populated channel map.
     pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
-        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
-            .into_iter()
-            .flatten()
+        for handle in [
+            &self.ask_user,
+            &self.reaction,
+            &self.escalate,
+            &self.poll,
+            &self.channel_send,
+        ]
+        .into_iter()
+        .flatten()
         {
             if let Some(channel) = handle.read().get(name) {
                 return Some(Arc::clone(channel));
@@ -465,6 +533,7 @@ impl AgentBuilder {
             allowed_tools: allowed,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            channel_targets: None,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
@@ -727,6 +796,7 @@ impl Agent {
             poll_handle,
             ask_user_handle,
             escalate_handle,
+            channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -960,11 +1030,18 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
+        // Build configured channel targets for system prompt injection.
+        let channel_targets = build_channel_targets(config);
+        if let Some(ref targets) = channel_targets {
+            agent.channel_targets = Some(targets.clone());
+        }
+
         agent.channel_handles = AgentChannelHandles {
             ask_user: ask_user_handle,
             reaction: reaction_handle,
             escalate: escalate_handle,
             poll: Some(poll_handle),
+            channel_send: channel_send_handle,
         };
 
         Ok(agent)
@@ -1038,7 +1115,13 @@ impl Agent {
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
-        self.prompt_builder.build(&ctx)
+        let mut prompt = self.prompt_builder.build(&ctx)?;
+        if let Some(ref targets) = self.channel_targets {
+            prompt.push('\n');
+            prompt.push_str(targets);
+            prompt.push('\n');
+        }
+        Ok(prompt)
     }
 
     async fn prepare_provider_messages(
