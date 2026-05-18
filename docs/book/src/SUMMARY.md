@@ -24,6 +24,7 @@
 - [Crates](./architecture/crates.md)
 - [Logging](./architecture/logging.md)
 - [Multi-agent runtime](./architecture/multi-agent.md)
+- [SubAgents](./architecture/subagents.md)
 
 # Reference
 

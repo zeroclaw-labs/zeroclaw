@@ -7,7 +7,7 @@ This page documents the architecture and operator-facing surface of the multi-ag
 - **Install dir** — the directory holding everything ZeroClaw owns on a host. Typically `~/.zeroclaw/`. Equivalent to the dir containing `config.toml`.
 - **Agent** — a configured `[agents.<alias>]` block: a join table of references (`risk_profile`, `model_provider`, `channels`), a per-agent workspace dir, and a per-agent memory backend selection. Each agent picks one memory backend at creation; that choice is immutable for the agent's lifetime.
 - **Aliased workspace** — `<install>/agents/<alias>/workspace/`. One per agent. Holds the agent's identity files (`AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `BOOTSTRAP.md`, `MEMORY.md`) and any operator data the agent owns.
-- **SubAgent** — a runtime-spawned ephemeral sub-agent that inherits its parent's identity, security policy, and memory allowlist. Two spawn sites: the cron `JobType::Agent` dispatch and the agent-loop `spawn_subagent` tool. SubAgents cannot escalate beyond the parent's permissions.
+- **SubAgent** — a runtime-spawned ephemeral child run that inherits its parent's identity, security policy, and memory allowlist. See [SubAgents](./subagents.md) for the full surface (lifecycle, spawn sites, the depth-1 cap, what gets returned to the parent).
 - **Peer group** — a `[peer_groups.<name>]` block declaring an opt-in cross-agent communication set on a single channel. Mutual membership: agents A and B are peers only when both appear in the same group's `agents` list.
 
 ## Permissions model
@@ -23,7 +23,7 @@ Each agent's effective `SecurityPolicy` is built by `SecurityPolicy::for_agent(c
 
 The read-only allowlist is honored by `file_read` (and other read-side tools); the read-write allowlist gates `file_write`, `file_edit`, `git_operations`, and the shell tool's path-touching invocations. POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are always readable so shell idioms keep working without per-agent config.
 
-SubAgent spawns enforce the rule that a child cannot escalate beyond its parent: `SecurityPolicy::ensure_no_escalation_beyond` runs at spawn time and rejects any policy override that adds paths, commands, or budgets the parent doesn't have. The rejection is wrapped with the precise `EscalationViolation` so diagnostics name the offending field.
+SubAgent spawns enforce the rule that a child cannot escalate beyond its parent. The validator's full axis list and the budget-sharing behavior are documented at [SubAgents → Permission inheritance](./subagents.md#permission-inheritance).
 
 ## Memory model
 
