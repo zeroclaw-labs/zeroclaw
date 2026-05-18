@@ -30,6 +30,8 @@
 
 use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Result, anyhow};
+#[cfg(feature = "whatsapp-web")]
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::path::Path;
@@ -39,6 +41,22 @@ use wa_rs_proto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 #[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
+
+/// Two-way E.164 normalize-and-compare predicate used by the
+/// allowlist aspect for WhatsApp Web. Mirrors the pre-aspect
+/// semantics: if either the entry or the phone fails to normalize to
+/// `+<digits>`, the match is rejected; otherwise the canonical forms
+/// are compared for byte equality.
+#[cfg(feature = "whatsapp-web")]
+pub(crate) fn whatsapp_phone_match(entry: &str, phone: &str) -> bool {
+    match (
+        WhatsAppWebChannel::normalize_phone_token(entry),
+        WhatsAppWebChannel::normalize_phone_token(phone),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -62,8 +80,11 @@ pub struct WhatsAppWebChannel {
     pair_phone: Option<String>,
     /// Custom pair code (optional)
     pair_code: Option<String>,
-    /// Allowed phone numbers (E.164 format) or "*" for all
-    allowed_numbers: Vec<String>,
+    /// Allowed phone numbers (E.164 format) or "*" for all.
+    /// Configured via `allowed_numbers`; the AllowlistAspect installs
+    /// `whatsapp_phone_match` as a matcher so both entries and
+    /// inputs are normalized to canonical E.164 before comparison.
+    allowlist: AllowlistAspect,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
@@ -142,11 +163,13 @@ impl WhatsAppWebChannel {
             );
         }
 
+        let allowlist = AllowlistAspect::new(allowed_numbers).with_matcher(whatsapp_phone_match);
+
         Self {
             session_path,
             pair_phone,
             pair_code,
-            allowed_numbers,
+            allowlist,
             mention_only,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             mode,
@@ -220,35 +243,11 @@ impl WhatsAppWebChannel {
         self
     }
 
-    /// Check if a phone number is allowed (E.164 format: +1234567890)
-    #[cfg(feature = "whatsapp-web")]
-    fn is_number_allowed(&self, phone: &str) -> bool {
-        Self::is_number_allowed_for_list(&self.allowed_numbers, phone)
-    }
-
-    /// Check whether a phone number is allowed against a provided allowlist.
-    #[cfg(feature = "whatsapp-web")]
-    fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-
-        let Some(phone_norm) = Self::normalize_phone_token(phone) else {
-            return false;
-        };
-
-        allowed_numbers.iter().any(|entry| {
-            Self::normalize_phone_token(entry)
-                .as_deref()
-                .is_some_and(|allowed_norm| allowed_norm == phone_norm)
-        })
-    }
-
     /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
     ///
     /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
     #[cfg(feature = "whatsapp-web")]
-    fn normalize_phone_token(value: &str) -> Option<String> {
+    pub(crate) fn normalize_phone_token(value: &str) -> Option<String> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
@@ -983,7 +982,7 @@ impl Channel for WhatsAppWebChannel {
         // Validate recipient allowlist only for direct phone-number targets.
         if !Self::is_jid(&message.recipient) {
             let normalized = self.normalize_phone(&message.recipient);
-            if !self.is_number_allowed(&normalized) {
+            if !self.allowlist.is_allowed(&normalized) {
                 tracing::warn!(
                     "WhatsApp Web: recipient {} not in allowed list",
                     message.recipient
@@ -1148,7 +1147,7 @@ impl Channel for WhatsAppWebChannel {
 
             // Build the bot
             let tx_clone = tx.clone();
-            let allowed_numbers = self.allowed_numbers.clone();
+            let allowlist = self.allowlist.clone();
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
@@ -1175,7 +1174,7 @@ impl Channel for WhatsAppWebChannel {
                 )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
-                    let allowed_numbers = allowed_numbers.clone();
+                    let allowlist = allowlist.clone();
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
@@ -1210,9 +1209,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 let normalized = sender_candidates
                                     .iter()
-                                    .find(|candidate| {
-                                        Self::is_number_allowed_for_list(&allowed_numbers, candidate)
-                                    })
+                                    .find(|candidate| allowlist.is_allowed(candidate))
                                     .cloned();
 
                                 let is_group = info.source.is_group;
@@ -1668,7 +1665,7 @@ impl Channel for WhatsAppWebChannel {
 
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
-            if !self.is_number_allowed(&normalized) {
+            if !self.allowlist.is_allowed(&normalized) {
                 tracing::warn!(
                     "WhatsApp Web: typing target {} not in allowed list",
                     recipient
@@ -1696,7 +1693,7 @@ impl Channel for WhatsAppWebChannel {
 
         if !Self::is_jid(recipient) {
             let normalized = self.normalize_phone(recipient);
-            if !self.is_number_allowed(&normalized) {
+            if !self.allowlist.is_allowed(&normalized) {
                 tracing::warn!(
                     "WhatsApp Web: typing target {} not in allowed list",
                     recipient
@@ -1816,8 +1813,8 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_exact() {
         let ch = make_channel();
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(!ch.is_number_allowed("+9876543210"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+9876543210"));
     }
 
     #[test]
@@ -1834,8 +1831,8 @@ mod tests {
             zeroclaw_config::schema::WhatsAppChatPolicy::default(),
             false,
         );
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(ch.is_number_allowed("+9999999999"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
@@ -1853,7 +1850,7 @@ mod tests {
             false,
         );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
-        assert!(!ch.is_number_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+1234567890"));
     }
 
     #[test]
@@ -1892,11 +1889,18 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_allowlist_matches_normalized_format() {
-        let allowed = vec!["+15551234567".to_string()];
-        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
-            &allowed,
-            "+1 (555) 123-4567"
-        ));
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["+15551234567".to_string()],
+            false,
+            zeroclaw_config::schema::WhatsAppWebMode::default(),
+            zeroclaw_config::schema::WhatsAppChatPolicy::default(),
+            zeroclaw_config::schema::WhatsAppChatPolicy::default(),
+            false,
+        );
+        assert!(ch.allowlist.is_allowed("+1 (555) 123-4567"));
     }
 
     #[test]
@@ -2487,5 +2491,62 @@ mod tests {
         assert!(!fromme_outside_self_chat_is_operator_trigger(
             false, &dm, &group, ""
         ));
+    }
+
+    // ── M1 parity: AllowlistAspect must accept exactly the same set of
+    // (entries, phone) pairs that the pre-aspect
+    // is_number_allowed_for_list shape did. Reference implementation is
+    // inlined below; both implementations are exercised against the
+    // same truth table.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        fn pre_aspect(entries: &[String], phone: &str) -> bool {
+            if entries.iter().any(|entry| entry.trim() == "*") {
+                return true;
+            }
+            let Some(phone_norm) = WhatsAppWebChannel::normalize_phone_token(phone) else {
+                return false;
+            };
+            entries.iter().any(|entry| {
+                WhatsAppWebChannel::normalize_phone_token(entry)
+                    .as_deref()
+                    .is_some_and(|allowed_norm| allowed_norm == phone_norm)
+            })
+        }
+
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "+1234567890"),                          // empty deny
+            (vec![], ""),                                     // empty + invalid input
+            (vec!["*"], "+1234567890"),                       // wildcard
+            (vec!["*"], ""),                                  // wildcard + invalid input
+            (vec!["+1234567890"], "+1234567890"),             // exact E.164 match
+            (vec!["+1234567890"], "+9876543210"),             // E.164 mismatch
+            (vec!["1234567890"], "+1234567890"),              // entry missing '+'
+            (vec!["+1234567890"], "1234567890"),              // phone missing '+'
+            (vec!["+1 (555) 123-4567"], "+15551234567"),      // formatted entry
+            (vec!["+15551234567"], "+1 (555) 123-4567"),      // formatted phone
+            (vec!["+15551234567"], "15551234567@s.whatsapp.net"), // JID phone
+            (vec!["15551234567@s.whatsapp.net"], "+15551234567"), // JID entry
+            (vec!["+1234567890", "+9999999999"], "+9999999999"), // multi-entry hit
+            (vec!["+1234567890", "*"], "anything"),           // wildcard among real entries (deny: not E.164, but wildcard wins)
+            (vec!["garbage"], "+1234567890"),                 // entry with no digits
+            (vec!["+1234567890"], "garbage"),                 // phone with no digits
+            (vec!["garbage"], "trash"),                       // both unnormalizable
+        ];
+
+        for (entries, phone) in cases {
+            let entries_owned: Vec<String> =
+                entries.iter().map(|s| (*s).to_string()).collect();
+            let baseline = pre_aspect(&entries_owned, phone);
+
+            let aspect =
+                AllowlistAspect::new(entries_owned.clone()).with_matcher(whatsapp_phone_match);
+            assert_eq!(
+                aspect.is_allowed(phone),
+                baseline,
+                "aspect drift for entries={entries:?} phone={phone:?}",
+            );
+        }
     }
 }
