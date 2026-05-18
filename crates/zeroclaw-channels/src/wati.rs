@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -14,7 +15,7 @@ pub struct WatiChannel {
     api_token: String,
     api_url: String,
     tenant_id: Option<String>,
-    allowed_numbers: Vec<String>,
+    allowlist: AllowlistAspect,
     client: reqwest::Client,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
@@ -40,7 +41,7 @@ impl WatiChannel {
             api_token,
             api_url,
             tenant_id,
-            allowed_numbers,
+            allowlist: AllowlistAspect::new(allowed_numbers),
             client: zeroclaw_config::schema::build_channel_proxy_client(
                 "channel.wati",
                 proxy_url.as_deref(),
@@ -70,10 +71,6 @@ impl WatiChannel {
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
-    fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
-    }
-
     /// Extract and normalize the sender phone number from a WATI webhook payload.
     /// Returns `None` if the sender is absent, empty, or not in the allowlist.
     fn extract_sender(&self, payload: &serde_json::Value) -> Option<String> {
@@ -98,7 +95,7 @@ impl WatiChannel {
         };
 
         // Check allowlist
-        if !self.is_number_allowed(&normalized_phone) {
+        if !self.allowlist.is_allowed(&normalized_phone) {
             tracing::warn!(
                 "WATI: ignoring message from unauthorized sender: {normalized_phone}. \
                 Add to channels.wati.allowed_numbers in config.toml, \
@@ -448,7 +445,7 @@ mod tests {
             api_token: "test-token".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: None,
-            allowed_numbers: vec!["+1234567890".into()],
+            allowlist: AllowlistAspect::new(vec!["+1234567890".to_string()]),
             client: reqwest::Client::new(),
             transcription_manager: None,
         }
@@ -459,7 +456,7 @@ mod tests {
             api_token: "test-token".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: None,
-            allowed_numbers: vec!["*".into()],
+            allowlist: AllowlistAspect::new(vec!["*".to_string()]),
             client: reqwest::Client::new(),
             transcription_manager: None,
         }
@@ -474,15 +471,15 @@ mod tests {
     #[test]
     fn wati_number_allowed_exact() {
         let ch = make_channel();
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(!ch.is_number_allowed("+9876543210"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+9876543210"));
     }
 
     #[test]
     fn wati_number_allowed_wildcard() {
         let ch = make_wildcard_channel();
-        assert!(ch.is_number_allowed("+1234567890"));
-        assert!(ch.is_number_allowed("+9999999999"));
+        assert!(ch.allowlist.is_allowed("+1234567890"));
+        assert!(ch.allowlist.is_allowed("+9999999999"));
     }
 
     #[test]
@@ -491,11 +488,11 @@ mod tests {
             api_token: "tok".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: None,
-            allowed_numbers: vec![],
+            allowlist: AllowlistAspect::new(Vec::<String>::new()),
             client: reqwest::Client::new(),
             transcription_manager: None,
         };
-        assert!(!ch.is_number_allowed("+1234567890"));
+        assert!(!ch.allowlist.is_allowed("+1234567890"));
     }
 
     #[test]
@@ -504,7 +501,7 @@ mod tests {
             api_token: "tok".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: Some("tenant1".into()),
-            allowed_numbers: vec![],
+            allowlist: AllowlistAspect::new(Vec::<String>::new()),
             client: reqwest::Client::new(),
             transcription_manager: None,
         };
@@ -523,7 +520,7 @@ mod tests {
             api_token: "tok".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: Some("tenant1".into()),
-            allowed_numbers: vec![],
+            allowlist: AllowlistAspect::new(Vec::<String>::new()),
             client: reqwest::Client::new(),
             transcription_manager: None,
         };
@@ -638,7 +635,7 @@ mod tests {
             api_token: "tok".into(),
             api_url: "https://live-mt-server.wati.io".into(),
             tenant_id: None,
-            allowed_numbers: vec!["+1234567890".into()],
+            allowlist: AllowlistAspect::new(vec!["+1234567890".to_string()]),
             client: reqwest::Client::new(),
             transcription_manager: None,
         };
