@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,7 +27,9 @@ pub struct IrcChannel {
     nickname: String,
     username: String,
     channels: Vec<String>,
-    allowed_users: Vec<String>,
+    /// AllowlistAspect with ASCII-lowercase normalizer for case-insensitive
+    /// nick comparison. Initialized from `IrcChannelConfig.allowed_users`.
+    allowlist: AllowlistAspect,
     server_password: Option<String>,
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
@@ -240,13 +243,15 @@ pub struct IrcChannelConfig {
 impl IrcChannel {
     pub fn new(cfg: IrcChannelConfig) -> Self {
         let username = cfg.username.unwrap_or_else(|| cfg.nickname.clone());
+        let allowlist =
+            AllowlistAspect::new(cfg.allowed_users).with_normalizer(|s| s.to_ascii_lowercase());
         Self {
             server: cfg.server,
             port: cfg.port,
             nickname: cfg.nickname,
             username,
             channels: cfg.channels,
-            allowed_users: cfg.allowed_users,
+            allowlist,
             server_password: cfg.server_password,
             nickserv_password: cfg.nickserv_password,
             sasl_password: cfg.sasl_password,
@@ -254,15 +259,6 @@ impl IrcChannel {
             mention_only: cfg.mention_only,
             writer: Arc::new(Mutex::new(None)),
         }
-    }
-
-    fn is_user_allowed(&self, nick: &str) -> bool {
-        if self.allowed_users.iter().any(|u| u == "*") {
-            return true;
-        }
-        self.allowed_users
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(nick))
     }
 
     fn is_mentioned(my_nick: &str, text: &str) -> bool {
@@ -549,7 +545,7 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if !self.is_user_allowed(sender_nick) {
+                    if !self.allowlist.is_allowed(sender_nick) {
                         continue;
                     }
 
@@ -815,8 +811,8 @@ mod tests {
     fn wildcard_allows_anyone() {
         let ch = make_channel();
         // Default make_channel has wildcard
-        assert!(ch.is_user_allowed("anyone"));
-        assert!(ch.is_user_allowed("stranger"));
+        assert!(ch.allowlist.is_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("stranger"));
     }
 
     #[test]
@@ -834,9 +830,9 @@ mod tests {
             verify_tls: true,
             mention_only: false,
         });
-        assert!(ch.is_user_allowed("alice"));
-        assert!(ch.is_user_allowed("bob"));
-        assert!(!ch.is_user_allowed("eve"));
+        assert!(ch.allowlist.is_allowed("alice"));
+        assert!(ch.allowlist.is_allowed("bob"));
+        assert!(!ch.allowlist.is_allowed("eve"));
     }
 
     #[test]
@@ -854,9 +850,9 @@ mod tests {
             verify_tls: true,
             mention_only: false,
         });
-        assert!(ch.is_user_allowed("alice"));
-        assert!(ch.is_user_allowed("ALICE"));
-        assert!(ch.is_user_allowed("Alice"));
+        assert!(ch.allowlist.is_allowed("alice"));
+        assert!(ch.allowlist.is_allowed("ALICE"));
+        assert!(ch.allowlist.is_allowed("Alice"));
     }
 
     #[test]
@@ -874,7 +870,7 @@ mod tests {
             verify_tls: true,
             mention_only: false,
         });
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     // ── Mention only ────────────────────────────────────────
@@ -977,7 +973,8 @@ mod tests {
         assert_eq!(ch.nickname, "zcbot");
         assert_eq!(ch.username, "zeroclaw");
         assert_eq!(ch.channels, vec!["#test"]);
-        assert_eq!(ch.allowed_users, vec!["alice"]);
+        assert!(ch.allowlist.is_allowed("alice"));
+        assert!(!ch.allowlist.is_allowed("eve"));
         assert_eq!(ch.server_password.as_deref(), Some("serverpass"));
         assert_eq!(ch.nickserv_password.as_deref(), Some("nspass"));
         assert_eq!(ch.sasl_password.as_deref(), Some("saslpass"));
@@ -1068,5 +1065,52 @@ nickname = "bot"
             verify_tls: true,
             mention_only: false,
         })
+    }
+
+    // ── M1 parity: AllowlistAspect must accept exactly the same set of
+    // (entries, nick) pairs that the pre-aspect is_user_allowed body did.
+    // The pre-aspect shape: wildcard "*" short-circuit, otherwise
+    // case-insensitive equality against any entry.
+    #[test]
+    fn allowlist_parity_with_pre_aspect_shape() {
+        fn pre_aspect(entries: &[String], nick: &str) -> bool {
+            if entries.iter().any(|u| u == "*") {
+                return true;
+            }
+            entries.iter().any(|u| u.eq_ignore_ascii_case(nick))
+        }
+
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec![], "alice"),
+            (vec![], ""),
+            (vec!["*"], "alice"),
+            (vec!["*"], ""),
+            (vec!["alice"], "alice"),
+            (vec!["alice"], "eve"),
+            (vec!["Alice"], "alice"),
+            (vec!["alice"], "ALICE"),
+            (vec!["ALICE"], "Alice"),
+            (vec!["alice", "bob"], "bob"),
+            (vec!["alice", "*"], "eve"),
+            (vec!["*", "alice"], "anyone"),
+            (vec!["alice"], "alice_"),    // suffix rejected
+            (vec!["alice"], "_alice"),    // prefix rejected
+            (vec!["alice_bot"], "alice"), // substring rejected
+            (vec!["123"], "123"),
+            (vec!["a", "b", "c"], "C"),   // case-insensitive multi-entry
+        ];
+
+        for (entries, nick) in cases {
+            let entries_owned: Vec<String> =
+                entries.iter().map(|s| (*s).to_string()).collect();
+            let baseline = pre_aspect(&entries_owned, nick);
+            let aspect = AllowlistAspect::new(entries_owned.clone())
+                .with_normalizer(|s| s.to_ascii_lowercase());
+            assert_eq!(
+                aspect.is_allowed(nick),
+                baseline,
+                "aspect drift for entries={entries:?} nick={nick:?}",
+            );
+        }
     }
 }
