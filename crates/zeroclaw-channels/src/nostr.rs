@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
@@ -13,38 +14,27 @@ enum NostrProtocol {
     Nip17,
 }
 
-/// Whether to allow all senders (wildcard) or only specific public keys.
-#[derive(Debug, Clone)]
-enum AllowList {
-    /// "*" — accept messages from any pubkey.
-    Any,
-    /// Accept only from these specific pubkeys.
-    Set(Vec<PublicKey>),
-}
-
-impl AllowList {
-    /// Parse the raw config strings into a typed allow list.
-    /// Empty list means deny-all. A single `"*"` means allow-all.
-    fn parse(raw: &[String]) -> Result<Self> {
-        if raw.is_empty() {
-            return Ok(Self::Set(Vec::new())); // deny-all
-        }
-        if raw.iter().any(|p| p == "*") {
-            return Ok(Self::Any);
-        }
-        let mut keys = Vec::with_capacity(raw.len());
-        for s in raw {
-            keys.push(PublicKey::parse(s).with_context(|| format!("Invalid allowed pubkey: {s}"))?);
-        }
-        Ok(Self::Set(keys))
+/// Canonicalize the configured pubkey allow list into the hex strings the
+/// AllowlistAspect compares against. Empty list = deny-all; a single
+/// `"*"` is preserved verbatim and short-circuits the aspect's wildcard
+/// path. Every other entry is validated via `PublicKey::parse` (which
+/// accepts both bech32 npub and hex forms) and stored as canonical
+/// 64-char lowercase hex so it matches `event.pubkey.to_hex()` at the
+/// call site.
+fn canonicalize_allowed_pubkeys(raw: &[String]) -> Result<Vec<String>> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
     }
-
-    fn is_allowed(&self, pubkey: &PublicKey) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Set(keys) => keys.iter().any(|k| k == pubkey),
-        }
+    if raw.iter().any(|p| p == "*") {
+        return Ok(vec!["*".to_string()]);
     }
+    let mut hex_keys = Vec::with_capacity(raw.len());
+    for s in raw {
+        let pk =
+            PublicKey::parse(s).with_context(|| format!("Invalid allowed pubkey: {s}"))?;
+        hex_keys.push(pk.to_hex());
+    }
+    Ok(hex_keys)
 }
 
 /// Nostr channel supporting NIP-04 (legacy) and NIP-17 (gift-wrapped) private messages.
@@ -52,7 +42,10 @@ impl AllowList {
 pub struct NostrChannel {
     client: Client,
     public_key: PublicKey,
-    allowed: AllowList,
+    /// Allowlist of permitted sender pubkeys, stored as canonical
+    /// lowercase hex. Call sites pass `event.pubkey.to_hex()` to
+    /// `is_allowed`. Built once via `AllowlistAspect::new`.
+    allowlist: AllowlistAspect,
     /// Tracks last-seen protocol per sender pubkey so replies match.
     sender_protocols: Arc<RwLock<HashMap<PublicKey, NostrProtocol>>>,
 }
@@ -68,7 +61,7 @@ impl NostrChannel {
     ) -> Result<Self> {
         let keys = Keys::parse(private_key).context("Invalid Nostr private key")?;
         let public_key = keys.public_key();
-        let allowed = AllowList::parse(allowed_pubkeys)?;
+        let allowlist = AllowlistAspect::new(canonicalize_allowed_pubkeys(allowed_pubkeys)?);
 
         let client = Client::builder().signer(keys).build();
         for relay in &relays {
@@ -82,7 +75,7 @@ impl NostrChannel {
         Ok(Self {
             client,
             public_key,
-            allowed,
+            allowlist,
             sender_protocols: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -180,7 +173,7 @@ impl Channel for NostrChannel {
                             if event.created_at < listen_start {
                                 continue;
                             }
-                            if !self.allowed.is_allowed(&event.pubkey) {
+                            if !self.allowlist.is_allowed(&event.pubkey.to_hex()) {
                                 tracing::warn!(
                                     "Nostr: ignoring NIP-04 message from unauthorized pubkey: {}",
                                     event.pubkey.to_hex()
@@ -217,7 +210,7 @@ impl Channel for NostrChannel {
                                         continue;
                                     }
                                     let sender = rumor.pubkey;
-                                    if !self.allowed.is_allowed(&sender) {
+                                    if !self.allowlist.is_allowed(&sender.to_hex()) {
                                         tracing::warn!(
                                             "Nostr: ignoring NIP-17 message from unauthorized pubkey: {}",
                                             sender.to_hex()
@@ -286,18 +279,22 @@ impl Channel for NostrChannel {
 mod tests {
     use super::*;
 
+    fn make_aspect(raw: &[String]) -> AllowlistAspect {
+        AllowlistAspect::new(canonicalize_allowed_pubkeys(raw).unwrap())
+    }
+
     #[test]
     fn allow_list_empty_denies_all() {
-        let al = AllowList::parse(&[]).unwrap();
+        let al = make_aspect(&[]);
         let pk = Keys::generate().public_key();
-        assert!(!al.is_allowed(&pk));
+        assert!(!al.is_allowed(&pk.to_hex()));
     }
 
     #[test]
     fn allow_list_wildcard_allows_all() {
-        let al = AllowList::parse(&["*".to_string()]).unwrap();
+        let al = make_aspect(&["*".to_string()]);
         let pk = Keys::generate().public_key();
-        assert!(al.is_allowed(&pk));
+        assert!(al.is_allowed(&pk.to_hex()));
     }
 
     #[test]
@@ -305,16 +302,29 @@ mod tests {
         let k1 = Keys::generate();
         let k2 = Keys::generate();
         let k3 = Keys::generate();
-        let al = AllowList::parse(&[k1.public_key().to_hex(), k2.public_key().to_hex()]).unwrap();
-        assert!(al.is_allowed(&k1.public_key()));
-        assert!(al.is_allowed(&k2.public_key()));
-        assert!(!al.is_allowed(&k3.public_key()));
+        let al = make_aspect(&[k1.public_key().to_hex(), k2.public_key().to_hex()]);
+        assert!(al.is_allowed(&k1.public_key().to_hex()));
+        assert!(al.is_allowed(&k2.public_key().to_hex()));
+        assert!(!al.is_allowed(&k3.public_key().to_hex()));
     }
 
     #[test]
     fn allow_list_rejects_invalid_key() {
-        let result = AllowList::parse(&["not-a-valid-pubkey".to_string()]);
+        let result = canonicalize_allowed_pubkeys(&["not-a-valid-pubkey".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn allow_list_canonicalizes_npub_to_hex() {
+        // bech32 npub form must match the hex form (and vice versa).
+        let k = Keys::generate();
+        let pk = k.public_key();
+        let npub = pk.to_bech32().unwrap();
+        let al = make_aspect(std::slice::from_ref(&npub));
+        assert!(
+            al.is_allowed(&pk.to_hex()),
+            "aspect must canonicalize npub entries to hex so call-site to_hex() matches",
+        );
     }
 
     #[tokio::test]
