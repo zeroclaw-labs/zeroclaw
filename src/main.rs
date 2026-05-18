@@ -2147,7 +2147,7 @@ async fn main() -> Result<()> {
             integration_command,
         } => integrations::handle_command(integration_command, &config),
 
-        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config).await,
 
         Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 
