@@ -65,11 +65,13 @@ jobs:
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
           - os: ubuntu-latest
             target: arm-unknown-linux-gnueabihf
             cross_compiler: gcc-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
           - os: ubuntu-latest
@@ -131,7 +133,12 @@ jobs:
             export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
-          cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
+          FEATURES="channel-matrix,channel-lark"
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zeroclaw-manual-${{ matrix.target }}
