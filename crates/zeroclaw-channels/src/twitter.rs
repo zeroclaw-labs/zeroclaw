@@ -1,3 +1,4 @@
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
@@ -12,7 +13,7 @@ const TWITTER_API_BASE: &str = "https://api.x.com/2";
 /// for sending tweets/DMs and filtered stream for receiving mentions.
 pub struct TwitterChannel {
     bearer_token: String,
-    allowed_users: Vec<String>,
+    allowlist: AllowlistAspect,
     /// Message deduplication set.
     dedup: Arc<RwLock<HashSet<String>>>,
 }
@@ -24,17 +25,13 @@ impl TwitterChannel {
     pub fn new(bearer_token: String, allowed_users: Vec<String>) -> Self {
         Self {
             bearer_token,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.twitter")
-    }
-
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     /// Check and insert tweet ID for deduplication.
@@ -257,7 +254,8 @@ impl Channel for TwitterChannel {
                                 .cloned()
                                 .unwrap_or_else(|| author_id.to_string());
 
-                            if !self.is_user_allowed(&username) && !self.is_user_allowed(author_id)
+                            if !self.allowlist.is_allowed(&username)
+                                && !self.allowlist.is_allowed(author_id)
                             {
                                 tracing::debug!(
                                     "Twitter: ignoring mention from unauthorized user: {username}"
@@ -390,20 +388,20 @@ mod tests {
     #[test]
     fn test_user_allowed_wildcard() {
         let ch = TwitterChannel::new("token".into(), vec!["*".into()]);
-        assert!(ch.is_user_allowed("anyone"));
+        assert!(ch.allowlist.is_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
         let ch = TwitterChannel::new("token".into(), vec!["user123".into()]);
-        assert!(ch.is_user_allowed("user123"));
-        assert!(!ch.is_user_allowed("other"));
+        assert!(ch.allowlist.is_allowed("user123"));
+        assert!(!ch.allowlist.is_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
         let ch = TwitterChannel::new("token".into(), vec![]);
-        assert!(!ch.is_user_allowed("anyone"));
+        assert!(!ch.allowlist.is_allowed("anyone"));
     }
 
     #[tokio::test]
