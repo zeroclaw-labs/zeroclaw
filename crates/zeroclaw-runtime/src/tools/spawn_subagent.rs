@@ -385,6 +385,64 @@ mod tests {
         );
     }
 
+    /// Receipt log: when a spawn proceeds past the depth/gate guards
+    /// and reaches the `agent::run` call, an INFO record fires naming
+    /// the parent alias and the child's `run_id`. Operators tail the
+    /// log and grep `spawn_subagent.proceed` to verify a spawn really
+    /// happened (the existing `zeroclaw_scope` block alone makes this
+    /// hard to distinguish from regular agent activity).
+    #[tokio::test]
+    async fn proceed_emits_structured_receipt_log() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufferWriter(StdArc<Mutex<Vec<u8>>>);
+        impl Write for BufferWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufferWriter {
+            type Writer = BufferWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = StdArc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = BufferWriter(StdArc::clone(&buf));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Config with a valid parent agent; agent::run will fail because
+        // no model provider is reachable, but the receipt fires BEFORE
+        // agent::run so the test does not depend on the LLM round-trip.
+        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha");
+        let _ = tool.execute(json!({ "prompt": "hello world" })).await;
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("spawn_subagent.proceed"),
+            "expected a structured receipt event named 'spawn_subagent.proceed' before agent::run; \
+             log capture was: {captured}"
+        );
+        assert!(
+            captured.contains("agent=alpha") || captured.contains("agent=\"alpha\""),
+            "receipt must carry the parent alias as `agent=<alias>`; got: {captured}"
+        );
+    }
+
     // ── Tool : Attributable contract ──────────────────────────
     //
     // Every Tool impl carries a structured role + alias the same way
