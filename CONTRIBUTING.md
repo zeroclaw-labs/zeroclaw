@@ -59,7 +59,6 @@ Pre-push hook opt-ins (set the env var to enable for one push):
 | Variable | Effect |
 |---|---|
 | `ZEROCLAW_STRICT_LINT=1` | Strict lint pass on the full repo |
-| `ZEROCLAW_STRICT_DELTA_LINT=1` | Strict lint on changed Rust lines only |
 | `ZEROCLAW_DOCS_LINT=1` | Markdown gate on changed lines |
 | `ZEROCLAW_DOCS_LINKS=1` | Link check on added links only |
 
@@ -124,7 +123,7 @@ For maintainer-facing content (PR workflow, reviewer playbook, release runbook, 
 - **Template is mandatory.** Complete every section in `.github/pull_request_template.md`.
 - **Validation evidence is required** — actual command output, not "CI will check."
 - **Privacy and identity discipline is a merge gate.** Never commit real names, emails, tokens, or PII.
-- **Co-authoring with AI is welcome.** Use the `Co-Authored-By` trailer where AI tools materially contributed.
+- **AI-assisted collaboration is welcome.** Do not add bot/AI attribution trailers or generated tool footers to PR bodies or commit-message tails. Human `Co-authored-by` trailers remain appropriate for incorporated contributor work when they follow the superseding and privacy rules.
 - **Squash-merge with conventional commits** is the merge style.
 
 ## Reporting

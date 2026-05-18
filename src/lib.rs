@@ -165,11 +165,20 @@ was previously paired (useful for adding additional clients).
 
 Examples:
   zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+  zeroclaw gateway get-paircode --new # generate a new pairing code
+  zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
     GetPaircode {
         /// Generate a new pairing code (even if already paired)
         #[arg(long)]
         new: bool,
+
+        /// Port of the running gateway to query; defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running gateway to query; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -287,6 +296,10 @@ pub enum SkillCommands {
     Install {
         /// Source URL or local path
         source: String,
+        /// Suppress only the install-time tier banner; other install
+        /// progress output (resolving, installed, audited) is unaffected.
+        #[arg(long)]
+        no_tier_banner: bool,
     },
     /// Remove an installed skill
     Remove {
@@ -328,8 +341,8 @@ pub enum CronCommands {
 Add a new recurring scheduled task.
 
 Uses standard 5-field cron syntax: 'min hour day month weekday'. \
-Times are evaluated in UTC by default; use --tz with an IANA \
-timezone name to override.
+When --tz is omitted, cron schedules use the runtime local timezone. \
+For user-facing schedules, pass --tz with an explicit IANA timezone.
 
 Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
@@ -350,17 +363,18 @@ Examples:
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
+    /// Add a one-shot scheduled task at an RFC3339 timestamp with explicit Z or offset
     #[command(long_about = "\
-Add a one-shot task that fires at a specific UTC timestamp.
+Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
 
-The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
+The timestamp must include an explicit Z or numeric offset \
+(e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
 
 Examples:
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
   zeroclaw cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
-        /// One-shot timestamp in RFC3339 format
+        /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]

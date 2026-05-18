@@ -1,31 +1,31 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import type { CronSettings } from '@/lib/api';
 import {
-  Clock,
-  Plus,
-  Trash2,
-  X,
-  CheckCircle,
-  XCircle,
-  AlertCircle,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-  Pencil,
-  Play,
-} from 'lucide-react';
-import type { CronJob, CronRun } from '@/types/api';
-import {
-  getCronJobs,
   addCronJob,
   deleteCronJob,
+  getCronJobs,
   getCronRuns,
   getCronSettings,
-  patchCronSettings,
   patchCronJob,
+  patchCronSettings,
   triggerCronJob,
 } from '@/lib/api';
-import type { CronSettings } from '@/lib/api';
 import { t } from '@/lib/i18n';
+import type { CronJob, CronRun } from '@/types/api';
+import {
+  AlertCircle,
+  CheckCircle,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  Trash2,
+  X,
+  XCircle,
+} from 'lucide-react';
+import React, { useCallback, useEffect, useState } from 'react';
 
 function formatDate(iso: string | null): string {
   if (!iso) return '-';
@@ -39,6 +39,23 @@ function formatDuration(ms: number | null): string {
   const secs = ms / 1000;
   if (secs < 60) return `${secs.toFixed(1)}s`;
   return `${(secs / 60).toFixed(1)}m`;
+}
+
+function browserProvidedTimezone(): string {
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof timezone === 'string' ? timezone : '';
+  } catch {
+    return '';
+  }
+}
+
+function scheduleTimezone(job: CronJob): string | null {
+  const schedule = job.schedule;
+  if (schedule.kind === 'cron' && typeof schedule.tz === 'string' && schedule.tz.trim()) {
+    return schedule.tz;
+  }
+  return null;
 }
 
 function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?: number }) {
@@ -163,6 +180,7 @@ export default function Cron() {
   // Shared form state for both add and edit
   const [formName, setFormName] = useState('');
   const [formSchedule, setFormSchedule] = useState('');
+  const [formTimezone, setFormTimezone] = useState('');
   const [formCommand, setFormCommand] = useState('');
   const [formJobType, setFormJobType] = useState<'shell' | 'agent'>('shell');
   const [formPrompt, setFormPrompt] = useState('');
@@ -177,6 +195,7 @@ export default function Cron() {
   const openAddModal = () => {
     setFormName('');
     setFormSchedule('');
+    setFormTimezone(browserProvidedTimezone());
     setFormCommand('');
     setFormJobType('shell');
     setFormPrompt('');
@@ -191,6 +210,7 @@ export default function Cron() {
     const jobType = job.job_type === 'agent' ? 'agent' : 'shell';
     setFormName(job.name ?? '');
     setFormSchedule(job.expression);
+    setFormTimezone(scheduleTimezone(job) ?? '');
     setFormJobType(jobType);
     if (jobType === 'agent') {
       setFormPrompt(job.prompt ?? '');
@@ -224,7 +244,7 @@ export default function Cron() {
   };
 
   const fetchSettings = () => {
-    getCronSettings().then(setSettings).catch(() => {});
+    getCronSettings().then(setSettings).catch(() => { });
   };
 
   const toggleCatchUp = async () => {
@@ -266,10 +286,17 @@ export default function Cron() {
 
     try {
       if (isEditing) {
-        const patch: { name?: string; schedule?: string; command?: string; prompt?: string } = {
+        const existingTimezone = scheduleTimezone(modalJob as CronJob);
+        const timezone = formTimezone.trim();
+        const patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string } = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
+        if (timezone) {
+          patch.tz = timezone;
+        } else if (existingTimezone) {
+          patch.clear_tz = true;
+        }
         if (isAgent) {
           patch.prompt = formPrompt.trim();
         } else {
@@ -286,6 +313,8 @@ export default function Cron() {
           schedule: formSchedule.trim(),
           job_type: formJobType,
         };
+        const timezone = formTimezone.trim();
+        if (timezone) body.tz = timezone;
         if (isAgent) {
           body.prompt = formPrompt.trim();
           if (formModel.trim()) body.model = formModel.trim();
@@ -355,11 +384,11 @@ export default function Cron() {
     if (!status) return null;
     switch (status.toLowerCase()) {
       case 'ok':
-        case 'success':
-          return <CheckCircle className="h-4 w-4" style={{ color: 'var(--color-status-success)' }} />;
+      case 'success':
+        return <CheckCircle className="h-4 w-4" style={{ color: 'var(--color-status-success)' }} />;
       case 'error':
-        case 'failed':
-          return <XCircle className="h-4 w-4" style={{ color: 'var(--color-status-error)' }} />;
+      case 'failed':
+        return <XCircle className="h-4 w-4" style={{ color: 'var(--color-status-error)' }} />;
       default:
         return <AlertCircle className="h-4 w-4" style={{ color: 'var(--color-status-warning)' }} />;
     }
@@ -422,11 +451,10 @@ export default function Cron() {
             }
           >
             <span
-              className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${
-                settings.catch_up_on_startup
+              className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${settings.catch_up_on_startup
                   ? 'translate-x-6'
                   : 'translate-x-1'
-              }`}
+                }`}
             />
           </button>
         </div>
@@ -472,11 +500,10 @@ export default function Cron() {
                     <button
                       type="button"
                       onClick={() => setFormJobType('shell')}
-                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
-                        formJobType === 'shell'
+                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${formJobType === 'shell'
                           ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
                           : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                      }`}
+                        }`}
                       style={formJobType === 'shell' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
                     >
                       {t('cron.job_type_shell')}
@@ -484,11 +511,10 @@ export default function Cron() {
                     <button
                       type="button"
                       onClick={() => setFormJobType('agent')}
-                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
-                        formJobType === 'agent'
+                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${formJobType === 'agent'
                           ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
                           : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                      }`}
+                        }`}
                       style={formJobType === 'agent' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
                     >
                       {t('cron.job_type_agent')}
@@ -507,6 +533,12 @@ export default function Cron() {
                   {t('cron.schedule_required')} <span style={{ color: 'var(--color-status-error)' }}>*</span>
                 </label>
                 <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder="e.g. 0 0 * * * (cron expression)" className="input-electric w-full px-3 py-2.5 text-sm" />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  {t('cron.timezone')}
+                </label>
+                <input type="text" value={formTimezone} onChange={(e) => setFormTimezone(e.target.value)} placeholder="e.g. America/New_York" className="input-electric w-full px-3 py-2.5 text-sm font-mono" />
               </div>
 
               {/* Conditional fields based on job type */}
@@ -559,11 +591,10 @@ export default function Cron() {
                           <button
                             type="button"
                             onClick={() => setFormSessionTarget('isolated')}
-                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                              formSessionTarget === 'isolated'
+                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'isolated'
                                 ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
                                 : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                            }`}
+                              }`}
                             style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
                           >
                             {t('cron.session_isolated')}
@@ -571,11 +602,10 @@ export default function Cron() {
                           <button
                             type="button"
                             onClick={() => setFormSessionTarget('main')}
-                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                              formSessionTarget === 'main'
+                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formSessionTarget === 'main'
                                 ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
                                 : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                            }`}
+                              }`}
                             style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
                           >
                             {t('cron.session_main')}
@@ -652,38 +682,41 @@ export default function Cron() {
                 <th>{t('cron.name')}</th>
                 <th>{t('cron.job_type')}</th>
                 <th>{t('cron.command')}</th>
+                <th>{t('cron.timezone')}</th>
                 <th>{t('cron.next_run')}</th>
                 <th>{t('cron.last_status')}</th>
                 <th>{t('cron.enabled')}</th>
-                <th className="text-right">{t('cron.actions')}</th>
+                <th>{t('cron.actions')}</th>
               </tr>
             </thead>
             <tbody>
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <tr>
-                    <td className="font-mono text-xs">
+                    <td className="font-mono text-xs max-w-40">
                       <button
                         onClick={() =>
                           setExpandedJob((prev) =>
                             prev === job.id ? null : job.id,
                           )
-                      }
-                        className="flex items-center gap-1 btn-icon"
+                        }
+                        className="flex min-w-0 items-center gap-1 btn-icon max-w-full"
                         title="Toggle run history"
                       >
                         {expandedJob === job.id ? (
-                          <ChevronDown className="h-3.5 w-3.5" />
+                          <ChevronDown className="h-3.5 w-3.5 shrink-0" />
                         ) : (
-                          <ChevronRight className="h-3.5 w-3.5" />
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
                         )}
-                        {job.id?.slice(0, 8) ?? job.id}
+                        <span className='min-w-0 truncate'>
+                          {job.id}
+                        </span>
                       </button>
                     </td>
-                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
+                    <td className="font-medium text-sm text-center" style={{ color: 'var(--pc-text-primary)' }}>
                       {job.name ?? '-'}
                     </td>
-                    <td>
+                    <td className='text-center'>
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold border"
                         style={job.job_type === 'agent'
                           ? { color: 'var(--pc-accent)', borderColor: 'rgba(0, 128, 255, 0.2)', background: 'rgba(0, 128, 255, 0.06)' }
@@ -692,28 +725,31 @@ export default function Cron() {
                         {job.job_type === 'agent' ? t('cron.job_type_agent') : t('cron.job_type_shell')}
                       </span>
                     </td>
-                    <td className="font-mono text-xs max-w-[200px] truncate" style={{ color: 'var(--pc-text-secondary)' }}>
+                    <td className="font-mono text-xs max-w-50 truncate text-center" style={{ color: 'var(--pc-text-secondary)' }}>
                       {job.prompt ?? job.command}
                     </td>
-                    <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                    <td className="font-mono text-xs text-center" style={{ color: 'var(--pc-text-muted)' }}>
+                      {scheduleTimezone(job) ?? t('cron.runtime_local_timezone')}
+                    </td>
+                    <td className="text-xs text-center" style={{ color: 'var(--pc-text-muted)' }}>
                       {formatDate(job.next_run)}
                     </td>
-                    <td>
-                      <div className="flex items-center gap-1.5">
+                    <td className="text-center">
+                      <div className="flex items-center gap-1.5 justify-center">
                         {statusIcon(job.last_status)}
                         <span className="text-xs capitalize" style={{ color: 'var(--pc-text-secondary)' }}>
                           {job.last_status ?? '-'}
                         </span>
                       </div>
                     </td>
-                    <td>
+                    <td className="text-center">
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold border"
                         style={job.enabled ? { color: 'var(--color-status-success)', borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' } : { color: 'var(--pc-text-faint)', borderColor: 'var(--pc-border)', background: 'transparent' }}>
                         {job.enabled ? t('cron.enabled_status') : t('cron.disabled_status')}
                       </span>
                     </td>
-                    <td className="text-right">
-                      <div className="flex items-center justify-end gap-2">
+                    <td className="text-center">
+                      <div className="flex items-center justify-center gap-2">
                         <button
                           onClick={() => handleTrigger(job.id)}
                           className="btn-icon"
@@ -766,7 +802,7 @@ export default function Cron() {
                   </tr>
                   {expandedJob === job.id && (
                     <tr>
-                      <td colSpan={8} style={{ background: 'var(--pc-bg-elevated)' }}>
+                      <td colSpan={9} style={{ background: 'var(--pc-bg-elevated)' }}>
                         <RunHistoryPanel jobId={job.id} refreshKey={runHistoryRefresh[job.id] ?? 0} />
                       </td>
                     </tr>

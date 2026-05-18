@@ -187,6 +187,35 @@ pub trait Observer: Send + Sync + 'static {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Blanket implementation: `Arc<T>` delegates all `Observer` methods to `T`.
+///
+/// Lets a singleton observer be handed out as `Arc<MyObserver>` and still be
+/// used wherever `Box<dyn Observer>` is expected (e.g.
+/// `Box::new(MyObserver::shared())`). `as_any` deliberately delegates to the
+/// inner `T` so downcasts in handlers like `/metrics` recover the concrete
+/// type rather than the `Arc` wrapper.
+impl<T: Observer + ?Sized> Observer for std::sync::Arc<T> {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.as_ref().record_event(event);
+    }
+
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.as_ref().record_metric(metric);
+    }
+
+    fn flush(&self) {
+        self.as_ref().flush();
+    }
+
+    fn name(&self) -> &str {
+        self.as_ref().name()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.as_ref().as_any()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,10 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
 
 # Copy the web dashboard bundled alongside the binary in the release tarball.
-# The dashboard was decoupled from the binary in #5665 and is now served from
-# disk at `gateway.web_dist_dir`; without this COPY the image has no
-# `/zeroclaw-data/web/dist` and `GET /` returns HTTP 503.
-COPY bin/${TARGETARCH}/web/dist /zeroclaw-data/web/dist
+# Installed at /usr/share/zeroclawlabs/web/dist (outside the documented
+# /zeroclaw-data mount) so a bind mount on /zeroclaw-data cannot shadow it
+# (#6400). The dashboard was decoupled from the binary in #5665 and is now
+# served from disk at `gateway.web_dist_dir`.
+COPY bin/${TARGETARCH}/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Runtime directory structure and default config
 COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/

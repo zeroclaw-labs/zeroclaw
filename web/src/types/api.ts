@@ -1,4 +1,5 @@
 export interface StatusResponse {
+  version?: string;
   provider: string | null;
   model: string;
   temperature: number;
@@ -32,6 +33,11 @@ export interface ToolSpec {
   parameters: any;
 }
 
+export type CronSchedule =
+  | { kind: 'cron'; expr: string; tz?: string | null }
+  | { kind: 'at'; at: string }
+  | { kind: 'every'; every_ms: number };
+
 export interface CronJob {
   id: string;
   name: string | null;
@@ -39,7 +45,7 @@ export interface CronJob {
   command: string;
   prompt: string | null;
   job_type: string;
-  schedule: unknown;
+  schedule: CronSchedule;
   enabled: boolean;
   delivery: unknown;
   delete_after_run: boolean;
@@ -68,11 +74,11 @@ export interface Integration {
   name: string;
   description: string;
   category: string;
-  status: 'Available' | 'Active';
+  status: "Available" | "Active";
 }
 
 export interface DiagResult {
-  severity: 'ok' | 'warn' | 'error';
+  severity: "ok" | "warn" | "error";
   category: string;
   message: string;
 }
@@ -122,10 +128,10 @@ export interface ChannelDetail {
   name: string;
   type: string;
   enabled: boolean;
-  status: 'active' | 'inactive' | 'error';
+  status: "active" | "inactive" | "error";
   message_count: number;
   last_message_at: string | null;
-  health: 'healthy' | 'degraded' | 'down';
+  health: "healthy" | "degraded" | "down";
 }
 
 export interface SSEEvent {
@@ -136,17 +142,19 @@ export interface SSEEvent {
 
 export interface WsMessage {
   type:
-    | 'message'
-    | 'chunk'
-    | 'chunk_reset'
-    | 'thinking'
-    | 'tool_call'
-    | 'tool_result'
-    | 'done'
-    | 'error'
-    | 'session_start'
-    | 'connected'
-    | 'cron_result';
+    | "message"
+    | "chunk"
+    | "chunk_reset"
+    | "thinking"
+    | "tool_call"
+    | "tool_result"
+    | "done"
+    | "error"
+    | "session_start"
+    | "connected"
+    | "cron_result"
+    | "approval_request"
+    | "aborted";
   content?: string;
   full_response?: string;
   name?: string;
@@ -160,6 +168,22 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  // Supervised-mode tool approval (server → client). See #6522.
+  request_id?: string;
+  tool?: string;
+  arguments_summary?: string;
+  timeout_secs?: number;
+}
+
+export type ApprovalDecision = "approve" | "deny" | "always";
+
+export interface PendingApproval {
+  requestId: string;
+  toolName: string;
+  argumentsSummary: string;
+  timeoutSecs: number;
+  /** Wall-clock millis when the request arrived; used to compute remaining time. */
+  receivedAt: number;
 }
 
 /** Row from GET /api/sessions/{id}/messages */

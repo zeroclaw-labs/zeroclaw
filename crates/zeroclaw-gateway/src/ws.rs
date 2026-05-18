@@ -218,7 +218,8 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-    let mut memory_session_id = session_id.clone();
+    // Match the sanitized form persisted by memory backend migrations.
+    let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
@@ -284,7 +285,8 @@ async fn handle_socket(
                             "WebSocket connect params received"
                         );
                         if let Some(sid) = &cp.session_id {
-                            memory_session_id = sid.clone();
+                            memory_session_id =
+                                zeroclaw_api::session_keys::sanitize_session_key(sid);
                             debug!(
                                 session_id = sid,
                                 "WebSocket connect session override received"
@@ -325,35 +327,47 @@ async fn handle_socket(
         }
     };
 
+    if let Some(err) = needs_onboarding_ws_error(&config) {
+        let _ = sender.send(Message::Text(err.to_string().into())).await;
+        return;
+    }
+
     // Build a persistent Agent for this connection so history is maintained
     // across turns. The session cwd becomes the security sandbox root; config
     // workspace remains the daemon data directory.
-    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
-        &config,
-        Some(&session_cwd),
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "Agent initialization failed");
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to initialise agent: {e}"),
-                "code": "AGENT_INIT_FAILED"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 1011,
-                    reason: axum::extract::ws::Utf8Bytes::from_static(
-                        "Agent initialization failed",
-                    ),
-                })))
-                .await;
-            return;
-        }
-    };
+    let mut agent =
+        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &config,
+            Some(&session_cwd),
+            true,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "Agent initialization failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to initialise agent: {e}"),
+                    "code": "AGENT_INIT_FAILED"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = sender
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: axum::extract::ws::Utf8Bytes::from_static(
+                            "Agent initialization failed",
+                        ),
+                    })))
+                    .await;
+                return;
+            }
+        };
+    // Inject the gateway's BroadcastObserver so that lifecycle events emitted
+    // inside Agent::turn_streamed (AgentStart, LlmRequest, LlmResponse,
+    // TurnComplete, AgentEnd) are broadcast to the SSE /api/events stream.
+    // Without this injection the WS path is dark to SSE dashboard clients.
+    agent.set_observer(state.observer.clone());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -557,7 +571,9 @@ async fn handle_socket(
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
-                if let Ok(event) = event {
+                if let Ok(event) = event
+                    && event_matches_session(&event, &session_id)
+                {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
             }
@@ -608,6 +624,27 @@ fn resolve_session_cwd(
         .map_err(|e| anyhow::anyhow!("cwd is not a usable directory ({}): {e}", cwd.display()))
 }
 
+fn needs_onboarding_ws_error(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<serde_json::Value> {
+    let model = config.providers.resolve_default_model().unwrap_or_default();
+    crate::needs_onboarding_for(&model)?;
+    Some(serde_json::json!({
+        "type": "error",
+        "error": "needs_onboarding",
+        "code": "NEEDS_ONBOARDING",
+        "message": crate::needs_onboarding_channel_reply(),
+        "url": "/onboard",
+    }))
+}
+
+fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
+    match event.get("session_id").and_then(|value| value.as_str()) {
+        Some(event_session_id) => event_session_id == session_id,
+        None => true,
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 ///
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
@@ -632,13 +669,6 @@ async fn process_chat_message(
         .fallback
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-
-    // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "provider": provider_label,
-        "model": state.model,
-    }));
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -706,11 +736,42 @@ async fn process_chat_message(
     // tool approval could neither be sent to the client nor answered before
     // the timeout fired.
     let forward_fut = async {
+        let mut cancel_drained = false;
         loop {
             tokio::select! {
                 biased;
+                // ── Cancellation arm ─────────────────────────────
+                // When `/abort` cancels the token, immediately drop every
+                // parked oneshot sender so any in-flight `request_approval`
+                // unblocks via the "sender dropped → deny" path in
+                // `WsApprovalChannel`. Without this, the approval future
+                // races only its own `timeout_secs` (default 120s) and
+                // ignores the cancel token, so the abort sits idle for up
+                // to two minutes before the tool loop even gets a chance
+                // to observe the cancellation.
+                _ = cancel_token.cancelled(), if !cancel_drained => {
+                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                    drop(drained);
+                    cancel_drained = true;
+                    // Fall through; the agent loop will now wake from the
+                    // approval await, see the cancel token, and propagate
+                    // a ToolLoopCancelled error which closes event_rx and
+                    // breaks this loop on the `event_rx.recv()` arm below.
+                }
                 client_msg = receiver.next() => {
-                    let Some(Ok(Message::Text(text))) = client_msg else { continue };
+                    // On client disconnect, `receiver.next()` returns `None`
+                    // (stream end) or `Err(_)` repeatedly. A bare `continue`
+                    // hot-loops the select; cancel the turn so `turn_fut`
+                    // resolves with `ToolLoopCancelled` and `tokio::join!`
+                    // below can return. See #6514.
+                    let text = match client_msg {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            cancel_token.cancel();
+                            break;
+                        }
+                        _ => continue,
+                    };
                     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                         continue;
                     };
@@ -864,13 +925,6 @@ async fn process_chat_message(
             let _ = backend.set_session_state(session_key, "idle", None);
         }
 
-        // Broadcast agent_end event
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_end",
-            "provider": provider_label,
-            "model": state.model,
-        }));
-
         // Trace the cancelled turn so the doctor / replay tool sees it
         // alongside successful turns. #6001 follow-through.
         zeroclaw_runtime::observability::runtime_trace::record_event(
@@ -961,13 +1015,6 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(session_key, "idle", None);
             }
-
-            // Broadcast agent_end event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "agent_end",
-                "provider": provider_label,
-                "model": state.model,
-            }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
             // sweep sees gateway WS turns alongside channel and CLI turns.
@@ -1170,6 +1217,28 @@ mod tests {
     }
 
     #[test]
+    fn session_scoped_events_only_match_their_session() {
+        let target_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "deploy finished"
+        });
+        let other_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-2",
+            "content": "different session"
+        });
+        let global_event = serde_json::json!({
+            "type": "cron_result",
+            "content": "global notification"
+        });
+
+        assert!(event_matches_session(&target_event, "operator-1"));
+        assert!(!event_matches_session(&other_event, "operator-1"));
+        assert!(event_matches_session(&global_event, "operator-1"));
+    }
+
+    #[test]
     fn resolve_session_cwd_uses_requested_cwd() {
         let requested = tempfile::tempdir().unwrap();
         let fallback = tempfile::tempdir().unwrap();
@@ -1198,5 +1267,101 @@ mod tests {
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    #[test]
+    fn needs_onboarding_ws_error_points_to_onboard() {
+        let config = zeroclaw_config::schema::Config::default();
+        let frame = needs_onboarding_ws_error(&config)
+            .expect("empty model must produce a WS onboarding error");
+
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["error"], "needs_onboarding");
+        assert_eq!(frame["code"], "NEEDS_ONBOARDING");
+        assert_eq!(frame["url"], "/onboard");
+        let message = frame["message"]
+            .as_str()
+            .expect("onboarding WS error must include a message");
+        assert!(
+            !message.starts_with('{') && !message.ends_with('}'),
+            "missing Fluent key fallback leaked into WS error message: {message:?}"
+        );
+        assert!(
+            message.to_lowercase().contains("onboarding"),
+            "WS onboarding message must explain the setup gap: {message:?}"
+        );
+    }
+
+    #[test]
+    fn needs_onboarding_ws_error_uses_current_configured_model() {
+        let mut config = zeroclaw_config::schema::Config {
+            providers: zeroclaw_config::providers::ProvidersConfig {
+                fallback: Some("openai".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.ensure_fallback_provider().model = Some("openai/gpt-4o-mini".to_string());
+
+        assert!(
+            needs_onboarding_ws_error(&config).is_none(),
+            "current configured model must allow WebSocket agent construction to continue"
+        );
+    }
+
+    // Regression for #6514. The mid-turn `client_msg` arm in `forward_fut`
+    // must (a) classify stream-end / close / error frames as "client gone"
+    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
+    // can return — a bare `continue` hot-loops the select forever.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DisconnectAction {
+        Break,
+        Continue,
+        ProcessText,
+    }
+
+    fn classify_client_msg(
+        msg: Option<Result<axum::extract::ws::Message, &'static str>>,
+    ) -> DisconnectAction {
+        use axum::extract::ws::Message;
+        match msg {
+            Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
+            _ => DisconnectAction::Continue,
+        }
+    }
+
+    #[test]
+    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
+        use axum::extract::ws::Message;
+        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Close(None)))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Err("io"))),
+            DisconnectAction::Break,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
+            DisconnectAction::Continue,
+        );
+        assert_eq!(
+            classify_client_msg(Some(Ok(Message::Text("{}".into())))),
+            DisconnectAction::ProcessText,
+        );
+    }
+
+    #[test]
+    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let clone_for_turn = token.clone();
+        assert!(!clone_for_turn.is_cancelled());
+        token.cancel();
+        assert!(
+            clone_for_turn.is_cancelled(),
+            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
+        );
     }
 }

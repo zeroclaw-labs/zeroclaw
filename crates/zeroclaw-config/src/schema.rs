@@ -620,6 +620,39 @@ pub struct ModelProviderConfig {
     /// tool calling for Groq models that support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
+    /// Enable or disable chain-of-thought thinking for models that support it
+    /// (e.g. Qwen3, GLM-4). `true` turns thinking on, `false` turns it off.
+    /// `None` (default) lets the model decide. Forwarded as `enable_thinking`
+    /// in the request body; mirrors the Ollama provider's `think` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
+    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
+    /// in the request body (llama.cpp-specific). Use this to pass model-family
+    /// template variables that control behaviour not exposed by other fields.
+    /// Example (Qwen3 thinking suppression):
+    ///   `chat_template_kwargs = { enable_thinking = false }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override the Ollama `num_ctx` (context window, in tokens) sent on
+    /// every `/api/chat` request. Only consulted when this profile resolves
+    /// to the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_CTX`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_ctx: Option<u32>,
+    /// Override the Ollama `num_predict` (max output tokens) sent on every
+    /// `/api/chat` request. Only consulted when this profile resolves to
+    /// the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `Provider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins — full
+    /// backward compatibility. Only consulted when this profile
+    /// resolves to the `ollama` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_temperature_override: Option<f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1602,6 +1635,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
 
+    /// Channel reply-intent precheck configuration (model override, timeout).
+    #[nested]
+    #[serde(default)]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Maximum characters for a single tool result before truncation.
     /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
     /// middle. Set to `0` to disable truncation. Default: `50000`.
@@ -1667,6 +1705,7 @@ impl Default for AgentConfig {
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
@@ -1803,6 +1842,10 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_creation: SkillCreationConfig,
+    /// Prompt-triggered install suggestions for missing skills.
+    #[serde(default, alias = "install-suggestions")]
+    #[nested]
+    pub install_suggestions: SkillInstallSuggestionsConfig,
     /// Automatic skill self-improvement after successful skill usage.
     #[serde(default)]
     #[nested]
@@ -1834,6 +1877,17 @@ impl Default for SkillCreationConfig {
             similarity_threshold: 0.85,
         }
     }
+}
+
+/// Prompt-triggered skill install suggestions (`[skills.install_suggestions]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.install-suggestions"]
+#[serde(default)]
+pub struct SkillInstallSuggestionsConfig {
+    /// Enable suggestions for installable skills before normal agent turns.
+    /// Default: `false`.
+    pub enabled: bool,
 }
 
 /// Skill self-improvement configuration (`[skills.auto_improve]` section).
@@ -1898,11 +1952,30 @@ impl Default for PipelineConfig {
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
+///
+/// # Privacy and cost note
+///
+/// Tool results that print real local image paths (e.g. shell tools doing
+/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
+/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
+/// This means image bytes that previously stayed local will be uploaded to
+/// the configured provider when surfaced by a tool.
+///
+/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
+/// image budget, but operators running shell-style tools over directories of
+/// personal or sensitive images should be aware of the upload semantics. See
+/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
+    ///
+    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older images are
+    /// dropped first when the cumulative count exceeds this limit. Acts as
+    /// the upper bound on per-turn upload cost when tool outputs surface
+    /// local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -5858,7 +5931,7 @@ pub struct AutonomyConfig {
     /// Extra directory roots the agent may read/write outside the workspace.
     /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
-    #[serde(default)]
+    #[serde(default, alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
 
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
@@ -6491,6 +6564,11 @@ pub struct DeliveryConfigDecl {
     /// Target/recipient identifier.
     #[serde(default)]
     pub to: Option<String>,
+    /// Optional thread/conversation identifier carried into the outbound send.
+    /// Required by channels that route on a separate `thread_id` field (e.g.
+    /// webhook callbacks bridging into agent-chat platforms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
@@ -7328,10 +7406,14 @@ pub struct SlackConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Slack bot OAuth token (xoxb-...).
+    /// Slack bot OAuth token (xoxb-...). When omitted from `config.toml`,
+    /// resolved at startup from `ZEROCLAW_SLACK_BOT_TOKEN` then
+    /// `SLACK_BOT_TOKEN`. Channel construction fails with a clear error
+    /// if the token is supplied through neither path. See #6237.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
+    #[serde(default)]
+    pub bot_token: Option<String>,
     /// Slack app-level token for Socket Mode (xapp-...).
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -7866,6 +7948,17 @@ pub struct NextcloudTalkConfig {
     /// If not set, defaults to an empty string (no self-message filtering by name).
     #[serde(default)]
     pub bot_name: Option<String>,
+    /// Controls whether and how streaming draft updates are delivered.
+    ///
+    /// - `"off"` (default) — responses are sent as a single final message.
+    /// - `"partial"` — a placeholder is posted first and edited incrementally
+    ///   as tokens arrive, making long responses visible in real time.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval in milliseconds between consecutive OCS edit calls per
+    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -9669,6 +9762,13 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            return Ok(expand_tilde_path(custom));
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -11289,6 +11389,26 @@ impl Config {
             }
         }
 
+        // Channel reply-intent precheck. Zero timeout or empty/whitespace model would
+        // silently fail open to REPLY and quietly disable the group-chat noise filter
+        // — reject the typo cases explicitly. Use `enabled = false` to disable instead.
+        if self.agent.precheck.timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "agent.precheck.timeout_secs",
+                "agent.precheck.timeout_secs must be greater than 0 (use agent.precheck.enabled = false to disable the precheck)"
+            );
+        }
+        if let Some(ref model) = self.agent.precheck.model
+            && model.trim().is_empty()
+        {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "agent.precheck.model",
+                "agent.precheck.model must not be empty or whitespace; omit the key to fall back to the route model"
+            );
+        }
+
         Ok(())
     }
 
@@ -11677,6 +11797,28 @@ impl Config {
                  implemented; this section is reserved for future use and will be ignored"
             );
         }
+
+        // Slack channel-token env-var fallbacks. Resolved here (after the
+        // file is parsed and all other overrides applied) so a config that
+        // omits `bot_token` entirely still deserializes — channel
+        // construction picks up the env value at startup. See #6237.
+        // ZEROCLAW_-prefixed variants take precedence over the bare names.
+        if let Some(ref mut sl) = self.channels.slack {
+            if sl.bot_token.as_deref().is_none_or(str::is_empty)
+                && let Ok(v) = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN")
+                    .or_else(|_| std::env::var("SLACK_BOT_TOKEN"))
+                && !v.is_empty()
+            {
+                sl.bot_token = Some(v);
+            }
+            if sl.app_token.as_deref().is_none_or(str::is_empty)
+                && let Ok(v) = std::env::var("ZEROCLAW_SLACK_APP_TOKEN")
+                    .or_else(|_| std::env::var("SLACK_APP_TOKEN"))
+                && !v.is_empty()
+            {
+                sl.app_token = Some(v);
+            }
+        }
     }
 
     async fn resolve_config_path_for_save(&self) -> Result<PathBuf> {
@@ -11884,7 +12026,9 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Falls back to `<workspace>/sops` when omitted.
+    /// Required to enable runtime SOP loading. When omitted, no SOPs are loaded
+    /// at runtime; CLI commands (`sop list`, `sop validate`, `sop show`) still
+    /// resolve the default `<workspace>/sops` for offline inspection.
     #[serde(default)]
     pub sops_dir: Option<String>,
 
@@ -12087,12 +12231,37 @@ mod tests {
         assert!(c.providers.fallback_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
+        assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn skills_install_suggestions_config_deserializes_enabled() {
+        let c = parse_test_config(
+            r#"
+[skills.install_suggestions]
+enabled = true
+"#,
+        );
+
+        assert!(c.skills.install_suggestions.enabled);
+    }
+
+    #[test]
+    async fn skills_install_suggestions_config_accepts_hyphen_alias() {
+        let c = parse_test_config(
+            r#"
+[skills.install-suggestions]
+enabled = true
+"#,
+        );
+
+        assert!(c.skills.install_suggestions.enabled);
     }
 
     #[derive(Clone, Default)]
@@ -12429,6 +12598,36 @@ auto_save = true
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_roundtrip() {
+        let toml = r#"
+            ollama_num_ctx = 16384
+            ollama_num_predict = 4096
+            ollama_temperature_override = 0.5
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.ollama_num_ctx, Some(16384));
+        assert_eq!(parsed.ollama_num_predict, Some(4096));
+        assert_eq!(parsed.ollama_temperature_override, Some(0.5));
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ModelProviderConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ollama_num_ctx, Some(16384));
+        assert_eq!(reparsed.ollama_num_predict, Some(4096));
+        assert_eq!(reparsed.ollama_temperature_override, Some(0.5));
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_default_to_none() {
+        let toml = r#"
+            api_key = "sk-test"
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.ollama_num_ctx.is_none());
+        assert!(parsed.ollama_num_predict.is_none());
+        assert!(parsed.ollama_temperature_override.is_none());
     }
 
     #[test]
@@ -13833,6 +14032,130 @@ allowed_users = ["@u:matrix.org"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    /// Regression test for #6237 — before the fix, omitting `bot_token`
+    /// from `[channels.slack]` made the entire config file fail to
+    /// deserialize with `missing field 'bot_token'`, blocking startup
+    /// even when `SLACK_BOT_TOKEN` was provided via the environment
+    /// (the env-fallback never ran because deserialization aborted first).
+    #[test]
+    async fn slack_config_deserializes_without_bot_token() {
+        let json = r#"{}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).expect(
+            "SlackConfig must deserialize without bot_token so the env-var \
+             fallback in apply_env_overrides has a chance to populate it",
+        );
+        assert!(parsed.bot_token.is_none());
+        assert!(parsed.app_token.is_none());
+    }
+
+    #[test]
+    async fn slack_config_deserializes_explicit_bot_token() {
+        let json = r#"{"bot_token":"xoxb-from-toml"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.bot_token.as_deref(), Some("xoxb-from-toml"));
+    }
+
+    /// `apply_env_overrides` populates `bot_token` from `SLACK_BOT_TOKEN`
+    /// when the config field is `None`. This is the path that #6237
+    /// reporters were trying to use — they had `SLACK_BOT_TOKEN` set in
+    /// their environment but the schema rejected the config before the
+    /// override could fire.
+    #[test]
+    async fn slack_apply_env_overrides_populates_bot_token_from_env() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::remove_var("ZEROCLAW_SLACK_BOT_TOKEN");
+            std::env::remove_var("ZEROCLAW_SLACK_APP_TOKEN");
+            std::env::remove_var("SLACK_APP_TOKEN");
+            std::env::set_var("SLACK_BOT_TOKEN", "xoxb-from-env");
+        }
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-from-env")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("SLACK_BOT_TOKEN") };
+    }
+
+    /// The `ZEROCLAW_SLACK_BOT_TOKEN` variant takes precedence over
+    /// `SLACK_BOT_TOKEN` so workspace-scoped envs can override a
+    /// generic one set on the host.
+    #[test]
+    async fn slack_apply_env_overrides_prefers_zeroclaw_prefix() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::set_var("SLACK_BOT_TOKEN", "xoxb-generic");
+            std::env::set_var("ZEROCLAW_SLACK_BOT_TOKEN", "xoxb-zeroclaw-prefix");
+        }
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-zeroclaw-prefix")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::remove_var("SLACK_BOT_TOKEN");
+            std::env::remove_var("ZEROCLAW_SLACK_BOT_TOKEN");
+        }
+    }
+
+    /// `apply_env_overrides` must NOT clobber a config-supplied bot_token,
+    /// otherwise users who set the value in `config.toml` would silently
+    /// have it replaced by an env var they didn't intend to be authoritative.
+    #[test]
+    async fn slack_apply_env_overrides_preserves_config_supplied_bot_token() {
+        let _env_guard = env_override_lock().await;
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("SLACK_BOT_TOKEN", "xoxb-from-env") };
+
+        let mut config = Config::default();
+        config.channels.slack = Some(SlackConfig {
+            bot_token: Some("xoxb-from-toml".to_string()),
+            ..Default::default()
+        });
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .channels
+                .slack
+                .as_ref()
+                .and_then(|s| s.bot_token.as_deref()),
+            Some("xoxb-from-toml"),
+            "config-supplied bot_token must win over env var"
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("SLACK_BOT_TOKEN") };
     }
 
     #[test]
@@ -15316,6 +15639,25 @@ model = "primary-model"
     }
 
     #[test]
+    async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir = std::env::temp_dir().join("zeroclaw-test-profile");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &custom_dir) };
+
+        let result = default_path_under_config_dir("knowledge.db");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") };
+
+        assert_eq!(
+            result,
+            custom_dir.join("knowledge.db").to_string_lossy().as_ref(),
+            "expected path under ZEROCLAW_CONFIG_DIR, got: {result}"
+        );
+    }
+
+    #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -15873,6 +16215,47 @@ default_model = "persisted-profile"
                 ..Default::default()
             },
         );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_timeout_zero() {
+        let mut config = Config::default();
+        config.agent.precheck.timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.timeout_secs") && msg.contains("greater than 0"),
+            "expected precheck timeout validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_precheck_empty_model() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("   ".into());
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent.precheck.model"),
+            "expected precheck model validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_default_precheck() {
+        let config = Config::default();
+        assert!(
+            config.validate().is_ok(),
+            "default ChannelPrecheckConfig must pass validation"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_precheck_model_override() {
+        let mut config = Config::default();
+        config.agent.precheck.model = Some("fast-classifier".into());
+        config.agent.precheck.timeout_secs = 3;
         assert!(config.validate().is_ok());
     }
 
@@ -16634,6 +17017,8 @@ group_policy = "disabled"
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let json = serde_json::to_string(&nc).unwrap();

@@ -26,6 +26,7 @@ pub fn run(
 
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
+    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &locale_entries())?;
     run_cmd(
         Command::new(mdbook_program()?)
             .args(["build", "-d", "po-extract"])

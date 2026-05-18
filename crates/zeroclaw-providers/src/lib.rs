@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod llamacpp;
 pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
@@ -100,18 +101,15 @@ pub fn is_minimax_intl_alias(name: &str) -> bool {
             | "minimax-portal-global"
     )
 }
-
 pub fn is_minimax_cn_alias(name: &str) -> bool {
     matches!(
         name,
         "minimax-cn" | "minimaxi" | "minimax-oauth-cn" | "minimax-portal-cn"
     )
 }
-
 pub fn is_minimax_alias(name: &str) -> bool {
     is_minimax_intl_alias(name) || is_minimax_cn_alias(name)
 }
-
 pub fn is_glm_global_alias(name: &str) -> bool {
     matches!(name, "glm" | "zhipu" | "glm-global" | "zhipu-global")
 }
@@ -725,6 +723,33 @@ pub struct ProviderRuntimeOptions {
     /// `ModelProviderConfig::native_tools`. Currently consulted only by the
     /// Groq factory branch (#5932).
     pub native_tools: Option<bool>,
+    /// Wire protocol to use for this provider.
+    /// `Some("responses")` routes the provider through the OpenResponses
+    /// `/v1/responses` API instead of chat_completions.  `None` uses the
+    /// provider's built-in default (chat_completions for most providers).
+    pub wire_api: Option<String>,
+    /// Enable or disable chain-of-thought thinking. Forwarded as
+    /// `enable_thinking` in the request body. `None` lets the model decide.
+    pub think: Option<bool>,
+    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Override for the Ollama `num_ctx` request option. Only consumed by
+    /// the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_ctx: Option<u32>,
+    /// Override for the Ollama `num_predict` request option. Only consumed
+    /// by the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_predict: Option<i32>,
+    /// Override the temperature sent on every Ollama `/api/chat` request.
+    /// Only consumed by the `ollama` factory arm. When `None` (default), the
+    /// per-call temperature passed through `Provider::chat_with_system`
+    /// wins — this field is preserved as `None` straight through to
+    /// `OllamaTuning::temperature_override`, and the request builder uses
+    /// `temperature_override.unwrap_or(temperature)`. When `Some(v)`, every
+    /// request to this Ollama provider uses `v` regardless of the per-call
+    /// argument. There is no framework-constant fallback for this field.
+    pub ollama_temperature_override: Option<f64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -743,6 +768,12 @@ impl Default for ProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             native_tools: None,
+            wire_api: None,
+            think: None,
+            chat_template_kwargs: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         }
     }
 }
@@ -751,29 +782,33 @@ pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
     let fallback = config.providers.fallback_provider();
-    // Resolve merge_system_into_user from the active model provider profile by
-    // matching api_url — apply_named_model_provider_profile() has already run
-    // and rewritten providers.fallback, but providers.models retains all profiles.
-    let merge_system_into_user = fallback
-        .and_then(|e| e.base_url.as_deref())
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .and_then(|active_url| {
-            config.providers.models.values().find(|p| {
-                p.base_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(|u| u.trim_end_matches('/'))
-                    == Some(active_url.trim_end_matches('/'))
+    // Prefer the active fallback profile, and keep the URL-match fallback for
+    // compatibility with older loaded configs that only preserved the base URL.
+    let merge_system_into_user = fallback.is_some_and(|entry| entry.merge_system_into_user)
+        || fallback
+            .and_then(|e| e.base_url.as_deref())
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .and_then(|active_url| {
+                config.providers.models.values().find(|p| {
+                    p.base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(|u| u.trim_end_matches('/'))
+                        == Some(active_url.trim_end_matches('/'))
+                })
             })
-        })
-        .map(|p| p.merge_system_into_user)
-        .unwrap_or(false);
+            .map(|p| p.merge_system_into_user)
+            .unwrap_or(false);
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
+        provider_api_url: fallback
+            .and_then(|e| e.base_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToString::to_string),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
@@ -787,6 +822,12 @@ pub fn provider_runtime_options_from_config(
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         native_tools: fallback.and_then(|e| e.native_tools),
+        wire_api: fallback.and_then(|e| e.wire_api.clone()),
+        think: fallback.and_then(|e| e.think),
+        chat_template_kwargs: fallback.and_then(|e| e.chat_template_kwargs.clone()),
+        ollama_num_ctx: fallback.and_then(|e| e.ollama_num_ctx),
+        ollama_num_predict: fallback.and_then(|e| e.ollama_num_predict),
+        ollama_temperature_override: fallback.and_then(|e| e.ollama_temperature_override),
     }
 }
 
@@ -966,6 +1007,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
+        "manifest" => vec!["MANIFEST_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
@@ -975,6 +1017,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "astrai" => vec!["ASTRAI_API_KEY"],
         "avian" => vec!["AVIAN_API_KEY"],
         "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
+        "morph" => vec!["MORPH_API_KEY"],
+        "github-models" | "github_models" => vec!["GITHUB_MODELS_TOKEN"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1036,6 +1080,8 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         Some("perplexity")
     } else if key.starts_with("xai-") {
         Some("xai")
+    } else if key.starts_with("mnfst_") {
+        Some("manifest")
     } else if key.starts_with("nvapi-") {
         Some("nvidia")
     } else if key.starts_with("KEY-") {
@@ -1054,6 +1100,7 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         "groq" => expected == "groq",
         "perplexity" => expected == "perplexity",
         "xai" | "grok" => expected == "xai",
+        "manifest" => expected == "manifest",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => expected == "nvidia",
         "telnyx" => expected == "telnyx",
         _ => return None, // Unknown format provider — skip
@@ -1083,6 +1130,18 @@ fn parse_custom_provider_url(
             "{provider_label} requires an http:// or https:// URL. Format: {format_hint}"
         ),
     }
+}
+
+fn configured_provider_base_url<'a>(
+    explicit_url: Option<&'a str>,
+    runtime_url: Option<&'a str>,
+    default_url: &'static str,
+) -> &'a str {
+    explicit_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| runtime_url.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(default_url)
 }
 
 /// Factory: create the right provider from config (without custom URL)
@@ -1252,11 +1311,16 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            let tuning = ollama::OllamaTuning::from_runtime_overrides(
+                options.ollama_num_ctx,
+                options.ollama_num_predict,
+                options.ollama_temperature_override,
+            );
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_tuning(tuning),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -1311,6 +1375,18 @@ fn create_provider_with_url_and_options(
                 "KimiCLI/0.77",
             )))
         }
+        "manifest" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("https://app.manifest.build/v1");
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "Manifest",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",
@@ -1336,11 +1412,17 @@ fn create_provider_with_url_and_options(
             AuthStyle::ZhipuJwt,
         ))),
         name if glm_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+            // GLM offers vision-capable models (e.g. `glm-4.5v`). Mark the
+            // provider as vision-capable so multimodal routing accepts it.
+            // The specific model still has to be a vision-capable one;
+            // text-only models will return an API error if given an image,
+            // matching the behaviour of other multi-modal providers.
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::ZhipuJwt,
+                true,
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
@@ -1433,6 +1515,17 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
+        "atomic-chat" | "atomic_chat" | "atomic" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("http://127.0.0.1:1337/v1");
+
+            Ok(compat(
+                OpenAiCompatibleProvider::new("Atomic Chat", base_url, key, AuthStyle::Bearer)
+                    .without_native_tools(),
+            ))
+        }
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => {
@@ -1502,32 +1595,20 @@ fn create_provider_with_url_and_options(
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
+            let base_url = configured_provider_base_url(
+                api_url,
+                options.provider_api_url.as_deref(),
+                "http://localhost:1234/v1",
+            );
             let lm_studio_key = key
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("lm-studio");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            let provider = OpenAiCompatibleProvider::new(
                 "LM Studio",
-                "http://localhost:1234/v1",
+                base_url,
                 Some(lm_studio_key),
                 AuthStyle::Bearer,
-            )))
-        }
-        "llamacpp" | "llama.cpp" => {
-            let base_url = api_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("http://localhost:8080/v1");
-            let llama_cpp_key = key
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("llama.cpp");
-            let provider = OpenAiCompatibleProvider::new_with_vision(
-                "llama.cpp",
-                base_url,
-                Some(llama_cpp_key),
-                AuthStyle::Bearer,
-                true,
             );
             let provider = if options.merge_system_into_user {
                 provider.with_merge_system_into_user()
@@ -1535,6 +1616,33 @@ fn create_provider_with_url_and_options(
                 provider
             };
             Ok(compat(provider))
+        }
+        "llamacpp" | "llama.cpp" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("http://localhost:8080/v1");
+            let credential = key
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let mut provider = llamacpp::LlamaCppProvider::new(base_url, credential.as_deref());
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            if !options.extra_headers.is_empty() {
+                provider = provider.with_extra_headers(options.extra_headers.clone());
+            }
+            if let Some(mt) = options.provider_max_tokens {
+                provider = provider.with_max_tokens(Some(mt));
+            }
+            if options.think.is_some() {
+                provider = provider.with_think(options.think);
+            }
+            if options.chat_template_kwargs.is_some() {
+                provider = provider.with_chat_template_kwargs(options.chat_template_kwargs.clone());
+            }
+            Ok(Box::new(provider))
         }
         "sglang" => {
             let base_url = api_url
@@ -1636,6 +1744,12 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
+        "morph" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Morph",
+            "https://api.morphllm.com/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
 
         // ── Model hosting platforms ──────────────────────────
         "deepinfra" | "deep-infra" => Ok(compat(OpenAiCompatibleProvider::new(
@@ -1647,6 +1761,12 @@ fn create_provider_with_url_and_options(
         "huggingface" | "hf" => Ok(compat(OpenAiCompatibleProvider::new(
             "Hugging Face",
             "https://router.huggingface.co/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "github-models" | "github_models" => Ok(compat(OpenAiCompatibleProvider::new(
+            "GitHub Models",
+            "https://models.github.ai/inference",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2155,6 +2275,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "manifest",
+            display_name: "Manifest",
+            description: "Open-source LLM router for cost-optimized inference",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
             name: "synthetic",
             display_name: "Synthetic",
             description: "Synthetic AI models",
@@ -2196,20 +2324,24 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "minimax",
-            display_name: "MiniMax",
-            description: "MiniMax AI models",
+            display_name: "MiniMax (Global)",
+            description: "MiniMax AI models — Global API (api.minimax.io)",
             aliases: &[
                 "minimax-intl",
                 "minimax-io",
                 "minimax-global",
-                "minimax-cn",
-                "minimaxi",
                 "minimax-oauth",
-                "minimax-oauth-cn",
                 "minimax-portal",
-                "minimax-portal-cn",
             ],
-            activation: ProviderActivation::FallbackKeyMatches(is_minimax_alias),
+            activation: ProviderActivation::FallbackKeyMatches(is_minimax_intl_alias),
+            local: false,
+        },
+        ProviderInfo {
+            name: "minimax-cn",
+            display_name: "MiniMax (China)",
+            description: "MiniMax AI models — China API (api.minimaxi.com)",
+            aliases: &["minimaxi", "minimax-oauth-cn", "minimax-portal-cn"],
+            activation: ProviderActivation::FallbackKeyMatches(is_minimax_cn_alias),
             local: false,
         },
         ProviderInfo {
@@ -2437,6 +2569,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "atomic-chat",
+            display_name: "Atomic Chat",
+            description: "Atomic Chat / Jan local runtime",
+            aliases: &["atomic_chat", "atomic"],
+            activation: ProviderActivation::FallbackKey,
+            local: true,
+        },
         // ── Fast inference ────────────────────────────────────
         ProviderInfo {
             name: "cerebras",
@@ -2462,6 +2602,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
+        ProviderInfo {
+            name: "morph",
+            display_name: "Morph (Fast Apply)",
+            description: "Fast apply-edits LLM",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
         // ── Model hosting platforms ──────────────────────────
         ProviderInfo {
             name: "deepinfra",
@@ -2476,6 +2624,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "Hugging Face",
             description: "Open-source models via Inference API",
             aliases: &["hf"],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
+            name: "github-models",
+            display_name: "GitHub Models",
+            description: "OpenAI/Meta/Microsoft via one GitHub PAT",
+            aliases: &["github_models"],
             activation: ProviderActivation::FallbackKey,
             local: false,
         },
@@ -2657,6 +2813,19 @@ pub mod test_util {
 mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
+
+    // Compile-time proof that both reqwest TLS-root features are enabled.
+    // `tls_built_in_webpki_certs` is gated on `rustls-tls-webpki-roots-no-provider`;
+    // `tls_built_in_native_certs` is gated on `rustls-tls-native-roots-no-provider`.
+    // If either feature were dropped, this test would fail to compile.
+    #[test]
+    fn provider_http_client_trusts_both_webpki_and_native_roots() {
+        let _client = reqwest::Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
+            .build()
+            .expect("client builder should succeed with both root sets enabled");
+    }
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
@@ -3001,6 +3170,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_manifest() {
+        assert!(create_provider("manifest", Some("mnfst_test")).is_ok());
+    }
+
+    #[test]
     fn factory_synthetic() {
         assert!(create_provider("synthetic", Some("key")).is_ok());
     }
@@ -3121,10 +3295,119 @@ mod tests {
     }
 
     #[test]
+    fn glm_provider_supports_vision() {
+        // GLM exposes vision-capable models (e.g. `glm-4.5v`). The provider
+        // must therefore report `supports_vision()` so multimodal routing
+        // can target it; the model field selects the actual variant.
+        for alias in ["glm", "zhipu", "glm-cn", "zhipu-cn"] {
+            let provider =
+                create_provider(alias, Some("id.secret")).expect("glm provider should build");
+            assert!(
+                provider.supports_vision(),
+                "alias `{alias}` should report vision capability"
+            );
+        }
+    }
+
+    #[test]
     fn factory_lmstudio() {
         assert!(create_provider("lmstudio", Some("key")).is_ok());
         assert!(create_provider("lm-studio", Some("key")).is_ok());
         assert!(create_provider("lmstudio", None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn lmstudio_runtime_options_apply_base_url_and_merge_system_messages() {
+        let response_body = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("read test server address")
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let header_end = loop {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read request");
+                assert!(
+                    read > 0,
+                    "provider closed connection before sending headers"
+                );
+                bytes.extend_from_slice(&buf[..read]);
+                if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .expect("request includes content-length");
+
+            while bytes.len() < header_end + content_length {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read request body");
+                assert!(read > 0, "provider closed connection before sending body");
+                bytes.extend_from_slice(&buf[..read]);
+            }
+
+            let request = String::from_utf8(bytes).expect("request is valid utf-8");
+            tx.send(request).expect("send captured request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+        });
+
+        let options = ProviderRuntimeOptions {
+            provider_api_url: Some(format!("{base_url}/v1")),
+            merge_system_into_user: true,
+            ..ProviderRuntimeOptions::default()
+        };
+        let provider = create_provider_with_url_and_options("lmstudio", None, None, &options)
+            .expect("create lmstudio provider");
+        let messages = [ChatMessage::system("system-only instruction")];
+        let result = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "local-model",
+                Some(0.0),
+            )
+            .await
+            .expect("lmstudio chat succeeds");
+        assert_eq!(result.text.as_deref(), Some("ok"));
+
+        let request = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("captured provider request");
+        server.join().expect("test server exits cleanly");
+        assert!(request.starts_with("POST /v1/chat/completions "));
+
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("captured request body");
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("provider request body is json");
+        let outbound_messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(outbound_messages.len(), 1);
+        assert_eq!(outbound_messages[0]["role"], "user");
+        assert_eq!(outbound_messages[0]["content"], "system-only instruction");
     }
 
     #[test]
@@ -3230,6 +3513,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn factory_atomic_chat_aliases() {
+        assert!(create_provider("atomic-chat", Some("key")).is_ok());
+        assert!(create_provider("atomic_chat", Some("key")).is_ok());
+        assert!(create_provider("atomic", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_atomic_chat_allows_missing_key() {
+        let result = create_provider("atomic-chat", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn atomic_chat_capabilities() {
+        let provider = create_provider("atomic-chat", Some("key")).expect("provider should exist");
+        assert!(
+            !provider.supports_native_tools(),
+            "atomic chat does not use native tools"
+        );
+    }
+
+    #[test]
+    fn atomic_chat_is_listed_as_local_provider() {
+        let providers = list_providers();
+        let provider = providers
+            .iter()
+            .find(|p| p.name == "atomic-chat")
+            .expect("atomic-chat must be listed");
+        assert!(provider.local, "atomic-chat must be local provider");
+    }
+
     // ── Extended ecosystem ───────────────────────────────────
 
     #[test]
@@ -3303,6 +3618,57 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active provider profile to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_lmstudio_system_merge_without_base_url() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.insert(
+            "lmstudio".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                merge_system_into_user: true,
+                ..Default::default()
+            },
+        );
+        config.providers.fallback = Some("lmstudio".to_string());
+
+        let options = provider_runtime_options_from_config(&config);
+        assert!(
+            options.merge_system_into_user,
+            "merge_system_into_user must propagate even when LM Studio uses its default base URL"
+        );
+    }
+
+    #[test]
+    fn configured_provider_base_url_ignores_empty_runtime_url() {
+        assert_eq!(
+            configured_provider_base_url(None, Some("   "), "http://localhost:1234/v1"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                Some(" http://explicit.example/v1 "),
+                Some("http://runtime.example/v1"),
+                "http://localhost:1234/v1",
+            ),
+            "http://explicit.example/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                Some("   "),
+                Some(" http://runtime.example/v1 "),
+                "http://localhost:1234/v1",
+            ),
+            "http://runtime.example/v1"
+        );
+        assert_eq!(
+            configured_provider_base_url(
+                None,
+                Some(" http://runtime.example/v1 "),
+                "http://localhost:1234/v1",
+            ),
+            "http://runtime.example/v1"
         );
     }
 
@@ -3409,6 +3775,42 @@ mod tests {
         let _guard = EnvGuard::set("DEEPMYST_API_KEY", Some("dm-test-key"));
         let resolved = resolve_provider_credential("deepmyst", None);
         assert_eq!(resolved, Some("dm-test-key".to_string()));
+    }
+
+    #[test]
+    fn factory_morph() {
+        assert!(create_provider("morph", Some("sk-morph-test")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_morph_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("MORPH_API_KEY", Some("morph-test-key"));
+        let resolved = resolve_provider_credential("morph", None);
+        assert_eq!(resolved, Some("morph-test-key".to_string()));
+    }
+
+    #[test]
+    fn factory_github_models() {
+        assert!(create_provider("github-models", Some("ghp_test_token")).is_ok());
+        assert!(create_provider("github_models", Some("ghp_test_token")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_github_models_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("GITHUB_MODELS_TOKEN", Some("ghp_models_test"));
+        let resolved = resolve_provider_credential("github-models", None);
+        assert_eq!(resolved, Some("ghp_models_test".to_string()));
+    }
+
+    #[test]
+    fn github_models_does_not_consume_github_token() {
+        let _env_lock = env_lock();
+        let _models_guard = EnvGuard::set("GITHUB_MODELS_TOKEN", None);
+        let _token_guard = EnvGuard::set("GITHUB_TOKEN", Some("gho_copilot_only"));
+        let resolved = resolve_provider_credential("github-models", None);
+        assert_ne!(resolved, Some("gho_copilot_only".to_string()));
     }
 
     // ── Custom / BYOP provider ─────────────────────────────
@@ -3736,6 +4138,8 @@ mod tests {
             "nvidia",
             "astrai",
             "avian",
+            "morph",
+            "github-models",
             "ovhcloud",
         ];
         for name in providers {
@@ -4089,5 +4493,52 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_populate_tuning_struct() {
+        // Mirror the factory's tuning derivation: the same expression used
+        // inside `create_provider_with_url_and_options`'s "ollama" arm.
+        // Asserting on the resulting struct gives us downcast-free coverage
+        // that the three runtime-option fields actually reach the provider.
+        let options = ProviderRuntimeOptions {
+            ollama_num_ctx: Some(16384),
+            ollama_num_predict: Some(4096),
+            ollama_temperature_override: Some(0.5),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert_eq!(tuning.num_ctx, 16384);
+        assert_eq!(tuning.num_predict, 4096);
+        assert_eq!(tuning.temperature_override, Some(0.5));
+
+        let provider = ollama::OllamaProvider::new(None, None).with_tuning(tuning);
+        assert_eq!(provider.tuning(), tuning);
+
+        // The factory itself must succeed with the same options.
+        let factory_provider = create_provider_with_url_and_options("ollama", None, None, &options);
+        assert!(factory_provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_default_to_none_temperature_override() {
+        // Default options must produce a tuning that leaves
+        // `temperature_override = None` so per-call temperature wins —
+        // the backward-compat guarantee for operators who never set the
+        // override in config.toml.
+        let options = ProviderRuntimeOptions::default();
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert!(tuning.temperature_override.is_none());
+        assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
+        assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
     }
 }

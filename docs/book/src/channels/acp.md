@@ -91,11 +91,11 @@ Send a prompt. The response is a sequence of `session/update` notifications stre
 ← {"jsonrpc":"2.0","id":3,"result":{
     "sessionId": "s-ab12cd",
     "stopReason": "end_turn",
-    "content": [{"type": "text", "text": "The last commit introduces..."}]
+    "content": "The last commit introduces..."
   }}
 ```
 
-`stopReason` is `"end_turn"` on normal completion. The `content` array mirrors the final assistant message.
+`stopReason` is `"end_turn"` on normal completion. The ACP completion signal is `stopReason`; ZeroClaw also includes the current final `content` string for existing clients.
 
 ### `session/update` notifications (agent → client)
 
@@ -148,15 +148,18 @@ If the client never replies (crash, network drop, user closes IDE), the request 
 
 `ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
 
-### `session/cancel`
+### `session/cancel` _(ZeroClaw extension)_
 
-Abort an in-flight `session/prompt` turn. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds `session/cancel` with different semantics, this will be renamed `_meta/session/cancel`.
+Abort an in-flight `session/prompt` turn. This method is a ZeroClaw extension,
+not part of the base ACP spec. If ACP later standardizes a conflicting
+`session/cancel`, ZeroClaw will move its extension to `_meta/session/cancel`.
 
 **Cancel vs. stop:** `session/cancel` aborts an in-flight prompt turn and returns `stopReason: "cancelled"` with any streamed text accumulated up to the interrupt point. `session/stop` gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.
 
+The canonical parameter is `sessionId`; `session_id` is accepted as a compatibility alias.
+
 ```json
 → {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s-ab12cd"}}
-← {"jsonrpc":"2.0","id":null,"result":{}}
 ← {"jsonrpc":"2.0","method":"session/update","params":{
     "sessionId": "s-ab12cd",
     "update": {"sessionUpdate": "agent_message_chunk", "content": {"type":"text","text":"partial..."}}
@@ -167,6 +170,8 @@ Abort an in-flight `session/prompt` turn. Not in the base ACP spec — ZeroClaw-
     "content": "partial...\n\n[interrupted by user]"
   }}
 ```
+
+Only one `session/prompt` may be active for a session at a time. A second prompt for the same session is rejected until the active turn completes or is cancelled.
 
 If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors.
 

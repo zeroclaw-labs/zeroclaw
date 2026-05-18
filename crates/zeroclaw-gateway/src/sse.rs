@@ -76,9 +76,10 @@ pub async fn handle_sse_events(
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
             match result {
-                Ok(value) => Some(Ok::<_, Infallible>(
+                Ok(value) if is_public_sse_event(&value) => Some(Ok::<_, Infallible>(
                     Event::default().data(value.to_string()),
                 )),
+                Ok(_) => None,
                 Err(_) => None, // Skip lagged messages
             }
         },
@@ -97,37 +98,56 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    let events = state.event_buffer.snapshot();
+    let events: Vec<_> = state
+        .event_buffer
+        .snapshot()
+        .into_iter()
+        .filter(is_public_sse_event)
+        .collect();
     Json(serde_json::json!({ "events": events })).into_response()
 }
 
-/// Broadcast observer that forwards events to the SSE broadcast channel.
-pub struct BroadcastObserver {
-    inner: Box<dyn zeroclaw_runtime::observability::Observer>,
+/// Returns true for events that should be visible on the global SSE stream.
+///
+/// Contract: broadcast events must not include `session_id` unless they are
+/// intentionally scoped to that session and hidden from global `/api/events`.
+fn is_public_sse_event(event: &serde_json::Value) -> bool {
+    event
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+}
+
+/// Broadcast observer that fans events out to SSE subscribers.
+///
+/// Installed as the process-wide broadcast hook by [`crate::run_gateway`] so
+/// that events recorded by *any* observer built through
+/// `observability::create_observer` — including the per-call observer the
+/// agent loop creates inside `process_message` — also reach `/api/events`
+/// clients.
+///
+/// Crate-private: the constructor signature is intentionally not part of any
+/// stable surface, since it is wired directly into `run_gateway`.
+pub(crate) struct BroadcastObserver {
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     buffer: Arc<EventBuffer>,
 }
 
 impl BroadcastObserver {
-    pub fn new(
-        inner: Box<dyn zeroclaw_runtime::observability::Observer>,
+    pub(crate) fn new(
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
         buffer: Arc<EventBuffer>,
     ) -> Self {
-        Self { inner, tx, buffer }
-    }
-
-    pub fn inner(&self) -> &dyn zeroclaw_runtime::observability::Observer {
-        self.inner.as_ref()
+        Self { tx, buffer }
     }
 }
 
 impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
     fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
-        // Forward to inner observer
-        self.inner.record_event(event);
-
-        // Broadcast to SSE subscribers
+        // Recording into the primary observer (logs / Prometheus) is the
+        // responsibility of whoever built the event source; `TeeObserver`
+        // takes care of that fan-out. Here we only translate to JSON and
+        // ship to SSE subscribers.
         let json = match event {
             zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
                 provider, model, ..
@@ -135,6 +155,25 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 "type": "llm_request",
                 "provider": provider,
                 "model": model,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => serde_json::json!({
+                "type": "llm_response",
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration.as_millis(),
+                "success": success,
+                "error_message": error_message,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
             zeroclaw_runtime::observability::ObserverEvent::ToolCall {
@@ -152,6 +191,27 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 serde_json::json!({
                     "type": "tool_call_start",
                     "tool": tool,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            zeroclaw_runtime::observability::ObserverEvent::TurnComplete => {
+                serde_json::json!({
+                    "type": "turn_complete",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            zeroclaw_runtime::observability::ObserverEvent::ChannelMessage {
+                channel,
+                direction,
+            } => serde_json::json!({
+                "type": "channel_message",
+                "channel": channel,
+                "direction": direction,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick => {
+                serde_json::json!({
+                    "type": "heartbeat_tick",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
@@ -186,6 +246,22 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 "cost_usd": cost_usd,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
+            zeroclaw_runtime::observability::ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => serde_json::json!({
+                "type": "cache_hit",
+                "cache_type": cache_type,
+                "tokens_saved": tokens_saved,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::CacheMiss { cache_type } => {
+                serde_json::json!({
+                    "type": "cache_miss",
+                    "cache_type": cache_type,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -193,12 +269,8 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
         let _ = self.tx.send(json);
     }
 
-    fn record_metric(&self, metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
-        self.inner.record_metric(metric);
-    }
-
-    fn flush(&self) {
-        self.inner.flush();
+    fn record_metric(&self, _metric: &zeroclaw_runtime::observability::traits::ObserverMetric) {
+        // Metrics are not broadcast over SSE; the primary observer records them.
     }
 
     fn name(&self) -> &str {
@@ -207,5 +279,137 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_runtime::observability::{Observer, ObserverEvent};
+
+    fn make_broadcast() -> (
+        Arc<BroadcastObserver>,
+        tokio::sync::broadcast::Receiver<serde_json::Value>,
+        Arc<EventBuffer>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let obs = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        (obs, rx, buffer)
+    }
+
+    #[test]
+    fn tool_call_event_is_broadcast_and_buffered() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: std::time::Duration::from_millis(42),
+            success: true,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0]["type"], "tool_call");
+    }
+
+    #[test]
+    fn tool_call_start_event_is_broadcast() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "mcp_filesystem__read_file".into(),
+            arguments: None,
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "tool_call_start");
+        assert_eq!(value["tool"], "mcp_filesystem__read_file");
+    }
+
+    #[test]
+    fn unmapped_events_are_skipped() {
+        let (obs, mut rx, buffer) = make_broadcast();
+
+        // HandStarted is intentionally not in BroadcastObserver's match arms;
+        // it falls through to `_ => return` and must never reach the SSE stream.
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+
+        assert!(rx.try_recv().is_err(), "HandStarted should not broadcast");
+        assert!(buffer.snapshot().is_empty());
+    }
+
+    #[test]
+    fn session_scoped_events_are_not_public_sse_events() {
+        let session_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private session notification"
+        });
+        let global_event = serde_json::json!({
+            "type": "tool_call",
+            "tool": "shell"
+        });
+
+        assert!(!is_public_sse_event(&session_event));
+        assert!(is_public_sse_event(&global_event));
+    }
+
+    /// End-to-end coverage of the wiring `run_gateway` performs at startup:
+    /// installing `BroadcastObserver` as the process-wide broadcast hook and
+    /// then building an observer through `create_observer` (the path the
+    /// agent loop takes inside `process_message`) must surface events on the
+    /// SSE broadcast channel. Codifies the load-bearing ordering so that
+    /// reordering or dropping `set_scoped_broadcast_hook` in `run_gateway` is caught
+    /// by `cargo test`, not by a silent regression in production.
+    #[test]
+    fn factory_observer_events_reach_broadcast_hook() {
+        // The broadcast hook is process-wide; serialize hook-touching tests
+        // within this test binary so they don't observe each other's state.
+        static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _guard = HOOK_TEST_LOCK.lock();
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let buffer = Arc::new(EventBuffer::new(16));
+        let bo: Arc<dyn Observer> = Arc::new(BroadcastObserver::new(tx, buffer.clone()));
+        zeroclaw_runtime::observability::set_broadcast_hook(bo);
+
+        // Same factory call site as `process_message` in the agent loop.
+        let cfg = zeroclaw_config::schema::ObservabilityConfig {
+            backend: "noop".into(),
+            ..Default::default()
+        };
+        let observer = zeroclaw_runtime::observability::create_observer(&cfg);
+
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: std::time::Duration::from_millis(7),
+            success: true,
+        });
+
+        let value = rx
+            .try_recv()
+            .expect("factory-built observer event must reach the SSE broadcast channel");
+        assert_eq!(value["type"], "tool_call");
+        assert_eq!(value["tool"], "shell");
+        assert_eq!(value["success"], true);
+
+        let snap = buffer.snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "broadcast events must also land in the buffer"
+        );
+
+        zeroclaw_runtime::observability::clear_broadcast_hook();
     }
 }

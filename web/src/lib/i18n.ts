@@ -72,6 +72,16 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
 
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': '需要授权工具调用',
+    'agent.approval_tool': '工具',
+    'agent.approval_arguments': '参数',
+    'agent.approval_timeout_in': '超时自动拒绝',
+    'agent.approval_approve': '批准',
+    'agent.approval_deny': '拒绝',
+    'agent.approval_always': '始终批准',
+    'agent.approval_always_hint': '本会话内自动批准此工具',
+
     // Tools
     'tools.title': '可用工具',
     'tools.name': '名称',
@@ -103,6 +113,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.command_required': '命令',
     'cron.schedule': '计划',
     'cron.schedule_required': '计划',
+    'cron.timezone': '时区',
+    'cron.runtime_local_timezone': '运行时本地',
     'cron.next_run': '下次执行',
     'cron.last_run': '上次执行',
     'cron.last_status': '上次状态',
@@ -410,6 +422,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.uptime': 'Uptime',
     'dashboard.temperature': 'Temperature',
     'dashboard.gateway_port': 'Gateway Port',
+    'dashboard.version': 'Version',
     'dashboard.memory_backend': 'Memory Backend',
     'dashboard.paired': 'Paired',
     'dashboard.channels': 'Channels',
@@ -458,6 +471,15 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.running': 'Running…',
+    // Supervised-mode tool approval (#6522)
+    'agent.approval_title': 'Tool approval required',
+    'agent.approval_tool': 'Tool',
+    'agent.approval_arguments': 'Arguments',
+    'agent.approval_timeout_in': 'Auto-deny in',
+    'agent.approval_approve': 'Approve',
+    'agent.approval_deny': 'Deny',
+    'agent.approval_always': 'Always approve',
+    'agent.approval_always_hint': 'Approve this tool automatically for the rest of this session',
     'agent.stop': 'Stop',
 
     // Tools
@@ -491,6 +513,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.command_required': 'Command',
     'cron.schedule': 'Schedule',
     'cron.schedule_required': 'Schedule',
+    'cron.timezone': 'Timezone',
+    'cron.runtime_local_timezone': 'Runtime local',
     'cron.next_run': 'Next Run',
     'cron.last_run': 'Last Run',
     'cron.last_status': 'Last Status',
