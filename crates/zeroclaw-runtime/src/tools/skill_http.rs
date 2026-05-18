@@ -27,6 +27,10 @@ impl SkillHttpTool {
     ///
     /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
     /// to prevent collisions with built-in tools.
+    ///
+    /// Note: `timeout_secs` from the manifest is intentionally ignored here;
+    /// HTTP tools use the fixed `HTTP_TIMEOUT_SECS` client timeout. Per-tool
+    /// HTTP timeout support is tracked as a follow-up.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
             tool_name: format!("{}.{}", skill_name, tool.name),
@@ -167,6 +171,7 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -216,6 +221,7 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

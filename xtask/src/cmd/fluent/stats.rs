@@ -1,3 +1,4 @@
+use crate::cmd::fluent::catalog::message_ids_from_file;
 use crate::util::*;
 
 pub fn run() -> anyhow::Result<()> {
@@ -28,7 +29,7 @@ pub fn run() -> anyhow::Result<()> {
 
     for locale in &locales {
         let locale_dir = locales_dir.join(locale);
-        let locale_keys = collect_keys(&locale_dir).unwrap_or_default();
+        let locale_keys = collect_keys(&locale_dir)?;
         let present = locale_keys
             .iter()
             .filter(|k| en_keys.contains(k.as_str()))
@@ -50,18 +51,8 @@ fn collect_keys(locale_dir: &std::path::Path) -> anyhow::Result<std::collections
         return Ok(keys);
     }
     for ftl_path in ftl_files_in(locale_dir)? {
-        let src = std::fs::read_to_string(&ftl_path)?;
-        for line in src.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
-                continue;
-            }
-            if let Some(key) = trimmed.split(" = ").next() {
-                let key = key.trim().to_string();
-                if !key.is_empty() {
-                    keys.insert(key);
-                }
-            }
+        for key in message_ids_from_file(&ftl_path)? {
+            keys.insert(key);
         }
     }
     Ok(keys)

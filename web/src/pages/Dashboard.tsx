@@ -224,43 +224,43 @@ function formatRelative(iso: string): string {
 
 function healthColor(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'var(--color-status-success)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'var(--color-status-warning)';
+    case "ok":
+    case "healthy":
+      return "var(--color-status-success)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "var(--color-status-warning)";
     default:
-      return 'var(--color-status-error)';
+      return "var(--color-status-error)";
   }
 }
 
 function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.2)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.2)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.2)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.2)";
     default:
-      return 'rgba(255, 68, 102, 0.2)';
+      return "rgba(255, 68, 102, 0.2)";
   }
 }
 
 function healthBg(status: string): string {
   switch (status.toLowerCase()) {
-    case 'ok':
-    case 'healthy':
-      return 'rgba(0, 230, 138, 0.05)';
-    case 'warn':
-    case 'warning':
-    case 'degraded':
-      return 'rgba(255, 170, 0, 0.05)';
+    case "ok":
+    case "healthy":
+      return "rgba(0, 230, 138, 0.05)";
+    case "warn":
+    case "warning":
+    case "degraded":
+      return "rgba(255, 170, 0, 0.05)";
     default:
-      return 'rgba(255, 68, 102, 0.05)';
+      return "rgba(255, 68, 102, 0.05)";
   }
 }
 
@@ -282,6 +282,13 @@ const STATUS_CARDS = [
     labelKey: "dashboard.gateway_port",
     getValue: (s: StatusResponse) => `:${s.gateway_port}`,
     getSub: (_s: StatusResponse) => "",
+  },
+  {
+    icon: Tag,
+    accent: "#fb923c",
+    labelKey: "dashboard.version",
+    getValue: (s: StatusResponse) => (s.version ? `v${s.version}` : "\u2014"),
+    getSub: () => "",
   },
 ];
 
@@ -313,20 +320,45 @@ function OverviewTab({
     cost.session_cost_usd,
     cost.daily_cost_usd,
     cost.monthly_cost_usd,
-    0.001
+    0.001,
   );
 
   return (
     <>
       {/* Status Cards Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
-          <div key={labelKey} className="card p-5 animate-slide-in-up">
-            <div className="flex items-center gap-3 mb-3">
-              <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent, }}>
-                <Icon className="h-5 w-5" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 stagger-children">
+        {STATUS_CARDS.map(
+          ({ icon: Icon, accent, labelKey, getValue, getSub }) => (
+            <div key={labelKey} className="card p-5 animate-slide-in-up">
+              <div className="flex items-center gap-3 mb-3">
+                <div
+                  className="p-2 rounded-2xl"
+                  style={{
+                    background: `rgba(var(--pc-accent-rgb), 0.08)`,
+                    color: accent,
+                  }}
+                >
+                  <Icon className="h-5 w-5" />
+                </div>
+                <span
+                  className="text-xs uppercase tracking-wider font-medium"
+                  style={{ color: "var(--pc-text-muted)" }}
+                >
+                  {t(labelKey)}
+                </span>
               </div>
-              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
+              <p
+                className="text-lg font-semibold truncate capitalize"
+                style={{ color: "var(--pc-text-primary)" }}
+              >
+                {getValue(status)}
+              </p>
+              <p
+                className="text-sm truncate"
+                style={{ color: "var(--pc-text-muted)" }}
+              >
+                {getSub(status)}
+              </p>
             </div>
             <p className="text-lg font-semibold truncate" style={{ color: "var(--pc-text-primary)" }}>{getValue(status)}</p>
             <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>{getSub(status)}</p>
@@ -340,8 +372,16 @@ function OverviewTab({
         {/* Cost Widget */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <DollarSign className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
-            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--pc-text-primary)" }}>{t("dashboard.cost_overview")}</h2>
+            <DollarSign
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.cost_overview")}
+            </h2>
           </div>
           <div className="space-y-4">
             {[
@@ -393,7 +433,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.total_tokens_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.total_tokens.toLocaleString()}
             </span>
           </div>
@@ -401,7 +444,10 @@ function OverviewTab({
             <span style={{ color: "var(--pc-text-muted)" }}>
               {t("dashboard.requests_label")}
             </span>
-            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+            <span
+              className="font-mono"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
               {cost.request_count.toLocaleString()}
             </span>
           </div>
@@ -449,15 +495,10 @@ function OverviewTab({
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
               </p>
-            ) : (() => {
-              const entries = Object.entries(status.channels).filter(
-                ([, active]) => showAllChannels || active
-              );
-              if (entries.length === 0) {
-                return (
-                  <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-                    {t("dashboard.no_active_channels")}
-                  </p>
+            ) : (
+              (() => {
+                const entries = Object.entries(status.channels).filter(
+                  ([, active]) => showAllChannels || active,
                 );
               }
               return entries.map(([name, active]) => (
@@ -499,7 +540,10 @@ function OverviewTab({
 
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
-            <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <Activity
+              className="h-5 w-5"
+              style={{ color: "var(--pc-accent)" }}
+            />
             <h2
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
@@ -656,7 +700,7 @@ function SessionsTab() {
   const [deleting, setDeleting] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['session_update', 'session_created', 'session_closed'],
+    filterTypes: ["session_update", "session_created", "session_closed"],
     autoConnect: true,
   });
 
@@ -1130,7 +1174,7 @@ function ChannelsTab() {
   const [error, setError] = useState<string | null>(null);
 
   const { events } = useSSE({
-    filterTypes: ['channel_update', 'channel_status'],
+    filterTypes: ["channel_update", "channel_status"],
     autoConnect: true,
   });
 
@@ -1162,7 +1206,10 @@ function ChannelsTab() {
         <div className="flex items-center gap-3">
           <div
             className="h-6 w-6 border-2 rounded-full animate-spin"
-            style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)" }}
+            style={{
+              borderColor: "var(--pc-border)",
+              borderTopColor: "var(--pc-accent)",
+            }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
             {t("dashboard.loading_channels")}
@@ -1176,7 +1223,11 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
+        style={{
+          background: "var(--color-status-error-alpha-08)",
+          borderColor: "var(--color-status-error-alpha-20)",
+          color: "var(--color-status-error)",
+        }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -1186,7 +1237,10 @@ function ChannelsTab() {
   if (channels.length === 0) {
     return (
       <div className="card p-5 animate-slide-in-up">
-        <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
+        <p
+          className="text-sm py-8 text-center"
+          style={{ color: "var(--pc-text-faint)" }}
+        >
           {t("dashboard.no_channels_detail")}
         </p>
       </div>
@@ -1362,7 +1416,14 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
+        <div
+          className="rounded-2xl border p-4"
+          style={{
+            background: "var(--color-status-error-alpha-08)",
+            borderColor: "var(--color-status-error-alpha-20)",
+            color: "var(--color-status-error)",
+          }}
+        >
           {t("dashboard.load_error")}: {error}
         </div>
       </div>
@@ -1372,7 +1433,13 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)", }}/>
+        <div
+          className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
+        />
       </div>
     );
   }
@@ -1421,7 +1488,7 @@ export default function Dashboard() {
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'overview' && (
+      {activeTab === "overview" && (
         <OverviewTab
           status={status}
           cost={cost}

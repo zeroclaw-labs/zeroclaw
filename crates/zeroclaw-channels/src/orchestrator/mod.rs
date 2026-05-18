@@ -1601,6 +1601,24 @@ async fn create_resilient_model_provider_nonblocking(
     .context("failed to join model_provider initialization task")?
 }
 
+fn channel_runtime_string(key: &str) -> String {
+    i18n::get_required_cli_string(key)
+}
+
+fn channel_runtime_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn build_current_route_summary(current: &ChannelRouteSelection) -> String {
+    channel_runtime_string_with_args(
+        "channel-runtime-current-route",
+        &[
+            ("provider", current.provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    )
+}
+
 fn build_models_help_response(
     current: &ChannelRouteSelection,
     workspace_dir: &Path,
@@ -1615,7 +1633,11 @@ fn build_models_help_response(
     response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
 
     if !model_routes.is_empty() {
-        response.push_str("\nConfigured model routes:\n");
+        response.push('\n');
+        response.push_str(&channel_runtime_string(
+            "channel-runtime-configured-model-routes",
+        ));
+        response.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 response,
@@ -1633,11 +1655,12 @@ fn build_models_help_response(
             current.model_provider, current.model_provider
         );
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_string_with_args(
+            "channel-runtime-cached-models",
+            &[("count", &cached_models.len().to_string())],
+        ));
+        response.push('\n');
         for model in cached_models {
             let _ = writeln!(response, "- `{model}`");
         }
@@ -1679,7 +1702,11 @@ fn build_config_text_response(
         let _ = writeln!(resp, "- `{}`", p.name);
     }
     if !model_routes.is_empty() {
-        resp.push_str("\nConfigured model routes:\n");
+        resp.push('\n');
+        resp.push_str(&channel_runtime_string(
+            "channel-runtime-configured-model-routes",
+        ));
+        resp.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 resp,
@@ -1787,7 +1814,10 @@ fn build_config_block_kit(
     let mut model_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_model",
-        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_string("channel-runtime-select-model")
+        },
         "options": model_options
     });
     if let Some(init) = initial_model {
@@ -1814,7 +1844,10 @@ fn build_config_block_kit(
         {
             "type": "section",
             "block_id": "config_model_block",
-            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_string("channel-runtime-model-label")
+            },
             "accessory": model_select
         }
     ]);
@@ -1874,7 +1907,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                channel_runtime_string("channel-runtime-model-id-empty")
             } else {
                 // Resolve model_provider+model from model_routes (match by model name or hint)
                 if let Some(route) = ctx.model_routes.iter().find(|r| {
@@ -1923,7 +1956,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            channel_runtime_string("channel-runtime-new-session")
         }
     };
 
@@ -3011,9 +3044,7 @@ async fn process_channel_message_body(
                     )
                     .await;
             }
-            return;
-        }
-    };
+        };
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
@@ -3794,13 +3825,12 @@ async fn process_channel_message_body(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let mut delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
-            };
+            let mut delivered_response =
+                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                    channel_runtime_string("channel-runtime-malformed-tool-output")
+                } else {
+                    sanitized_response
+                };
 
             // Append a footer when the response was served by a different model_provider family.
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
@@ -3811,13 +3841,15 @@ async fn process_channel_message_body(
                     || req_base.starts_with(act_base)
                     || act_base.starts_with(req_base);
                 if !same_family {
-                    use std::fmt::Write as _;
-                    write!(
-                        delivered_response,
-                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
-                        fb.requested_provider, fb.actual_provider, fb.actual_model,
-                    )
-                    .ok();
+                    delivered_response.push_str("\n\n");
+                    delivered_response.push_str(&channel_runtime_string_with_args(
+                        "channel-runtime-fallback-footer",
+                        &[
+                            ("requested_provider", fb.requested_provider.as_str()),
+                            ("actual_provider", fb.actual_provider.as_str()),
+                            ("actual_model", fb.actual_model.as_str()),
+                        ],
+                    ));
                 }
             }
 
@@ -3927,8 +3959,7 @@ async fn process_channel_message_body(
                 if receipts.is_empty() {
                     None
                 } else {
-                    use std::fmt::Write as _;
-                    let mut block = String::from("---\nTool receipts:");
+                    let mut block = channel_runtime_string("channel-runtime-tool-receipts-header");
                     for r in receipts.iter() {
                         write!(block, "\n  {r}").ok();
                     }
@@ -4038,9 +4069,9 @@ async fn process_channel_message_body(
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                    channel_runtime_string("channel-runtime-context-window-exceeded-compacted")
                 } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                    channel_runtime_string("channel-runtime-context-window-exceeded")
                 };
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
@@ -4066,7 +4097,7 @@ async fn process_channel_message_body(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -4181,11 +4212,10 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = channel_runtime_string("channel-runtime-request-timed-out");
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel
@@ -4358,9 +4388,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                channel_runtime_string("channel-runtime-stop-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                channel_runtime_string("channel-runtime-stop-none")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
@@ -9605,6 +9635,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         // Two sends: the model's reply and the trailing receipts block.
         assert!(
             sent_messages.len() >= 2,
@@ -9615,10 +9646,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let receipts_message = sent_messages
             .iter()
-            .find(|m| m.contains("Tool receipts:"))
+            .find(|m| m.contains(&receipts_header))
             .unwrap_or_else(|| {
                 panic!(
-                    "no `Tool receipts:` send found; got {:?}",
+                    "no localized tool receipts send found; got {:?}",
                     sent_messages.as_slice()
                 )
             });
@@ -9627,8 +9658,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "receipts block must be sent to the same reply target as the agent reply, got {receipts_message}"
         );
         assert!(
-            receipts_message.contains("---\nTool receipts:"),
-            "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
+            receipts_message.contains(&receipts_header),
+            "receipts block must be prefixed with the localized receipt header, got {receipts_message}"
         );
         assert!(
             receipts_message.contains("zc-receipt-"),
@@ -9745,8 +9776,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         assert!(
-            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            !sent_messages.iter().any(|m| m.contains(&receipts_header)),
             "no receipts block must be sent when show_receipts_in_response=false; got {:?}",
             sent_messages.as_slice()
         );
@@ -9863,8 +9895,9 @@ BTC is currently around $65,000 based on latest tool output."#
             "no zc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
+        let receipts_header = i18n::get_required_cli_string("channel-runtime-tool-receipts-header");
         assert!(
-            !sent_messages.iter().any(|m| m.contains("Tool receipts:")),
+            !sent_messages.iter().any(|m| m.contains(&receipts_header)),
             "no `Tool receipts:` block must be sent when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
@@ -11871,6 +11904,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -11909,6 +11943,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -11957,6 +11992,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -12962,10 +12998,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let new_session_message = i18n::get_required_cli_string("channel-runtime-new-session");
         assert!(
-            sent_messages.iter().any(|message| {
-                message.contains("Conversation history cleared. Starting fresh.")
-            })
+            sent_messages
+                .iter()
+                .any(|message| { message.contains(&new_session_message) })
         );
     }
 

@@ -213,6 +213,7 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String) {
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
@@ -249,6 +250,7 @@ async fn process_due_jobs(
     jobs: Vec<CronJob>,
     component: &str,
     event_tx: &EventBroadcast,
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -278,6 +280,7 @@ async fn process_due_jobs(
                 &agent_alias,
                 &job,
                 &component,
+                observer,
             ))
             .await
         })
@@ -313,6 +316,7 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
@@ -341,6 +345,7 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) -> (bool, String) {
     // Cron is one of two SubAgent spawn sites; the other is the
     // agent-loop `spawn_subagent` tool. Both funnel through
@@ -837,11 +842,9 @@ async fn run_job_command_with_timeout(
 
 /// Build a shell `Command` for cron job execution.
 ///
-/// Uses `sh -c <command>` (non-login shell). On Windows, ZeroClaw users
-/// typically have Git Bash installed which provides `sh` in PATH, and
-/// cron commands are written with Unix shell syntax. The previous `-lc`
-/// (login shell) flag was dropped: login shells load the full user
-/// profile on every invocation which is slow and may cause side effects.
+/// On non-Windows: `sh -c <command>` (non-login shell).
+/// On Windows: `cmd.exe /C <command>` with `CREATE_NO_WINDOW` so the
+/// subprocess does not flash a console window.
 ///
 /// The command is configured with:
 /// - `current_dir` set to the workspace
@@ -852,10 +855,22 @@ fn build_cron_shell_command(
     command: &str,
     workspace_dir: &std::path::Path,
 ) -> anyhow::Result<Command> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_dir)
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(command).creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+
+    cmd.current_dir(workspace_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

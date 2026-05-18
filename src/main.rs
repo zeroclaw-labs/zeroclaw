@@ -250,6 +250,12 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Emit raw LLM message payload trace events for local debugging; default
+    /// logging writes them to stderr, but custom subscribers may route them
+    /// elsewhere. May include prompts, history, and tool output.
+    #[arg(long, global = true)]
+    log_llm: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -265,6 +271,10 @@ enum Commands {
         /// Skip interactive prompts; read from --api-key/--model-provider/--model/--memory.
         #[arg(long)]
         quick: bool,
+
+        /// Force interactive onboarding mode.
+        #[arg(long, conflicts_with = "quick")]
+        interactive: bool,
 
         /// Force the dialoguer CLI backend instead of the default ratatui TUI.
         #[arg(long)]
@@ -1272,6 +1282,7 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         section,
         quick,
+        interactive: _interactive,
         cli: use_cli,
         tui: use_tui_deprecated,
         force,
@@ -3618,6 +3629,38 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn log_llm_is_global_flag_for_agent_debugging() {
+        for args in [
+            ["zeroclaw", "--log-llm", "agent", "--message", "hello"],
+            ["zeroclaw", "agent", "--log-llm", "--message", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("--log-llm should parse globally");
+
+            assert!(
+                cli.log_llm,
+                "--log-llm should opt in to provider payload tracing"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn log_llm_help_warns_about_raw_payloads() {
+        let mut help = Vec::new();
+        Cli::command()
+            .write_long_help(&mut help)
+            .expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+
+        assert!(help.contains("--log-llm"));
+        assert!(help.contains("Emit raw LLM message payload trace events"));
+        assert!(help.contains("default logging writes them to stderr"));
+        assert!(help.contains("custom subscribers may route them elsewhere"));
+        assert!(help.contains("May include prompts, history, and tool output"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
         assert_eq!(
             gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
@@ -3728,9 +3771,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3743,6 +3791,12 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn onboard_cli_rejects_quick_with_interactive_flag() {
+        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--interactive"]).is_err());
     }
 
     #[test]

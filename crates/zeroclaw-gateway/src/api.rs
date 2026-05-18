@@ -447,8 +447,12 @@ pub async fn handle_api_cron_run(
     };
 
     let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
+    let (mut success, output) = zeroclaw_runtime::cron::scheduler::execute_job_now(
+        &config,
+        &job,
+        Some(state.observer.clone()),
+    )
+    .await;
     let finished_at = chrono::Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
 

@@ -3553,6 +3553,7 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    observer: Option<Arc<dyn Observer>>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = config

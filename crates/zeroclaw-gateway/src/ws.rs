@@ -410,6 +410,11 @@ async fn handle_socket(
                 return;
             }
         };
+    // Inject the gateway's BroadcastObserver so that lifecycle events emitted
+    // inside Agent::turn_streamed (AgentStart, LlmRequest, LlmResponse,
+    // TurnComplete, AgentEnd) are broadcast to the SSE /api/events stream.
+    // Without this injection the WS path is dark to SSE dashboard clients.
+    agent.set_observer(state.observer.clone());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);

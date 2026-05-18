@@ -178,6 +178,7 @@ pub async fn run(
             "gateway",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
@@ -200,6 +201,7 @@ pub async fn run(
                 "channels",
                 initial_backoff,
                 max_backoff,
+                Some(event_tx.clone()),
                 move || {
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
@@ -265,6 +267,7 @@ pub async fn run(
             "heartbeat",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -279,6 +282,7 @@ pub async fn run(
             "scheduler",
             initial_backoff,
             max_backoff,
+            Some(event_tx.clone()),
             move || {
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
@@ -304,6 +308,21 @@ pub async fn run(
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
     let exit = wait_for_exit_signal(reload_rx).await?;
+    // Broadcast daemon lifecycle event so SSE clients know without checking tracing output.
+    match exit {
+        DaemonExit::Reload => {
+            let _ = event_tx.send(serde_json::json!({
+                "type": "daemon_reload",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+        DaemonExit::Shutdown => {
+            let _ = event_tx.send(serde_json::json!({
+                "type": "daemon_shutdown",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+    }
     crate::health::mark_component_error(
         "daemon",
         match exit {
@@ -366,6 +385,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -406,8 +426,15 @@ where
             }
 
             crate::health::bump_component_restart(name);
+            // Broadcast component restart so SSE clients know without checking tracing output.
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(serde_json::json!({
+                    "type": "component_restart",
+                    "component": name,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }));
+            }
             tokio::time::sleep(Duration::from_secs(backoff)).await;
-            // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
@@ -1188,7 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
+        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, None, || async {
             anyhow::bail!("boom")
         });
 
@@ -1210,7 +1237,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let handle =
+            spawn_component_supervisor("daemon-test-exit", 1, 1, None, || async { Ok(()) });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
