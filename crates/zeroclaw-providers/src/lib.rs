@@ -1536,12 +1536,22 @@ fn create_provider_with_url_and_options(
             OpenAiCompatibleProvider::new("xAI", "https://api.x.ai/v1", key, AuthStyle::Bearer)
                 .with_models_dev_key("xai"),
         )),
-        "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
-            "DeepSeek",
-            "https://api.deepseek.com",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "deepseek" => {
+            // Honor `[providers.models.deepseek] base_url` so operators can
+            // point at a self-hosted gateway, a regional endpoint, or a proxy
+            // (per the documented contract on `ModelProviderConfig.base_url`).
+            // Falls back to the public endpoint when unset.
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("https://api.deepseek.com");
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "DeepSeek",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
         "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Together AI",
             "https://api.together.xyz",
@@ -3623,6 +3633,19 @@ mod tests {
     #[test]
     fn factory_deepseek() {
         assert!(create_provider("deepseek", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_deepseek_custom_url() {
+        // Verify that a custom api_url overrides the default public endpoint.
+        let options = ProviderRuntimeOptions::default();
+        let p = create_provider_with_url_and_options(
+            "deepseek",
+            Some("key"),
+            Some("http://gateway.internal:8080/v1"),
+            &options,
+        );
+        assert!(p.is_ok());
     }
 
     #[test]
