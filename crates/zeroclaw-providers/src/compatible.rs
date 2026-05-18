@@ -3561,7 +3561,7 @@ mod tests {
     fn minimax_provider_supports_native_tool_calling_with_system_merge() {
         let p = OpenAiCompatibleProvider::new(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         )
@@ -3592,7 +3592,7 @@ mod tests {
         ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
@@ -3638,7 +3638,7 @@ mod tests {
         ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
@@ -3661,7 +3661,7 @@ mod tests {
         ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
@@ -4838,7 +4838,7 @@ mod tests {
         ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
@@ -4878,7 +4878,7 @@ mod tests {
         ];
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
-            "https://api.minimax.chat/v1",
+            "https://api.minimaxi.com/v1",
             Some("k"),
             AuthStyle::Bearer,
         );
