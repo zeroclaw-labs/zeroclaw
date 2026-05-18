@@ -1502,7 +1502,7 @@ impl Agent {
                         tokens_used: None,
                         cost_usd: None,
                     });
-                    return Ok(cached);
+                    return Ok((cached, new_msgs));
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
                     cache_type: "response".into(),
@@ -1820,7 +1820,7 @@ impl Agent {
                     tokens_used: None,
                     cost_usd: None,
                 });
-                return Ok(final_text);
+                return Ok((final_text, new_msgs));
             }
 
             // Pre-assign stable IDs to tool calls that don't have one
