@@ -158,6 +158,7 @@ Verified endpoints:
 | Vercel AI Gateway | `https://gateway.ai.vercel.app` | per model |
 | Cloudflare Gateway | `https://gateway.ai.cloudflare.com/v1/.../.../chat/completions` | per model |
 | OpenCode | `https://api.opencode.ai` | per model |
+| Manifest | `https://app.manifest.build/v1` | auto (routes to cheapest capable model) |
 | Synthetic | `https://api.synthetic.ai` | per model |
 
 Any endpoint that claims OpenAI chat-completions compatibility should work — if it doesn't, file an issue with a minimal reproducer.
@@ -165,6 +166,21 @@ Any endpoint that claims OpenAI chat-completions compatibility should work — i
 ---
 
 ## Meta
+
+### Manifest
+
+```toml
+[providers.models.manifest]
+kind = "manifest"
+model = "auto"
+api_key = "mnfst_..."
+```
+
+Open-source LLM router that scores each request and routes it to the cheapest model that can handle it. `model = "auto"` lets Manifest pick the best model. Self-hosted users can override the endpoint:
+
+```toml
+base_url = "http://localhost:3001/v1"
+```
 
 ### OpenRouter
 
