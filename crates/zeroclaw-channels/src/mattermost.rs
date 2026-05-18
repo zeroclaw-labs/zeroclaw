@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use aspect_std::AllowlistAspect;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -12,7 +13,9 @@ pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
     bot_token: String,
     channel_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// Allowlist of permitted sender user_ids, built once from
+    /// `allowed_users`. Empty list = deny-all; `"*"` = allow-all.
+    allowlist: AllowlistAspect,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
     thread_replies: bool,
@@ -41,7 +44,7 @@ impl MattermostChannel {
             base_url,
             bot_token,
             channel_id,
-            allowed_users,
+            allowlist: AllowlistAspect::new(allowed_users),
             thread_replies,
             mention_only,
             typing_handle: Mutex::new(None),
@@ -85,12 +88,6 @@ impl MattermostChannel {
             30,
             10,
         )
-    }
-
-    /// Check if a user ID is in the allowlist.
-    /// Empty list means deny everyone. "*" means allow everyone.
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
     /// Get the bot's own user ID and username so we can ignore our own messages
@@ -432,7 +429,7 @@ impl MattermostChannel {
             text
         };
 
-        if !self.is_user_allowed(user_id) {
+        if !self.allowlist.is_allowed(user_id) {
             tracing::warn!("Mattermost: ignoring message from unauthorized user: {user_id}");
             return None;
         }
@@ -660,7 +657,7 @@ mod tests {
     #[test]
     fn mattermost_allowlist_wildcard() {
         let ch = make_channel(vec!["*".into()], false);
-        assert!(ch.is_user_allowed("any-id"));
+        assert!(ch.allowlist.is_allowed("any-id"));
     }
 
     #[test]
