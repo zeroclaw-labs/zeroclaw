@@ -665,6 +665,8 @@ fn install_macos(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Renders the macOS LaunchAgent plist; path arguments are XML-escaped before interpolation,
+/// and the caller is responsible for writing the returned XML to the plist path.
 fn render_macos_launch_agent_plist(
     exe: &Path,
     stdout: &Path,
@@ -1395,6 +1397,8 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+// Plain `#[cfg(test)]` is intentional: these pure renderer tests have no
+// integration dependencies and should run in every zeroclaw-runtime test build.
 #[cfg(test)]
 mod macos_plist_tests {
     use super::*;
