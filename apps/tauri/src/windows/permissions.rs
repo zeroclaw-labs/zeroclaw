@@ -14,7 +14,9 @@ struct WindowsPrivacySnapshot {
     admin: bool,
 }
 
-const SNAPSHOT_TTL: Duration = Duration::from_secs(1);
+// Onboarding refreshes permission status every 2s; cache slightly longer to avoid
+// spawning PowerShell on every poll while still reflecting setting changes quickly.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WindowsPrivacySnapshot)>>> = OnceLock::new();
 
 fn execute_powershell_script(script: &str, envs: &[(&str, &str)]) -> Option<String> {

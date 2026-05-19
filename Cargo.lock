@@ -13526,6 +13526,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zeroclaw-api",
  "zeroclaw-config",

@@ -367,7 +367,7 @@ mod tests {
     /// then building an observer through `create_observer` (the path the
     /// agent loop takes inside `process_message`) must surface events on the
     /// SSE broadcast channel. Codifies the load-bearing ordering so that
-    /// reordering or dropping `set_broadcast_hook` in `run_gateway` is caught
+    /// reordering or dropping `set_scoped_broadcast_hook` in `run_gateway` is caught
     /// by `cargo test`, not by a silent regression in production.
     #[test]
     fn factory_observer_events_reach_broadcast_hook() {

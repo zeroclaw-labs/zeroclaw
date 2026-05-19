@@ -395,7 +395,7 @@ mod tests {
         // entry up by canonical name (not display_name) so display
         // copy can change without breaking the contract.
         let cases = [
-            ("minimax-cn", "minimax"),
+            ("minimaxi", "minimax-cn"),
             ("glm-cn", "glm"),
             ("moonshot-intl", "moonshot"),
             ("qwen-intl", "qwen"),

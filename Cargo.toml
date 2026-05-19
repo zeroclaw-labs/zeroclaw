@@ -332,7 +332,7 @@ browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
-webauthn = ["zeroclaw-runtime/webauthn"]
+webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
 
 # Backward-compatible aliases
