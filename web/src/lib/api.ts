@@ -824,6 +824,7 @@ export function getCronJobs(): Promise<CronJob[]> {
 export function addCronJob(body: {
   name?: string;
   schedule: string;
+  tz?: string;
   command?: string;
   job_type?: string;
   prompt?: string;
@@ -863,7 +864,7 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 
 export function patchCronJob(
   id: string,
-  patch: { name?: string; schedule?: string; command?: string; prompt?: string },
+  patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
     `/api/cron/${encodeURIComponent(id)}`,

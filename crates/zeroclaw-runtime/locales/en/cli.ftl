@@ -66,11 +66,68 @@ cli-wechat-connected = ✅ WeChat connected!
 cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to ZeroClaw now.
 cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
 
+channel-runtime-current-route =
+    Current provider: `{$provider}`
+    Current model: `{$model}`
+channel-runtime-switch-model-help = Switch model with `/model <model-id>` or `/model <hint>`.
+channel-runtime-configured-model-routes = Configured model routes:
+channel-runtime-no-cached-models = No cached model list found for `{$provider}`. Ask the operator to run `zeroclaw models refresh --provider {$provider}`.
+channel-runtime-cached-models = Cached model IDs (top {$count}):
+channel-runtime-switch-provider-help = Switch provider with `/models <provider>`.
+channel-runtime-switch-model-command-help = Switch model with `/model <model-id>`.
+channel-runtime-available-providers = Available providers:
+channel-runtime-provider-aliases = aliases: {$aliases}
+channel-runtime-use-models-and-model =
+    Use `/models <provider>` to switch provider.
+    Use `/model <model-id>` to switch model.
+channel-runtime-provider-switched =
+    Provider switched to `{$provider}` for this sender session. Current model is `{$model}`.
+    Use `/model <model-id>` to set a provider-compatible model.
+channel-runtime-provider-init-failed =
+    Failed to initialize provider `{$provider}`. Route unchanged.
+    Details: {$details}
+channel-runtime-provider-unavailable =
+    ⚠️ Failed to initialize provider `{$provider}`. Please run `/models` to choose another provider.
+    Details: {$details}
+channel-runtime-unknown-provider = Unknown provider `{$provider}`. Use `/models` to list valid providers.
+channel-runtime-model-id-empty = Model ID cannot be empty. Use `/model <model-id>`.
+channel-runtime-model-switched = Model switched to `{$model}` (provider: `{$provider}`). Context preserved.
+channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-stop-sent = Stop signal sent.
+channel-runtime-stop-none = No in-flight task for this sender scope.
+channel-runtime-malformed-tool-output = I encountered malformed tool-call output and could not produce a safe reply. Please try again.
+channel-runtime-fallback-footer =
+    ---
+    ⚡ `{$requested_provider}` unavailable — response from **{$actual_provider}** (`{$actual_model}`)
+    Switch model: /models
+channel-runtime-tool-receipts-header =
+    ---
+    Tool receipts:
+channel-runtime-context-window-exceeded-compacted = ⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message.
+channel-runtime-context-window-exceeded = ⚠️ Context window exceeded for this conversation. Please resend your last message.
+channel-runtime-request-timed-out = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-config-block-title = *Model Configuration*
+    Current: `{$provider}` / `{$model}`
+channel-runtime-select-provider = Select provider
+channel-runtime-select-model = Select model
+channel-runtime-provider-label = *Provider*
+channel-runtime-model-label = *Model*
+
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-install-start = Installing skill from: {$source}
+cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
+cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
+cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
+cli-skills-install-tier-official = Installing {$name} v{$version} — Official (zeroclaw-labs maintained)
+cli-skills-install-tier-community =
+    Installing {$name} v{$version} — Community submission
+    This skill is not audited by ZeroClaw. Review the skill content
+    and run `zeroclaw skills audit {$name}` before granting any
+    permissions or running it in production.
 
 cli-cron-list-about = List all scheduled tasks
 cli-cron-add-about = Add a new recurring scheduled task
@@ -274,6 +331,12 @@ cli-self-test-long-about =
     Examples:
       zeroclaw self-test             # full suite
       zeroclaw self-test --quick     # quick checks only (no network)
+
+cli-skills-install-suggestion =
+    It looks like this request needs the `{$name}` skill, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
 
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.

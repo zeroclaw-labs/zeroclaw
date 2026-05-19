@@ -1842,6 +1842,10 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_creation: SkillCreationConfig,
+    /// Prompt-triggered install suggestions for missing skills.
+    #[serde(default, alias = "install-suggestions")]
+    #[nested]
+    pub install_suggestions: SkillInstallSuggestionsConfig,
     /// Automatic skill self-improvement after successful skill usage.
     #[serde(default)]
     #[nested]
@@ -1873,6 +1877,17 @@ impl Default for SkillCreationConfig {
             similarity_threshold: 0.85,
         }
     }
+}
+
+/// Prompt-triggered skill install suggestions (`[skills.install_suggestions]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.install-suggestions"]
+#[serde(default)]
+pub struct SkillInstallSuggestionsConfig {
+    /// Enable suggestions for installable skills before normal agent turns.
+    /// Default: `false`.
+    pub enabled: bool,
 }
 
 /// Skill self-improvement configuration (`[skills.auto_improve]` section).
@@ -12205,12 +12220,37 @@ mod tests {
         assert!(c.providers.fallback_provider().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
+        assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn skills_install_suggestions_config_deserializes_enabled() {
+        let c = parse_test_config(
+            r#"
+[skills.install_suggestions]
+enabled = true
+"#,
+        );
+
+        assert!(c.skills.install_suggestions.enabled);
+    }
+
+    #[test]
+    async fn skills_install_suggestions_config_accepts_hyphen_alias() {
+        let c = parse_test_config(
+            r#"
+[skills.install-suggestions]
+enabled = true
+"#,
+        );
+
+        assert!(c.skills.install_suggestions.enabled);
     }
 
     #[derive(Clone, Default)]

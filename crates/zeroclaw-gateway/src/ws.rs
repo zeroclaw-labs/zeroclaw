@@ -363,6 +363,11 @@ async fn handle_socket(
                 return;
             }
         };
+    // Inject the gateway's BroadcastObserver so that lifecycle events emitted
+    // inside Agent::turn_streamed (AgentStart, LlmRequest, LlmResponse,
+    // TurnComplete, AgentEnd) are broadcast to the SSE /api/events stream.
+    // Without this injection the WS path is dark to SSE dashboard clients.
+    agent.set_observer(state.observer.clone());
     agent.set_memory_session_id(Some(memory_session_id));
     if !stored_messages.is_empty() {
         agent.seed_history(&stored_messages);
@@ -566,7 +571,9 @@ async fn handle_socket(
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
-                if let Ok(event) = event {
+                if let Ok(event) = event
+                    && event_matches_session(&event, &session_id)
+                {
                     let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
             }
@@ -631,6 +638,13 @@ fn needs_onboarding_ws_error(
     }))
 }
 
+fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
+    match event.get("session_id").and_then(|value| value.as_str()) {
+        Some(event_session_id) => event_session_id == session_id,
+        None => true,
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 ///
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
@@ -655,13 +669,6 @@ async fn process_chat_message(
         .fallback
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-
-    // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "provider": provider_label,
-        "model": state.model,
-    }));
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -918,13 +925,6 @@ async fn process_chat_message(
             let _ = backend.set_session_state(session_key, "idle", None);
         }
 
-        // Broadcast agent_end event
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_end",
-            "provider": provider_label,
-            "model": state.model,
-        }));
-
         // Trace the cancelled turn so the doctor / replay tool sees it
         // alongside successful turns. #6001 follow-through.
         zeroclaw_runtime::observability::runtime_trace::record_event(
@@ -1015,13 +1015,6 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(session_key, "idle", None);
             }
-
-            // Broadcast agent_end event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "agent_end",
-                "provider": provider_label,
-                "model": state.model,
-            }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
             // sweep sees gateway WS turns alongside channel and CLI turns.
@@ -1221,6 +1214,28 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn session_scoped_events_only_match_their_session() {
+        let target_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "deploy finished"
+        });
+        let other_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-2",
+            "content": "different session"
+        });
+        let global_event = serde_json::json!({
+            "type": "cron_result",
+            "content": "global notification"
+        });
+
+        assert!(event_matches_session(&target_event, "operator-1"));
+        assert!(!event_matches_session(&other_event, "operator-1"));
+        assert!(event_matches_session(&global_event, "operator-1"));
     }
 
     #[test]

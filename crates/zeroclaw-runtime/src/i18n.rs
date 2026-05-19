@@ -413,6 +413,250 @@ mod tests {
     }
 
     #[test]
+    fn skills_install_cli_strings_format_from_fluent() {
+        type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let en_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["Installing skill from", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  Resolving", "example-skill", "skills registry"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "3 files scanned"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  Security audit completed successfully"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "Official"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "Community submission",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+        let zh_cn_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["正在安装技能来源", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  正在从技能注册表解析", "example-skill"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "已扫描 3 个文件"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  安全审计已成功完成"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "官方"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "社区提交",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+
+        for (source, locale, cases) in [
+            (include_str!("../locales/en/cli.ftl"), "en", en_cases),
+            (
+                include_str!("../locales/zh-CN/cli.ftl"),
+                "zh-CN",
+                zh_cn_cases,
+            ),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn channel_runtime_cli_strings_format_from_fluent() {
+        let keys = [
+            (
+                "channel-runtime-current-route",
+                &[("provider", "openrouter"), ("model", "gpt-test")][..],
+                ["openrouter", "gpt-test"].as_slice(),
+            ),
+            (
+                "channel-runtime-switch-model-help",
+                &[][..],
+                ["/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-configured-model-routes",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-no-cached-models",
+                &[("provider", "openrouter")][..],
+                ["openrouter", "zeroclaw models refresh"].as_slice(),
+            ),
+            (
+                "channel-runtime-cached-models",
+                &[("count", "10")][..],
+                ["10"].as_slice(),
+            ),
+            (
+                "channel-runtime-switch-provider-help",
+                &[][..],
+                ["/models <provider>"].as_slice(),
+            ),
+            (
+                "channel-runtime-switch-model-command-help",
+                &[][..],
+                ["/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-available-providers",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-aliases",
+                &[("aliases", "anthropic, claude")][..],
+                ["anthropic, claude"].as_slice(),
+            ),
+            (
+                "channel-runtime-use-models-and-model",
+                &[][..],
+                ["/models <provider>", "/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-switched",
+                &[("provider", "openrouter"), ("model", "gpt-test")][..],
+                ["openrouter", "gpt-test", "/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-init-failed",
+                &[("provider", "openrouter"), ("details", "401 unauthorized")][..],
+                ["openrouter", "401 unauthorized"].as_slice(),
+            ),
+            (
+                "channel-runtime-provider-unavailable",
+                &[("provider", "openrouter"), ("details", "401 unauthorized")][..],
+                ["openrouter", "401 unauthorized", "/models"].as_slice(),
+            ),
+            (
+                "channel-runtime-unknown-provider",
+                &[("provider", "unknown")][..],
+                ["unknown", "/models"].as_slice(),
+            ),
+            (
+                "channel-runtime-model-id-empty",
+                &[][..],
+                ["/model <model-id>"].as_slice(),
+            ),
+            (
+                "channel-runtime-model-switched",
+                &[("provider", "openrouter"), ("model", "gpt-test")][..],
+                ["openrouter", "gpt-test"].as_slice(),
+            ),
+            ("channel-runtime-new-session", &[][..], [].as_slice()),
+            ("channel-runtime-stop-sent", &[][..], [].as_slice()),
+            ("channel-runtime-stop-none", &[][..], [].as_slice()),
+            (
+                "channel-runtime-malformed-tool-output",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-fallback-footer",
+                &[
+                    ("requested_provider", "openai"),
+                    ("actual_provider", "anthropic"),
+                    ("actual_model", "claude-test"),
+                ][..],
+                ["openai", "anthropic", "claude-test", "/models"].as_slice(),
+            ),
+            (
+                "channel-runtime-tool-receipts-header",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-context-window-exceeded-compacted",
+                &[][..],
+                [].as_slice(),
+            ),
+            (
+                "channel-runtime-context-window-exceeded",
+                &[][..],
+                [].as_slice(),
+            ),
+            ("channel-runtime-request-timed-out", &[][..], [].as_slice()),
+            (
+                "channel-runtime-config-block-title",
+                &[("provider", "openrouter"), ("model", "gpt-test")][..],
+                ["openrouter", "gpt-test"].as_slice(),
+            ),
+            ("channel-runtime-select-provider", &[][..], [].as_slice()),
+            ("channel-runtime-select-model", &[][..], [].as_slice()),
+            ("channel-runtime-provider-label", &[][..], [].as_slice()),
+            ("channel-runtime-model-label", &[][..], [].as_slice()),
+        ];
+        for source in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in keys {
+                let value = format_ftl_message(source.0, source.1, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", source.1));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {} should preserve {expected}",
+                        source.1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn normalize_locale_strips_encoding() {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");

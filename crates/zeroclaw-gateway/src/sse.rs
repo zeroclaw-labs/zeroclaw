@@ -76,9 +76,10 @@ pub async fn handle_sse_events(
             tokio_stream::wrappers::errors::BroadcastStreamRecvError,
         >| {
             match result {
-                Ok(value) => Some(Ok::<_, Infallible>(
+                Ok(value) if is_public_sse_event(&value) => Some(Ok::<_, Infallible>(
                     Event::default().data(value.to_string()),
                 )),
+                Ok(_) => None,
                 Err(_) => None, // Skip lagged messages
             }
         },
@@ -97,8 +98,24 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    let events = state.event_buffer.snapshot();
+    let events: Vec<_> = state
+        .event_buffer
+        .snapshot()
+        .into_iter()
+        .filter(is_public_sse_event)
+        .collect();
     Json(serde_json::json!({ "events": events })).into_response()
+}
+
+/// Returns true for events that should be visible on the global SSE stream.
+///
+/// Contract: broadcast events must not include `session_id` unless they are
+/// intentionally scoped to that session and hidden from global `/api/events`.
+fn is_public_sse_event(event: &serde_json::Value) -> bool {
+    event
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
 }
 
 /// Broadcast observer that fans events out to SSE subscribers.
@@ -140,6 +157,25 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 "model": model,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
+            zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => serde_json::json!({
+                "type": "llm_response",
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration.as_millis(),
+                "success": success,
+                "error_message": error_message,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
             zeroclaw_runtime::observability::ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -155,6 +191,27 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 serde_json::json!({
                     "type": "tool_call_start",
                     "tool": tool,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            zeroclaw_runtime::observability::ObserverEvent::TurnComplete => {
+                serde_json::json!({
+                    "type": "turn_complete",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            zeroclaw_runtime::observability::ObserverEvent::ChannelMessage {
+                channel,
+                direction,
+            } => serde_json::json!({
+                "type": "channel_message",
+                "channel": channel,
+                "direction": direction,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick => {
+                serde_json::json!({
+                    "type": "heartbeat_tick",
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
@@ -189,6 +246,22 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 "cost_usd": cost_usd,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
+            zeroclaw_runtime::observability::ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => serde_json::json!({
+                "type": "cache_hit",
+                "cache_type": cache_type,
+                "tokens_saved": tokens_saved,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::CacheMiss { cache_type } => {
+                serde_json::json!({
+                    "type": "cache_miss",
+                    "cache_type": cache_type,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -263,10 +336,30 @@ mod tests {
     fn unmapped_events_are_skipped() {
         let (obs, mut rx, buffer) = make_broadcast();
 
-        obs.record_event(&ObserverEvent::HeartbeatTick);
+        // HandStarted is intentionally not in BroadcastObserver's match arms;
+        // it falls through to `_ => return` and must never reach the SSE stream.
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
 
-        assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
+        assert!(rx.try_recv().is_err(), "HandStarted should not broadcast");
         assert!(buffer.snapshot().is_empty());
+    }
+
+    #[test]
+    fn session_scoped_events_are_not_public_sse_events() {
+        let session_event = serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private session notification"
+        });
+        let global_event = serde_json::json!({
+            "type": "tool_call",
+            "tool": "shell"
+        });
+
+        assert!(!is_public_sse_event(&session_event));
+        assert!(is_public_sse_event(&global_event));
     }
 
     /// End-to-end coverage of the wiring `run_gateway` performs at startup:
@@ -274,7 +367,7 @@ mod tests {
     /// then building an observer through `create_observer` (the path the
     /// agent loop takes inside `process_message`) must surface events on the
     /// SSE broadcast channel. Codifies the load-bearing ordering so that
-    /// reordering or dropping `set_broadcast_hook` in `run_gateway` is caught
+    /// reordering or dropping `set_scoped_broadcast_hook` in `run_gateway` is caught
     /// by `cargo test`, not by a silent regression in production.
     #[test]
     fn factory_observer_events_reach_broadcast_hook() {

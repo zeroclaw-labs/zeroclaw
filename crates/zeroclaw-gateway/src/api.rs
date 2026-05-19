@@ -70,6 +70,7 @@ pub struct CronRunsQuery {
 pub struct CronAddBody {
     pub name: Option<String>,
     pub schedule: String,
+    pub tz: Option<String>,
     pub command: Option<String>,
     pub job_type: Option<String>,
     pub prompt: Option<String>,
@@ -84,8 +85,76 @@ pub struct CronAddBody {
 pub struct CronPatchBody {
     pub name: Option<String>,
     pub schedule: Option<String>,
+    pub tz: Option<String>,
+    pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+}
+
+enum CronTimezonePatch {
+    Preserve,
+    Set(String),
+    Clear,
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+}
+
+fn normalize_optional_timezone(
+    tz: Option<String>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    match tz {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(bad_request(
+                    "tz must be a non-empty IANA timezone; use clear_tz=true to clear it",
+                ))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_timezone_patch(
+    tz: Option<String>,
+    clear_tz: Option<bool>,
+) -> Result<CronTimezonePatch, (StatusCode, Json<serde_json::Value>)> {
+    let tz = normalize_optional_timezone(tz)?;
+    let clear_tz = clear_tz.unwrap_or(false);
+
+    if clear_tz && tz.is_some() {
+        return Err(bad_request("Provide either tz or clear_tz=true, not both"));
+    }
+
+    if clear_tz {
+        Ok(CronTimezonePatch::Clear)
+    } else if let Some(tz) = tz {
+        Ok(CronTimezonePatch::Set(tz))
+    } else {
+        Ok(CronTimezonePatch::Preserve)
+    }
+}
+
+fn cron_schedule_from_api(
+    expr: String,
+    tz: Option<String>,
+) -> Result<zeroclaw_runtime::cron::Schedule, (StatusCode, Json<serde_json::Value>)> {
+    let schedule = zeroclaw_runtime::cron::Schedule::Cron { expr, tz };
+    zeroclaw_runtime::cron::validate_schedule(&schedule, chrono::Utc::now())
+        .map_err(|e| bad_request(format!("Invalid cron schedule: {e}")))?;
+    Ok(schedule)
+}
+
+#[derive(Deserialize)]
+pub struct SessionMessagePostBody {
+    pub content: String,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -115,8 +184,21 @@ pub async fn handle_api_status(
         .map(String::from)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
+    // Build a version string that is useful whether running a release or a
+    // local source build. The git vars are captured at compile time by
+    // build.rs; they fall back to "unknown"/"false" when git is unavailable
+    // (Docker layer without .git, tarball builds, crates.io installs).
+    let pkg_version = env!("CARGO_PKG_VERSION");
+    let git_sha = env!("GIT_COMMIT_SHA");
+    let git_dirty = env!("GIT_DIRTY") == "true";
+    let version = match (git_sha, git_dirty) {
+        ("unknown", _) => pkg_version.to_string(),
+        (sha, false) => format!("{pkg_version} ({sha})"),
+        (sha, true) => format!("{pkg_version} ({sha}, dirty)"),
+    };
+
     let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version,
         "provider": config.providers.fallback,
         "model": state.model,
         "temperature": state.temperature,
@@ -189,6 +271,7 @@ pub async fn handle_api_cron_add(
     let CronAddBody {
         name,
         schedule,
+        tz,
         command,
         job_type,
         prompt,
@@ -200,9 +283,13 @@ pub async fn handle_api_cron_add(
     } = body;
 
     let config = state.config.lock().clone();
-    let schedule = zeroclaw_runtime::cron::Schedule::Cron {
-        expr: schedule,
-        tz: None,
+    let tz = match normalize_optional_timezone(tz) {
+        Ok(tz) => tz,
+        Err(e) => return e.into_response(),
+    };
+    let schedule = match cron_schedule_from_api(schedule, tz) {
+        Ok(schedule) => schedule,
+        Err(e) => return e.into_response(),
     };
     if let Err(e) = zeroclaw_runtime::cron::validate_delivery_config(delivery.as_ref()) {
         return (
@@ -347,8 +434,12 @@ pub async fn handle_api_cron_run(
     };
 
     let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
+    let (mut success, output) = zeroclaw_runtime::cron::scheduler::execute_job_now(
+        &config,
+        &job,
+        Some(state.observer.clone()),
+    )
+    .await;
     let finished_at = chrono::Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
@@ -441,14 +532,17 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.lock().clone();
-
-    // Build the schedule from the provided expression string (if any).
-    let schedule = match body.schedule {
-        Some(expr) if !expr.trim().is_empty() => Some(zeroclaw_runtime::cron::Schedule::Cron {
-            expr: expr.trim().to_string(),
-            tz: None,
-        }),
-        _ => None,
+    let CronPatchBody {
+        name,
+        schedule: schedule_expr,
+        tz,
+        clear_tz,
+        command,
+        prompt,
+    } = body;
+    let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
+        Ok(patch) => patch,
+        Err(e) => return e.into_response(),
     };
 
     // Route the edited text to the correct field based on the job's stored type.
@@ -464,15 +558,49 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let new_expr = schedule_expr
+        .as_deref()
+        .map(str::trim)
+        .filter(|expr| !expr.is_empty())
+        .map(str::to_string);
+    let timezone_changed = !matches!(timezone_patch, CronTimezonePatch::Preserve);
+    let schedule = if new_expr.is_some() || timezone_changed {
+        let (expr, existing_tz) = match (&existing.schedule, new_expr) {
+            (_, Some(expr)) => {
+                let existing_tz = match &existing.schedule {
+                    zeroclaw_runtime::cron::Schedule::Cron { tz, .. } => tz.clone(),
+                    _ => None,
+                };
+                (expr, existing_tz)
+            }
+            (zeroclaw_runtime::cron::Schedule::Cron { expr, tz }, None) => {
+                (expr.clone(), tz.clone())
+            }
+            (_, None) => {
+                return bad_request("tz can only be updated on cron schedules").into_response();
+            }
+        };
+        let tz = match timezone_patch {
+            CronTimezonePatch::Preserve => existing_tz,
+            CronTimezonePatch::Set(tz) => Some(tz),
+            CronTimezonePatch::Clear => None,
+        };
+        match cron_schedule_from_api(expr, tz) {
+            Ok(schedule) => Some(schedule),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
-        (None, body.command.or(body.prompt))
+        (None, command.or(prompt))
     } else {
-        (body.command.or(body.prompt), None)
+        (command.or(prompt), None)
     };
 
     let patch = zeroclaw_runtime::cron::CronJobPatch {
-        name: body.name,
+        name,
         schedule,
         command: patch_command,
         prompt: patch_prompt,
@@ -930,6 +1058,97 @@ pub async fn handle_api_session_messages(
     .into_response()
 }
 
+/// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
+pub async fn handle_api_session_message_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<SessionMessagePostBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if body.content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "content is required"})),
+        )
+            .into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    if !backend
+        .list_sessions()
+        .iter()
+        .any(|key| key == &session_key)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
+            )
+                .into_response();
+        }
+    };
+
+    let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
+    if let Err(e) = backend.append(&session_key, &message) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Use the raw dashboard session ID here to match the WS `?session_id=`
+    // query parameter; the `gw_` storage key is only for persistence.
+    let event = serde_json::json!({
+        "type": "message",
+        "session_id": id.clone(),
+        "role": "assistant",
+        "content": body.content.clone(),
+        "source": "api",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let _ = state.event_tx.send(event);
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "session_id": id,
+        "message": {
+            "role": "assistant",
+            "content": message.content,
+        },
+        "session_persistence": true,
+    }))
+    .into_response()
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
@@ -1191,6 +1410,8 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Duration;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::Provider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -1317,6 +1538,192 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    fn test_state_with_session_backend(
+        config: zeroclaw_config::schema::Config,
+        backend: Arc<dyn SessionBackend>,
+    ) -> AppState {
+        let mut state = test_state(config);
+        state.session_backend = Some(backend);
+        state
+    }
+
+    #[tokio::test]
+    async fn session_message_post_persists_and_broadcasts_to_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "deploy finished"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["session_id"], "operator-1");
+        assert_eq!(json["message"]["role"], "assistant");
+        assert_eq!(json["message"]["content"], "deploy finished");
+        assert!(json.get("message_count").is_none());
+
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "deploy finished");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["type"], "message");
+        assert_eq!(event["session_id"], "operator-1");
+        assert_eq!(event["role"], "assistant");
+        assert_eq!(event["content"], "deploy finished");
+
+        let history = state.event_buffer.snapshot();
+        assert!(
+            history.is_empty(),
+            "session-scoped chat messages stay out of global event history"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_message_post_rejects_empty_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "content is required");
+    }
+
+    #[tokio::test]
+    async fn session_message_post_rejects_unknown_session_without_creating_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "deploy finished"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert_eq!(json["error"], "Session not found");
+        assert!(backend.load("gw_operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_waits_for_session_queue_before_append() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let response_fut = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "queued notification"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should wait behind the active session queue guard"
+        );
+        assert_eq!(backend.load("gw_operator-1").len(), 1);
+
+        drop(session_guard);
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "queued notification");
+    }
+
     #[tokio::test]
     async fn cron_api_shell_roundtrip_includes_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1402,6 +1809,326 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_add_persists_explicit_timezone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "localized-job",
+                    "schedule": "0 9 * * *",
+                    "tz": "America/New_York",
+                    "command": "echo hello"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.lock().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(
+            jobs[0].schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_add_rejects_invalid_timezone_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_add(
+            State(state),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "invalid-timezone-job",
+                    "schedule": "0 9 * * *",
+                    "tz": "Invalid/Zone",
+                    "command": "echo hello"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Invalid IANA timezone")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_schedule_preserves_existing_timezone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("Europe/Berlin".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "schedule": "30 9 * * *"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.lock().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: Some("Europe/Berlin".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_replaces_timezone_when_provided() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "schedule": "30 9 * * *",
+                    "tz": "Asia/Tokyo"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.lock().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: Some("Asia/Tokyo".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_sets_timezone_without_schedule_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            Some("runtime-local-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "tz": "America/Chicago"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.lock().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/Chicago".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_rejects_invalid_timezone_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state),
+            HeaderMap::new(),
+            Path(job.id),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "tz": "Invalid/Zone"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Invalid IANA timezone")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_clears_timezone_with_explicit_signal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.lock().clone(),
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "clear_tz": true
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.lock().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: None,
+            }
+        );
     }
 
     #[tokio::test]

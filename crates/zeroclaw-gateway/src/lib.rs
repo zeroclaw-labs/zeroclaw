@@ -243,7 +243,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
@@ -268,7 +268,7 @@ pub struct IdempotencyStore {
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
             max_keys: max_keys.max(1),
@@ -948,6 +948,44 @@ pub async fn run_gateway(
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
 
+    // Create shutdown channel early so the health pulse task can observe it.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Broadcast gateway_started so connected SSE clients (e.g. on reload) know the gateway is up.
+    let _ = event_tx.send(serde_json::json!({
+        "type": "gateway_started",
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }));
+
+    // Spawn health pulse task: broadcasts a snapshot every 30s so remote dashboard
+    // users can see the system is alive and check component health without page refresh.
+    // The task is bound to the shutdown watch so it stops when run_gateway() returns.
+    {
+        let pulse_tx = event_tx.clone();
+        let mut pulse_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let health = zeroclaw_runtime::health::snapshot();
+                        let _ = pulse_tx.send(serde_json::json!({
+                            "type": "pulse",
+                            "uptime_seconds": health.uptime_seconds,
+                            "components": health.components,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }));
+                    }
+                    _ = pulse_shutdown_rx.changed() => {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // Fire gateway start hook
     if let Some(ref hooks) = hooks {
         hooks.fire_gateway_start(host, actual_port).await;
@@ -961,7 +999,8 @@ pub async fn run_gateway(
     let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
         sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
     );
-    zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
+    let broadcast_hook_guard =
+        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
 
     // Bound into AppState. Not a broadcaster — the broadcaster is the
     // `broadcast_layer` installed above as the global hook. This is the
@@ -970,8 +1009,6 @@ pub async fn run_gateway(
     let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
@@ -1157,7 +1194,7 @@ pub async fn run_gateway(
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(api::handle_api_session_messages),
+            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
@@ -1349,6 +1386,8 @@ pub async fn run_gateway(
         })
         .await?;
     }
+
+    drop(broadcast_hook_guard);
 
     Ok(())
 }
@@ -1623,7 +1662,12 @@ async fn run_gateway_chat_with_tools(
         let response = Box::pin(
             zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, message, session_id),
+                zeroclaw_runtime::agent::process_message(
+                    config,
+                    message,
+                    session_id,
+                    Some(state.observer.clone()),
+                ),
             ),
         )
         .await?;
