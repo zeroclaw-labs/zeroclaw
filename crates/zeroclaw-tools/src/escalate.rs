@@ -26,7 +26,11 @@ pub struct EscalateToHumanTool {
 }
 
 impl EscalateToHumanTool {
-    pub fn new(security: Arc<SecurityPolicy>, alert_channels: Vec<String>, channel_map: ChannelMapHandle) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        alert_channels: Vec<String>,
+        channel_map: ChannelMapHandle,
+    ) -> Self {
         Self {
             security,
             channel_map,
@@ -429,7 +433,11 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![], Arc::new(RwLock::new(HashMap::new())));
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -442,7 +450,11 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![], Arc::new(RwLock::new(HashMap::new())));
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -452,7 +464,11 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![], Arc::new(RwLock::new(HashMap::new())));
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());

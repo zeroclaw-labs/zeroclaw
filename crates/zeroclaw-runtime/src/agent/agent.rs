@@ -119,6 +119,76 @@ pub struct Agent {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
     approval_manager: Option<Arc<ApprovalManager>>,
+    /// Late-bound channel-map handles for the five channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all five tool maps in one shot.
+    channel_handles: AgentChannelHandles,
+}
+
+/// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
+/// cheap (Arc clones); the underlying maps are shared with the live tools.
+#[derive(Clone, Default)]
+pub struct AgentChannelHandles {
+    pub ask_user: Option<tools::PerToolChannelHandle>,
+    pub reaction: tools::PerToolChannelHandle,
+    pub poll: Option<tools::PerToolChannelHandle>,
+    pub escalate: Option<tools::PerToolChannelHandle>,
+    pub channel_send: Option<tools::PerToolChannelHandle>,
+}
+
+impl AgentChannelHandles {
+    /// Register a channel into every populated handle so all channel-driven
+    /// tools can resolve it by name.
+    pub fn register_channel(
+        &self,
+        name: impl Into<String>,
+        channel: Arc<dyn zeroclaw_api::channel::Channel>,
+    ) {
+        let name = name.into();
+        let handles: Vec<_> = vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ];
+        for handle in handles.into_iter().flatten() {
+            handle.write().insert(name.clone(), Arc::clone(&channel));
+        }
+    }
+
+    /// Remove a channel from every populated handle (used on session/stop).
+    pub fn unregister_channel(&self, name: &str) {
+        let handles: Vec<_> = vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ];
+        for handle in handles.into_iter().flatten() {
+            handle.write().remove(name);
+        }
+    }
+
+    /// Look up a registered channel by name from any populated channel map.
+    pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
+        let handles: Vec<_> = vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ];
+        for handle in handles.into_iter().flatten() {
+            if let Some(channel) = handle.read().get(name) {
+                return Some(Arc::clone(channel));
+            }
+        }
+        None
+    }
 }
 
 pub struct AgentBuilder {
@@ -463,6 +533,7 @@ impl AgentBuilder {
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
+            channel_handles: AgentChannelHandles::default(),
         })
     }
 }
@@ -474,6 +545,15 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Late-bound channel-map handles for the five channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all five tool maps in one shot.
+    pub fn channel_handles(&self) -> &AgentChannelHandles {
+        &self.channel_handles
     }
 
     pub fn clear_history(&mut self) {
@@ -705,6 +785,11 @@ impl Agent {
         let (
             mut tools,
             delegate_handle,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -944,6 +1029,16 @@ impl Agent {
             agent.channel_targets = Some(targets.clone());
         }
 
+        // Wire per-tool channel-map handles into the agent so callers (e.g.
+        // the ACP server) can register back-channels after construction.
+        agent.channel_handles = AgentChannelHandles {
+            ask_user: ask_user_handle,
+            reaction: reaction_handle,
+            poll: poll_handle,
+            escalate: escalate_handle,
+            channel_send: channel_send_handle,
+        };
+
         Ok(agent)
     }
 
@@ -1014,14 +1109,9 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            channel_targets: self.channel_targets.clone(),
         };
-        let mut prompt = self.prompt_builder.build(&ctx)?;
-        if let Some(ref targets) = self.channel_targets {
-            prompt.push('\n');
-            prompt.push_str(targets);
-            prompt.push('\n');
-        }
-        Ok(prompt)
+        self.prompt_builder.build(&ctx)
     }
 
     async fn prepare_provider_messages(
@@ -1099,11 +1189,17 @@ impl Agent {
                 let mut decision_channel_name = String::new();
                 // Collect channels while holding the lock briefly, then drop
                 // the lock before any await points so the guard is not Send.
-                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = tools::SHARED_CHANNEL_MAP
-                    .read()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                    .collect();
+                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
+                    .channel_handles
+                    .ask_user
+                    .as_ref()
+                    .map(|h| {
+                        h.read()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for (ch_name, ch) in &channels {
                     match ch.request_approval("", &ch_request).await {
                         Ok(Some(r)) => {
@@ -2523,7 +2619,7 @@ mod tests {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        tools::SHARED_CHANNEL_MAP.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2578,7 +2674,7 @@ mod tests {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        tools::SHARED_CHANNEL_MAP.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2634,7 +2730,7 @@ mod tests {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
         });
-        tools::SHARED_CHANNEL_MAP.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2694,7 +2790,7 @@ mod tests {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
         });
-        tools::SHARED_CHANNEL_MAP.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let result = agent
             .execute_tool_call(&ParsedToolCall {
@@ -2759,7 +2855,7 @@ mod tests {
             response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
             requests: Arc::clone(&approval_requests),
         });
-        tools::SHARED_CHANNEL_MAP.write().insert("acp".to_string(), channel);
+        agent.channel_handles().register_channel("acp", channel);
 
         let first_result = agent
             .execute_tool_call(&ParsedToolCall {
