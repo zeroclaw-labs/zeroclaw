@@ -38,3 +38,4 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

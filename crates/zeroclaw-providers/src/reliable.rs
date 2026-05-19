@@ -34,6 +34,10 @@ tokio::task_local! {
 }
 
 static LLM_PAYLOAD_TRACING_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static LLM_PAYLOAD_TRACE_TEST_EMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static LLM_PAYLOAD_TRACE_TEST_LAST_MESSAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Enable or disable raw LLM payload tracing.
 ///
@@ -370,6 +374,11 @@ fn should_trace_llm_payload() -> bool {
 fn trace_llm_payload(provider: &str, model: &str, messages: &[ChatMessage], attempt: u32) {
     if !should_trace_llm_payload() {
         return;
+    }
+    #[cfg(test)]
+    {
+        LLM_PAYLOAD_TRACE_TEST_EMIT_COUNT.fetch_add(1, Ordering::SeqCst);
+        LLM_PAYLOAD_TRACE_TEST_LAST_MESSAGE_COUNT.store(messages.len(), Ordering::SeqCst);
     }
     let payload = llm_payload_trace_json(messages);
     tracing::trace!(
@@ -2284,12 +2293,15 @@ mod tests {
         assert!(json.contains(r#""content": "{\"result\":\"ok\"}""#));
     }
 
-    #[test]
-    fn llm_payload_trace_requires_explicit_opt_in() {
+    #[tokio::test]
+    async fn llm_payload_trace_requires_explicit_opt_in() {
+        let _guard = LLM_PAYLOAD_TRACE_TEST_LOCK.lock().await;
         let previous = set_llm_payload_tracing_enabled(false);
         let _reset = scopeguard::guard(previous, |previous| {
             set_llm_payload_tracing_enabled(previous);
+            reset_llm_payload_trace_test_state();
         });
+        reset_llm_payload_trace_test_state();
 
         assert!(
             !llm_payload_trace_should_emit(true),
@@ -2306,6 +2318,266 @@ mod tests {
             !llm_payload_trace_should_emit(false),
             "explicit opt-in still needs the trace target enabled"
         );
+    }
+
+    fn reset_llm_payload_trace_test_state() {
+        LLM_PAYLOAD_TRACE_TEST_EMIT_COUNT.store(0, Ordering::SeqCst);
+        LLM_PAYLOAD_TRACE_TEST_LAST_MESSAGE_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    fn llm_payload_trace_test_emits() -> usize {
+        LLM_PAYLOAD_TRACE_TEST_EMIT_COUNT.load(Ordering::SeqCst)
+    }
+
+    fn llm_payload_trace_test_last_message_count() -> usize {
+        LLM_PAYLOAD_TRACE_TEST_LAST_MESSAGE_COUNT.load(Ordering::SeqCst)
+    }
+
+    static LLM_PAYLOAD_TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct PayloadTraceStreamingMock;
+
+    #[async_trait]
+    impl Provider for PayloadTraceStreamingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            stream::iter(vec![Ok(StreamEvent::Final)]).boxed()
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+        }
+    }
+
+    fn payload_trace_streaming_provider() -> ReliableProvider {
+        ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(PayloadTraceStreamingMock) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        )
+    }
+
+    // Payload tracing fires while the streaming request is constructed, before
+    // the returned stream is polled, so the scoped subscriber only needs to wrap
+    // the provider call that builds the stream.
+    fn with_trace_subscriber<T>(f: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f)
+    }
+
+    #[tokio::test]
+    async fn stream_chat_payload_trace_requires_explicit_opt_in() {
+        let _guard = LLM_PAYLOAD_TRACE_TEST_LOCK.lock().await;
+        let previous = set_llm_payload_tracing_enabled(false);
+        let _reset = scopeguard::guard(previous, |previous| {
+            set_llm_payload_tracing_enabled(previous);
+            reset_llm_payload_trace_test_state();
+        });
+        reset_llm_payload_trace_test_state();
+
+        let provider = payload_trace_streaming_provider();
+        let messages = vec![ChatMessage::user("sample prompt")];
+        let mut stream = with_trace_subscriber(|| {
+            provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+        });
+
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::Final
+        ));
+        assert_eq!(
+            llm_payload_trace_test_emits(),
+            0,
+            "TRACE logging alone must not emit raw streaming payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_payload_trace_reaches_streaming_call_sites() {
+        let _guard = LLM_PAYLOAD_TRACE_TEST_LOCK.lock().await;
+        let previous = set_llm_payload_tracing_enabled(true);
+        let _reset = scopeguard::guard(previous, |previous| {
+            set_llm_payload_tracing_enabled(previous);
+            reset_llm_payload_trace_test_state();
+        });
+        reset_llm_payload_trace_test_state();
+
+        let provider = payload_trace_streaming_provider();
+
+        let messages = vec![ChatMessage::user("sample prompt")];
+        let mut stream = with_trace_subscriber(|| {
+            provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+        });
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::Final
+        ));
+        assert_eq!(llm_payload_trace_test_emits(), 1);
+        assert_eq!(llm_payload_trace_test_last_message_count(), 1);
+
+        let mut stream = with_trace_subscriber(|| {
+            provider.stream_chat_with_system(
+                Some("system prompt"),
+                "sample prompt",
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+        });
+        assert!(stream.next().await.unwrap().unwrap().is_final);
+        assert_eq!(llm_payload_trace_test_emits(), 2);
+        assert_eq!(
+            llm_payload_trace_test_last_message_count(),
+            2,
+            "system streaming trace should include system and user messages"
+        );
+
+        let history = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("first turn"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("sample prompt"),
+        ];
+        let mut stream = with_trace_subscriber(|| {
+            provider.stream_chat_with_history(
+                &history,
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+        });
+        assert!(stream.next().await.unwrap().unwrap().is_final);
+        assert_eq!(llm_payload_trace_test_emits(), 3);
+        assert_eq!(
+            llm_payload_trace_test_last_message_count(),
+            4,
+            "history streaming trace should include the full conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_payload_trace_uses_selected_tool_event_provider() {
+        let _guard = LLM_PAYLOAD_TRACE_TEST_LOCK.lock().await;
+        let previous = set_llm_payload_tracing_enabled(true);
+        let _reset = scopeguard::guard(previous, |previous| {
+            set_llm_payload_tracing_enabled(previous);
+            reset_llm_payload_trace_test_state();
+        });
+        reset_llm_payload_trace_test_state();
+
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let fallback = Arc::new(StreamingToolEventMock::new(true));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("sample prompt")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut stream = with_trace_subscriber(|| {
+            provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "model",
+                Some(0.0),
+                StreamOptions::new(true),
+            )
+        });
+
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::ToolCall(_)
+        ));
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::Final
+        ));
+        assert_eq!(
+            primary.stream_calls.load(Ordering::SeqCst),
+            0,
+            "provider without tool-event support should be skipped before tracing"
+        );
+        assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            llm_payload_trace_test_emits(),
+            1,
+            "stream_chat should trace only the selected streaming tool-event provider"
+        );
+        assert_eq!(llm_payload_trace_test_last_message_count(), 1);
     }
 
     #[test]

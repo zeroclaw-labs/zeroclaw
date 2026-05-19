@@ -305,32 +305,34 @@ async fn normalize_native_tool_result_json(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
-) -> anyhow::Result<Option<String>> {
+) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
-        return Ok(None);
+        return None;
     };
 
     let Some(serde_json::Value::String(inner)) = obj.get("content").cloned() else {
-        return Ok(None);
+        return None;
     };
 
     let (cleaned_text, refs) = parse_image_markers(&inner);
     if refs.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    let mut normalized_refs = Vec::with_capacity(refs.len());
-    for reference in refs {
-        let data_uri =
-            normalize_image_reference(&reference, config, max_bytes, remote_client).await?;
-        normalized_refs.push(data_uri);
-    }
-
-    let new_inner = compose_multimodal_message(&cleaned_text, &normalized_refs);
+    let normalized = normalize_image_references(&refs, config, max_bytes, remote_client).await;
+    let new_inner = compose_multimodal_content(
+        &cleaned_text,
+        &normalized.data_uris,
+        normalized.skipped_count,
+        refs.len(),
+    );
     obj.insert("content".to_string(), serde_json::Value::String(new_inner));
 
-    Ok(Some(serde_json::Value::Object(obj).to_string()))
+    Some((
+        serde_json::Value::Object(obj).to_string(),
+        !normalized.data_uris.is_empty(),
+    ))
 }
 
 pub async fn prepare_messages_for_provider(
@@ -356,21 +358,12 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
-    // When image count exceeds the limit, strip markers from oldest messages
-    // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
-    // cumulative image count crosses the threshold.
-    let trimmed = if total_images > max_images {
-        trim_old_images(messages, max_images)
-    } else {
-        messages.to_vec()
-    };
-
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(&trimmed);
+    let latest_tool_indices = latest_tool_result_indices(messages);
 
-    let mut normalized_messages = Vec::with_capacity(trimmed.len());
-    for (index, message) in trimmed.iter().enumerate() {
+    let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut has_successful_images = false;
+    for (index, message) in messages.iter().enumerate() {
         if !should_normalize_message_images(index, message, &latest_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
@@ -391,18 +384,19 @@ pub async fn prepare_messages_for_provider(
         // JSON so adapters keep seeing the structure they expect. Falls
         // through to the plain-text path for non-JSON tool messages.
         if message.role == "tool"
-            && let Some(prepared) = normalize_native_tool_result_json(
+            && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
                 &message.content,
                 config,
                 max_bytes,
                 &remote_client,
             )
-            .await?
+            .await
         {
             normalized_messages.push(ChatMessage {
                 role: message.role.clone(),
                 content: prepared,
             });
+            has_successful_images |= contains_images;
             continue;
         }
 
@@ -412,39 +406,32 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
-            match normalize_image_reference(&reference, config, max_bytes, &remote_client).await {
-                Ok(data_uri) => normalized_refs.push(data_uri),
-                Err(error) => {
-                    // Drop "broken marker" errors (missing file, malformed
-                    // marker, IO/network failure) so a single stale entry in
-                    // session memory — e.g. the historical
-                    // `[IMAGE:<key> | download failed]` text fallback — does
-                    // not abort the whole LLM call.  Policy errors
-                    // (size/MIME/remote-fetch-disabled) still propagate so
-                    // misconfiguration surfaces loudly.
-                    if is_broken_marker_error(&error) {
-                        tracing::warn!(
-                            "multimodal: dropping bad image marker {reference:?}: {error}"
-                        );
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        let normalized = normalize_image_references(&refs, config, max_bytes, &remote_client).await;
+        let content = compose_multimodal_content(
+            &cleaned_text,
+            &normalized.data_uris,
+            normalized.skipped_count,
+            refs.len(),
+        );
+        has_successful_images |= !normalized.data_uris.is_empty();
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
         });
     }
 
+    // Apply the per-request image cap after normalization so failed image refs
+    // do not consume budget and evict older images that could still be sent.
+    let capped_messages =
+        if has_successful_images && count_image_markers(&normalized_messages) > max_images {
+            trim_old_images(&normalized_messages, max_images)
+        } else {
+            normalized_messages
+        };
+
     Ok(PreparedMessages {
-        messages: normalized_messages,
-        contains_images: true,
+        contains_images: count_image_markers(&capped_messages) > 0,
+        messages: capped_messages,
     })
 }
 
@@ -520,6 +507,115 @@ fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
     }
 
     content
+}
+
+struct NormalizedImageReferences {
+    data_uris: Vec<String>,
+    skipped_count: usize,
+}
+
+async fn normalize_image_references(
+    refs: &[String],
+    config: &MultimodalConfig,
+    max_bytes: usize,
+    remote_client: &Client,
+) -> NormalizedImageReferences {
+    let mut data_uris = Vec::with_capacity(refs.len());
+    let mut skipped_count = 0usize;
+
+    for reference in refs {
+        match normalize_image_reference(reference, config, max_bytes, remote_client).await {
+            Ok(data_uri) => data_uris.push(data_uri),
+            Err(error) => {
+                skipped_count += 1;
+                let error_reason = multimodal_error_reason(&error);
+                tracing::warn!(
+                    source_kind = image_reference_kind(reference),
+                    error_kind = multimodal_error_kind(&error),
+                    reason = error_reason.as_deref().unwrap_or(""),
+                    "skipping multimodal image that could not be loaded"
+                );
+            }
+        }
+    }
+
+    NormalizedImageReferences {
+        data_uris,
+        skipped_count,
+    }
+}
+
+fn compose_multimodal_content(
+    text: &str,
+    data_uris: &[String],
+    skipped_count: usize,
+    total_refs: usize,
+) -> String {
+    if skipped_count == 0 {
+        return compose_multimodal_message(text, data_uris);
+    }
+
+    let text_with_note = append_skipped_image_note(text, skipped_count, total_refs);
+    if data_uris.is_empty() {
+        text_with_note.trim().to_string()
+    } else {
+        compose_multimodal_message(&text_with_note, data_uris)
+    }
+}
+
+fn append_skipped_image_note(text: &str, skipped_count: usize, total_refs: usize) -> String {
+    if skipped_count == 0 {
+        return text.to_string();
+    }
+
+    // This note is model-facing provider context, not direct localized UI text.
+    let note = if skipped_count == total_refs {
+        format!("{skipped_count} attached image(s) could not be loaded")
+    } else {
+        format!("{skipped_count} of {total_refs} attached image(s) could not be loaded")
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        format!("Note: {note}.")
+    } else {
+        format!("{trimmed}\n\nNote: {note}.")
+    }
+}
+
+fn image_reference_kind(reference: &str) -> &'static str {
+    if reference.starts_with("data:") {
+        "data"
+    } else if reference.starts_with("http://") || reference.starts_with("https://") {
+        "remote"
+    } else {
+        "local"
+    }
+}
+
+fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::TooManyImages { .. }) => "too_many_images",
+        Some(MultimodalError::ImageTooLarge { .. }) => "image_too_large",
+        Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
+        Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
+        Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
+        Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
+        Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
+        Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
+        None => "unknown",
+    }
+}
+
+fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::InvalidMarker { input, reason })
+        | Some(MultimodalError::RemoteFetchFailed { input, reason })
+        | Some(MultimodalError::LocalReadFailed { input, reason }) => {
+            Some(reason.replace(input, "<source>"))
+        }
+        _ => None,
+    }
 }
 
 async fn normalize_image_reference(
@@ -1096,6 +1192,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "generated screenshot [IMAGE:https://example.com/missing.png]",
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("skipped native tool image should not fail message preparation");
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(inner.contains("1 attached image(s) could not be loaded"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_with_mixed_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("mixed-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!(
+                "generated [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+                image_path.display()
+            ),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("valid native tool image should survive while bad ref is skipped");
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated"));
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
+        assert!(!inner.contains("mixed-native-tool-result.png"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
     async fn prepare_messages_strips_stale_native_tool_result_images() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("stale-native-tool-result.png");
@@ -1499,24 +1677,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_remote_url_when_disabled() {
+    async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect_err("should reject remote image URL when fetch is disabled");
+            .expect("disabled remote image should be skipped");
 
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
+        assert!(result.messages[0].content.contains("Look"));
         assert!(
-            error
-                .to_string()
-                .contains("multimodal remote image fetch is disabled")
+            result.messages[0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/img.png")
         );
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_oversized_local_image() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
@@ -1534,14 +1720,107 @@ mod tests {
             ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject oversized local image");
+            .expect("oversized local image should be skipped");
 
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
         assert!(
-            error
-                .to_string()
-                .contains("multimodal image size limit exceeded")
+            result.messages[0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains(image_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_successful_images_when_some_are_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("ok.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "Look [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+            image_path.display()
+        ))];
+
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("valid local image should survive while remote image is skipped");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            result.messages[0]
+                .content
+                .contains("1 of 2 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/missing.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_images_do_not_consume_image_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older-valid.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Older valid image [IMAGE:{}]",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "Newer broken image [IMAGE:https://example.com/missing.png]".to_string(),
+            ),
+        ];
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("broken image should not evict an older valid image");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(result.messages[1].content.contains("Newer broken image"));
+        assert!(
+            result.messages[1]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[1]
+                .content
+                .contains("https://example.com/missing.png")
         );
     }
 

@@ -104,6 +104,14 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::YumcSearch);
             assert_eq!(resolved.canonical_provider, YUMC_SEARCH_PROVIDER);
+       }
+    }
+    fn resolve_aliases_to_tavily() {
+        let tavily_aliases = ["tavily", "tavily-search", "tavily_search"];
+        for alias in tavily_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Tavily);
+            assert_eq!(resolved.canonical_provider, TAVILY_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

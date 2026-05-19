@@ -399,7 +399,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     // for the engine so HeartbeatTick/Error events reach the primary backend.
     // The agent::run() calls below pass None so loop_::run() calls create_observer()
     // internally, preserving the configured backend alongside the gateway's SSE hook.
-    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_broadcast_hook.
+    // See: crates/zeroclaw-runtime/src/observability/mod.rs — set_scoped_broadcast_hook.
     let engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
