@@ -91,6 +91,7 @@ pub struct CronAddBody {
     pub agent: String,
     pub name: Option<String>,
     pub schedule: String,
+    pub tz: Option<String>,
     pub command: Option<String>,
     pub job_type: Option<String>,
     pub prompt: Option<String>,
@@ -108,8 +109,71 @@ pub struct CronPatchBody {
     pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
+    pub tz: Option<String>,
+    pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+}
+
+enum CronTimezonePatch {
+    Preserve,
+    Set(String),
+    Clear,
+}
+
+fn bad_request(message: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+}
+
+fn normalize_optional_timezone(
+    tz: Option<String>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    match tz {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(bad_request(
+                    "tz must be a non-empty IANA timezone; use clear_tz=true to clear it",
+                ))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_timezone_patch(
+    tz: Option<String>,
+    clear_tz: Option<bool>,
+) -> Result<CronTimezonePatch, (StatusCode, Json<serde_json::Value>)> {
+    let tz = normalize_optional_timezone(tz)?;
+    let clear_tz = clear_tz.unwrap_or(false);
+
+    if clear_tz && tz.is_some() {
+        return Err(bad_request("Provide either tz or clear_tz=true, not both"));
+    }
+
+    if clear_tz {
+        Ok(CronTimezonePatch::Clear)
+    } else if let Some(tz) = tz {
+        Ok(CronTimezonePatch::Set(tz))
+    } else {
+        Ok(CronTimezonePatch::Preserve)
+    }
+}
+
+fn cron_schedule_from_api(
+    expr: String,
+    tz: Option<String>,
+) -> Result<zeroclaw_runtime::cron::Schedule, (StatusCode, Json<serde_json::Value>)> {
+    let schedule = zeroclaw_runtime::cron::Schedule::Cron { expr, tz };
+    zeroclaw_runtime::cron::validate_schedule(&schedule, chrono::Utc::now())
+        .map_err(|e| bad_request(format!("Invalid cron schedule: {e}")))?;
+    Ok(schedule)
 }
 
 #[derive(Deserialize)]
@@ -273,6 +337,7 @@ pub async fn handle_api_cron_add(
         agent: agent_alias,
         name,
         schedule,
+        tz,
         command,
         job_type,
         prompt,
@@ -293,9 +358,13 @@ pub async fn handle_api_cron_add(
         )
             .into_response();
     }
-    let schedule = zeroclaw_runtime::cron::Schedule::Cron {
-        expr: schedule,
-        tz: None,
+    let tz = match normalize_optional_timezone(tz) {
+        Ok(tz) => tz,
+        Err(e) => return e.into_response(),
+    };
+    let schedule = match cron_schedule_from_api(schedule, tz) {
+        Ok(schedule) => schedule,
+        Err(e) => return e.into_response(),
     };
     if let Err(e) = zeroclaw_runtime::cron::validate_delivery_config(delivery.as_ref()) {
         return (
@@ -560,19 +629,20 @@ pub async fn handle_api_cron_patch(
             .into_response();
     }
     let agent_alias = body.agent.clone();
-
-    // Build the schedule from the provided expression string (if any).
-    let schedule = match body.schedule {
-        Some(expr) if !expr.trim().is_empty() => Some(zeroclaw_runtime::cron::Schedule::Cron {
-            expr: expr.trim().to_string(),
-            tz: None,
-        }),
-        _ => None,
+    let CronPatchBody {
+        agent: _,
+        name,
+        schedule: schedule_expr,
+        tz,
+        clear_tz,
+        command,
+        prompt,
+    } = body;
+    let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
+        Ok(patch) => patch,
+        Err(e) => return e.into_response(),
     };
 
-    // Route the edited text to the correct field based on the job's stored type.
-    // The frontend sends a single textarea value; for agent jobs it is the prompt,
-    // for shell jobs it is the command.
     let existing = match zeroclaw_runtime::cron::get_job(&config, &id) {
         Ok(j) => j,
         Err(e) => {
@@ -583,15 +653,49 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let new_expr = schedule_expr
+        .as_deref()
+        .map(str::trim)
+        .filter(|expr| !expr.is_empty())
+        .map(str::to_string);
+    let timezone_changed = !matches!(timezone_patch, CronTimezonePatch::Preserve);
+    let schedule = if new_expr.is_some() || timezone_changed {
+        let (expr, existing_tz) = match (&existing.schedule, new_expr) {
+            (_, Some(expr)) => {
+                let existing_tz = match &existing.schedule {
+                    zeroclaw_runtime::cron::Schedule::Cron { tz, .. } => tz.clone(),
+                    _ => None,
+                };
+                (expr, existing_tz)
+            }
+            (zeroclaw_runtime::cron::Schedule::Cron { expr, tz }, None) => {
+                (expr.clone(), tz.clone())
+            }
+            (_, None) => {
+                return bad_request("tz can only be updated on cron schedules").into_response();
+            }
+        };
+        let tz = match timezone_patch {
+            CronTimezonePatch::Preserve => existing_tz,
+            CronTimezonePatch::Set(tz) => Some(tz),
+            CronTimezonePatch::Clear => None,
+        };
+        match cron_schedule_from_api(expr, tz) {
+            Ok(schedule) => Some(schedule),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
-        (None, body.command.or(body.prompt))
+        (None, command.or(prompt))
     } else {
-        (body.command.or(body.prompt), None)
+        (command.or(prompt), None)
     };
 
     let patch = zeroclaw_runtime::cron::CronJobPatch {
-        name: body.name,
+        name,
         schedule,
         command: patch_command,
         prompt: patch_prompt,
@@ -2029,6 +2133,338 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_add_persists_explicit_timezone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "name": "localized-job",
+                    "schedule": "0 9 * * *",
+                    "tz": "America/New_York",
+                    "command": "echo hello"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(
+            jobs[0].schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_add_rejects_invalid_timezone_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "name": "invalid-timezone-job",
+                    "schedule": "0 9 * * *",
+                    "tz": "Invalid/Zone",
+                    "command": "echo hello"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Invalid IANA timezone")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_schedule_preserves_existing_timezone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("Europe/Berlin".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "schedule": "30 9 * * *"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: Some("Europe/Berlin".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_replaces_timezone_when_provided() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "schedule": "30 9 * * *",
+                    "tz": "Asia/Tokyo"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: Some("Asia/Tokyo".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_sets_timezone_without_schedule_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("runtime-local-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "tz": "America/Chicago"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/Chicago".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_rejects_invalid_timezone_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state),
+            HeaderMap::new(),
+            Path(job.id),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "tz": "Invalid/Zone"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Invalid IANA timezone")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_timezone_patch_clears_timezone_with_explicit_signal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("localized-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: Some("America/New_York".to_string()),
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "test-agent",
+                    "clear_tz": true
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "0 9 * * *".to_string(),
+                tz: None,
+            }
+        );
     }
 
     #[tokio::test]

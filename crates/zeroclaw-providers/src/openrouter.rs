@@ -1804,6 +1804,45 @@ mod tests {
         assert_eq!(result[1].function.name, "another-valid");
     }
 
+    /// Regression: skill tools used to be registered with a `.` separator
+    /// (`{skill}.{tool}`), e.g. `openrouter-spend.check_openrouter_spend`.
+    /// That format silently failed `is_valid_openai_tool_name` and got
+    /// dropped from the function-call spec list sent to OpenAI-compatible
+    /// providers, while still appearing in the system prompt — leaving the
+    /// LLM hallucinating "unknown tool" errors. Skill tools now use the
+    /// `__` separator (matching the MCP `<server>__<tool>` convention),
+    /// which passes the validator and survives `convert_tools`.
+    #[test]
+    fn convert_tools_preserves_skill_namespaced_names_with_double_underscore() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let tools = vec![
+            // New format — must pass through.
+            ToolSpec {
+                name: "openrouter-spend__check_openrouter_spend".into(),
+                description: "Skill tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            // Old format — must still be rejected so the regression stays caught.
+            ToolSpec {
+                name: "openrouter-spend.check_openrouter_spend".into(),
+                description: "Skill tool with legacy dotted name".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "only the __ form should survive convert_tools"
+        );
+        assert_eq!(
+            result[0].function.name,
+            "openrouter-spend__check_openrouter_spend"
+        );
+    }
+
     #[test]
     fn convert_tools_returns_none_when_all_invalid() {
         use zeroclaw_api::tool::ToolSpec;

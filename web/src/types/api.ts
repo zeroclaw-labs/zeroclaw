@@ -68,7 +68,7 @@ export interface CronJob {
   command: string;
   prompt: string | null;
   job_type: string;
-  schedule: unknown;
+  schedule: CronSchedule;
   enabled: boolean;
   delivery: CronDeliveryConfig;
   delete_after_run: boolean;

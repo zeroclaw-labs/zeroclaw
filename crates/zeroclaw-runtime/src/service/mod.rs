@@ -661,9 +661,29 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
+    let plist =
+        render_macos_launch_agent_plist(&exe, &stdout, &stderr, homebrew_var_dir.as_deref());
+
+    fs::write(&file, plist)?;
+    println!("✅ Installed launchd service: {}", file.display());
+    if let Some(ref var_dir) = homebrew_var_dir {
+        println!("   Homebrew var: {}", var_dir.display());
+    }
+    println!("   Start with: zeroclaw service start");
+    Ok(())
+}
+
+/// Renders the macOS LaunchAgent plist; path arguments are XML-escaped before interpolation,
+/// and the caller is responsible for writing the returned XML to the plist path.
+fn render_macos_launch_agent_plist(
+    exe: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    homebrew_var_dir: Option<&Path>,
+) -> String {
     // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
     // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(ref var_dir) = homebrew_var_dir {
+    let env_section = if let Some(var_dir) = homebrew_var_dir {
         format!(
             r#"  <key>EnvironmentVariables</key>
   <dict>
@@ -680,10 +700,10 @@ fn install_macos(config: &Config) -> Result<()> {
         String::new()
     };
 
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>Label</key>
   <string>{label}</string>
@@ -708,18 +728,7 @@ fn install_macos(config: &Config) -> Result<()> {
         env_section = env_section,
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string())
-    );
-
-    fs::write(&file, plist)?;
-    println!(
-        "✅ Installed launchd service: {}",
-        file.display().to_string()
-    );
-    if let Some(ref var_dir) = homebrew_var_dir {
-        println!("   Homebrew var: {}", var_dir.display().to_string());
-    }
-    println!("   Start with: zeroclaw service start");
-    Ok(())
+    )
 }
 
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -1439,6 +1448,78 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+// Plain `#[cfg(test)]` is intentional: these pure renderer tests have no
+// integration dependencies and should run in every zeroclaw-runtime test build.
+#[cfg(test)]
+mod macos_plist_tests {
+    use super::*;
+
+    #[test]
+    fn macos_plist_renderer_uses_plain_xml_quotes() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stdout.log"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stderr.log"),
+            Some(Path::new("/opt/homebrew/var/zeroclaw")),
+        );
+
+        assert!(!plist.contains(r#"\""#));
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains(
+            r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
+        ));
+        assert!(plist.contains(r#"<plist version="1.0">"#));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+    }
+
+    #[test]
+    fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            None,
+        );
+
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stdout.log"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stderr.log"));
+        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(!plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_renderer_emits_plutil_parseable_xml() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
+        );
+
+        let file = std::env::temp_dir().join(format!(
+            "zeroclaw-launch-agent-plist-{}.plist",
+            std::process::id()
+        ));
+        fs::write(&file, plist).expect("write plist fixture");
+
+        let output = Command::new("plutil")
+            .arg("-lint")
+            .arg(&file)
+            .output()
+            .expect("run plutil");
+        let _ = fs::remove_file(&file);
+
+        assert!(
+            output.status.success(),
+            "plutil failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[cfg(all(test, zeroclaw_root_crate))]

@@ -1,6 +1,7 @@
-use crate::cron::{
-    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
+use super::cron_common::{
+    AT_DESCRIPTION, CRON_TZ_DESCRIPTION, cron_add_output, deserialize_schedule_arg,
 };
+use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -113,16 +114,16 @@ impl Tool for CronAddTool {
                             "properties": {
                                 "kind": { "type": "string", "enum": ["cron"] },
                                 "expr": { "type": "string", "description": "Standard 5-field cron expression, e.g. '*/5 * * * *'" },
-                                "tz": { "type": "string", "description": "Optional IANA timezone name, e.g. 'America/New_York'. Defaults to UTC." }
+                                "tz": { "type": "string", "description": CRON_TZ_DESCRIPTION }
                             },
                             "required": ["kind", "expr"]
                         },
                         {
                             "type": "object",
-                            "description": "One-shot schedule at a specific UTC datetime. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
+                            "description": "One-shot schedule at a specific RFC3339 timestamp with explicit Z or offset. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
                             "properties": {
                                 "kind": { "type": "string", "enum": ["at"] },
-                                "at": { "type": "string", "description": "ISO 8601 UTC datetime string, e.g. '2025-12-31T23:59:00Z'" }
+                                "at": { "type": "string", "description": AT_DESCRIPTION }
                             },
                             "required": ["kind", "at"]
                         },
@@ -225,24 +226,24 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                match deserialize_maybe_stringified::<Schedule>(v) {
+                match deserialize_schedule_arg(v) {
                     Ok(schedule) => schedule,
-                    Err(e) => {
+                    Err(error) => {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!("Invalid schedule: {e}")),
+                            error: Some(error),
                         });
                     }
                 }
             }
-            Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
+            Some(v) => match deserialize_schedule_arg(v) {
                 Ok(schedule) => schedule,
-                Err(e) => {
+                Err(error) => {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Invalid schedule: {e}")),
+                        error: Some(error),
                     });
                 }
             },
@@ -409,15 +410,7 @@ impl Tool for CronAddTool {
         match result {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "id": job.id,
-                    "name": job.name,
-                    "job_type": job.job_type,
-                    "schedule": job.schedule,
-                    "next_run": job.next_run,
-                    "enabled": job.enabled,
-                    "allowed_tools": job.allowed_tools
-                }))?,
+                output: serde_json::to_string_pretty(&cron_add_output(&job))?,
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -495,6 +488,57 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn output_includes_timezone_confirmation_fields_for_explicit_cron_timezone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 9 * * 1-5", "tz": "America/New_York" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["next_run"], output["next_run_utc"]);
+        assert_eq!(output["schedule_timezone"], "America/New_York");
+        assert_eq!(output["timezone_source"], "explicit");
+        assert!(
+            output["next_run_local"]
+                .as_str()
+                .is_some_and(|value| value.contains("T09:00:00")),
+            "next_run_local should display the next run in the explicit schedule timezone: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_identifies_runtime_local_fallback_when_cron_timezone_is_omitted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["timezone_source"], "runtime_local");
+        assert_eq!(output["schedule_timezone"], "runtime local timezone");
+        assert!(
+            output["next_run_local"].as_str().is_some(),
+            "next_run_local should be present for runtime-local cron schedules: {output}"
+        );
     }
 
     #[tokio::test]
@@ -796,6 +840,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_at_timestamp_without_explicit_offset_with_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "at", "at": "2026-05-18T09:00:00" },
+                "job_type": "shell",
+                "command": "echo at"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("RFC3339 timestamp with explicit Z or offset"),
+            "error should explain the explicit offset requirement: {error}"
+        );
+        assert!(error.contains("2026-05-18T09:00:00Z"));
+        assert!(error.contains("2026-05-18T09:00:00-04:00"));
+    }
+
+    #[tokio::test]
     async fn agent_job_requires_prompt() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -1006,5 +1075,37 @@ mod tests {
                 _ => panic!("unexpected kind: {kind}"),
             }
         }
+
+        let cron_variant = one_of
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "cron")
+            .expect("cron variant");
+        let cron_tz_description = cron_variant["properties"]["tz"]["description"]
+            .as_str()
+            .expect("cron tz description");
+        assert!(
+            cron_tz_description.contains("runtime local timezone"),
+            "cron tz description must match scheduler fallback: {cron_tz_description}"
+        );
+        assert!(
+            cron_tz_description.contains("explicit IANA timezone"),
+            "cron tz description should recommend explicit IANA timezones: {cron_tz_description}"
+        );
+        assert!(
+            !cron_tz_description.contains("Defaults to UTC"),
+            "cron tz description must not claim a UTC default"
+        );
+
+        let at_variant = one_of
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["enum"][0] == "at")
+            .expect("at variant");
+        let at_description = at_variant["properties"]["at"]["description"]
+            .as_str()
+            .expect("at description");
+        assert!(
+            at_description.contains("RFC3339 timestamp with explicit Z or offset"),
+            "at description should require explicit Z or offset: {at_description}"
+        );
     }
 }

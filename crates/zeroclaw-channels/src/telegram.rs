@@ -3772,7 +3772,9 @@ Ensure only one `zeroclaw` process is using this bot token."
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": status.to_string(), "err": err})),
+                        .with_attrs(
+                            ::serde_json::json!({"status": status.to_string(), "err": err})
+                        ),
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
@@ -3821,7 +3823,6 @@ Ensure only one `zeroclaw` process is using this bot token."
             self.pending_approvals.lock().await.remove(&approval_id);
             anyhow::bail!("Telegram sendMessage (approval) failed after fallback");
         }
-
 
         // Wait for the user to tap a button. Timeout is configurable via
         // `channels.telegram.approval_timeout_secs` (default 120s).
