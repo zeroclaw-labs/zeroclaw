@@ -37,7 +37,8 @@ impl FileUploadTool {
             "zip" => "application/zip",
             "tar" => "application/x-tar",
             "gz" | "tgz" => "application/gzip",
-            "txt" | "log" | "md" => "text/plain",
+            "txt" | "log" => "text/plain",
+            "md" | "markdown" => "text/markdown",
             "csv" => "text/csv",
             "html" | "htm" => "text/html",
             "mp3" => "audio/mpeg",
@@ -500,6 +501,15 @@ mod tests {
             FileUploadTool::mime_for_filename("a.zip"),
             "application/zip"
         );
+        assert_eq!(
+            FileUploadTool::mime_for_filename("README.md"),
+            "text/markdown"
+        );
+        assert_eq!(
+            FileUploadTool::mime_for_filename("notes.markdown"),
+            "text/markdown"
+        );
+        assert_eq!(FileUploadTool::mime_for_filename("a.txt"), "text/plain");
         assert_eq!(
             FileUploadTool::mime_for_filename("noext"),
             "application/octet-stream"
