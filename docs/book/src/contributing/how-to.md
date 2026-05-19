@@ -55,6 +55,19 @@ For the full five-level taxonomy (unit / component / integration / system / live
 - Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are generated — don't hand-edit. Run `cargo mdbook refs` and commit the output
 - Localisation — if you change user-facing strings, run `cargo mdbook sync` to refresh the `.po` files
 
+## Publishing blog or website metadata
+
+When you publish a blog post or otherwise update the public blog metadata, update the hand-maintained feed timestamps in the same PR:
+
+- `web/public/blog/rss.xml` — set `<lastBuildDate>` to the latest post publish time in RFC 2822 / GMT format
+- `web/public/blog/atom.xml` — set `<updated>` to the latest post publish time in ISO 8601 UTC format
+- `web/public/sitemap.xml` — set the `/blog` entry's `<lastmod>` to the latest publish date
+
+Keep feed discovery environment-local:
+
+- `web/index.html` should keep `/blog/rss.xml`, `/blog/atom.xml`, and `/sitemap.xml` as root-relative links
+- `web/public/sitemap.xml` should list the human-facing `/blog` page, not the XML feed files
+
 ## Commit messages
 
 Conventional Commits:
