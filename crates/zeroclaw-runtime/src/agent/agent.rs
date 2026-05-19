@@ -778,6 +778,7 @@ impl Agent {
 
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
+                config,
                 provider_name,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
                 agent_model_provider.and_then(|e| e.uri.as_deref()),

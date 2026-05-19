@@ -13098,14 +13098,21 @@ pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
-    /// External-peer usernames authorized on a channel of `channel_type`,
-    /// from every `[peer_groups.<name>]` whose `channel == channel_type`.
-    /// `_alias` is ignored — peer-groups bind to the type, not an instance.
-    pub fn channel_external_peers(&self, channel_type: &str, _alias: &str) -> Vec<String> {
+    /// External-peer usernames authorized on `<channel_type>.<alias>`.
+    ///
+    /// A `[peer_groups.<name>]` contributes when its `channel` field either
+    /// matches `channel_type` (type-wide group, applies to every alias of
+    /// that type) or matches the full dotted `"<channel_type>.<alias>"`
+    /// (instance-scoped group, applies to that one alias only).
+    pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
-            if group.channel != channel_type {
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
                 continue;
             }
             for peer in &group.external_peers {
@@ -13353,14 +13360,6 @@ impl Config {
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
             let mut config: Config = crate::migration::migrate_to_current(&contents)
                 .context("Failed to migrate config")?;
-            // V3 healer: peer_groups.<name>.channel is type-only. Strip
-            // any legacy "<type>.<alias>" suffix in place so existing
-            // V3 configs from before the change keep working.
-            for group in config.peer_groups.values_mut() {
-                if let Some((ty, _)) = group.channel.split_once('.') {
-                    group.channel = ty.to_string();
-                }
-            }
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -13744,12 +13743,33 @@ impl Config {
                     "model_routes[{i}].hint must not be empty"
                 );
             }
-            if route.model_provider.trim().is_empty() {
+            let mp = route.model_provider.trim();
+            if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model_provider"),
                     "model_routes[{i}].model_provider must not be empty"
                 );
+            }
+            // Route refs are dotted `<type>.<alias>` and must resolve to a
+            // configured `[model_providers.<type>.<alias>]` entry. Unresolved
+            // routes are dropped at runtime construction; rejecting them here
+            // keeps that drift visible at config-load time.
+            match mp.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    if self.providers.models.find(ty, inner).is_none() {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("model_routes[{i}].model_provider"),
+                            "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("model_routes[{i}].model_provider"),
+                    "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+                ),
             }
             if route.model.trim().is_empty() {
                 validation_bail!(
@@ -13769,12 +13789,31 @@ impl Config {
                     "embedding_routes[{i}].hint must not be empty"
                 );
             }
-            if route.model_provider.trim().is_empty() {
+            let mp = route.model_provider.trim();
+            if mp.is_empty() {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must not be empty"
                 );
+            }
+            // Embedding routes resolve against the same model-provider map;
+            // there is no separate `providers.embeddings` typed section.
+            match mp.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    if self.providers.models.find(ty, inner).is_none() {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("embedding_routes[{i}].model_provider"),
+                            "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("embedding_routes[{i}].model_provider"),
+                    "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+                ),
             }
             if route.model.trim().is_empty() {
                 validation_bail!(
@@ -14521,23 +14560,38 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\")",
+                    "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
                 );
             }
             // `get_map_keys` stores section names in kebab form (the schema
             // macro converts snake idents via `snake_to_kebab`); convert
             // before the lookup so underscored channel types like
             // `nextcloud_talk` resolve correctly.
-            let group_channel_kebab = group_channel.replace('_', "-");
-            if self
-                .get_map_keys(&format!("channels.{group_channel_kebab}"))
-                .is_none()
-            {
+            let (group_channel_type, group_channel_alias) = match group_channel.split_once('.') {
+                Some((ty, al)) => (ty, Some(al)),
+                None => (group_channel, None),
+            };
+            let group_channel_type_kebab = group_channel_type.replace('_', "-");
+            let channel_aliases =
+                self.get_map_keys(&format!("channels.{group_channel_type_kebab}"));
+            if channel_aliases.is_none() {
                 validation_bail!(
                     DanglingReference,
                     format!("peer_groups.{group_name}.channel"),
-                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel}.*] block is configured",
+                    "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{group_channel_type}.*] block is configured",
                 );
+            }
+            if let Some(alias) = group_channel_alias {
+                let exists = channel_aliases
+                    .as_ref()
+                    .is_some_and(|keys| keys.iter().any(|k| k == alias));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("peer_groups.{group_name}.channel"),
+                        "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{group_channel_type}.{alias}] is not configured",
+                    );
+                }
             }
             for (i, member) in group.agents.iter().enumerate() {
                 let member_str = member.as_str();
@@ -14548,15 +14602,22 @@ impl Config {
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
                     );
                 };
-                let has_channel_of_type = member_agent
-                    .channels
-                    .iter()
-                    .any(|ch| ch.as_str().starts_with(&format!("{group_channel}.")));
-                if !has_channel_of_type {
+                let has_channel_match = member_agent.channels.iter().any(|ch| {
+                    let ch_str = ch.as_str();
+                    match group_channel_alias {
+                        Some(alias) => ch_str == format!("{group_channel_type}.{alias}"),
+                        None => ch_str.starts_with(&format!("{group_channel_type}.")),
+                    }
+                });
+                if !has_channel_match {
+                    let needs_msg = match group_channel_alias {
+                        Some(alias) => format!("entry for {group_channel_type}.{alias}"),
+                        None => format!("entry of type {group_channel_type:?}"),
+                    };
                     validation_bail!(
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
-                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no entry of type {group_channel:?}",
+                        "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
                     );
                 }
             }
@@ -21595,5 +21656,70 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    #[test]
+    async fn channel_external_peers_type_group_covers_every_alias_of_that_type() {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .telegram
+            .insert("personal".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram".to_string(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            external_peers: vec![crate::multi_agent::PeerUsername::new("@team_user")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let draft_peers = config.channel_external_peers("telegram", "draft");
+        let personal_peers = config.channel_external_peers("telegram", "personal");
+        assert_eq!(draft_peers, vec!["@team_user".to_string()]);
+        assert_eq!(personal_peers, vec!["@team_user".to_string()]);
+    }
+
+    #[test]
+    async fn channel_external_peers_dotted_group_is_alias_scoped() {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .telegram
+            .insert("personal".to_string(), TelegramConfig::default());
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.draft".to_string(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            external_peers: vec![crate::multi_agent::PeerUsername::new("@work_only")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("draft_only".to_string(), group);
+
+        let draft_peers = config.channel_external_peers("telegram", "draft");
+        let personal_peers = config.channel_external_peers("telegram", "personal");
+        assert_eq!(draft_peers, vec!["@work_only".to_string()]);
+        assert!(
+            personal_peers.is_empty(),
+            "dotted peer group must not contribute to other aliases of the same type; got {personal_peers:?}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_peer_group_with_dotted_channel_to_unconfigured_alias() {
+        let mut config = multi_agent_test_config();
+        let group = crate::multi_agent::PeerGroupConfig {
+            channel: "telegram.nope".to_string(),
+            agents: vec![crate::multi_agent::AgentAlias::new("alpha")],
+            ..crate::multi_agent::PeerGroupConfig::default()
+        };
+        config.peer_groups.insert("team_chat".to_string(), group);
+
+        let err = config
+            .validate()
+            .expect_err("dotted channel pointing at an unconfigured alias must fail validation");
+        assert!(
+            err.to_string()
+                .contains("[channels.telegram.nope] is not configured"),
+            "expected unconfigured-alias explanation, got: {err}"
+        );
     }
 }

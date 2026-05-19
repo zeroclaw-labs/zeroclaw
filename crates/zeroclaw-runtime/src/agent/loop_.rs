@@ -2622,6 +2622,7 @@ pub async fn run(
 
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
+                &config,
                 &provider_name,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
                 agent_model_provider.and_then(|e| e.uri.as_deref()),
@@ -3042,6 +3043,7 @@ pub async fn run(
 
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
+                                    &config,
                                     &new_model_provider,
                                     agent_model_provider.and_then(|e| e.api_key.as_deref()),
                                     agent_model_provider.and_then(|e| e.uri.as_deref()),
@@ -3427,6 +3429,7 @@ pub async fn run(
 
                                 model_provider =
                                     zeroclaw_providers::create_routed_model_provider_with_options(
+                                        &config,
                                         &new_model_provider,
                                         agent_model_provider.and_then(|e| e.api_key.as_deref()),
                                         agent_model_provider.and_then(|e| e.uri.as_deref()),
@@ -3835,6 +3838,7 @@ pub async fn process_message(
             zeroclaw_providers::provider_runtime_options_from_config(&config);
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
+                &config,
                 provider_name,
                 agent_model_provider
                     .as_ref()

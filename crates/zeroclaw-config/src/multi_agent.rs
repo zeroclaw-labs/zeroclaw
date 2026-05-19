@@ -128,8 +128,9 @@ pub struct AgentMemoryConfig {
 #[prefix = "peer-group"]
 #[serde(default)]
 pub struct PeerGroupConfig {
-    /// Channel type (`"discord"`, `"telegram"`, …). Type, not alias —
-    /// each agent has its own alias and peers cannot share one.
+    /// Either a channel type (`"telegram"`) or a dotted channel alias
+    /// (`"telegram.work"`). A bare type applies to every alias of that
+    /// type; a dotted form scopes the group to that single instance.
     pub channel: String,
     /// Member agents by alias.
     pub agents: Vec<AgentAlias>,

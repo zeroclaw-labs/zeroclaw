@@ -953,9 +953,17 @@ fn runtime_defaults_from_config(
     let entry = dotted
         .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
         .or_else(|| config.first_model_provider());
-    let default_model_provider = dotted
-        .map(|(t, _)| t.to_string())
-        .unwrap_or_else(|| resolved_default_provider(config));
+    // `default_model_provider` carries the dotted `<type>.<alias>` ref so
+    // it compares equal to `route.model_provider` entries (also dotted),
+    // letting `get_or_create_provider` short-circuit the cache when a
+    // route targets the same alias as the default.
+    let default_model_provider = if !model_provider.is_empty() {
+        model_provider.to_string()
+    } else {
+        config
+            .first_model_provider_alias()
+            .unwrap_or_else(|| resolved_default_provider(config))
+    };
     let model = entry
         .and_then(|e| e.model.clone())
         .or_else(|| resolved_default_model(config).ok())
@@ -1552,6 +1560,7 @@ async fn get_or_create_provider(
         .or_else(|| ctx.api_key.clone());
 
     let model_provider = create_resilient_model_provider_nonblocking(
+        Arc::clone(&ctx.prompt_config),
         provider_name,
         effective_api_key,
         api_url.map(ToString::to_string),
@@ -1581,6 +1590,7 @@ async fn get_or_create_provider(
 }
 
 async fn create_resilient_model_provider_nonblocking(
+    config: Arc<zeroclaw_config::schema::Config>,
     provider_name: &str,
     api_key: Option<String>,
     api_url: Option<String>,
@@ -1589,12 +1599,18 @@ async fn create_resilient_model_provider_nonblocking(
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        zeroclaw_providers::create_resilient_model_provider_with_options(
+        let options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &provider_name,
+            &provider_runtime_options,
+        );
+        zeroclaw_providers::create_resilient_model_provider_from_ref(
+            &config,
             &provider_name,
             api_key.as_deref(),
             api_url.as_deref(),
             &reliability,
-            &provider_runtime_options,
+            &options,
         )
     })
     .await
@@ -3603,6 +3619,7 @@ async fn process_channel_message_body(
                 );
 
                 match create_resilient_model_provider_nonblocking(
+                    Arc::clone(&ctx.prompt_config),
                     &new_model_provider,
                     ctx.api_key.clone(),
                     ctx.api_url.clone(),
@@ -6416,12 +6433,15 @@ pub async fn start_channels(
         let provider_name = config
             .agents
             .get(agent_alias)
-            .and_then(|a| a.model_provider.split_once('.').map(|(t, _)| t.to_string()))
+            .map(|a| a.model_provider.as_str().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| config.first_model_provider_alias())
             .unwrap_or_else(|| resolved_default_provider(&config));
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
+                Arc::new(config.clone()),
                 &provider_name,
                 agent_provider_entry.and_then(|e| e.api_key.clone()),
                 agent_provider_entry.and_then(|e| e.uri.clone()),

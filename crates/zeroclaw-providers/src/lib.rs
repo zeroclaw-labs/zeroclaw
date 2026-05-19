@@ -703,6 +703,40 @@ pub fn provider_runtime_options_from_config(
     model_provider_runtime_options_from_model_provider_entry(config, config.first_model_provider())
 }
 
+/// Build runtime options for a specific dotted provider alias
+/// (`<family>.<alias>`). Mirrors `provider_runtime_options_for_agent` but
+/// keyed on the typed provider entry directly, so routed providers can
+/// resolve their alias-specific endpoint URI and other typed extras
+/// without going through an owning agent.
+pub fn provider_runtime_options_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> ModelProviderRuntimeOptions {
+    let entry = config.providers.models.find(family, alias);
+    let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
+    if options.provider_api_url.is_none()
+        && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
+    {
+        options.provider_api_url = Some(uri.to_string());
+    }
+    options
+}
+
+/// Options to use when building a provider from a name that may be either
+/// a bare family or a dotted alias. Dotted names yield alias-resolved
+/// options; bare names return `fallback` unchanged.
+pub fn options_for_provider_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    fallback: &ModelProviderRuntimeOptions,
+) -> ModelProviderRuntimeOptions {
+    match name.split_once('.') {
+        Some((family, alias)) => provider_runtime_options_for_alias(config, family, alias),
+        None => fallback.clone(),
+    }
+}
+
 fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
 }
@@ -1204,30 +1238,46 @@ pub fn create_resilient_model_provider_for_alias(
     Ok(Box::new(reliable))
 }
 
-/// Create a RouterModelProvider if model routes are configured, otherwise return a
-/// standard resilient model_provider. The router wraps individual model_providers per route,
-/// each with its own retry harness.
-pub fn create_routed_model_provider(
-    primary_name: &str,
+/// Build a resilient model provider from a name that may be either a bare
+/// family (`"openai"`) or a dotted alias (`"openai.work"`). Dotted names
+/// dispatch through the typed alias factory so endpoint URI, family
+/// extras, and per-alias credentials from `[model_providers.<family>.<alias>]`
+/// are honored; bare names route through the family factory directly.
+pub fn create_resilient_model_provider_from_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
-    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
-    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_routed_model_provider_with_options(
-        primary_name,
-        api_key,
-        api_url,
-        reliability,
-        model_routes,
-        default_model,
-        &ModelProviderRuntimeOptions::default(),
-    )
+    match name.split_once('.') {
+        Some((family, alias)) => create_resilient_model_provider_for_alias(
+            config,
+            family,
+            alias,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        ),
+        None => create_resilient_model_provider_with_options(
+            name,
+            api_key,
+            api_url,
+            reliability,
+            options,
+        ),
+    }
 }
 
-/// Create a routed model_provider using explicit runtime options.
+/// Build a router fronted by `primary_name` plus one provider per unique
+/// `model_routes` entry. Each dotted `<family>.<alias>` name resolves
+/// through the typed `[model_providers.<family>.<alias>]` config (endpoint
+/// URI, Azure resource, Gemini OAuth, etc.); bare family names use family
+/// defaults.
 pub fn create_routed_model_provider_with_options(
+    config: &zeroclaw_config::schema::Config,
     primary_name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,
@@ -1237,7 +1287,8 @@ pub fn create_routed_model_provider_with_options(
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     if model_routes.is_empty() {
-        return create_resilient_model_provider_with_options(
+        return create_resilient_model_provider_from_ref(
+            config,
             primary_name,
             api_key,
             api_url,
@@ -1254,7 +1305,10 @@ pub fn create_routed_model_provider_with_options(
         }
     }
 
-    // Create each model_provider (with its own resilience wrapper)
+    // Create each model_provider (with its own resilience wrapper). Each
+    // entry's options come from its own typed alias block when dotted;
+    // the primary inherits the caller's options (already alias-resolved
+    // upstream for the owning agent).
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let routed_credential = model_routes
@@ -1267,9 +1321,21 @@ pub fn create_routed_model_provider_with_options(
                 })
             });
         let key = routed_credential.or(api_key);
-        // Only use api_url for the primary model_provider
         let url = if name == primary_name { api_url } else { None };
-        match create_resilient_model_provider_with_options(name, key, url, reliability, options) {
+        let entry_options = if name == primary_name {
+            options.clone()
+        } else {
+            options_for_provider_ref(config, name, options)
+        };
+
+        match create_resilient_model_provider_from_ref(
+            config,
+            name,
+            key,
+            url,
+            reliability,
+            &entry_options,
+        ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
                 if name == primary_name {
@@ -1279,7 +1345,9 @@ pub fn create_routed_model_provider_with_options(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"model_provider": name.as_str()})),
+                        .with_attrs(
+                            ::serde_json::json!({"model_provider": name.as_str(), "error": e.to_string()})
+                        ),
                     "Ignoring routed model_provider that failed to initialize"
                 );
             }
@@ -2796,5 +2864,59 @@ mod tests {
         assert!(tuning.temperature_override.is_none());
         assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
         assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
+    }
+
+    /// Counterfactual: `create_resilient_model_provider_from_ref` accepts a
+    /// dotted name that the bare-family factory rejects. Pins the dispatch
+    /// direction so the dotted path can't silently regress to the legacy
+    /// "Unknown model_provider family" failure mode.
+    #[test]
+    fn from_ref_dispatches_dotted_via_alias_path_not_legacy_family_factory() {
+        let config = config_with_two_anthropic_aliases();
+        let from_ref = create_resilient_model_provider_from_ref(
+            &config,
+            "anthropic.work",
+            None,
+            None,
+            &config.reliability,
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            from_ref.is_ok(),
+            "dotted ref must succeed via alias path: {:?}",
+            from_ref.err()
+        );
+
+        let from_bare = create_resilient_model_provider_with_options(
+            "anthropic.work",
+            None,
+            None,
+            &config.reliability,
+            &ModelProviderRuntimeOptions::default(),
+        );
+        let Err(err) = from_bare else {
+            panic!("bare-family factory must reject dotted form");
+        };
+        assert!(
+            err.to_string().contains("Unknown model_provider family"),
+            "expected family-dispatch rejection, got: {err}"
+        );
+    }
+
+    /// Proves `options_for_provider_ref` flows a dotted alias's typed
+    /// endpoint URI into the runtime options, distinct from the fallback.
+    #[test]
+    fn options_for_provider_ref_dotted_yields_alias_specific_uri() {
+        let config = config_with_two_anthropic_aliases();
+        let fallback = ModelProviderRuntimeOptions::default();
+
+        let work = options_for_provider_ref(&config, "anthropic.work", &fallback);
+        assert_eq!(
+            work.provider_api_url.as_deref(),
+            Some("https://work-proxy.example/v1/v1/anthropic/messages"),
+        );
+
+        let bare = options_for_provider_ref(&config, "anthropic", &fallback);
+        assert_eq!(bare.provider_api_url, fallback.provider_api_url);
     }
 }
