@@ -17,12 +17,24 @@ impl FileUploadTool {
         Self { security, config }
     }
 
+    /// Best-effort MIME detection. Tries content-sniffing on the first bytes
+    /// (catches binary files with wrong or missing extensions), then falls
+    /// back to a filename-extension table for text formats and types `infer`
+    /// does not cover, then finally to `application/octet-stream`.
+    fn detect_mime(bytes: &[u8], file_name: &str) -> &'static str {
+        if let Some(kind) = infer::get(bytes) {
+            return kind.mime_type();
+        }
+        Self::mime_for_filename(file_name)
+    }
+
     fn mime_for_filename(name: &str) -> &'static str {
         let ext = name
             .rsplit_once('.')
             .map(|(_, e)| e.to_ascii_lowercase())
             .unwrap_or_default();
         match ext.as_str() {
+            // Images
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "gif" => "image/gif",
@@ -31,22 +43,62 @@ impl FileUploadTool {
             "tiff" | "tif" => "image/tiff",
             "svg" => "image/svg+xml",
             "heic" => "image/heic",
+            "avif" => "image/avif",
+            "ico" => "image/x-icon",
+            // Documents
             "pdf" => "application/pdf",
+            "rtf" => "application/rtf",
+            "doc" => "application/msword",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls" => "application/vnd.ms-excel",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "ppt" => "application/vnd.ms-powerpoint",
+            "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "odt" => "application/vnd.oasis.opendocument.text",
+            "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+            "epub" => "application/epub+zip",
+            // Data / structured
             "json" => "application/json",
             "xml" => "application/xml",
+            "yaml" | "yml" => "application/yaml",
+            "toml" => "application/toml",
+            "sql" => "application/sql",
+            // Archives
             "zip" => "application/zip",
             "tar" => "application/x-tar",
             "gz" | "tgz" => "application/gzip",
+            "bz2" => "application/x-bzip2",
+            "xz" => "application/x-xz",
+            "7z" => "application/x-7z-compressed",
+            "rar" => "application/vnd.rar",
+            // Code / text
             "txt" | "log" => "text/plain",
             "md" | "markdown" => "text/markdown",
             "csv" => "text/csv",
+            "tsv" => "text/tab-separated-values",
             "html" | "htm" => "text/html",
+            "css" => "text/css",
+            "js" | "mjs" | "cjs" => "application/javascript",
+            "ts" => "application/typescript",
+            "rs" => "text/x-rust",
+            "py" => "text/x-python",
+            "sh" | "bash" => "application/x-sh",
+            // Audio
             "mp3" => "audio/mpeg",
             "wav" => "audio/wav",
             "ogg" | "oga" | "opus" => "audio/ogg",
+            "flac" => "audio/flac",
+            // Video
             "m4a" | "mp4" => "video/mp4",
             "webm" => "video/webm",
             "mov" => "video/quicktime",
+            "mkv" => "video/x-matroska",
+            "avi" => "video/x-msvideo",
+            // Fonts
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            "otf" => "font/otf",
             _ => "application/octet-stream",
         }
     }
@@ -214,7 +266,7 @@ impl Tool for FileUploadTool {
             .and_then(|s| s.to_str())
             .unwrap_or("upload")
             .to_string();
-        let mime = Self::mime_for_filename(&file_name);
+        let mime = Self::detect_mime(&bytes, &file_name);
 
         let part = match reqwest::multipart::Part::bytes(bytes)
             .file_name(file_name.clone())
@@ -511,7 +563,70 @@ mod tests {
         );
         assert_eq!(FileUploadTool::mime_for_filename("a.txt"), "text/plain");
         assert_eq!(
+            FileUploadTool::mime_for_filename("config.yaml"),
+            "application/yaml"
+        );
+        assert_eq!(
+            FileUploadTool::mime_for_filename("Cargo.toml"),
+            "application/toml"
+        );
+        assert_eq!(
+            FileUploadTool::mime_for_filename("app.js"),
+            "application/javascript"
+        );
+        assert_eq!(
+            FileUploadTool::mime_for_filename("report.xlsx"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(FileUploadTool::mime_for_filename("a.woff2"), "font/woff2");
+        assert_eq!(
             FileUploadTool::mime_for_filename("noext"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn detect_mime_uses_content_sniff_for_binary_with_wrong_extension() {
+        // PNG magic bytes — should win over the .tmp extension
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        assert_eq!(
+            FileUploadTool::detect_mime(&png, "screenshot.tmp"),
+            "image/png"
+        );
+
+        // PDF magic bytes
+        let pdf = b"%PDF-1.7\n";
+        assert_eq!(
+            FileUploadTool::detect_mime(pdf, "report.bin"),
+            "application/pdf"
+        );
+    }
+
+    #[test]
+    fn detect_mime_falls_back_to_extension_for_text_formats() {
+        // Markdown has no magic bytes; content-sniff returns None and we should
+        // pick up the extension-table mapping.
+        let md = b"# Title\n\nSome paragraph text.\n";
+        assert_eq!(
+            FileUploadTool::detect_mime(md, "README.md"),
+            "text/markdown"
+        );
+
+        // YAML similarly has no magic bytes.
+        let yaml = b"key: value\nother: 42\n";
+        assert_eq!(
+            FileUploadTool::detect_mime(yaml, "config.yaml"),
+            "application/yaml"
+        );
+    }
+
+    #[test]
+    fn detect_mime_falls_back_to_octet_stream_for_unknown() {
+        let bytes = b"\x00\x01\x02\x03unknown binary garbage";
+        assert_eq!(
+            FileUploadTool::detect_mime(bytes, "mystery.dat"),
             "application/octet-stream"
         );
     }
