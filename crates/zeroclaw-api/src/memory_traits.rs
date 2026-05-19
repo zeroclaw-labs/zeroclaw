@@ -167,7 +167,7 @@ pub trait Memory: Send + Sync {
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
-    /// Remove all memories in a namespace (category).
+    /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
     /// Default: returns unsupported error. Backends that support bulk deletion override this.
     async fn purge_namespace(&self, _namespace: &str) -> anyhow::Result<usize> {

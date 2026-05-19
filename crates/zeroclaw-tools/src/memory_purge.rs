@@ -143,25 +143,36 @@ mod tests {
     #[tokio::test]
     async fn purge_namespace_removes_all_memories() {
         let (_tmp, mem) = test_mem();
-        mem.store(
+        mem.store_with_metadata(
             "a1",
             "data1",
-            MemoryCategory::Custom("test_ns".into()),
+            MemoryCategory::Core,
+            None,
+            Some("test_ns"),
             None,
         )
         .await
         .unwrap();
-        mem.store(
+        mem.store_with_metadata(
             "a2",
             "data2",
-            MemoryCategory::Custom("test_ns".into()),
+            MemoryCategory::Core,
+            None,
+            Some("test_ns"),
             None,
         )
         .await
         .unwrap();
-        mem.store("b1", "data3", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store_with_metadata(
+            "b1",
+            "data3",
+            MemoryCategory::Core,
+            None,
+            Some("other_ns"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let tool = MemoryPurgeTool::new(mem.clone(), test_security());
         let result = tool.execute(json!({"namespace": "test_ns"})).await.unwrap();

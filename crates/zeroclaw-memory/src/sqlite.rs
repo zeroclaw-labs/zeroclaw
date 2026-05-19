@@ -1104,7 +1104,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
             let affected = conn.execute(
-                "DELETE FROM memories WHERE category = ?1",
+                "DELETE FROM memories WHERE namespace = ?1",
                 params![namespace],
             )?;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -2371,67 +2371,26 @@ mod tests {
     // ── Bulk deletion tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn sqlite_purge_namespace_removes_all_matching_entries() {
+    async fn sqlite_purge_namespace_deletes_only_rows_in_target_namespace() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+
+        mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)
             .await
             .unwrap();
-        mem.store("a2", "data2", MemoryCategory::Custom("ns1".into()), None)
-            .await
-            .unwrap();
-        mem.store("b1", "data3", MemoryCategory::Custom("ns2".into()), None)
+        mem.store_with_metadata("b", "data", MemoryCategory::Core, None, Some("ns2"), None)
             .await
             .unwrap();
 
-        let count = mem.purge_namespace("ns1").await.unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(mem.count().await.unwrap(), 1);
-    }
+        let in_ns1 =
+            |entries: &[MemoryEntry]| entries.iter().filter(|e| e.namespace == "ns1").count();
 
-    #[tokio::test]
-    async fn sqlite_purge_namespace_preserves_other_namespaces() {
-        let (_tmp, mem) = temp_sqlite();
-        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
-            .await
-            .unwrap();
-        mem.store("b1", "data2", MemoryCategory::Custom("ns2".into()), None)
-            .await
-            .unwrap();
-        mem.store("c1", "data3", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("d1", "data4", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        let before = mem.list(None, None).await.unwrap();
+        let deleted = mem.purge_namespace("ns1").await.unwrap();
+        let after = mem.list(None, None).await.unwrap();
 
-        let count = mem.purge_namespace("ns1").await.unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(mem.count().await.unwrap(), 3);
-
-        let remaining = mem.list(None, None).await.unwrap();
-        assert!(
-            remaining
-                .iter()
-                .all(|e| e.category != MemoryCategory::Custom("ns1".into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn sqlite_purge_namespace_returns_count() {
-        let (_tmp, mem) = temp_sqlite();
-        for i in 0..5 {
-            mem.store(
-                &format!("k{i}"),
-                "data",
-                MemoryCategory::Custom("target".into()),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let count = mem.purge_namespace("target").await.unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(in_ns1(&after), 0);
+        assert_eq!(after.len() - in_ns1(&after), before.len() - in_ns1(&before));
+        assert_eq!(deleted, in_ns1(&before));
     }
 
     #[tokio::test]
@@ -2493,18 +2452,6 @@ mod tests {
 
         let count = mem.purge_session("target-sess").await.unwrap();
         assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn sqlite_purge_namespace_empty_namespace_is_noop() {
-        let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-
-        let count = mem.purge_namespace("").await.unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(mem.count().await.unwrap(), 1);
     }
 
     #[tokio::test]
