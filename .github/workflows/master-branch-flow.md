@@ -91,12 +91,12 @@ for the full procedure. In summary:
 
 | Target | `ci.yml` | `cross-platform-build-manual.yml` | `release-stable-manual.yml` |
 |---|:---:|:---:|:---:|
-| `x86_64-unknown-linux-gnu` | ✓ | | ✓ |
+| `x86_64-unknown-linux-gnu` | ✓ | ✓ | ✓ |
 | `aarch64-unknown-linux-gnu` | | ✓ | ✓ |
-| `armv7-unknown-linux-gnueabihf` | | | ✓ |
-| `arm-unknown-linux-gnueabihf` | | | ✓ |
-| `aarch64-apple-darwin` | ✓ | | ✓ |
-| `aarch64-linux-android` | | | ✓ (experimental) |
+| `armv7-unknown-linux-gnueabihf` | | ✓ | ✓ |
+| `arm-unknown-linux-gnueabihf` | | ✓ | ✓ |
+| `aarch64-apple-darwin` | ✓ | ✓ | ✓ |
+| `aarch64-linux-android` | | ✓ | ✓ (experimental) |
 | `x86_64-apple-darwin` | | ✓ | |
 | `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ |
 
