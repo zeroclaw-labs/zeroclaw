@@ -163,6 +163,21 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.get(key).await
     }
 
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Get,
+            Some(key),
+            None,
+            None,
+            Some(&format!("agent_id={agent_id}")),
+        );
+        self.inner.get_for_agent(key, agent_id).await
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
@@ -175,6 +190,17 @@ impl<M: Memory> Memory for AuditedMemory<M> {
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.log_audit(AuditOp::Forget, Some(key), None, None, None);
         self.inner.forget(key).await
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        self.log_audit(
+            AuditOp::Forget,
+            Some(key),
+            None,
+            None,
+            Some(&format!("agent_id={agent_id}")),
+        );
+        self.inner.forget_for_agent(key, agent_id).await
     }
 
     async fn count(&self) -> anyhow::Result<usize> {

@@ -398,6 +398,14 @@ impl Memory for LucidMemory {
         self.local.get(key).await
     }
 
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.local.get_for_agent(key, agent_id).await
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
@@ -408,6 +416,10 @@ impl Memory for LucidMemory {
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.local.forget(key).await
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        self.local.forget_for_agent(key, agent_id).await
     }
 
     async fn count(&self) -> anyhow::Result<usize> {

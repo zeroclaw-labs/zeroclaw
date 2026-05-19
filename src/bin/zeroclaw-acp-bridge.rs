@@ -252,6 +252,9 @@ async fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
     Ok(())
 }
 

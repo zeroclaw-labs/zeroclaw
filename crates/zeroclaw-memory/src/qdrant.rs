@@ -759,6 +759,17 @@ impl Memory for QdrantMemory {
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
+        // Qdrant's delete response does not expose a match count, so
+        // probe for a matching point first. Returning `false` when
+        // nothing exists keeps the bool meaningful for callers (absent
+        // and deleted are distinguishable).
+        if self
+            .scroll_first_matching(&[("key", key), ("agent_id", agent_id)])
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
         self.delete_points_matching(&[("key", key), ("agent_id", agent_id)])
             .await
     }
@@ -838,9 +849,11 @@ impl Memory for QdrantMemory {
 
         // Pre-upsert cleanup must scope to the writing agent so sibling
         // points under the same key for other agents survive.
-        let _ = self
-            .delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
-            .await;
+        // Propagate failures so a cleanup error doesn't leave duplicate
+        // (agent_id, key) points after the upsert lands.
+        self.delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
+            .await
+            .context("qdrant pre-upsert cleanup failed")?;
 
         let upsert_body = serde_json::json!({
             "points": [{

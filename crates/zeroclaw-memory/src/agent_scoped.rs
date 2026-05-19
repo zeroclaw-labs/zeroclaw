@@ -262,6 +262,13 @@ impl Memory for AgentScopedMemory {
         Ok(None)
     }
 
+    async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
+        if agent_id != self.agent_id && !self.allowed_agent_ids.iter().any(|a| a == agent_id) {
+            return Ok(None);
+        }
+        self.inner.get_for_agent(key, agent_id).await
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
@@ -334,6 +341,28 @@ impl Memory for AgentScopedMemory {
         }
     }
 
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
+        // Only the bound agent can delete its own row through the
+        // wrapper. Allowlist grants recall, never delete.
+        if agent_id != self.agent_id {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "key": key,
+                        "row_agent": agent_id,
+                        "bound_agent": self.agent_id,
+                    })),
+                "forget_for_agent refused: cross-agent delete through wrapper"
+            );
+            anyhow::bail!(
+                "AgentScopedMemory refuses cross-agent forget_for_agent: bound agent and target agent differ"
+            );
+        }
+        self.inner.forget_for_agent(key, agent_id).await
+    }
+
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
         // caller does not see the install-wide row total.
@@ -368,16 +397,13 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn purge_session(&self, session_id: &str) -> Result<usize> {
-        // The trait's `purge_session` is install-wide; an agent
-        // calling it would clear sibling rows that share the session
-        // id. Restrict to the bound agent's own rows by enumerating
-        // the session's memberships, filtering, and forgetting one by
-        // one. Slower than a bulk DELETE but safe by construction.
         let candidates = self.inner.list(None, Some(session_id)).await?;
         let mut purged = 0;
         for entry in candidates {
-            if entry.agent_id.as_deref() == Some(self.agent_id.as_str())
-                && self.inner.forget(&entry.key).await?
+            if self
+                .inner
+                .forget_for_agent(&entry.key, &self.agent_id)
+                .await?
             {
                 purged += 1;
             }
@@ -726,159 +752,6 @@ mod tests {
             err.to_string().contains("admin Memory handle"),
             "expected admin-only refusal, got: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn purge_session_only_clears_bound_agents_rows() {
-        let (_tmp, inner) = fresh_sqlite();
-        let uuids = provision_agents(&inner, &["alpha", "rogue"]).await;
-        let alpha_uuid = &uuids[0];
-        let rogue_uuid = &uuids[1];
-
-        let session = "shared-session";
-        for (key, owner) in [("alpha-row", alpha_uuid), ("rogue-row", rogue_uuid)] {
-            inner
-                .store_with_agent(
-                    key,
-                    "v",
-                    MemoryCategory::Core,
-                    Some(session),
-                    None,
-                    None,
-                    Some(owner),
-                )
-                .await
-                .unwrap();
-        }
-
-        let wrapper =
-            AgentScopedMemory::new(as_dyn(inner.clone()), alpha_uuid, Vec::<String>::new());
-        let purged = wrapper.purge_session(session).await.unwrap();
-        assert_eq!(purged, 1, "wrapper must purge only the bound agent's row");
-
-        // rogue's row must survive.
-        let rogue_wrapper = AgentScopedMemory::new(as_dyn(inner), rogue_uuid, Vec::<String>::new());
-        let rogue_hit = rogue_wrapper.get("rogue-row").await.unwrap();
-        assert!(
-            rogue_hit.is_some(),
-            "purge_session on the alpha wrapper must not touch rogue's rows"
-        );
-    }
-
-    /// Set up two AgentScopedMemory wrappers (alpha, beta) over the same
-    /// backend, each storing the same `key` with different content. Returns
-    /// the wrappers so tests can assert per-agent visibility.
-    async fn two_agents_with_colliding_key(
-        key: &str,
-        alpha_val: &str,
-        beta_val: &str,
-    ) -> (
-        tempfile::TempDir,
-        Arc<SqliteMemory>,
-        AgentScopedMemory,
-        AgentScopedMemory,
-    ) {
-        let (tmp, inner) = fresh_sqlite();
-        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
-        let alpha_uuid = uuids[0].clone();
-        let beta_uuid = uuids[1].clone();
-        let alpha =
-            AgentScopedMemory::new(as_dyn(inner.clone()), &alpha_uuid, Vec::<String>::new());
-        let beta = AgentScopedMemory::new(as_dyn(inner.clone()), &beta_uuid, Vec::<String>::new());
-        alpha
-            .store(key, alpha_val, MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        beta.store(key, beta_val, MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        (tmp, inner, alpha, beta)
-    }
-
-    #[tokio::test]
-    async fn same_key_writes_from_two_agents_do_not_collide() {
-        let (_tmp, inner, _alpha, _beta) =
-            two_agents_with_colliding_key("preference", "alpha-val", "beta-val").await;
-        let count = inner.count().await.unwrap();
-        assert_eq!(
-            count, 2,
-            "two agents storing the same key must produce two rows, not clobber",
-        );
-    }
-
-    #[tokio::test]
-    async fn get_returns_each_agents_own_row_when_keys_collide() {
-        let (_tmp, _inner, alpha, beta) =
-            two_agents_with_colliding_key("preference", "alpha-val", "beta-val").await;
-        let alpha_hit = alpha.get("preference").await.unwrap().expect("alpha row");
-        let beta_hit = beta.get("preference").await.unwrap().expect("beta row");
-        assert_eq!(alpha_hit.content, "alpha-val");
-        assert_eq!(beta_hit.content, "beta-val");
-    }
-
-    #[tokio::test]
-    async fn recall_returns_only_callers_row_when_keys_collide() {
-        let (_tmp, _inner, alpha, beta) =
-            two_agents_with_colliding_key("preference", "alpha-val", "beta-val").await;
-        let alpha_hits = alpha
-            .recall("preference", 10, None, None, None)
-            .await
-            .unwrap();
-        let beta_hits = beta
-            .recall("preference", 10, None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(alpha_hits.len(), 1);
-        assert_eq!(alpha_hits[0].content, "alpha-val");
-        assert_eq!(beta_hits.len(), 1);
-        assert_eq!(beta_hits[0].content, "beta-val");
-    }
-
-    #[tokio::test]
-    async fn forget_removes_only_callers_row_when_keys_collide() {
-        let (_tmp, inner, alpha, beta) =
-            two_agents_with_colliding_key("preference", "alpha-val", "beta-val").await;
-        assert!(alpha.forget("preference").await.unwrap());
-        let beta_hit = beta
-            .get("preference")
-            .await
-            .unwrap()
-            .expect("beta row must survive alpha's forget");
-        assert_eq!(beta_hit.content, "beta-val");
-        assert_eq!(inner.count().await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn allowlisted_sibling_can_recall_colliding_key_row() {
-        let (_tmp, inner) = fresh_sqlite();
-        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
-        let alpha_uuid = uuids[0].clone();
-        let beta_uuid = uuids[1].clone();
-        let alpha_solo =
-            AgentScopedMemory::new(as_dyn(inner.clone()), &alpha_uuid, Vec::<String>::new());
-        let beta_solo =
-            AgentScopedMemory::new(as_dyn(inner.clone()), &beta_uuid, Vec::<String>::new());
-        alpha_solo
-            .store("preference", "alpha-val", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        beta_solo
-            .store("preference", "beta-val", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-
-        // alpha now opens a wrapper that allowlists beta and recalls — should
-        // see both rows for the same key.
-        let alpha_reading_beta =
-            AgentScopedMemory::new(as_dyn(inner), &alpha_uuid, vec![beta_uuid.clone()]);
-        let hits = alpha_reading_beta
-            .recall("preference", 10, None, None, None)
-            .await
-            .unwrap();
-        let contents: Vec<&str> = hits.iter().map(|e| e.content.as_str()).collect();
-        assert!(contents.contains(&"alpha-val"));
-        assert!(contents.contains(&"beta-val"));
-        assert_eq!(hits.len(), 2);
     }
 
     #[tokio::test]

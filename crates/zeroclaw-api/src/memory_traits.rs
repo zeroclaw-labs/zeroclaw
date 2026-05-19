@@ -212,20 +212,11 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
     /// Remove the row matching `(key, agent_id)`. Siblings of the same key
-    /// under other agents are untouched. Returns `true` iff a row was
-    /// removed.
-    ///
-    /// The default implementation composes [`get_for_agent`](Self::get_for_agent)
-    /// with [`forget`](Self::forget) and is only correct for backends whose
-    /// storage layout cannot hold more than one row per `key`. Backends
-    /// with multi-row-per-key support override this with a native
-    /// composite delete.
-    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
-        let Some(_entry) = self.get_for_agent(key, agent_id).await? else {
-            return Ok(false);
-        };
-        self.forget(key).await
-    }
+    /// under other agents are untouched. Returns `true` if a row was
+    /// removed. Required: no safe default exists for backends or wrappers
+    /// that can hold more than one row per `key` — the unscoped `forget`
+    /// would destroy sibling rows.
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
     /// Remove all memories in a namespace (category).
     /// Returns the number of deleted entries.

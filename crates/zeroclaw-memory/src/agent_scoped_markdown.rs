@@ -255,6 +255,10 @@ impl Memory for AgentScopedMarkdownMemory {
         self.own.forget(key).await
     }
 
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
+        self.own.forget_for_agent(key, agent_id).await
+    }
+
     async fn count(&self) -> Result<usize> {
         self.own.count().await
     }

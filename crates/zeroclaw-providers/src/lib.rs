@@ -1230,22 +1230,6 @@ fn create_model_provider_inner(
     factory::dispatch_family_factory(config, name, alias, key, resolved_url, options)
 }
 
-/// Wrap the primary model_provider in a retry/backoff harness.
-pub fn create_resilient_model_provider(
-    primary_name: &str,
-    api_key: Option<&str>,
-    api_url: Option<&str>,
-    reliability: &zeroclaw_config::schema::ReliabilityConfig,
-) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_resilient_model_provider_with_options(
-        primary_name,
-        api_key,
-        api_url,
-        reliability,
-        &ModelProviderRuntimeOptions::default(),
-    )
-}
-
 /// Wrap the primary model_provider in a retry/backoff harness, threading auth runtime options.
 ///
 /// Legacy entry point — no per-alias typed extras. Codex routing now
@@ -2498,18 +2482,6 @@ mod tests {
     }
 
     #[test]
-    fn resilient_provider_errors_for_invalid_primary() {
-        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
-        let model_provider = create_resilient_model_provider(
-            "totally-invalid",
-            Some("provider-test-credential"),
-            None,
-            &reliability,
-        );
-        assert!(model_provider.is_err());
-    }
-
-    #[test]
     fn ollama_with_custom_url() {
         let model_provider =
             create_model_provider_with_url("ollama", None, Some("http://10.100.2.32:11434"));
@@ -2927,59 +2899,5 @@ mod tests {
         assert!(tuning.temperature_override.is_none());
         assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
         assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
-    }
-
-    /// Counterfactual: `create_resilient_model_provider_from_ref` accepts a
-    /// dotted name that the bare-family factory rejects. Pins the dispatch
-    /// direction so the dotted path can't silently regress to the legacy
-    /// "Unknown model_provider family" failure mode.
-    #[test]
-    fn from_ref_dispatches_dotted_via_alias_path_not_legacy_family_factory() {
-        let config = config_with_two_anthropic_aliases();
-        let from_ref = create_resilient_model_provider_from_ref(
-            &config,
-            "anthropic.work",
-            None,
-            None,
-            &config.reliability,
-            &ModelProviderRuntimeOptions::default(),
-        );
-        assert!(
-            from_ref.is_ok(),
-            "dotted ref must succeed via alias path: {:?}",
-            from_ref.err()
-        );
-
-        let from_bare = create_resilient_model_provider_with_options(
-            "anthropic.work",
-            None,
-            None,
-            &config.reliability,
-            &ModelProviderRuntimeOptions::default(),
-        );
-        let Err(err) = from_bare else {
-            panic!("bare-family factory must reject dotted form");
-        };
-        assert!(
-            err.to_string().contains("Unknown model_provider family"),
-            "expected family-dispatch rejection, got: {err}"
-        );
-    }
-
-    /// Proves `options_for_provider_ref` flows a dotted alias's typed
-    /// endpoint URI into the runtime options, distinct from the fallback.
-    #[test]
-    fn options_for_provider_ref_dotted_yields_alias_specific_uri() {
-        let config = config_with_two_anthropic_aliases();
-        let fallback = ModelProviderRuntimeOptions::default();
-
-        let work = options_for_provider_ref(&config, "anthropic.work", &fallback);
-        assert_eq!(
-            work.provider_api_url.as_deref(),
-            Some("https://work-proxy.example/v1/v1/anthropic/messages"),
-        );
-
-        let bare = options_for_provider_ref(&config, "anthropic", &fallback);
-        assert_eq!(bare.provider_api_url, fallback.provider_api_url);
     }
 }

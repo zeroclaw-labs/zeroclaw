@@ -897,9 +897,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
 
 /// Verify `name` matches a canonical model provider family known to the
 /// runtime registry. Returns the canonical (case-corrected) name, or `None`
-/// when the input doesn't name a known family. Originally an alias resolver;
-/// post-#6273 there are no aliases left to resolve, just a canonical-name
-/// presence check.
+/// when the input doesn't name a known family. Used by the channel
+/// `/models` slash command, which accepts only the bare family name; dotted
+/// aliases (`<family>.<alias>`) are resolved elsewhere through
+/// `create_resilient_model_provider_from_ref`.
 fn canonical_model_provider_name(name: &str) -> Option<String> {
     let candidate = name.trim();
     if candidate.is_empty() {
@@ -1021,10 +1022,10 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
-async fn load_runtime_defaults_from_config_file(
+async fn load_runtime_config_and_defaults(
     path: &Path,
     model_provider: &str,
-) -> Result<ChannelRuntimeDefaults> {
+) -> Result<(Config, ChannelRuntimeDefaults)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -1038,7 +1039,8 @@ async fn load_runtime_defaults_from_config_file(
         parsed.decrypt_secrets(&store)?;
     }
 
-    runtime_defaults_from_config(&parsed, model_provider)
+    let defaults = runtime_defaults_from_config(&parsed, model_provider)?;
+    Ok((parsed, defaults))
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -1060,16 +1062,21 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults =
-        load_runtime_defaults_from_config_file(&config_path, &ctx.agent_cfg.model_provider).await?;
-    let next_default_model_provider =
-        zeroclaw_providers::create_resilient_model_provider_with_options(
-            &next_defaults.default_model_provider,
-            next_defaults.api_key.as_deref(),
-            next_defaults.api_url.as_deref(),
-            &next_defaults.reliability,
-            &ctx.provider_runtime_options,
-        )?;
+    let (next_config, next_defaults) =
+        load_runtime_config_and_defaults(&config_path, &ctx.agent_cfg.model_provider).await?;
+    let next_options = zeroclaw_providers::options_for_provider_ref(
+        &next_config,
+        &next_defaults.default_model_provider,
+        &ctx.provider_runtime_options,
+    );
+    let next_default_model_provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
+        &next_config,
+        &next_defaults.default_model_provider,
+        next_defaults.api_key.as_deref(),
+        next_defaults.api_url.as_deref(),
+        &next_defaults.reliability,
+        &next_options,
+    )?;
     let next_default_model_provider: Arc<dyn ModelProvider> =
         Arc::from(next_default_model_provider);
 
@@ -4503,13 +4510,16 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     // not on the channel block. Convention: the synthesized group
     // name is `<type>_<alias>` (matching what the V2→V3 fold uses)
     // so a hand-bound identity lands in the same group an operator
-    // would inspect after an upgrade.
+    // would inspect after an upgrade. The `channel` field is the
+    // dotted alias ref so authorization stays scoped to the bound
+    // alias; a bare type would broaden the peer across every
+    // telegram alias on the install.
     let group_name = "telegram_default".to_string();
     let group = updated
         .peer_groups
         .entry(group_name.clone())
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram".to_string(),
+            channel: "telegram.default".to_string(),
             ..PeerGroupConfig::default()
         });
 
@@ -10898,6 +10908,10 @@ BTC is currently around $65,000 based on latest tool output."#
             Ok(false)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
@@ -10997,6 +11011,10 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
             Ok(false)
         }
 
