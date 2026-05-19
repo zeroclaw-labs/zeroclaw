@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use zeroclaw_channels::orchestrator::acp_server::{AcpServer, AcpServerConfig};
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
 
 const ACP_WS_PROTOCOL: &str = "zeroclaw.acp.v1";
 
@@ -60,11 +61,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
 
     let config = state.config.lock().clone();
-    let server = Arc::new(AcpServer::new_with_writer(
-        config,
-        AcpServerConfig::default(),
-        output_tx,
-    ));
+    let acp_config = AcpServerConfig {
+        max_sessions: config.acp.max_sessions,
+        session_timeout_secs: config.acp.session_timeout_secs,
+    };
+    let store = AcpSessionStore::new(&config.workspace_dir)
+        .map(Arc::new)
+        .inspect_err(|e| warn!("Failed to open ACP session store: {e}"))
+        .ok();
+    let server = if let Some(store) = store {
+        Arc::new(AcpServer::new_with_writer_and_store(
+            config, acp_config, output_tx, store,
+        ))
+    } else {
+        Arc::new(AcpServer::new_with_writer(config, acp_config, output_tx))
+    };
 
     let server_task = tokio::spawn(Arc::clone(&server).run_messages(input_rx));
 

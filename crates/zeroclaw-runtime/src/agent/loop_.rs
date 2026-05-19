@@ -1631,6 +1631,7 @@ pub async fn run_tool_call_loop(
                         let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                             tool_name: request.tool_name.clone(),
                             arguments_summary: crate::approval::summarize_args(&request.arguments),
+                            raw_arguments: Some(request.arguments.clone()),
                         };
                         let recipient = channel_reply_target.unwrap_or_default();
                         match ch.request_approval(recipient, &ch_request).await {

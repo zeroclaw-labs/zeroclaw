@@ -185,6 +185,11 @@ pub struct Config {
     #[nested]
     pub cron: CronConfig,
 
+    /// ACP (Agent Client Protocol) server configuration (`[acp]`).
+    #[serde(default)]
+    #[nested]
+    pub acp: AcpConfig,
+
     /// Channel configurations: Telegram, Discord, Slack, etc. (`[channels]`).
     #[serde(default, alias = "channels_config")]
     #[nested]
@@ -6597,6 +6602,36 @@ impl Default for CronConfig {
     }
 }
 
+/// ACP (Agent Client Protocol) server configuration (`[acp]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AcpConfig {
+    /// Maximum number of concurrent ACP sessions. Default: `10`.
+    #[serde(default = "default_acp_max_sessions")]
+    pub max_sessions: usize,
+    /// Idle session timeout in seconds. Sessions with no activity for this
+    /// duration are eligible for eviction. Default: `3600` (1 hour).
+    #[serde(default = "default_acp_session_timeout_secs")]
+    pub session_timeout_secs: u64,
+}
+
+fn default_acp_max_sessions() -> usize {
+    10
+}
+
+fn default_acp_session_timeout_secs() -> u64 {
+    3600
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: default_acp_max_sessions(),
+            session_timeout_secs: default_acp_session_timeout_secs(),
+        }
+    }
+}
+
 // ── Tunnel ──────────────────────────────────────────────────────
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
@@ -9690,6 +9725,7 @@ impl Default for Config {
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -12701,6 +12737,7 @@ auto_save = true
                 ..HeartbeatConfig::default()
             },
             cron: CronConfig::default(),
+            acp: AcpConfig::default(),
             channels: ChannelsConfig {
                 cli: true,
                 telegram: Some(TelegramConfig {
@@ -13327,6 +13364,7 @@ default_temperature = 0.7
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
+            acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
