@@ -11,6 +11,10 @@ use crate::media::MediaAttachment;
 pub struct ChannelApprovalRequest {
     pub tool_name: String,
     pub arguments_summary: String,
+    /// Raw tool arguments for channels (e.g. ACP) that can render structured
+    /// diffs instead of a plain summary string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_arguments: Option<serde_json::Value>,
 }
 
 /// The operator's response to a channel-presented approval prompt.

@@ -1616,15 +1616,28 @@ async fn main() -> Result<()> {
             max_sessions,
             session_timeout,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig::default();
+            let mut acp_config = channels::acp_server::AcpServerConfig {
+                max_sessions: config.acp.max_sessions,
+                session_timeout_secs: config.acp.session_timeout_secs,
+            };
             if let Some(max) = max_sessions {
                 acp_config.max_sessions = max;
             }
             if let Some(timeout) = session_timeout {
                 acp_config.session_timeout_secs = timeout;
             }
-            let server =
-                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config));
+            let store =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.workspace_dir)
+                    .map(std::sync::Arc::new)
+                    .inspect_err(|e| warn!("Failed to open ACP session store: {e}"))
+                    .ok();
+            let server = if let Some(store) = store {
+                std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
+                    config, acp_config, store,
+                ))
+            } else {
+                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
+            };
             server.run().await
         }
 

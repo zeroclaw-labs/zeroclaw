@@ -491,6 +491,31 @@ impl Agent {
         }
     }
 
+    /// Hydrate the agent with a full `ConversationMessage` history (e.g. restored
+    /// from an ACP session store). Preserves all variants including `AssistantToolCalls`
+    /// and `ToolResults` — use this for ACP restore; use `seed_history` for flat
+    /// channel session hydration.
+    pub fn seed_conversation_history(&mut self, messages: Vec<ConversationMessage>) {
+        if self.history.is_empty()
+            && let Ok(sys) = self.build_system_prompt()
+        {
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+        }
+        for msg in messages {
+            // Skip system messages from the seed — the system prompt is already prepended above.
+            if matches!(&msg, ConversationMessage::Chat(m) if m.role == "system") {
+                continue;
+            }
+            self.history.push(msg);
+        }
+        // Trim immediately so pre_len snapshots (taken before the first turn)
+        // are always within the configured limit; otherwise a long restored
+        // history would cause history[pre_len..] to panic after trim_history
+        // shrinks the vec below pre_len during the turn.
+        self.trim_history();
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self> {
         Self::from_config_with_session_cwd(config, None).await
     }
@@ -961,6 +986,7 @@ impl Agent {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    raw_arguments: Some(request.arguments.clone()),
                 };
                 let mut channel_decision: Option<zeroclaw_api::channel::ChannelApprovalResponse> =
                     None;
@@ -1354,14 +1380,16 @@ impl Agent {
     /// through the provided channel so callers (e.g. the WebSocket gateway)
     /// can relay incremental updates to clients.
     ///
-    /// The returned `String` is the final, complete assistant response — the
-    /// same value that `turn` would return.
+    /// The returned tuple contains the final assistant response string and all
+    /// new [`ConversationMessage`]s added during this turn (captured before
+    /// any `trim_history` call so callers can persist them correctly even when
+    /// the history is already at its configured limit).
     pub async fn turn_streamed(
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<ConversationMessage>)> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -1400,8 +1428,10 @@ impl Agent {
             format!("{context}[{now}] {user_message}")
         };
 
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+        let mut new_msgs: Vec<ConversationMessage> = Vec::new();
+        let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
+        new_msgs.push(user_msg.clone());
+        self.history.push(user_msg);
 
         let effective_model = self.classify_model(user_message);
         let turn_started_at = Instant::now();
@@ -1459,10 +1489,10 @@ impl Agent {
                         cache_type: "response".into(),
                         tokens_saved: 0,
                     });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
+                    let cached_msg =
+                        ConversationMessage::Chat(ChatMessage::assistant(cached.clone()));
+                    new_msgs.push(cached_msg.clone());
+                    self.history.push(cached_msg);
                     self.trim_history();
                     self.observer.record_event(&ObserverEvent::TurnComplete);
                     self.observer.record_event(&ObserverEvent::AgentEnd {
@@ -1472,7 +1502,7 @@ impl Agent {
                         tokens_used: None,
                         cost_usd: None,
                     });
-                    return Ok(cached);
+                    return Ok((cached, new_msgs));
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
                     cache_type: "response".into(),
@@ -1774,6 +1804,9 @@ impl Agent {
                         .await;
                 }
 
+                new_msgs.push(ConversationMessage::Chat(ChatMessage::assistant(
+                    final_text.clone(),
+                )));
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
@@ -1787,7 +1820,7 @@ impl Agent {
                     tokens_used: None,
                     cost_usd: None,
                 });
-                return Ok(final_text);
+                return Ok((final_text, new_msgs));
             }
 
             // Pre-assign stable IDs to tool calls that don't have one
@@ -1798,11 +1831,13 @@ impl Agent {
             }
 
             // ── Tool calls ─────────────────────────────────────────────
-            self.history.push(ConversationMessage::AssistantToolCalls {
+            let tool_call_msg = ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
                 reasoning_content: response.reasoning_content.clone(),
-            });
+            };
+            new_msgs.push(tool_call_msg.clone());
+            self.history.push(tool_call_msg);
 
             // Notify about each tool call
             for call in &calls {
@@ -1831,6 +1866,7 @@ impl Agent {
             }
 
             let formatted = self.tool_dispatcher.format_results(&results);
+            new_msgs.push(formatted.clone());
             self.history.push(formatted);
             self.trim_history();
         }
@@ -3014,6 +3050,73 @@ mod tests {
         assert_eq!(history.len(), 3);
     }
 
+    #[test]
+    fn seed_conversation_history_preserves_tool_call_variants() {
+        use zeroclaw_api::provider::{
+            ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+        };
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("run it")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+
+        agent.seed_conversation_history(messages);
+
+        // System prompt may have been prepended; find non-system messages
+        let non_system: Vec<_> = agent
+            .history()
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .collect();
+
+        assert_eq!(non_system.len(), 4);
+        assert!(
+            matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
+    }
+
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
     /// and returns a tool call followed by a text response through the stream.
     struct StreamToolCaptureProvider {
@@ -3143,7 +3246,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let response = agent
+        let (response, _) = agent
             .turn_streamed("use the echo tool", event_tx, None)
             .await
             .unwrap();
@@ -3957,6 +4060,94 @@ mod tests {
         }
 
         assert_eq!(tools.len(), 2);
+    }
+
+    /// Regression test: `turn_streamed` must return the new messages in its
+    /// second tuple element even when `trim_history` fires and removes old
+    /// entries from the front of the history.  Before the fix, callers that
+    /// sliced `history[pre_len..]` after the turn would get an empty slice
+    /// because trim had shifted the tail back to `pre_len`.
+    #[tokio::test]
+    async fn turn_streamed_returns_new_messages_at_history_limit() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        // Use a small limit so that pre-filling to the limit forces a trim on
+        // the very first new turn.
+        let agent_config = zeroclaw_config::schema::AgentConfig {
+            max_history_messages: 4,
+            ..zeroclaw_config::schema::AgentConfig::default()
+        };
+
+        // Simple streaming provider that returns plain text (no tool calls).
+        let provider = Box::new(NarrationStreamProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Pre-fill the history to exactly max_history_messages non-system
+        // messages so that adding a new user+assistant pair triggers trim.
+        // (system message is added by turn_streamed on first call, so we
+        // push user+assistant pairs to simulate a history-at-limit state.)
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::system("sys")));
+        for i in 0..2 {
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::user(format!(
+                    "old {i}"
+                ))));
+            agent
+                .history
+                .push(ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "old reply {i}"
+                ))));
+        }
+        // History is now: [system, user0, assistant0, user1, assistant1] = 5
+        // entries.  max_history_messages=4 means trim fires after adding the
+        // new turn.
+
+        let (event_tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let (_, new_msgs) = agent
+            .turn_streamed("new question", event_tx, None)
+            .await
+            .expect("turn_streamed should succeed");
+
+        // The returned Vec must contain the new user message.
+        let has_user = new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"));
+        assert!(
+            has_user,
+            "new_msgs must include the user message even after trim; got: {new_msgs:?}"
+        );
+
+        // The returned Vec must contain the new assistant reply.
+        let has_assistant = new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant"));
+        assert!(
+            has_assistant,
+            "new_msgs must include the assistant reply even after trim; got: {new_msgs:?}"
+        );
     }
 
     #[test]

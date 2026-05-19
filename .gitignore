@@ -7,6 +7,8 @@
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
 /docs/book/theme/lang-switcher.js
+/docs/superpowers/plans
+/docs/superpowers/specs
 .secrets
 firmware/*/target
 web/dist/*
@@ -19,6 +21,8 @@ web/dist/*
 web/src/lib/api-generated.ts
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 .DS_Store
 ._*
 .wt-pr37/

@@ -20,7 +20,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +29,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
+use zeroclaw_api::provider::ConversationMessage;
 use zeroclaw_config::schema::Config;
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 
 use crate::acp_channel::AcpChannel;
@@ -287,12 +289,18 @@ pub struct AcpServer {
     /// rejected before it can overwrite the active turn's token. If pipelining
     /// is needed in the future, the key should become `(session_id, turn_id)`.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Tracks session IDs currently being loaded/resumed (between the initial
+    /// check and the final insert into `sessions`). Used to prevent duplicate
+    /// concurrent restores of the same session and to count in-flight slots
+    /// against `max_sessions`.
+    loading_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    store: Option<Arc<AcpSessionStore>>,
 }
 
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
-        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx))
+        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), None)
     }
 
     pub fn new_with_writer(
@@ -300,7 +308,25 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
-        Self::with_writer(config, acp_config, writer_tx, None)
+        Self::with_writer(config, acp_config, writer_tx, None, None)
+    }
+
+    pub fn new_with_store(
+        config: Config,
+        acp_config: AcpServerConfig,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx), Some(store))
+    }
+
+    pub fn new_with_writer_and_store(
+        config: Config,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+        store: Arc<AcpSessionStore>,
+    ) -> Self {
+        Self::with_writer(config, acp_config, writer_tx, None, Some(store))
     }
 
     fn with_writer(
@@ -308,6 +334,7 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
+        store: Option<Arc<AcpSessionStore>>,
     ) -> Self {
         Self {
             config,
@@ -316,6 +343,8 @@ impl AcpServer {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             writer_rx: std::sync::Mutex::new(writer_rx),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            store,
         }
     }
 
@@ -462,6 +491,9 @@ impl AcpServer {
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(&request.params),
             "session/new" => self.handle_session_new(&request.params).await,
+            "session/load" => self.handle_session_load(&request.params).await,
+            "session/resume" => self.handle_session_resume(&request.params).await,
+            "session/close" => self.handle_session_close(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
             "session/cancel" => self.handle_session_cancel(&request.params).await,
@@ -499,10 +531,16 @@ impl AcpServer {
             zeroclaw_meta["defaultModel"] = serde_json::json!(model);
         }
 
+        let session_capabilities = if self.store.is_some() {
+            serde_json::json!({ "resume": {}, "close": {} })
+        } else {
+            serde_json::json!({})
+        };
+
         Ok(serde_json::json!({
             "protocolVersion": ACP_PROTOCOL_VERSION,
             "agentCapabilities": {
-                "loadSession": false,
+                "loadSession": self.store.is_some(),
                 "promptCapabilities": {
                     "image": false,
                     "audio": false,
@@ -512,7 +550,7 @@ impl AcpServer {
                     "http": false,
                     "sse": false,
                 },
-                "sessionCapabilities": {},
+                "sessionCapabilities": session_capabilities,
             },
             "agentInfo": {
                 "name": "zeroclaw-acp",
@@ -529,7 +567,8 @@ impl AcpServer {
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let mut sessions = self.sessions.lock().await;
 
-        if sessions.len() >= self.acp_config.max_sessions {
+        let loading_count = self.loading_sessions.lock().await.len();
+        if sessions.len() + loading_count >= self.acp_config.max_sessions {
             return Err(RpcError {
                 code: SESSION_LIMIT_REACHED,
                 message: format!(
@@ -594,12 +633,325 @@ impl AcpServer {
             })),
         );
 
+        if let Some(store) = &self.store
+            && let Err(e) = store.create_session(&session_id, &workspace_dir)
+        {
+            // Roll back: remove the session we just inserted and surface the error.
+            sessions.remove(&session_id);
+            return Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to persist session: {e}"),
+                data: None,
+            });
+        }
+
         debug!("Created session {session_id} (workspace: {workspace_dir})");
 
         Ok(serde_json::json!({
             "sessionId": session_id,
             "workspaceDir": workspace_dir,
         }))
+    }
+
+    async fn handle_session_load(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?
+            .to_string();
+
+        let store = self.store.as_ref().ok_or_else(|| RpcError {
+            code: SESSION_NOT_FOUND,
+            message: format!("Session not found: {session_id}"),
+            data: None,
+        })?;
+
+        // Atomically check and reserve the session slot
+        {
+            let sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            if sessions.contains_key(&session_id) || loading.contains(&session_id) {
+                return Err(RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "Session already active: {session_id}. Call session/close first."
+                    ),
+                    data: None,
+                });
+            }
+            loading.insert(session_id.clone());
+        }
+
+        // Flatten both the SQLite error and the not-found case into a single
+        // Result so the cleanup match below runs for every failure after the
+        // reservation was inserted.
+        let data = store
+            .load_session(&session_id)
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to load session: {e}"),
+                data: None,
+            })
+            .and_then(|opt| {
+                opt.ok_or_else(|| RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!("Session not found: {session_id}"),
+                    data: None,
+                })
+            });
+
+        // On error (SQLite failure or not-found), release the reservation.
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+
+        let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+
+        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &self.config,
+            Some(&workspace_dir),
+            false,
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        });
+
+        let mut agent = match agent_result {
+            Ok(a) => a,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+
+        agent.seed_conversation_history(data.messages.clone());
+
+        let acp_channel = Arc::new(AcpChannel::new(
+            "acp",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+            Duration::from_secs(self.acp_config.session_timeout_secs),
+        ));
+        agent.channel_handles().register_channel("acp", acp_channel);
+
+        let now = Instant::now();
+        // Atomically insert and release reservation
+        {
+            let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
+            sessions.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(Session {
+                    agent,
+                    created_at: now,
+                    last_active: now,
+                })),
+            );
+        }
+
+        // Stream conversation history to client as session/update notifications
+        for msg in &data.messages {
+            for notification in history_notifications_for_message(&session_id, msg) {
+                self.write_notification(&notification).await;
+            }
+        }
+
+        debug!(
+            "Loaded session {session_id} ({} messages)",
+            data.messages.len()
+        );
+        Ok(serde_json::json!({}))
+    }
+
+    async fn handle_session_resume(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?
+            .to_string();
+
+        let store = self.store.as_ref().ok_or_else(|| RpcError {
+            code: SESSION_NOT_FOUND,
+            message: format!("Session not found: {session_id}"),
+            data: None,
+        })?;
+
+        // Atomically check and reserve the session slot
+        {
+            let sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                return Err(RpcError {
+                    code: SESSION_LIMIT_REACHED,
+                    message: format!(
+                        "Maximum session limit reached ({})",
+                        self.acp_config.max_sessions
+                    ),
+                    data: None,
+                });
+            }
+            if sessions.contains_key(&session_id) || loading.contains(&session_id) {
+                return Err(RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "Session already active: {session_id}. Call session/close first."
+                    ),
+                    data: None,
+                });
+            }
+            loading.insert(session_id.clone());
+        }
+
+        let data = store
+            .load_session(&session_id)
+            .map_err(|e| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to load session: {e}"),
+                data: None,
+            })
+            .and_then(|opt| {
+                opt.ok_or_else(|| RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!("Session not found: {session_id}"),
+                    data: None,
+                })
+            });
+
+        // On error (SQLite failure or not-found), release the reservation.
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+
+        let workspace_dir = std::path::PathBuf::from(&data.workspace_dir);
+
+        let agent_result = Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            &self.config,
+            Some(&workspace_dir),
+            false,
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        });
+
+        let mut agent = match agent_result {
+            Ok(a) => a,
+            Err(e) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+
+        agent.seed_conversation_history(data.messages);
+
+        let acp_channel = Arc::new(AcpChannel::new(
+            "acp",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+            Duration::from_secs(self.acp_config.session_timeout_secs),
+        ));
+        agent.channel_handles().register_channel("acp", acp_channel);
+
+        let now = Instant::now();
+        // Atomically insert and release reservation
+        {
+            let mut sessions = self.sessions.lock().await;
+            let mut loading = self.loading_sessions.lock().await;
+            loading.remove(&session_id);
+            sessions.insert(
+                session_id.clone(),
+                Arc::new(Mutex::new(Session {
+                    agent,
+                    created_at: now,
+                    last_active: now,
+                })),
+            );
+        }
+
+        debug!("Resumed session {session_id}");
+        Ok(serde_json::json!({}))
+    }
+
+    /// Handle `session/close` requests (ACP spec §Session Management).
+    ///
+    /// Closes a session: fires the cancel token to interrupt any in-flight turn,
+    /// removes the session from the in-memory map, and unregisters the ACP channel.
+    /// The session record in the persistent store is NOT deleted.
+    ///
+    /// Returns an empty object on success, or SESSION_NOT_FOUND if the session
+    /// is not in the in-memory map (it may still exist in the store).
+    async fn handle_session_close(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?;
+
+        // Fire the cancel token for any in-flight turn before acquiring the session lock.
+        let token = self
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .get(session_id)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+            debug!("Cancelled active turn for closing session {session_id}");
+        }
+
+        let session_arc = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id).ok_or_else(|| RpcError {
+                code: SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            })?
+        };
+
+        // Wait for any in-flight turn to finish (the cancel token may have already stopped it).
+        let session = session_arc.lock().await;
+        session.agent.channel_handles().unregister_channel("acp");
+        debug!("Closed session {session_id}");
+
+        Ok(serde_json::json!({}))
     }
 
     fn requested_session_cwd(&self, params: &Value) -> PathBuf {
@@ -709,13 +1061,25 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let result = turn_result.map_err(|e| RpcError {
+        let (result_text, new_turn_msgs) = turn_result.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent turn failed: {e}"),
             data: None,
         })?;
 
-        Ok(Self::prompt_result(session_id, "end_turn", result))
+        // Persist new messages on successful, non-cancelled turns.
+        if let Some(store) = &self.store
+            && !new_turn_msgs.is_empty()
+            && let Err(e) = store.append_turn(&session_id, &new_turn_msgs)
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "Failed to persist turn; session continues in memory"
+            );
+        }
+
+        Ok(Self::prompt_result(session_id, "end_turn", result_text))
     }
 
     fn register_cancel_token(
@@ -768,8 +1132,20 @@ impl AcpServer {
             Some(Value::Array(arr)) => {
                 let mut joined = String::new();
                 for part in arr {
+                    let mut added = false;
                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                         if !joined.is_empty() {
+                            joined.push_str("\n\n");
+                        }
+                        joined.push_str(text);
+                        added = true;
+                    }
+                    // Support ACP resource blocks for @-notation file attachments
+                    // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
+                    if let Some(res) = part.get("resource")
+                        && let Some(text) = res.get("text").and_then(|v| v.as_str())
+                    {
+                        if added || !joined.is_empty() {
                             joined.push_str("\n\n");
                         }
                         joined.push_str(text);
@@ -981,6 +1357,53 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     }
 }
 
+/// Translate tool args into the ACP `rawInput` shape.
+///
+/// For file-editing tools, the ACP Diff schema uses `oldText`/`newText` (camelCase).
+/// ZeroClaw's internal tool args use `old_string`/`new_string` (snake_case) for
+/// `file_edit` and `content` for `file_write`. Without this translation, ACP clients
+/// (Toad, Zed) cannot recognise the Diff shape and fall back to rendering the raw JSON
+/// fields as giant strings.
+fn to_acp_raw_input(name: &str, args: &Value) -> Value {
+    match name {
+        "file_edit" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let old_text = args.get("old_string").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
+            serde_json::json!({ "path": path, "oldText": old_text, "newText": new_text })
+        }
+        "file_write" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
+            serde_json::json!({ "path": path, "newText": new_text })
+        }
+        _ => args.clone(),
+    }
+}
+
+/// Build the ACP `content` array for a tool call notification.
+///
+/// Zed and Toad render tool call content from the `content` array. For
+/// file-editing tools, emit an ACP Diff content item (`{ "type": "diff", ... }`)
+/// so clients show a side-by-side diff editor. Non-edit tools return an empty
+/// array — their `rawInput` is displayed via the standard `raw_input` fallback.
+fn to_acp_content(name: &str, args: &Value) -> Value {
+    match name {
+        "file_edit" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let old_text = args.get("old_string").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("new_string").cloned().unwrap_or(Value::Null);
+            serde_json::json!([{ "type": "diff", "path": path, "oldText": old_text, "newText": new_text }])
+        }
+        "file_write" => {
+            let path = args.get("path").cloned().unwrap_or(Value::Null);
+            let new_text = args.get("content").cloned().unwrap_or(Value::Null);
+            serde_json::json!([{ "type": "diff", "path": path, "newText": new_text }])
+        }
+        _ => serde_json::json!([]),
+    }
+}
+
 fn map_tool_kind(name: &str) -> &'static str {
     match name {
         "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
@@ -1049,22 +1472,32 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            method: "session/update",
-            params: serde_json::json!({
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": id,
-                    "name": name,
-                    "title": name,
-                    "kind": map_tool_kind(name),
-                    "rawInput": args,
-                    "status": "pending"
-                }
-            }),
-        },
+        TurnEvent::ToolCall { id, name, args } => {
+            let acp_content = to_acp_content(name, args);
+            let mut update = serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "name": name,
+                "title": name,
+                "kind": map_tool_kind(name),
+                "rawInput": to_acp_raw_input(name, args),
+                "status": "pending"
+            });
+            if acp_content
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                update["content"] = acp_content;
+            }
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": update
+                }),
+            }
+        }
         TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -1117,6 +1550,102 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
              ACP has no session/update notification for token usage"
         ),
     })
+}
+
+fn history_notifications_for_message(
+    session_id: &str,
+    msg: &ConversationMessage,
+) -> Vec<JsonRpcNotification> {
+    match msg {
+        ConversationMessage::Chat(chat) => {
+            let update_type = match chat.role.as_str() {
+                "user" => "user_message_chunk",
+                "assistant" => "agent_message_chunk",
+                _ => return vec![],
+            };
+            vec![JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": update_type,
+                        "content": { "type": "text", "text": &chat.content }
+                    }
+                }),
+            }]
+        }
+        ConversationMessage::AssistantToolCalls {
+            text, tool_calls, ..
+        } => {
+            let mut notifications = Vec::new();
+            if let Some(t) = text
+                && !t.is_empty()
+            {
+                notifications.push(JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": t }
+                        }
+                    }),
+                });
+            }
+            for tc in tool_calls {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                let acp_content = to_acp_content(&tc.name, &args);
+                let mut update = serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": &tc.id,
+                    "name": &tc.name,
+                    "title": &tc.name,
+                    "kind": map_tool_kind(&tc.name),
+                    "rawInput": to_acp_raw_input(&tc.name, &args),
+                    "status": "completed"
+                });
+                if acp_content
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    update["content"] = acp_content;
+                }
+                notifications.push(JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": update
+                    }),
+                });
+            }
+            notifications
+        }
+        ConversationMessage::ToolResults(results) => results
+            .iter()
+            .map(|r| JsonRpcNotification {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": &r.tool_call_id,
+                        "status": "completed",
+                        "rawOutput": &r.content,
+                        "body": &r.content,
+                        "content": [{
+                            "type": "content",
+                            "content": { "type": "text", "text": &r.content }
+                        }]
+                    }
+                }),
+            })
+            .collect(),
+    }
 }
 
 // ── Error helper ─────────────────────────────────────────────────
@@ -1236,6 +1765,28 @@ mod tests {
         );
         assert!(result.get("serverInfo").is_none());
         assert!(result.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn initialize_advertises_load_session_when_store_present() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            store,
+        );
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["resume"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            result["agentCapabilities"]["sessionCapabilities"]["close"],
+            serde_json::json!({})
+        );
     }
 
     #[test]
@@ -1406,10 +1957,16 @@ mod tests {
         let result = AcpServer::parse_prompt(&no_text_params);
         assert!(result.is_err());
 
-        // Missing prompt
-        let missing_params = serde_json::json!({});
-        let result = AcpServer::parse_prompt(&missing_params);
-        assert!(result.is_err());
+        // Array prompt with resource (file @-notation from ACP client)
+        let resource_params = serde_json::json!({
+            "prompt": [
+                {"type": "text", "text": "analyze this file:"},
+                {"type": "resource", "resource": {"uri": "file:///tmp/example.rs", "text": "fn main() { println!(\"hi\"); }", "mimeType": "text/rust"}}
+            ]
+        });
+        let result = AcpServer::parse_prompt(&resource_params).unwrap();
+        assert!(result.contains("analyze this file:"));
+        assert!(result.contains("fn main() { println!(\"hi\"); }"));
     }
 
     #[test]
@@ -1500,6 +2057,81 @@ mod tests {
         assert!(json2.contains("file1.txt"));
         // Verify matching toolCallId across events
         assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
+    }
+
+    #[test]
+    fn file_edit_raw_input_uses_acp_diff_field_names() {
+        let call = notification_for_turn_event(
+            "sid",
+            &TurnEvent::ToolCall {
+                id: "tc-1".to_string(),
+                name: "file_edit".to_string(),
+                args: serde_json::json!({
+                    "path": "src/foo.rs",
+                    "old_string": "let x = 1;",
+                    "new_string": "let x = 2;"
+                }),
+            },
+        );
+        let v = serde_json::to_value(call.unwrap()).unwrap();
+        let raw = &v["params"]["update"]["rawInput"];
+        assert_eq!(raw["path"], "src/foo.rs");
+        assert_eq!(raw["oldText"], "let x = 1;");
+        assert_eq!(raw["newText"], "let x = 2;");
+        assert!(
+            raw.get("old_string").is_none(),
+            "old_string must not appear in rawInput"
+        );
+        assert!(
+            raw.get("new_string").is_none(),
+            "new_string must not appear in rawInput"
+        );
+
+        let content = &v["params"]["update"]["content"];
+        assert!(content.is_array(), "file_edit must emit a content array");
+        let diff = &content[0];
+        assert_eq!(diff["type"], "diff");
+        assert_eq!(diff["path"], "src/foo.rs");
+        assert_eq!(diff["oldText"], "let x = 1;");
+        assert_eq!(diff["newText"], "let x = 2;");
+    }
+
+    #[test]
+    fn file_write_raw_input_uses_acp_diff_field_names() {
+        let call = notification_for_turn_event(
+            "sid",
+            &TurnEvent::ToolCall {
+                id: "tc-2".to_string(),
+                name: "file_write".to_string(),
+                args: serde_json::json!({
+                    "path": "src/new.rs",
+                    "content": "fn main() {}"
+                }),
+            },
+        );
+        let v = serde_json::to_value(call.unwrap()).unwrap();
+        let raw = &v["params"]["update"]["rawInput"];
+        assert_eq!(raw["path"], "src/new.rs");
+        assert_eq!(raw["newText"], "fn main() {}");
+        assert!(
+            raw.get("oldText").is_none(),
+            "oldText must not appear in file_write rawInput"
+        );
+        assert!(
+            raw.get("content").is_none(),
+            "content must not appear in rawInput"
+        );
+
+        let content = &v["params"]["update"]["content"];
+        assert!(content.is_array(), "file_write must emit a content array");
+        let diff = &content[0];
+        assert_eq!(diff["type"], "diff");
+        assert_eq!(diff["path"], "src/new.rs");
+        assert_eq!(diff["newText"], "fn main() {}");
+        assert!(
+            diff.get("oldText").is_none(),
+            "oldText must be absent for file_write diff"
+        );
     }
 
     #[test]
@@ -1635,6 +2267,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn session_new_persists_to_store() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+
+        // Session must appear in the store
+        let data = store.load_session(session_id).unwrap();
+        assert!(
+            data.is_some(),
+            "session/new must persist to AcpSessionStore"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_without_store_still_works() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed without a store");
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert!(server.sessions.lock().await.contains_key(session_id));
     }
 
     fn make_test_config(cwd: &std::path::Path) -> Config {
@@ -1834,5 +2513,432 @@ mod tests {
             .expect("cancel_tokens lock poisoned")
             .len();
         assert_eq!(remaining, 0, "cancel token must be removed after turn ends");
+    }
+
+    #[tokio::test]
+    async fn session_load_restores_history_and_streams_notifications() {
+        use zeroclaw_api::provider::{ChatMessage, ConversationMessage};
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-load-test";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("hello")),
+                    ConversationMessage::Chat(ChatMessage::assistant("hi there")),
+                ],
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        let result = server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        assert_eq!(result, serde_json::json!({}));
+
+        // Session must now be in the in-memory map
+        assert!(server.sessions.lock().await.contains_key(session_id));
+
+        // Collect notifications (non-blocking drain)
+        let mut notifications = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            notifications.push(msg);
+        }
+
+        // Expect two session/update notifications: user then assistant
+        assert_eq!(
+            notifications.len(),
+            2,
+            "expected 2 notifications, got: {notifications:?}"
+        );
+        let n0: serde_json::Value = serde_json::from_str(&notifications[0]).unwrap();
+        assert_eq!(
+            n0["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+        assert_eq!(n0["params"]["update"]["content"]["text"], "hello");
+        let n1: serde_json::Value = serde_json::from_str(&notifications[1]).unwrap();
+        assert_eq!(
+            n1["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(n1["params"]["update"]["content"]["text"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn session_load_returns_not_found_for_unknown_id() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            store,
+        );
+
+        let err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": "ghost" }))
+            .await
+            .expect_err("unknown session must fail");
+
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn session_load_rejects_already_active_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // Create and load the session once to put it in memory
+        let session_id = "sess-already-active";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .unwrap();
+
+        // Second load must be rejected
+        let err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("session/load for active session must fail");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn session_resume_restores_without_replay() {
+        use zeroclaw_api::provider::{ChatMessage, ConversationMessage};
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-test";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        let result = server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        // Result is empty object
+        assert_eq!(result, serde_json::json!({}));
+
+        // Session must be in memory
+        assert!(server.sessions.lock().await.contains_key(session_id));
+
+        // No notifications must have been emitted
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "session/resume must not emit session/update notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_close_releases_memory_but_keeps_store_record() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        assert!(server.sessions.lock().await.contains_key(&session_id));
+
+        let result = server
+            .handle_session_close(&serde_json::json!({ "sessionId": &session_id }))
+            .await
+            .expect("session/close must succeed");
+
+        assert_eq!(result, serde_json::json!({}));
+
+        // Session gone from in-memory map
+        assert!(!server.sessions.lock().await.contains_key(&session_id));
+
+        // Session record still on disk
+        let data = store.load_session(&session_id).unwrap();
+        assert!(
+            data.is_some(),
+            "session/close must not delete the DB record"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_close_returns_not_found_for_unknown_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = AcpServer::new(make_test_config(cwd.path()), AcpServerConfig::default());
+
+        let err = server
+            .handle_session_close(&serde_json::json!({ "sessionId": "ghost" }))
+            .await
+            .expect_err("unknown session must fail");
+
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    /// `session/load` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached by an active session created via `session/new`.
+    #[tokio::test]
+    async fn session_load_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // Pre-create a stored session that we'll attempt to load
+        let stored_id = "sess-load-limit-test";
+        store
+            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // Fill the one available slot via session/new
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed when under limit");
+
+        // Now session/load for the stored session must fail with SESSION_LIMIT_REACHED
+        let err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": stored_id }))
+            .await
+            .expect_err("session/load must fail when max_sessions reached");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {:?}",
+            err
+        );
+    }
+
+    /// `session/resume` must return SESSION_LIMIT_REACHED when `max_sessions` is
+    /// already reached by an active session created via `session/new`.
+    #[tokio::test]
+    async fn session_resume_respects_max_sessions() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        // Pre-create a stored session that we'll attempt to resume
+        let stored_id = "sess-resume-limit-test";
+        store
+            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig {
+                max_sessions: 1,
+                ..AcpServerConfig::default()
+            },
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // Fill the one available slot via session/new
+        server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed when under limit");
+
+        // Now session/resume for the stored session must fail with SESSION_LIMIT_REACHED
+        let err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": stored_id }))
+            .await
+            .expect_err("session/resume must fail when max_sessions reached");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "expected SESSION_LIMIT_REACHED, got: {:?}",
+            err
+        );
+    }
+
+    /// A SQLite error during `store.load_session` must release the `loading_sessions`
+    /// reservation so a subsequent restore attempt is not permanently blocked.
+    #[tokio::test]
+    async fn session_load_releases_reservation_on_store_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-load-store-err";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // Drop the schema via a second connection to force a "no such table"
+        // error on the store's next query_row call.
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        {
+            let second =
+                rusqlite::Connection::open(&db_path).expect("second conn must open same db");
+            second
+                .execute_batch(
+                    "DROP TABLE IF EXISTS acp_messages; DROP TABLE IF EXISTS acp_sessions;",
+                )
+                .expect("schema drop must succeed on second conn");
+        }
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        // First call: must fail with INTERNAL_ERROR (SQLite "no such table").
+        let first_err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("session/load must fail when store returns Err");
+        assert_eq!(
+            first_err.code, INTERNAL_ERROR,
+            "expected INTERNAL_ERROR from store failure, got: {:?}",
+            first_err
+        );
+
+        // Second call for the same session: must also fail with INTERNAL_ERROR,
+        // NOT with INVALID_PARAMS ("already active"). A leaked reservation would
+        // cause INVALID_PARAMS, proving the slot was never released.
+        let second_err = server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("second session/load must also fail");
+        assert_eq!(
+            second_err.code, INTERNAL_ERROR,
+            "second load must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
+            second_err
+        );
+    }
+
+    /// Same coverage as `session_load_releases_reservation_on_store_error` but
+    /// for the `session/resume` path.
+    #[tokio::test]
+    async fn session_resume_releases_reservation_on_store_error() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-store-err";
+        store
+            .create_session(session_id, &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let db_path = cwd.path().join("sessions/acp-sessions.db");
+        {
+            let second =
+                rusqlite::Connection::open(&db_path).expect("second conn must open same db");
+            second
+                .execute_batch(
+                    "DROP TABLE IF EXISTS acp_messages; DROP TABLE IF EXISTS acp_sessions;",
+                )
+                .expect("schema drop must succeed on second conn");
+        }
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        let first_err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("session/resume must fail when store returns Err");
+        assert_eq!(
+            first_err.code, INTERNAL_ERROR,
+            "expected INTERNAL_ERROR from store failure, got: {:?}",
+            first_err
+        );
+
+        let second_err = server
+            .handle_session_resume(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect_err("second session/resume must also fail");
+        assert_eq!(
+            second_err.code, INTERNAL_ERROR,
+            "second resume must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
+            second_err
+        );
     }
 }
