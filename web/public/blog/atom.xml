@@ -6,5 +6,8 @@
   <link href="https://www.zeroclawlabs.ai/blog" />
   <link href="https://www.zeroclawlabs.ai/blog/atom.xml" rel="self" />
   <link href="https://www.zeroclawlabs.ai/blog/rss.xml" rel="alternate" type="application/rss+xml" />
+  <author>
+    <name>ZeroClaw Labs</name>
+  </author>
   <updated>2026-05-19T13:55:46Z</updated>
 </feed>
