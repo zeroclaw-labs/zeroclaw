@@ -667,11 +667,21 @@ enum QuoteState {
 ///
 /// Characters inside single or double quotes are treated as literals, so
 /// `sqlite3 db "SELECT 1; SELECT 2;"` remains a single segment.
+///
+/// Heredoc bodies (`<<WORD ... WORD`) are kept as part of the same segment
+/// as the command that opens them; newlines inside the body do not split.
 fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    // Heredoc state: Some(delim) while inside a heredoc body.
+    let mut heredoc_delimiter: Option<String> = None;
+    // Accumulates the current line while inside a heredoc body, for terminator detection.
+    let mut heredoc_line_buf = String::new();
+    // True while reading the delimiter word that follows `<<`.
+    let mut reading_heredoc_word = false;
+    let mut heredoc_word_buf = String::new();
     let mut chars = command.chars().peekable();
 
     let push_segment = |segments: &mut Vec<String>, current: &mut String| {
@@ -710,11 +720,58 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 if escaped {
                     escaped = false;
                     current.push(ch);
+                    if heredoc_delimiter.is_some() {
+                        heredoc_line_buf.push(ch);
+                    }
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
                     current.push(ch);
+                    if heredoc_delimiter.is_some() {
+                        heredoc_line_buf.push(ch);
+                    }
+                    continue;
+                }
+
+                // Reading the delimiter word that follows `<<`.
+                if reading_heredoc_word {
+                    if ch == '\n' {
+                        // Finalise the delimiter and enter the heredoc body.
+                        let raw = heredoc_word_buf.trim().trim_start_matches('-');
+                        let delim = raw
+                            .trim_matches(|c| c == '\'' || c == '"' || c == '\\')
+                            .to_string();
+                        if !delim.is_empty() {
+                            heredoc_delimiter = Some(delim);
+                        }
+                        heredoc_word_buf.clear();
+                        reading_heredoc_word = false;
+                        // The newline after `<<WORD` belongs to the same segment.
+                        current.push(ch);
+                    } else {
+                        heredoc_word_buf.push(ch);
+                        current.push(ch);
+                    }
+                    continue;
+                }
+
+                // Inside a heredoc body: don't split on newlines.
+                if let Some(ref delim) = heredoc_delimiter.clone() {
+                    if ch == '\n' {
+                        if heredoc_line_buf.trim() == delim.as_str() {
+                            // Terminator line reached — end of heredoc body.
+                            heredoc_delimiter = None;
+                            heredoc_line_buf.clear();
+                            push_segment(&mut segments, &mut current);
+                        } else {
+                            heredoc_line_buf.clear();
+                            current.push(ch);
+                        }
+                    } else {
+                        heredoc_line_buf.push(ch);
+                        current.push(ch);
+                    }
                     continue;
                 }
 
@@ -740,6 +797,18 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                             push_segment(&mut segments, &mut current);
                         } else {
                             current.push(ch);
+                        }
+                    }
+                    '<' => {
+                        current.push(ch);
+                        // Detect `<<` (heredoc) but not `<<<` (here-string).
+                        if chars.peek() == Some(&'<') {
+                            let second = chars.next().unwrap();
+                            current.push(second);
+                            if chars.peek() != Some(&'<') {
+                                reading_heredoc_word = true;
+                            }
+                            // `<<<` falls through with no heredoc tracking.
                         }
                     }
                     _ => current.push(ch),
@@ -3524,6 +3593,22 @@ mod tests {
         assert!(!p.is_command_allowed("cat < /etc/passwd"));
         // Output redirects to files still blocked
         assert!(!p.is_command_allowed("echo secret > output.txt"));
+    }
+
+    #[test]
+    fn multiline_heredoc_allowed() {
+        let p = default_policy();
+        // Multiline heredoc body must not be split into separate segments that
+        // fail the allowlist check on the body lines.
+        assert!(p.is_command_allowed("cat <<EOF\nhello world\nEOF"));
+        assert!(p.is_command_allowed("cat <<'EOF'\nhello world\nEOF"));
+        assert!(p.is_command_allowed("cat << EOF\nhello world\nEOF"));
+        // Quoted delimiter variant
+        assert!(p.is_command_allowed("cat <<\"EOF\"\nhello world\nEOF"));
+        // Heredoc followed by an allowed command is still two valid segments
+        assert!(p.is_command_allowed("cat <<EOF\nhello\nEOF\necho done"));
+        // Heredoc followed by a disallowed command must be blocked
+        assert!(!p.is_command_allowed("cat <<EOF\nhello\nEOF\nrm -rf /"));
     }
 
     #[test]
