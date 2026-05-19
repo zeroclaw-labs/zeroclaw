@@ -136,6 +136,41 @@ impl RusqliteStore {
             table_exists && !has_raw_id
         };
 
+        // Probe `device` for the 5 wacore-0.6 columns. Each entry is
+        // (column_name, SQL fragment for ALTER TABLE ... ADD COLUMN).
+        // The order mirrors upstream's sqlite-storage migration history
+        // so a sqlite-browser diff against an upstream DB is readable.
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so we resolve which
+        // ones to add up-front and apply only the missing ones inside
+        // the transaction — same crash-safety contract as `raw_id`.
+        let device_06_migrations: Vec<(&'static str, &'static str)> = {
+            let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut stmt = conn.prepare("PRAGMA table_info(device)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for r in rows {
+                existing.insert(r?);
+            }
+            const ALL: &[(&str, &str)] = &[
+                ("next_pre_key_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("server_has_prekeys", "INTEGER NOT NULL DEFAULT 0"),
+                ("nct_salt", "BLOB"),
+                ("server_cert_chain", "BLOB"),
+                ("login_counter", "INTEGER NOT NULL DEFAULT 0"),
+            ];
+            // If the table doesn't exist yet (existing is empty), the
+            // CREATE TABLE inside the transaction will define all five
+            // columns, so we want an empty migration list. The same
+            // empty-set check that `needs_raw_id` relies on applies here.
+            if existing.is_empty() {
+                Vec::new()
+            } else {
+                ALL.iter()
+                    .copied()
+                    .filter(|(col, _)| !existing.contains(*col))
+                    .collect()
+            }
+        };
+
         // Wrap CREATEs + the conditional ALTER in a single transaction so a
         // crash between them can't leave the DB with new tables but no
         // `raw_id` column — that state survives reboots because the PRAGMA
@@ -346,6 +381,19 @@ impl RusqliteStore {
         if needs_raw_id {
             to_store_err!(execute: tx.execute(
                 "ALTER TABLE device_registry ADD COLUMN raw_id INTEGER",
+                [],
+            ))?;
+        }
+
+        // Apply the wacore-0.6 device column migrations inside the same
+        // transaction as the CREATEs + raw_id ALTER. SQLite refuses to
+        // ALTER TABLE if the column already exists, so we use the
+        // pre-computed `device_06_migrations` list rather than a blanket
+        // probe inside the loop (which would re-read PRAGMA after each
+        // ALTER and complicate failure modes).
+        for (col, ty) in &device_06_migrations {
+            to_store_err!(execute: tx.execute(
+                &format!("ALTER TABLE device ADD COLUMN {col} {ty}"),
                 [],
             ))?;
         }
@@ -1644,5 +1692,66 @@ mod tests {
         assert_eq!(cert.intermediate.not_before, 1_700_000_000);
         assert_eq!(cert.leaf.not_after, 1_800_000_000);
         assert_eq!(loaded.login_counter, 7);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn pre_06_device_table_gets_new_columns_on_open() {
+        use wacore::store::Device as CoreDevice;
+        use wacore::store::traits::DeviceStore as DeviceStoreTrait;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Hand-create a legacy pre-0.6 device table (18 columns, no
+        // wacore-0.6 fields) to simulate an existing on-disk database
+        // from a daemon that ran against whatsapp-rust 0.5.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE device (
+                    id INTEGER PRIMARY KEY,
+                    lid TEXT,
+                    pn TEXT,
+                    registration_id INTEGER NOT NULL,
+                    noise_key BLOB NOT NULL,
+                    identity_key BLOB NOT NULL,
+                    signed_pre_key BLOB NOT NULL,
+                    signed_pre_key_id INTEGER NOT NULL,
+                    signed_pre_key_signature BLOB NOT NULL,
+                    adv_secret_key BLOB NOT NULL,
+                    account BLOB,
+                    push_name TEXT NOT NULL,
+                    app_version_primary INTEGER NOT NULL,
+                    app_version_secondary INTEGER NOT NULL,
+                    app_version_tertiary INTEGER NOT NULL,
+                    app_version_last_fetched_ms INTEGER NOT NULL,
+                    edge_routing_info BLOB,
+                    props_hash TEXT
+                );",
+            )
+            .unwrap();
+        }
+
+        // Opening the store must add the 5 wacore-0.6 columns idempotently;
+        // a subsequent save+load round-trip must succeed.
+        let store = RusqliteStore::new(&path).unwrap();
+        let mut device = CoreDevice::new();
+        device.next_pre_key_id = 99;
+        device.login_counter = 3;
+        DeviceStoreTrait::save(&store, &device).await.unwrap();
+
+        let loaded = DeviceStoreTrait::load(&store)
+            .await
+            .unwrap()
+            .expect("device row should exist after save");
+        assert_eq!(loaded.next_pre_key_id, 99);
+        assert_eq!(loaded.login_counter, 3);
+
+        // Re-opening a second time must be a no-op (idempotent ALTER).
+        drop(store);
+        let store2 = RusqliteStore::new(&path).unwrap();
+        let loaded2 = DeviceStoreTrait::load(&store2).await.unwrap().unwrap();
+        assert_eq!(loaded2.next_pre_key_id, 99);
     }
 }
