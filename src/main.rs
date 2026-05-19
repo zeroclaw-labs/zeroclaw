@@ -1700,6 +1700,18 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // Populate shared channel map so channel_send, ask_user, reaction,
+            // escalate, and poll all see configured channels.
+            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
+                &config,
+            );
+            if !channel_names.is_empty() {
+                tracing::info!(
+                    channels = ?channel_names,
+                    "Registered channels for CLI agent"
+                );
+            }
+
             Box::pin(agent::run(
                 config,
                 &agent_alias,
