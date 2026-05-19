@@ -6019,6 +6019,14 @@ pub async fn start_channels(
         ));
     }
 
+    // Dawn S3 tool - upload files to Dawn S3 compatible storage
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+    }
+
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
     // Skip this filter when autonomy is `Full` — full-autonomy agents keep
