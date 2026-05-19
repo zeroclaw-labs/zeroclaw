@@ -7,11 +7,4 @@
   <link href="https://www.zeroclawlabs.ai/blog/atom.xml" rel="self" />
   <link href="https://www.zeroclawlabs.ai/blog/rss.xml" rel="alternate" type="application/rss+xml" />
   <updated>2026-05-19T13:55:46Z</updated>
-  <entry>
-    <title>ZeroClaw Blog</title>
-    <id>https://www.zeroclawlabs.ai/blog</id>
-    <link href="https://www.zeroclawlabs.ai/blog" />
-    <updated>2026-05-19T13:55:46Z</updated>
-    <summary>Latest posts from ZeroClaw Labs.</summary>
-  </entry>
 </feed>
