@@ -431,9 +431,7 @@ async fn handle_socket(
         pending_approvals.clone(),
         Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
     ));
-    agent
-        .channel_handles()
-        .register_channel("ws", approval_channel.clone());
+    zeroclaw_runtime::tools::SHARED_CHANNEL_MAP.write().insert("ws".to_string(), approval_channel.clone());
 
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {

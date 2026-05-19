@@ -25,23 +25,12 @@ pub struct ReactionTool {
 }
 
 impl ReactionTool {
-    /// Create a new reaction tool with an empty channel map.
-    /// Write to the returned [`ChannelMapHandle`] once channels are available.
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+    /// Create a new reaction tool using the given channel map.
+    pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
         Self {
-            channels: Arc::new(RwLock::new(HashMap::new())),
+            channels,
             security,
         }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channels)
-    }
-
-    /// Convenience: populate the channel map from a pre-built map.
-    pub fn populate(&self, map: HashMap<String, Arc<dyn Channel>>) {
-        *self.channels.write() = map;
     }
 }
 
@@ -308,7 +297,7 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> ReactionTool {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), Arc::new(RwLock::new(HashMap::new())));
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -319,7 +308,7 @@ mod tests {
 
     #[test]
     fn tool_metadata() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), Arc::new(RwLock::new(HashMap::new())));
         assert_eq!(tool.name(), "reaction");
         assert!(!tool.description().is_empty());
         let schema = tool.parameters_schema();
@@ -476,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channels_returns_not_initialized() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), Arc::new(RwLock::new(HashMap::new())));
         // No channels populated
 
         let result = tool
@@ -541,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), Arc::new(RwLock::new(HashMap::new())));
         let handle = tool.channel_map_handle();
 
         // Initially empty — tool reports not initialized
@@ -580,7 +569,7 @@ mod tests {
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), Arc::new(RwLock::new(HashMap::new())));
         let spec = tool.spec();
         assert_eq!(spec.name, "reaction");
         assert_eq!(spec.description, tool.description());

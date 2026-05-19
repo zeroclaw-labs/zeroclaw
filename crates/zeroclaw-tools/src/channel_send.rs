@@ -27,16 +27,11 @@ pub struct ChannelSendTool {
 }
 
 impl ChannelSendTool {
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, channel_map: ChannelMapHandle) -> Self {
         Self {
             security,
-            channel_map: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            channel_map,
         }
-    }
-
-    /// Return a handle to the channel map for external population.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channel_map)
     }
 }
 

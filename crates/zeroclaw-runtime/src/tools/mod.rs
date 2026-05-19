@@ -148,9 +148,22 @@ use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::Arc;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
+
+/// Shared channel map populated by `start_channels()` when channels are
+/// configured. All tool instances share this single map, so `channel_send`,
+/// `ask_user`, `reaction`, `escalate`, and `poll` all see the same set of
+/// channels regardless of which code path (CLI, gateway, orchestrator) they
+/// were created in.
+///
+/// If `start_channels()` is never called (standalone CLI / gateway with no
+/// channels configured), the map is empty and channel-aware tools will fail
+/// with a clear "Channel not found" error.
+pub static SHARED_CHANNEL_MAP: LazyLock<ChannelMapHandle> =
+    LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -360,11 +373,6 @@ pub fn all_tools(
 ) -> (
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
-    Option<ChannelMapHandle>,
-    ChannelMapHandle,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
 ) {
     all_tools_with_runtime(
         config,
@@ -414,11 +422,6 @@ pub fn all_tools_with_runtime(
 ) -> (
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
-    Option<ChannelMapHandle>,
-    ChannelMapHandle,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
-    Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let runtime_kind = root_config.runtime.kind.as_str();
@@ -905,11 +908,10 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Poll tool — always registered; uses late-bound channel map handle
-    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    // Poll tool — always registered; uses shared channel map.
     tool_arcs.push(Arc::new(PollTool::new(
         security.clone(),
-        Arc::clone(&channel_map_handle),
+        Arc::clone(&*SHARED_CHANNEL_MAP),
     )));
 
     // SOP tools (registered when sops_dir is configured)
@@ -934,27 +936,24 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Emoji reaction tool — always registered; channel map populated later by start_channels.
-    let reaction_tool = ReactionTool::new(security.clone());
-    let reaction_handle = reaction_tool.channel_map_handle();
+    // Emoji reaction tool — always registered; uses shared channel map.
+    let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&*SHARED_CHANNEL_MAP));
     tool_arcs.push(Arc::new(reaction_tool));
 
-    // Interactive ask_user tool — always registered; channel map populated later by start_channels.
-    let ask_user_tool = AskUserTool::new(security.clone());
-    let ask_user_handle = ask_user_tool.channel_map_handle();
+    // Interactive ask_user tool — always registered; uses shared channel map.
+    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&*SHARED_CHANNEL_MAP));
     tool_arcs.push(Arc::new(ask_user_tool));
 
-    // Human escalation tool — always registered; channel map populated later by start_channels.
+    // Human escalation tool — always registered; uses shared channel map.
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
+        Arc::clone(&*SHARED_CHANNEL_MAP),
     );
-    let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 
-    // Channel send tool — always registered; channel map populated later by start_channels.
-    let channel_send_tool = ChannelSendTool::new(security.clone());
-    let channel_send_handle = channel_send_tool.channel_map_handle();
+    // Channel send tool — always registered; uses shared channel map.
+    let channel_send_tool = ChannelSendTool::new(security.clone(), Arc::clone(&*SHARED_CHANNEL_MAP));
     tool_arcs.push(Arc::new(channel_send_tool));
 
     // Microsoft 365 Graph API integration
@@ -989,11 +988,6 @@ pub fn all_tools_with_runtime(
                 return (
                     boxed_registry_from_arcs(tool_arcs),
                     None,
-                    Some(reaction_handle),
-                    channel_map_handle,
-                    Some(ask_user_handle),
-                    Some(escalate_handle),
-                    Some(channel_send_handle),
                 );
             }
 
@@ -1186,11 +1180,6 @@ pub fn all_tools_with_runtime(
     (
         boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
-        Some(reaction_handle),
-        channel_map_handle,
-        Some(ask_user_handle),
-        Some(escalate_handle),
-        Some(channel_send_handle),
     )
 }
 
