@@ -3336,6 +3336,14 @@ pub struct WebSearchConfig {
     /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
+    /// Yumc-Search API key (required if provider is `"yumc-search"`)
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub yumc_search_api_key: Option<String>,
+    /// Yumc-Search base URL (optional, defaults to internal URL if not set)
+    #[serde(default)]
+    pub yumc_search_base_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -3364,6 +3372,8 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             tavily_api_key: None,
             searxng_instance_url: None,
+            yumc_search_api_key: None,
+            yumc_search_base_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -13020,7 +13030,7 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
-hooks: HooksConfig::default(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
