@@ -3110,6 +3110,15 @@ impl Config {
             .map(|(alias, _)| alias.as_str())
     }
 
+    /// Workspace dir a channel's inbound-media handler writes into. Resolves
+    /// the channel's owning agent and returns `<install>/agents/<alias>/workspace/`;
+    /// falls back to `data_dir` for orphan channels (no owning agent enabled).
+    #[must_use]
+    pub fn channel_workspace_dir(&self, channel_ref: &str) -> PathBuf {
+        self.agent_for_channel(channel_ref)
+            .map_or_else(|| self.data_dir.clone(), |a| self.agent_workspace_dir(a))
+    }
+
     /// Schema-walk: every populated `[channels.<type>.<alias>]` block.
     /// Type names come from the `prop_fields()` enumeration (kebab as the
     /// macro emits them) so adding a new channel type via the macro

@@ -4656,10 +4656,6 @@ fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
-    // Shadow `config` with a read guard so the existing body, which
-    // dereferences fields like `config.channels.foo`, keeps working
-    // through `Deref<Target = Config>`. Peer-resolver closures that
-    // need to outlive this function capture `config_arc.clone()`.
     let config = config_arc.read();
     match channel_id {
         #[cfg(feature = "channel-telegram")]
@@ -5336,7 +5332,7 @@ fn collect_configured_channels(
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                 .with_proxy_url(tg.proxy_url.clone())
                 .with_tool_command_specs(tool_specs.to_vec())
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
@@ -5365,7 +5361,7 @@ fn collect_configured_channels(
             dc.mention_only,
         )
         .with_channel_ids(dc.channel_ids.clone())
-        .with_workspace_dir(config.data_dir.clone())
+        .with_workspace_dir(config.channel_workspace_dir(&format!("discord.{alias}")))
         .with_streaming(
             dc.stream_mode,
             dc.draft_update_interval_ms,
@@ -5424,7 +5420,7 @@ fn collect_configured_channels(
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_strict_mention_in_thread(sl.strict_mention_in_thread)
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_proxy_url(sl.proxy_url.clone())
                 .with_transcription(config.transcription.clone())
@@ -5513,7 +5509,7 @@ fn collect_configured_channels(
             Ok(channel) => {
                 let channel = channel
                     .with_transcription(config.transcription.clone())
-                    .with_workspace_dir(config.data_dir.clone())
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
@@ -5961,7 +5957,7 @@ fn collect_configured_channels(
                     alias.clone(),
                     peer_resolver,
                 )
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(config.channel_workspace_dir(&format!("qq.{alias}")))
                 .with_proxy_url(qq.proxy_url.clone()),
             ),
         });
@@ -6065,7 +6061,9 @@ fn collect_configured_channels(
                     channel: Arc::new(
                         channel
                             .with_persistence(config_arc.clone())
-                            .with_workspace_dir(config.data_dir.clone()),
+                            .with_workspace_dir(
+                                config.channel_workspace_dir(&format!("wechat.{alias}")),
+                            ),
                     ),
                 });
             }
