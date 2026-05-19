@@ -3341,7 +3341,7 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub yumc_search_api_key: Option<String>,
-    /// Yumc-Search base URL (optional, defaults to internal URL if not set)
+    /// Yumc-Search base URL (required if provider is `"yumc-search"`)
     #[serde(default)]
     pub yumc_search_base_url: Option<String>,
     /// Maximum results per search (1-10)

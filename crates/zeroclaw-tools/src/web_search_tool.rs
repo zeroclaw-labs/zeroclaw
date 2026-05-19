@@ -579,7 +579,7 @@ impl WebSearchTool {
             .yumc_search_base_url
             .as_deref()
             .filter(|s| !s.is_empty())
-            .unwrap_or("http://share-nextg-nexx-gray.prd.yumc.local/tool/294/api/v1/search");
+            .ok_or_else(|| anyhow::anyhow!("Yumc-Search base URL not configured"))?;
 
         let body = serde_json::json!({
             "queries": [query],
