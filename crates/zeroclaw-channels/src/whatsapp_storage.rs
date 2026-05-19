@@ -163,7 +163,12 @@ impl RusqliteStore {
                 app_version_tertiary INTEGER NOT NULL,
                 app_version_last_fetched_ms INTEGER NOT NULL,
                 edge_routing_info BLOB,
-                props_hash TEXT
+                props_hash TEXT,
+                next_pre_key_id INTEGER NOT NULL DEFAULT 0,
+                server_has_prekeys INTEGER NOT NULL DEFAULT 0,
+                nct_salt BLOB,
+                server_cert_chain BLOB,
+                login_counter INTEGER NOT NULL DEFAULT 0
             );
 
             -- Signal identity keys
@@ -1299,14 +1304,27 @@ impl DeviceStoreTrait for RusqliteStore {
         // rusqlite errors without logging parameter values.
         let account = device.account.as_ref().map(|a| a.encode_to_vec());
 
+        let server_cert_chain_blob = device
+            .server_cert_chain
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| wacore::store::error::StoreError::Serialization(Box::new(e)))?;
+
         to_store_err!(execute: conn.execute(
             "INSERT OR REPLACE INTO device (
                 id, lid, pn, registration_id, noise_key, identity_key,
                 signed_pre_key, signed_pre_key_id, signed_pre_key_signature,
                 adv_secret_key, account, push_name, app_version_primary,
                 app_version_secondary, app_version_tertiary, app_version_last_fetched_ms,
-                edge_routing_info, props_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                edge_routing_info, props_hash,
+                next_pre_key_id, server_has_prekeys, nct_salt,
+                server_cert_chain, login_counter
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21, ?22, ?23
+            )",
             params![
                 self.device_id,
                 device.lid.as_ref().map(|j| j.to_string()),
@@ -1326,6 +1344,11 @@ impl DeviceStoreTrait for RusqliteStore {
                 device.app_version_last_fetched_ms,
                 device.edge_routing_info.clone(),
                 device.props_hash.clone(),
+                device.next_pre_key_id,
+                device.server_has_prekeys as i64,
+                device.nct_salt.clone(),
+                server_cert_chain_blob,
+                device.login_counter,
             ],
         ))
     }
@@ -1396,6 +1419,15 @@ impl DeviceStoreTrait for RusqliteStore {
                     None
                 };
 
+                let server_cert_chain: Option<wacore::store::device::CachedServerCertChain> = {
+                    let bytes: Option<Vec<u8>> = row.get("server_cert_chain")?;
+                    match bytes {
+                        Some(b) => Some(serde_json::from_slice(&b).map_err(to_rusqlite_err)?),
+                        None => None,
+                    }
+                };
+                let server_has_prekeys_int: i64 = row.get("server_has_prekeys")?;
+
                 Ok(CoreDevice {
                     lid: lid_str.and_then(|s| s.parse().ok()),
                     pn: pn_str.and_then(|s| s.parse().ok()),
@@ -1414,6 +1446,11 @@ impl DeviceStoreTrait for RusqliteStore {
                     app_version_last_fetched_ms: row.get("app_version_last_fetched_ms")?,
                     edge_routing_info: row.get("edge_routing_info")?,
                     props_hash: row.get("props_hash")?,
+                    next_pre_key_id: row.get("next_pre_key_id")?,
+                    server_has_prekeys: server_has_prekeys_int != 0,
+                    nct_salt: row.get("nct_salt")?,
+                    server_cert_chain,
+                    login_counter: row.get("login_counter")?,
                     ..Default::default()
                 })
             },
@@ -1548,5 +1585,64 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn device_save_load_round_trips_wacore_06_fields() {
+        use wacore::store::Device as CoreDevice;
+        use wacore::store::device::{CachedNoiseCert, CachedServerCertChain};
+        use wacore::store::traits::DeviceStore as DeviceStoreTrait;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // First boot: populate the 5 wacore-0.6 device fields with
+        // non-default values and persist.
+        {
+            let store = RusqliteStore::new(&path).unwrap();
+            let mut device = CoreDevice::new();
+            device.next_pre_key_id = 42;
+            device.server_has_prekeys = true;
+            device.nct_salt = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            device.server_cert_chain = Some(CachedServerCertChain {
+                intermediate: CachedNoiseCert {
+                    key: [1u8; 32],
+                    not_before: 1_700_000_000,
+                    not_after: 1_800_000_000,
+                },
+                leaf: CachedNoiseCert {
+                    key: [2u8; 32],
+                    not_before: 1_700_000_000,
+                    not_after: 1_800_000_000,
+                },
+            });
+            device.login_counter = 7;
+            DeviceStoreTrait::save(&store, &device).await.unwrap();
+        }
+
+        // Second boot: reopen the on-disk database and confirm the
+        // values survived the restart.
+        let store = RusqliteStore::new(&path).unwrap();
+        let loaded = DeviceStoreTrait::load(&store)
+            .await
+            .unwrap()
+            .expect("device row should exist after save");
+
+        assert_eq!(loaded.next_pre_key_id, 42);
+        assert!(loaded.server_has_prekeys);
+        assert_eq!(
+            loaded.nct_salt.as_deref(),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
+        let cert = loaded
+            .server_cert_chain
+            .as_ref()
+            .expect("server_cert_chain should round-trip");
+        assert_eq!(cert.intermediate.key, [1u8; 32]);
+        assert_eq!(cert.leaf.key, [2u8; 32]);
+        assert_eq!(cert.intermediate.not_before, 1_700_000_000);
+        assert_eq!(cert.leaf.not_after, 1_800_000_000);
+        assert_eq!(loaded.login_counter, 7);
     }
 }
