@@ -243,7 +243,7 @@ pub struct GatewayRateLimiter {
 }
 
 impl GatewayRateLimiter {
-    fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
         let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         Self {
             pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
@@ -268,7 +268,7 @@ pub struct IdempotencyStore {
 }
 
 impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
         Self {
             ttl,
             max_keys: max_keys.max(1),
@@ -999,7 +999,8 @@ pub async fn run_gateway(
     let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
         sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
     );
-    zeroclaw_runtime::observability::set_broadcast_hook(broadcast_layer);
+    let broadcast_hook_guard =
+        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
 
     // Bound into AppState. Not a broadcaster — the broadcaster is the
     // `broadcast_layer` installed above as the global hook. This is the
@@ -1385,6 +1386,8 @@ pub async fn run_gateway(
         })
         .await?;
     }
+
+    drop(broadcast_hook_guard);
 
     Ok(())
 }

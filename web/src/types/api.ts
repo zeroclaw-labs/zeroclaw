@@ -33,6 +33,11 @@ export interface ToolSpec {
   parameters: any;
 }
 
+export type CronSchedule =
+  | { kind: 'cron'; expr: string; tz?: string | null }
+  | { kind: 'at'; at: string }
+  | { kind: 'every'; every_ms: number };
+
 export interface CronJob {
   id: string;
   name: string | null;
@@ -40,7 +45,7 @@ export interface CronJob {
   command: string;
   prompt: string | null;
   job_type: string;
-  schedule: unknown;
+  schedule: CronSchedule;
   enabled: boolean;
   delivery: unknown;
   delete_after_run: boolean;

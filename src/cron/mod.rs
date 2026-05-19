@@ -3,6 +3,16 @@ pub use zeroclaw_runtime::cron::*;
 use crate::config::Config;
 use anyhow::{Result, bail};
 
+fn parse_explicit_rfc3339_utc(raw: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Invalid RFC3339 timestamp for --at: expected RFC3339 timestamp with explicit Z or offset, e.g. 2026-05-18T09:00:00Z or 2026-05-18T09:00:00-04:00; got '{raw}': {err}"
+            )
+        })
+}
+
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
         crate::CronCommands::List => {
@@ -86,9 +96,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             allowed_tools,
             command,
         } => {
-            let at = chrono::DateTime::parse_from_rfc3339(&at)
-                .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
-                .with_timezone(&chrono::Utc);
+            let at = parse_explicit_rfc3339_utc(&at)?;
             let schedule = Schedule::At { at };
             if agent {
                 let job = add_agent_job(
@@ -284,5 +292,46 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("▶️  Resumed cron job {id}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config
+    }
+
+    #[test]
+    fn cli_add_at_rejects_timestamp_without_explicit_offset_with_actionable_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let result = handle_command(
+            crate::CronCommands::AddAt {
+                at: "2026-05-18T09:00:00".into(),
+                agent: false,
+                allowed_tools: vec![],
+                command: "echo at".into(),
+            },
+            &config,
+        );
+
+        let error = result.expect_err("bare local timestamp must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("RFC3339 timestamp with explicit Z or offset"),
+            "error should explain the explicit offset requirement: {message}"
+        );
+        assert!(message.contains("2026-05-18T09:00:00Z"));
+        assert!(message.contains("2026-05-18T09:00:00-04:00"));
     }
 }
