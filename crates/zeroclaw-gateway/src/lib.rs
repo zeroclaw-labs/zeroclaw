@@ -2946,12 +2946,11 @@ async fn handle_gmail_push_webhook(
     }
 
     let body_str = String::from_utf8_lossy(&body);
-    let envelope: zeroclaw_channels::gmail_push::PubSubEnvelope = match serde_json::from_str(
-        &body_str,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            ::zeroclaw_log::record!(
+    let envelope: zeroclaw_channels::gmail_push::PubSubEnvelope =
+        match serde_json::from_str(&body_str) {
+            Ok(e) => e,
+            Err(e) => {
+                ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
@@ -2960,12 +2959,12 @@ async fn handle_gmail_push_webhook(
                     ),
                 "webhook: invalid payload"
             );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid Pub/Sub envelope"})),
-            );
-        }
-    };
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid Pub/Sub envelope"})),
+                );
+            }
+        };
 
     // Process the notification asynchronously (non-blocking for the webhook response)
     let channel = Arc::clone(gmail_push);

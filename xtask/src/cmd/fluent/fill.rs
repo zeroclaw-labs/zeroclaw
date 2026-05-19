@@ -182,9 +182,8 @@ fn call_api(
         anyhow::bail!("API error {status}: {text}");
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        anyhow::Error::msg(format!("Failed to parse API response: {e}\n{text}"))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::Error::msg(format!("Failed to parse API response: {e}\n{text}")))?;
 
     let content = parsed["choices"][0]["message"]["content"]
         .as_str()
