@@ -219,7 +219,7 @@ impl Tool for DawnS3Tool {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| {
-                let ct = guess_content_type(&resolved_path);
+                let ct = guess_content_type(resolved_path.to_string_lossy().as_ref());
                 tracing::debug!(target: "dawn_s3", "auto-detected content_type: {}", ct);
                 ct
             });
