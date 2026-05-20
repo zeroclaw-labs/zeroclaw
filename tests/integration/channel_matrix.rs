@@ -106,6 +106,17 @@ impl MatrixTestChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for MatrixTestChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "test"
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixTestChannel {
     fn name(&self) -> &str {
@@ -127,13 +138,14 @@ impl Channel for MatrixTestChannel {
             reply_target: "matrix_target".into(),
             content: "matrix test message".into(),
             channel: self.channel_name.clone(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| anyhow::Error::msg(e.to_string()))
     }
 
     async fn health_check(&self) -> bool {
@@ -623,6 +635,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         reply_target: "target".into(),
         content: "threaded".into(),
         channel: "slack".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
@@ -641,6 +654,7 @@ fn channel_message_none_thread_ts_preserved() {
         reply_target: "target".into(),
         content: "non-threaded".into(),
         channel: "telegram".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
@@ -696,6 +710,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "123456789".into(),
             content: "hi".into(),
             channel: "telegram".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -707,6 +722,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "channel_111222333".into(),
             content: "hi".into(),
             channel: "discord".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -718,6 +734,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "C01CHANNEL".into(),
             content: "hi".into(),
             channel: "slack".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
@@ -729,6 +746,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15551234567".into(),
             content: "hi".into(),
             channel: "imessage".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -740,6 +758,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "#zeroclaw".into(),
             content: "hi".into(),
             channel: "irc".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -751,6 +770,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "alice@example.com".into(),
             content: "hi".into(),
             channel: "email".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -762,6 +782,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15559876543".into(),
             content: "hi".into(),
             channel: "signal".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -773,6 +794,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "channel_xyz789".into(),
             content: "hi".into(),
             channel: "mattermost".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
@@ -784,6 +806,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+14155552671".into(),
             content: "hi".into(),
             channel: "whatsapp".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -795,6 +818,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "room-token-123".into(),
             content: "hi".into(),
             channel: "nextcloud_talk".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -806,6 +830,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "wecom_user1".into(),
             content: "hi".into(),
             channel: "wecom".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -817,6 +842,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "conversation_456".into(),
             content: "hi".into(),
             channel: "dingtalk".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -828,6 +854,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "qq_group_101".into(),
             content: "hi".into(),
             channel: "qq".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -839,6 +866,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15551112222".into(),
             content: "hi".into(),
             channel: "linq".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -850,6 +878,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15553334444".into(),
             content: "hi".into(),
             channel: "wati".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -861,6 +890,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "user".into(),
             content: "hi".into(),
             channel: "cli".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
@@ -1164,6 +1194,7 @@ fn channel_message_zero_timestamp() {
         reply_target: "t".into(),
         content: "c".into(),
         channel: "ch".into(),
+        channel_alias: None,
         timestamp: 0,
         thread_ts: None,
         interruption_scope_id: None,
@@ -1180,6 +1211,7 @@ fn channel_message_max_timestamp() {
         reply_target: "t".into(),
         content: "c".into(),
         channel: "ch".into(),
+        channel_alias: None,
         timestamp: u64::MAX,
         thread_ts: None,
         interruption_scope_id: None,
@@ -1309,6 +1341,17 @@ async fn capability_matrix_spec() {
 
 /// Minimal channel with ONLY required methods — validates all defaults work.
 struct MinimalChannel;
+
+impl ::zeroclaw_api::attribution::Attributable for MinimalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "minimal"
+    }
+}
 
 #[async_trait]
 impl Channel for MinimalChannel {

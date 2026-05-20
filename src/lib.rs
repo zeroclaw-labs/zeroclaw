@@ -58,8 +58,6 @@ pub(crate) mod doctor;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "agent-runtime")]
-pub mod hands;
-#[cfg(feature = "agent-runtime")]
 pub(crate) mod hardware;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod health;
@@ -287,6 +285,60 @@ Examples:
 pub enum SkillCommands {
     /// List all installed skills
     List,
+    /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
+    #[command(long_about = "\
+Scaffold a new skill under a skill bundle. Writes <bundle.directory>/<name>/SKILL.md \
+plus the canonical optional subdirs (scripts/, references/, assets/). \
+Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
+
+Examples:
+  zeroclaw skills add code-review --bundle official --description \"Review PRs.\"
+  zeroclaw skills add ops-runbook --description \"Triage prod incidents.\" --edit")]
+    Add {
+        /// Skill name (lowercase + hyphens only)
+        name: String,
+        /// Target bundle alias. Optional when exactly one bundle is configured.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// What the skill does and when to use it (frontmatter `description`).
+        /// Required; prompted on TTY when missing.
+        #[arg(long)]
+        description: Option<String>,
+        /// SPDX license identifier (e.g. MIT).
+        #[arg(long)]
+        license: Option<String>,
+        /// Skill author handle.
+        #[arg(long)]
+        author: Option<String>,
+        /// SemVer version (defaults to 0.1.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Skill category for registry grouping.
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip scaffolding scripts/, references/, assets/.
+        #[arg(long)]
+        no_scaffold: bool,
+        /// Open SKILL.md in $EDITOR after scaffold.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Open a skill's SKILL.md (or a sibling file) in $EDITOR
+    Edit {
+        /// Skill name
+        name: String,
+        /// Target bundle alias. Optional when name is unique across bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Edit a sibling file instead of SKILL.md (e.g. scripts/runner.sh).
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Manage skill bundles (the named directories skills live in)
+    Bundle {
+        #[command(subcommand)]
+        bundle_command: SkillBundleCommands,
+    },
     /// Audit a skill source directory or installed skill name
     Audit {
         /// Skill path or installed skill name
@@ -313,6 +365,32 @@ pub enum SkillCommands {
         /// Show verbose output
         #[arg(long)]
         verbose: bool,
+    },
+}
+
+/// Skill bundle subcommands (`zeroclaw skills bundle <op>`)
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillBundleCommands {
+    /// List configured skill bundles and their resolved directories
+    List,
+    /// Add a new skill bundle. Directory defaults to shared/skills/<alias>/.
+    Add {
+        /// Bundle alias (lowercase + hyphens; same convention as agents/channels)
+        alias: String,
+        /// Override directory (relative to install root or absolute).
+        /// Must resolve inside `<install>/shared/`.
+        #[arg(long)]
+        directory: Option<String>,
+    },
+    /// Remove a configured skill bundle
+    Remove {
+        /// Bundle alias
+        alias: String,
+    },
+    /// Show metadata + skill list for a bundle
+    Show {
+        /// Bundle alias
+        alias: String,
     },
 }
 
@@ -351,16 +429,20 @@ Examples:
     Add {
         /// Cron expression
         expression: String,
+        /// Configured agent alias the cron job runs as. Required —
+        /// there is no default agent.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp with explicit Z or offset
@@ -371,18 +453,21 @@ The timestamp must include an explicit Z or numeric offset \
 (e.g. 2025-01-15T14:00:00Z or 2025-01-15T09:00:00-05:00).
 
 Examples:
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  zeroclaw cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
+  zeroclaw cron add-at --agent morning-shift 2025-01-15T14:00:00Z 'Send reminder'
+  zeroclaw cron add-at --agent morning-shift --prompt 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot RFC3339 timestamp with explicit Z or offset
         at: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a fixed-interval scheduled task
@@ -392,18 +477,21 @@ Add a task that repeats at a fixed interval.
 Interval is specified in milliseconds. For example, 60000 = 1 minute.
 
 Examples:
-  zeroclaw cron add-every 60000 'Ping heartbeat'     # every minute
-  zeroclaw cron add-every 3600000 'Hourly report'    # every hour")]
+  zeroclaw cron add-every --agent triage 60000 'Ping heartbeat'
+  zeroclaw cron add-every --agent triage 3600000 'Hourly report'")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
@@ -414,19 +502,21 @@ Accepts human-readable durations: s (seconds), m (minutes), \
 h (hours), d (days).
 
 Examples:
-  zeroclaw cron once 30m 'Run backup in 30 minutes'
-  zeroclaw cron once 2h 'Follow up on deployment'
-  zeroclaw cron once 1d 'Daily check'")]
+  zeroclaw cron once --agent ops-bot 30m 'Run backup in 30 minutes'
+  zeroclaw cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
     Once {
         /// Delay duration
         delay: String,
-        /// Treat the argument as an agent prompt instead of a shell command
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
         #[arg(long)]
-        agent: bool,
-        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
-        /// Command (shell) or prompt (agent) to run
+        /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
     /// Remove a scheduled task
@@ -447,6 +537,10 @@ Examples:
     Update {
         /// Task ID
         id: String,
+        /// Configured agent alias whose risk profile gates the new
+        /// shell command (when --command is provided). Required.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
         /// New cron expression
         #[arg(long)]
         expression: Option<String>,

@@ -7,7 +7,7 @@ ZeroClaw has two independent translation layers:
 | **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<name>]` and pass `--provider <name>` to the fill commands.
+They are filled separately and stored separately. Both use a provider-agnostic fill pipeline: configure any OpenAI-compatible endpoint in `~/.zeroclaw/config.toml` under `[providers.models.<type>.<alias>]` and pass `--provider <type>` to the fill commands.
 
 Local models via [Ollama](https://ollama.com) are a first-class option — no API keys required, no per-call cost. A hosted provider is also fine for release-grade quality. Translation is a local operation — run `cargo mdbook sync` before you PR.
 
@@ -17,8 +17,8 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 
 ```toml
 # Local via Ollama — free, runs on your machine
-[providers.models.ollama]
-base_url = "http://localhost:11434"
+[providers.models.ollama.local]
+uri   = "http://localhost:11434"
 model = "qwen3.6:35b-a3b" # Current preferred model
 ```
 

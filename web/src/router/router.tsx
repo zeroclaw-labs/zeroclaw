@@ -3,14 +3,15 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import Layout from '../components/layout/Layout';
 import {
   AgentChat,
+  AgentWorkspaceExplorer,
+  AgentsList,
   Canvas,
-  Config, Cost,
+  Config,
   Cron,
   Dashboard,
   Doctor,
   Integrations,
   Logs,
-  Memory,
   Onboard,
   Pairing,
   Tools,
@@ -32,15 +33,19 @@ export const Router = () => (
     <Routes>
       <Route element={<Layout />}>
         <Route path="/" element={<Dashboard />} />
-        <Route path="/agent" element={<AgentChat />} />
+        <Route path="/agent" element={<Navigate to="/agents" replace />} />
+        <Route path="/agents" element={<AgentsList />} />
+        <Route path="/agent/:alias" element={<AgentChat />} />
+        <Route path="/agent/:alias/workspace" element={<AgentWorkspaceExplorer />} />
         <Route path="/tools" element={<Tools />} />
         <Route path="/cron" element={<Cron />} />
         <Route path="/integrations" element={<Integrations />} />
-        <Route path="/memory" element={<Memory />} />
+        <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />
         <Route path="/config/:section" element={<Config />} />
+        <Route path="/config/:section/:type" element={<Config />} />
+        <Route path="/config/:section/:type/:alias" element={<Config />} />
         <Route path="/setup/:section" element={<Config />} />
-        <Route path="/cost" element={<Cost />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/doctor" element={<Doctor />} />
         <Route path="/pairing" element={<Pairing />} />

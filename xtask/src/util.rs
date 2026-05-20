@@ -88,7 +88,7 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_owned))
         .and_then(|p| std::fs::canonicalize(&p).ok());
     let paths = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("PATH environment variable is unset"))?;
+        .ok_or_else(|| anyhow::Error::msg("PATH environment variable is unset"))?;
     for dir in std::env::split_paths(&paths) {
         if let (Some(ex), Ok(canon)) = (exclude.as_deref(), std::fs::canonicalize(&dir))
             && canon.starts_with(ex)
@@ -151,7 +151,7 @@ pub struct ProviderConfig {
 }
 
 /// Read a `[providers.models.<name>]` entry from ~/.zeroclaw/config.toml.
-pub fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
+pub fn read_model_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
     let home =
         std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
     let candidates = [
@@ -161,28 +161,30 @@ pub fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfi
     let raw = candidates
         .iter()
         .find_map(|p| std::fs::read_to_string(p).ok())
-        .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
+        .ok_or_else(|| {
+            anyhow::Error::msg("config.toml not found (tried ~/.zeroclaw/config.toml)")
+        })?;
 
     let table: toml::Table = raw.parse()?;
-    let provider = table
-        .get("providers")
+    let model_provider = table
+        .get("model_providers")
         .and_then(|v| v.get("models"))
         .and_then(|v| v.get(provider_name))
         .ok_or_else(|| {
-            anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml")
+            anyhow::Error::msg("[providers.models.{provider_name}] not found in config.toml")
         })?;
 
     Ok(ProviderConfig {
-        base_url: provider
+        base_url: model_provider
             .get("base_url")
             .and_then(|v| v.as_str())
             .unwrap_or("http://localhost:11434")
             .to_string(),
-        model: provider
+        model: model_provider
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        api_key: provider
+        api_key: model_provider
             .get("api_key")
             .and_then(|v| v.as_str())
             .map(str::to_string),

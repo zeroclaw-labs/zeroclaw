@@ -181,7 +181,7 @@ For low-latency, typed RPC between ZeroClaw and peripherals:
 - Methods: `GpioWrite`, `GpioRead`, `I2cTransfer`, `SpiTransfer`, `MemoryRead`, `FlashWrite`, etc.
 - Enables streaming, bidirectional calls, and code generation from `.proto` files.
 
-### Serial Fallback (Host-Mediated, legacy)
+### Serial Transport (Host-Mediated, legacy)
 
 Simple JSON over serial for boards without gRPC support:
 

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -11,25 +12,43 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 pub struct LinqChannel {
     api_token: String,
     from_phone: String,
-    allowed_senders: Vec<String>,
+    /// The alias key under `[channels.linq.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     client: reqwest::Client,
 }
 
 const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
 
 impl LinqChannel {
-    pub fn new(api_token: String, from_phone: String, allowed_senders: Vec<String>) -> Self {
+    pub fn new(
+        api_token: String,
+        from_phone: String,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             api_token,
             from_phone,
-            allowed_senders,
+            alias: alias.into(),
+            peer_resolver,
             client: reqwest::Client::new(),
         }
     }
 
+    /// Return the alias under `[channels.linq.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
     /// Check if a sender phone number is allowed (E.164 format: +1234567890)
     fn is_sender_allowed(&self, phone: &str) -> bool {
-        self.allowed_senders.iter().any(|n| n == "*" || n == phone)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, phone, crate::allowlist::Match::Sensitive)
     }
 
     /// Get the bot's phone number
@@ -157,7 +176,12 @@ impl LinqChannel {
             .and_then(|e| e.as_str())
             .unwrap_or("");
         if event_type != "message.received" {
-            tracing::debug!("Linq: skipping non-message event: {event_type}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"event_type": event_type})),
+                "skipping non-message event"
+            );
             return messages;
         }
 
@@ -167,7 +191,11 @@ impl LinqChannel {
 
         // Skip messages sent by the bot itself
         if Self::sender_is_from_me(data) {
-            tracing::debug!("Linq: skipping is_from_me message");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping is_from_me message"
+            );
             return messages;
         }
 
@@ -185,10 +213,12 @@ impl LinqChannel {
 
         // Check allowlist
         if !self.is_sender_allowed(&normalized_from) {
-            tracing::warn!(
-                "Linq: ignoring message from unauthorized sender: {normalized_from}. \
-                Add to channels.linq.allowed_senders in config.toml, \
-                or run `zeroclaw onboard --channels-only` to configure interactively."
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"normalized_from": normalized_from})),
+                "ignoring message from unauthorized sender: . Add to channels.linq.allowed_senders in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
             );
             return messages;
         }
@@ -214,12 +244,28 @@ impl LinqChannel {
                         if let Some(marker) = Self::media_part_to_image_marker(part) {
                             Some(marker)
                         } else {
-                            tracing::debug!("Linq: skipping unsupported {part_type} part");
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"part_type": part_type})),
+                                "skipping unsupported part"
+                            );
                             None
                         }
                     }
                     _ => {
-                        tracing::debug!("Linq: skipping {part_type} part");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"part_type": part_type})),
+                            "skipping part"
+                        );
                         None
                     }
                 }
@@ -265,6 +311,7 @@ impl LinqChannel {
             sender: normalized_from,
             content,
             channel: "linq".to_string(),
+            channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
@@ -272,6 +319,15 @@ impl LinqChannel {
         });
 
         messages
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LinqChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Linq)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -336,8 +392,8 @@ impl Channel for LinqChannel {
             if !create_resp.status().is_success() {
                 let status = create_resp.status();
                 let error_body = create_resp.text().await.unwrap_or_default();
-                tracing::error!("Linq create chat failed: {status} — {error_body}");
-                anyhow::bail!("Linq API error: {status}");
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "create chat failed:");
+                anyhow::bail!("API error: {status}");
             }
 
             return Ok(());
@@ -345,15 +401,25 @@ impl Channel for LinqChannel {
 
         let status = resp.status();
         let error_body = resp.text().await.unwrap_or_default();
-        tracing::error!("Linq send failed: {status} — {error_body}");
-        anyhow::bail!("Linq API error: {status}");
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(
+                    ::serde_json::json!({"status": status.to_string(), "error_body": error_body})
+                ),
+            "send failed:"
+        );
+        anyhow::bail!("API error: {status}");
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // Linq uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /linq endpoint.
-        tracing::info!(
-            "Linq channel active (webhook mode). \
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "channel active (webhook mode). \
             Configure Linq webhook to POST to your gateway's /linq endpoint."
         );
 
@@ -387,7 +453,11 @@ impl Channel for LinqChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::debug!("Linq start_typing failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("start_typing failed: {}", resp.status())
+            );
         }
 
         Ok(())
@@ -404,7 +474,11 @@ impl Channel for LinqChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::debug!("Linq stop_typing failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("stop_typing failed: {}", resp.status())
+            );
         }
 
         Ok(())
@@ -424,11 +498,23 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
     if let Ok(ts) = timestamp.parse::<i64>() {
         let now = chrono::Utc::now().timestamp();
         if (now - ts).unsigned_abs() > 300 {
-            tracing::warn!("Linq: rejecting stale webhook timestamp ({ts}, now={now})");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"ts": ts, "now": now})),
+                "rejecting stale webhook timestamp (, now=)"
+            );
             return false;
         }
     } else {
-        tracing::warn!("Linq: invalid webhook timestamp: {timestamp}");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"timestamp": timestamp})),
+            "invalid webhook timestamp"
+        );
         return false;
     }
 
@@ -443,7 +529,12 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
         .strip_prefix("sha256=")
         .unwrap_or(signature);
     let Ok(provided) = hex::decode(signature_hex.trim()) else {
-        tracing::warn!("Linq: invalid webhook signature format");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "invalid webhook signature format"
+        );
         return false;
     };
 
@@ -455,43 +546,60 @@ pub fn verify_linq_signature(secret: &str, body: &str, timestamp: &str, signatur
 mod tests {
     use super::*;
 
-    fn make_channel() -> LinqChannel {
-        LinqChannel::new(
-            "test-token".into(),
-            "+15551234567".into(),
-            vec!["+1234567890".into()],
-        )
-    }
-
     #[test]
     fn linq_channel_name() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert_eq!(ch.name(), "linq");
     }
 
     #[test]
     fn linq_sender_allowed_exact() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert!(ch.is_sender_allowed("+1234567890"));
         assert!(!ch.is_sender_allowed("+9876543210"));
     }
 
     #[test]
     fn linq_sender_allowed_wildcard() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         assert!(ch.is_sender_allowed("+1234567890"));
         assert!(ch.is_sender_allowed("+9999999999"));
     }
 
     #[test]
     fn linq_sender_allowed_empty() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec![]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(Vec::new),
+        );
         assert!(!ch.is_sender_allowed("+1234567890"));
     }
 
     #[test]
     fn linq_parse_valid_text_message() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "api_version": "v3",
             "event_type": "message.received",
@@ -527,7 +635,8 @@ mod tests {
         let ch = LinqChannel::new(
             "tok".into(),
             "+15551234567".into(),
-            vec!["+1234567890".into()],
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         );
         let payload = serde_json::json!({
             "api_version": "v3",
@@ -560,7 +669,12 @@ mod tests {
 
     #[test]
     fn linq_parse_skip_is_from_me() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -580,7 +694,12 @@ mod tests {
 
     #[test]
     fn linq_parse_skip_latest_outbound_message() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -608,7 +727,12 @@ mod tests {
 
     #[test]
     fn linq_parse_skip_non_message_event() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.delivered",
             "data": {
@@ -623,7 +747,12 @@ mod tests {
 
     #[test]
     fn linq_parse_unauthorized_sender() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -643,7 +772,12 @@ mod tests {
 
     #[test]
     fn linq_parse_empty_payload() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({});
         let msgs = ch.parse_webhook_payload(&payload);
         assert!(msgs.is_empty());
@@ -651,7 +785,12 @@ mod tests {
 
     #[test]
     fn linq_parse_media_only_translated_to_image_marker() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -676,7 +815,12 @@ mod tests {
 
     #[test]
     fn linq_parse_media_non_image_still_skipped() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -700,7 +844,12 @@ mod tests {
 
     #[test]
     fn linq_parse_multiple_text_parts() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -814,7 +963,8 @@ mod tests {
         let ch = LinqChannel::new(
             "tok".into(),
             "+15551234567".into(),
-            vec!["+1234567890".into()],
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         );
         // API sends without +, normalize to +
         let payload = serde_json::json!({
@@ -837,7 +987,12 @@ mod tests {
 
     #[test]
     fn linq_parse_missing_data() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received"
         });
@@ -847,7 +1002,12 @@ mod tests {
 
     #[test]
     fn linq_parse_missing_message_parts() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -866,7 +1026,12 @@ mod tests {
 
     #[test]
     fn linq_parse_empty_text_value() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -886,7 +1051,12 @@ mod tests {
 
     #[test]
     fn linq_parse_fallback_reply_target_when_no_chat_id() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "data": {
@@ -907,7 +1077,12 @@ mod tests {
 
     #[test]
     fn linq_phone_number_accessor() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert_eq!(ch.phone_number(), "+15551234567");
     }
 
@@ -915,7 +1090,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_text_message() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "api_version": "v3",
             "webhook_version": "2026-02-03",
@@ -949,7 +1129,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_skip_is_me() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -974,7 +1159,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_skip_outbound_direction() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -996,7 +1186,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_unauthorized_sender() {
-        let ch = make_channel();
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -1021,7 +1216,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_media_image() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -1048,7 +1248,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_multiple_parts() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -1077,7 +1282,12 @@ mod tests {
 
     #[test]
     fn linq_parse_new_format_fallback_reply_target_when_no_chat() {
-        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let ch = LinqChannel::new(
+            "tok".into(),
+            "+15551234567".into(),
+            "linq_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "event_type": "message.received",
             "webhook_version": "2026-02-03",
@@ -1102,7 +1312,8 @@ mod tests {
         let ch = LinqChannel::new(
             "tok".into(),
             "+15551234567".into(),
-            vec!["+1234567890".into()],
+            "linq_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         );
         let payload = serde_json::json!({
             "event_type": "message.received",

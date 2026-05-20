@@ -63,6 +63,17 @@ impl AcpChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for AcpChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Map a tool name to the ACP `kind` field for approval prompts.
 /// `file_edit` / `file_write` are `"edit"` so clients render a diff view;
 /// everything else falls back to `"execute"`.
