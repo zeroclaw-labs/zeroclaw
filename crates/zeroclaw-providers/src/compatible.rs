@@ -4719,9 +4719,11 @@ mod tests {
     fn parse_sse_line_with_empty_reasoning_content_falls_back_to_reasoning() {
         let line =
             r#"data: {"choices":[{"delta":{"reasoning_content":"","reasoning":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap().unwrap();
-        assert!(result.delta.is_empty());
-        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
+        let result = parse_sse_line(line).unwrap();
+        assert!(
+            result.is_none(),
+            "canonical reasoning_content is present, so the reasoning alias must not be used"
+        );
     }
 
     #[test]
