@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use std::collections::HashSet;
 use std::path::Path;
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -131,10 +132,21 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+}
+
+fn count_image_markers_with_latest_tool_results(
+    messages: &[ChatMessage],
+    latest_tool_result_indices: &HashSet<usize>,
+) -> usize {
     messages
         .iter()
-        .filter(|m| should_normalize_message_images(&m.role))
-        .map(|m| parse_image_markers(&m.content).1.len())
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, latest_tool_result_indices)
+        })
+        .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
 }
 
@@ -181,8 +193,100 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-fn should_normalize_message_images(role: &str) -> bool {
-    matches!(role, "user" | "tool")
+fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
+    message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
+}
+
+fn is_tool_result_carrier(message: &ChatMessage) -> bool {
+    message.role == "tool" || is_prompt_tool_result_message(message)
+}
+
+fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
+        return indices;
+    };
+
+    if is_prompt_tool_result_message(last_message) {
+        indices.insert(last_index);
+        return indices;
+    }
+
+    if last_message.role == "tool" {
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.role != "tool" {
+                break;
+            }
+            indices.insert(index);
+        }
+    }
+
+    indices
+}
+
+fn should_normalize_message_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> bool {
+    if is_tool_result_carrier(message) {
+        return latest_tool_result_indices.contains(&index);
+    }
+
+    message.role == "user"
+}
+
+fn stripped_image_marker_text(content: &str) -> String {
+    let (cleaned, refs) = parse_image_markers(content);
+    if refs.is_empty() {
+        return content.to_string();
+    }
+
+    if cleaned.trim().is_empty() {
+        "[image removed from history]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+        return message.clone();
+    }
+
+    if message.role == "tool"
+        && let Ok(serde_json::Value::Object(mut obj)) =
+            serde_json::from_str::<serde_json::Value>(&message.content)
+        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
+    {
+        let stripped = stripped_image_marker_text(&inner);
+        if stripped == inner {
+            return message.clone();
+        }
+
+        obj.insert("content".to_string(), serde_json::Value::String(stripped));
+        return ChatMessage {
+            role: message.role.clone(),
+            content: serde_json::Value::Object(obj).to_string(),
+        };
+    }
+
+    ChatMessage {
+        role: message.role.clone(),
+        content: stripped_image_marker_text(&message.content),
+    }
+}
+
+fn replay_message_without_stale_tool_images(
+    index: usize,
+    message: &ChatMessage,
+    latest_tool_result_indices: &HashSet<usize>,
+) -> ChatMessage {
+    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+        strip_tool_result_image_markers(message)
+    } else {
+        message.clone()
+    }
 }
 
 /// Attempt to normalize image markers inside a native tool-result JSON
@@ -201,32 +305,34 @@ async fn normalize_native_tool_result_json(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
-) -> anyhow::Result<Option<String>> {
+) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
-        return Ok(None);
+        return None;
     };
 
     let Some(serde_json::Value::String(inner)) = obj.get("content").cloned() else {
-        return Ok(None);
+        return None;
     };
 
     let (cleaned_text, refs) = parse_image_markers(&inner);
     if refs.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    let mut normalized_refs = Vec::with_capacity(refs.len());
-    for reference in refs {
-        let data_uri =
-            normalize_image_reference(&reference, config, max_bytes, remote_client).await?;
-        normalized_refs.push(data_uri);
-    }
-
-    let new_inner = compose_multimodal_message(&cleaned_text, &normalized_refs);
+    let normalized = normalize_image_references(&refs, config, max_bytes, remote_client).await;
+    let new_inner = compose_multimodal_content(
+        &cleaned_text,
+        &normalized.data_uris,
+        normalized.skipped_count,
+        refs.len(),
+    );
     obj.insert("content".to_string(), serde_json::Value::String(new_inner));
 
-    Ok(Some(serde_json::Value::Object(obj).to_string()))
+    Some((
+        serde_json::Value::Object(obj).to_string(),
+        !normalized.data_uris.is_empty(),
+    ))
 }
 
 pub async fn prepare_messages_for_provider(
@@ -236,11 +342,18 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let total_images = count_image_markers(messages);
+    let latest_tool_indices = latest_tool_result_indices(messages);
+    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
-            messages: messages.to_vec(),
+            messages: messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                })
+                .collect(),
             contains_images: false,
         });
     }
@@ -255,12 +368,18 @@ pub async fn prepare_messages_for_provider(
         messages.to_vec()
     };
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
+    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
+    let latest_tool_indices = latest_tool_result_indices(&trimmed);
 
-    let mut normalized_messages = Vec::with_capacity(trimmed.len());
-    for message in &trimmed {
-        if !should_normalize_message_images(&message.role) {
-            normalized_messages.push(message.clone());
+    let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut has_successful_images = false;
+    for (index, message) in messages.iter().enumerate() {
+        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+            normalized_messages.push(replay_message_without_stale_tool_images(
+                index,
+                message,
+                &latest_tool_indices,
+            ));
             continue;
         }
 
@@ -275,18 +394,19 @@ pub async fn prepare_messages_for_provider(
         // JSON so adapters keep seeing the structure they expect. Falls
         // through to the plain-text path for non-JSON tool messages.
         if message.role == "tool"
-            && let Some(prepared) = normalize_native_tool_result_json(
+            && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
                 &message.content,
                 config,
                 max_bytes,
                 &remote_client,
             )
-            .await?
+            .await
         {
             normalized_messages.push(ChatMessage {
                 role: message.role.clone(),
                 content: prepared,
             });
+            has_successful_images |= contains_images;
             continue;
         }
 
@@ -296,34 +416,46 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
-        }
-
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        let normalized = normalize_image_references(&refs, config, max_bytes, &remote_client).await;
+        let content = compose_multimodal_content(
+            &cleaned_text,
+            &normalized.data_uris,
+            normalized.skipped_count,
+            refs.len(),
+        );
+        has_successful_images |= !normalized.data_uris.is_empty();
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
         });
     }
 
+    // Apply the per-request image cap after normalization so failed image refs
+    // do not consume budget and evict older images that could still be sent.
+    let capped_messages =
+        if has_successful_images && count_image_markers(&normalized_messages) > max_images {
+            trim_old_images(&normalized_messages, max_images)
+        } else {
+            normalized_messages
+        };
+
     Ok(PreparedMessages {
-        messages: normalized_messages,
-        contains_images: true,
+        contains_images: count_image_markers(&capped_messages) > 0,
+        messages: capped_messages,
     })
 }
 
 /// Strip image markers from older messages (oldest first) until total image
 /// count is within `max_images`. Keeps the text content of each message.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
+    let latest_tool_indices = latest_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| should_normalize_message_images(&m.role))
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, &latest_tool_indices)
+        })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
             if count > 0 { Some((i, count)) } else { None }
@@ -360,7 +492,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                     content: text,
                 }
             } else {
-                m.clone()
+                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
             }
         })
         .collect()
@@ -385,6 +517,120 @@ fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
     }
 
     content
+}
+
+struct NormalizedImageReferences {
+    data_uris: Vec<String>,
+    skipped_count: usize,
+}
+
+async fn normalize_image_references(
+    refs: &[String],
+    config: &MultimodalConfig,
+    max_bytes: usize,
+    remote_client: &Client,
+) -> NormalizedImageReferences {
+    let mut data_uris = Vec::with_capacity(refs.len());
+    let mut skipped_count = 0usize;
+
+    for reference in refs {
+        match normalize_image_reference(reference, config, max_bytes, remote_client).await {
+            Ok(data_uri) => data_uris.push(data_uri),
+            Err(error) => {
+                skipped_count += 1;
+                let error_reason = multimodal_error_reason(&error);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "source_kind": image_reference_kind(reference),
+                            "error_kind": multimodal_error_kind(&error),
+                            "reason": error_reason.as_deref().unwrap_or(""),
+                        })),
+                    "skipping multimodal image that could not be loaded"
+                );
+            }
+        }
+    }
+
+    NormalizedImageReferences {
+        data_uris,
+        skipped_count,
+    }
+}
+
+fn compose_multimodal_content(
+    text: &str,
+    data_uris: &[String],
+    skipped_count: usize,
+    total_refs: usize,
+) -> String {
+    if skipped_count == 0 {
+        return compose_multimodal_message(text, data_uris);
+    }
+
+    let text_with_note = append_skipped_image_note(text, skipped_count, total_refs);
+    if data_uris.is_empty() {
+        text_with_note.trim().to_string()
+    } else {
+        compose_multimodal_message(&text_with_note, data_uris)
+    }
+}
+
+fn append_skipped_image_note(text: &str, skipped_count: usize, total_refs: usize) -> String {
+    if skipped_count == 0 {
+        return text.to_string();
+    }
+
+    // This note is model-facing provider context, not direct localized UI text.
+    let note = if skipped_count == total_refs {
+        format!("{skipped_count} attached image(s) could not be loaded")
+    } else {
+        format!("{skipped_count} of {total_refs} attached image(s) could not be loaded")
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        format!("Note: {note}.")
+    } else {
+        format!("{trimmed}\n\nNote: {note}.")
+    }
+}
+
+fn image_reference_kind(reference: &str) -> &'static str {
+    if reference.starts_with("data:") {
+        "data"
+    } else if reference.starts_with("http://") || reference.starts_with("https://") {
+        "remote"
+    } else {
+        "local"
+    }
+}
+
+fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::TooManyImages { .. }) => "too_many_images",
+        Some(MultimodalError::ImageTooLarge { .. }) => "image_too_large",
+        Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
+        Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
+        Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
+        Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
+        Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
+        Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
+        None => "unknown",
+    }
+}
+
+fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<MultimodalError>() {
+        Some(MultimodalError::InvalidMarker { input, reason })
+        | Some(MultimodalError::RemoteFetchFailed { input, reason })
+        | Some(MultimodalError::LocalReadFailed { input, reason }) => {
+            Some(reason.replace(input, "<source>"))
+        }
+        _ => None,
+    }
 }
 
 async fn normalize_image_reference(
@@ -836,7 +1082,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("see attached [IMAGE:{}]", image_path.display()),
+            "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
 
@@ -875,6 +1121,253 @@ mod tests {
             !inner.contains("native-tool-result.png"),
             "raw local path must not leak after normalization"
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "generated screenshot [IMAGE:https://example.com/missing.png]",
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("skipped native tool image should not fail message preparation");
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(inner.contains("1 attached image(s) could not be loaded"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_preserves_native_tool_json_with_mixed_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("mixed-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!(
+                "generated [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+                image_path.display()
+            ),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("valid native tool image should survive while bad ref is skipped");
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated"));
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
+        assert!(!inner.contains("mixed-native-tool-result.png"));
+        assert!(!inner.contains("https://example.com/missing.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_native_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-native-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("What happened next?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "stale tool-result images should not keep the request in vision mode"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc1")
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-native-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_prompt_tool_result_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("stale-prompt-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user("Continue.".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale prompt-mode tool images");
+
+        assert!(!prepared.contains_images);
+        assert!(prepared.messages[0].content.contains("[Tool results]"));
+        assert!(prepared.messages[0].content.contains("Generated"));
+        assert!(!prepared.messages[0].content.contains("[IMAGE:"));
+        assert!(!prepared.messages[0].content.contains("data:image"));
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("stale-prompt-tool-result.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_stale_tool_image_while_normalizing_current_user_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale_path = temp.path().join("stale-tool-result.png");
+        let fresh_path = temp.path().join("fresh-user-image.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&stale_path, png).unwrap();
+        std::fs::write(&fresh_path, png).unwrap();
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::tool(native_tool_content),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I generated the screenshot.".to_string(),
+            },
+            ChatMessage::user(format!(
+                "Now inspect this [IMAGE:{}]",
+                fresh_path.display().to_string()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should strip stale tool images and normalize current user image");
+
+        assert!(prepared.contains_images);
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("stale native tool result should remain valid JSON");
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("stale-tool-result.png"));
+
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
+        assert_eq!(cleaned, "Now inspect this");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("fresh-user-image.png")
+        );
+    }
+
+    #[test]
+    fn count_image_markers_ignores_stale_tool_results() {
+        let messages = vec![
+            ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 0);
+
+        let messages = vec![
+            ChatMessage::user("Create an image".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
     }
 
     #[tokio::test]
@@ -968,16 +1461,16 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_counts_tool_messages() {
+    fn trim_old_images_counts_latest_tool_messages() {
         let messages = vec![
-            ChatMessage::tool("[IMAGE:/tmp/tool-old.png]\nGenerated".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/user-new.png]\nNewest".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/tool-new.png]\nGenerated".to_string()),
         ];
 
         let trimmed = trim_old_images(&messages, 1);
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty(), "oldest tool image should be stripped");
-        assert!(trimmed[0].content.contains("Generated"));
+        assert!(refs0.is_empty(), "oldest user image should be stripped");
+        assert!(trimmed[0].content.contains("Oldest"));
 
         let (_, refs1) = parse_image_markers(&trimmed[1].content);
         assert_eq!(refs1.len(), 1);
@@ -1092,9 +1585,9 @@ mod tests {
         }
 
         let messages = vec![
-            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display().to_string())),
         ];
 
         let config = MultimodalConfig {
@@ -1119,24 +1612,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_remote_url_when_disabled() {
+    async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect_err("should reject remote image URL when fetch is disabled");
+            .expect("disabled remote image should be skipped");
 
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
+        assert!(result.messages[0].content.contains("Look"));
         assert!(
-            error
-                .to_string()
-                .contains("multimodal remote image fetch is disabled")
+            result.messages[0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/img.png")
         );
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_oversized_local_image() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
@@ -1154,14 +1655,107 @@ mod tests {
             ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject oversized local image");
+            .expect("oversized local image should be skipped");
 
+        assert!(!result.contains_images);
+        assert_eq!(result.messages.len(), 1);
         assert!(
-            error
-                .to_string()
-                .contains("multimodal image size limit exceeded")
+            result.messages[0]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains(image_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_successful_images_when_some_are_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("ok.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "Look [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
+            image_path.display()
+        ))];
+
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("valid local image should survive while remote image is skipped");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            result.messages[0]
+                .content
+                .contains("1 of 2 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[0]
+                .content
+                .contains("https://example.com/missing.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_images_do_not_consume_image_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older-valid.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Older valid image [IMAGE:{}]",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "Newer broken image [IMAGE:https://example.com/missing.png]".to_string(),
+            ),
+        ];
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("broken image should not evict an older valid image");
+
+        assert!(result.contains_images);
+        assert!(
+            result.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(result.messages[1].content.contains("Newer broken image"));
+        assert!(
+            result.messages[1]
+                .content
+                .contains("1 attached image(s) could not be loaded")
+        );
+        assert!(
+            !result.messages[1]
+                .content
+                .contains("https://example.com/missing.png")
         );
     }
 
@@ -1173,7 +1767,7 @@ mod tests {
     }
 
     /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    /// portion, which is the behaviour needed for non-vision model_providers.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";

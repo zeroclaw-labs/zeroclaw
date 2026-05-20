@@ -195,15 +195,39 @@ impl Tool for GoogleWorkspaceTool {
         let service = args
             .get("service")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'service' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "service"})),
+                    "google_workspace: missing service parameter"
+                );
+                anyhow::Error::msg("Missing 'service' parameter")
+            })?;
         let resource = args
             .get("resource")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'resource' parameter"))?;
-        let method = args
-            .get("method")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "resource"})),
+                    "google_workspace: missing resource parameter"
+                );
+                anyhow::Error::msg("Missing 'resource' parameter")
+            })?;
+        let method = args.get("method").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "method"})),
+                "google_workspace: missing method parameter"
+            );
+            anyhow::Error::msg("Missing 'method' parameter")
+        })?;
 
         // Extract and validate sub_resource early so the allowlist check can account for it.
         let sub_resource: Option<&str> = if let Some(sub_resource_value) = args.get("sub_resource")
@@ -384,7 +408,12 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
-        let mut cmd = tokio::process::Command::new("gws");
+        // Resolve `gws` via PATH so Windows `.cmd` shims (e.g. npm-installed
+        // `gws.cmd`) are picked up — `Command::new` on Windows does not append
+        // PATHEXT itself. Falls back to bare "gws" so the not-found error path
+        // below still fires when the binary is genuinely missing.
+        let gws_path: std::path::PathBuf = which::which("gws").unwrap_or_else(|_| "gws".into());
+        let mut cmd = tokio::process::Command::new(gws_path);
         cmd.args(&cmd_args);
         cmd.env_clear();
         // gws needs PATH to find itself and HOME/APPDATA for credential storage
@@ -405,14 +434,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         if self.audit_log {
-            tracing::info!(
-                tool = "google_workspace",
-                service = service,
-                resource = resource,
-                sub_resource = sub_resource.unwrap_or(""),
-                method = method,
-                "gws audit: executing API call"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": "google_workspace", "service": service, "resource": resource, "sub_resource": sub_resource.unwrap_or(""), "method": method})), "gws audit: executing API call");
         }
 
         let result =
@@ -482,6 +504,16 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    // Regression for #6410: PATH resolution must produce a usable PathBuf
+    // even when `gws` is not installed, so the executor can still emit the
+    // documented "Failed to execute gws" error rather than panicking.
+    #[test]
+    fn gws_path_resolution_falls_back_when_not_on_path() {
+        let resolved: std::path::PathBuf =
+            which::which("definitely-not-a-real-binary-zc6410").unwrap_or_else(|_| "gws".into());
+        assert_eq!(resolved.as_os_str(), "gws");
     }
 
     #[test]

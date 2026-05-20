@@ -11,9 +11,9 @@ const MAX_IMAGE_BYTES: u64 = 5_242_880;
 
 /// Tool to read image metadata and optionally return base64-encoded data.
 ///
-/// Since providers are currently text-only, this tool extracts what it can
+/// Since model_providers are currently text-only, this tool extracts what it can
 /// (file size, format, dimensions from header bytes) and provides base64
-/// data for future multimodal provider support.
+/// data for future multimodal model_provider support.
 pub struct ImageInfoTool {
     // Held for API symmetry with other tools and to keep room for future
     // tool-specific checks (e.g. post-canonicalization is_resolved_path_allowed).
@@ -151,10 +151,16 @@ impl Tool for ImageInfoTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path_str = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path_str = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "image_info: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let include_base64 = args
             .get("include_base64")
@@ -175,9 +181,19 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path_str,
+                        "error": format!("{}", e),
+                    })),
+                "image_info: failed to read file metadata"
+            );
+            anyhow::Error::msg(format!("Failed to read file metadata: {e}"))
+        })?;
 
         let file_size = metadata.len();
 
@@ -191,9 +207,19 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path_str,
+                        "error": format!("{}", e),
+                    })),
+                "image_info: failed to read image file"
+            );
+            anyhow::Error::msg(format!("Failed to read image file: {e}"))
+        })?;
 
         let format = Self::detect_format(&bytes);
         let dimensions = Self::extract_dimensions(&bytes, format);

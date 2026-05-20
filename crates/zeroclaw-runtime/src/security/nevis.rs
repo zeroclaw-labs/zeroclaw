@@ -1,4 +1,4 @@
-//! Nevis IAM authentication provider for ZeroClaw.
+//! Nevis IAM authentication model_provider for ZeroClaw.
 //!
 //! Integrates with Nevis Security Suite (Adnovum) for OAuth2/OIDC token
 //! validation, FIDO2/passkey verification, and session management. Maps Nevis
@@ -42,9 +42,9 @@ impl TokenValidationMode {
     }
 }
 
-/// Authentication provider backed by a Nevis instance.
+/// Authentication model_provider backed by a Nevis instance.
 ///
-/// Validates tokens, manages sessions, and resolves identities. The provider
+/// Validates tokens, manages sessions, and resolves identities. The model_provider
 /// is designed to be shared across concurrent requests (`Send + Sync`).
 pub struct NevisAuthProvider {
     /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
@@ -96,7 +96,7 @@ const _: () = {
 };
 
 impl NevisAuthProvider {
-    /// Create a new Nevis auth provider from config values.
+    /// Create a new Nevis auth model_provider from config values.
     ///
     /// `client_secret` should already be decrypted by the config loader.
     pub fn new(
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn remote_mode_works_without_jwks_url() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
             "zeroclaw-client".into(),
@@ -443,12 +443,12 @@ mod tests {
             false,
             3600,
         );
-        assert!(provider.is_ok());
+        assert!(model_provider.is_ok());
     }
 
     #[test]
     fn provider_stores_config_correctly() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "test-realm".into(),
             "zeroclaw-client".into(),
@@ -460,15 +460,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(provider.instance_url(), "https://nevis.example.com");
-        assert_eq!(provider.realm(), "test-realm");
-        assert!(provider.require_mfa);
-        assert_eq!(provider.session_timeout, Duration::from_secs(7200));
+        assert_eq!(model_provider.instance_url(), "https://nevis.example.com");
+        assert_eq!(model_provider.realm(), "test-realm");
+        assert!(model_provider.require_mfa);
+        assert_eq!(model_provider.session_timeout, Duration::from_secs(7200));
     }
 
     #[test]
     fn debug_redacts_client_secret() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "test-realm".into(),
             "zeroclaw-client".into(),
@@ -480,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        let debug_output = format!("{:?}", provider);
+        let debug_output = format!("{:?}", model_provider);
         assert!(
             !debug_output.contains("super-secret-value"),
             "Debug output must not contain the raw client_secret"
@@ -493,7 +493,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_token_rejects_empty() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
             "zeroclaw-client".into(),
@@ -505,13 +505,13 @@ mod tests {
         )
         .unwrap();
 
-        let err = provider.validate_token("").await.unwrap_err();
+        let err = model_provider.validate_token("").await.unwrap_err();
         assert!(err.to_string().contains("empty bearer token"));
     }
 
     #[tokio::test]
     async fn validate_session_rejects_empty() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
             "zeroclaw-client".into(),
@@ -523,7 +523,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = provider.validate_session("").await.unwrap_err();
+        let err = model_provider.validate_session("").await.unwrap_err();
         assert!(err.to_string().contains("empty session token"));
     }
 
@@ -546,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_validation_rejects_malformed_jwt() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
             "zeroclaw-client".into(),
@@ -558,13 +558,16 @@ mod tests {
         )
         .unwrap();
 
-        let err = provider.validate_token("not-a-jwt").await.unwrap_err();
+        let err = model_provider
+            .validate_token("not-a-jwt")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Invalid JWT structure"));
     }
 
     #[tokio::test]
     async fn local_validation_errors_instead_of_silent_fallback() {
-        let provider = NevisAuthProvider::new(
+        let model_provider = NevisAuthProvider::new(
             "https://nevis.example.com".into(),
             "master".into(),
             "zeroclaw-client".into(),
@@ -578,7 +581,7 @@ mod tests {
 
         // A well-formed JWT structure should hit the "not yet implemented" error
         // instead of silently falling back to remote introspection.
-        let err = provider
+        let err = model_provider
             .validate_token("header.payload.signature")
             .await
             .unwrap_err();

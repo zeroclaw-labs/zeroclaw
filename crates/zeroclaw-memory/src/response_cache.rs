@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// An in-memory hot cache entry for the two-tier response cache.
 struct InMemoryEntry {
@@ -28,8 +28,6 @@ struct InMemoryEntry {
 /// the entry is promoted to the hot cache.
 pub struct ResponseCache {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
     ttl_minutes: i64,
     max_entries: usize,
     hot_cache: Mutex<HashMap<String, InMemoryEntry>>,
@@ -77,7 +75,6 @@ impl ResponseCache {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
             ttl_minutes: i64::from(ttl_minutes),
             max_entries,
             hot_cache: Mutex::new(HashMap::new()),

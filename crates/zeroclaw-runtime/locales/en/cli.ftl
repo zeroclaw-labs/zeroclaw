@@ -71,6 +71,42 @@ cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-install-start = Installing skill from: {$source}
+cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
+cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
+cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
+cli-skills-install-tier-official = Installing {$name} v{$version} — Official (zeroclaw-labs maintained)
+cli-skills-install-tier-community =
+    Installing {$name} v{$version} — Community submission
+    This skill is not audited by ZeroClaw. Review the skill content
+    and run `zeroclaw skills audit {$name}` before granting any
+    permissions or running it in production.
+
+cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
+
+cli-skills-bundle-add-prompt =
+    To create skill-bundle '{$alias}' with directory '{$dir}', run:
+      zeroclaw config map-key skill-bundles {$alias}
+      zeroclaw config set skill-bundles.{$alias}.directory {$dir}
+
+    (Direct bundle creation through `zeroclaw skills bundle add` would duplicate the config mutation surface.)
+
+cli-skills-bundle-remove-prompt =
+    To remove skill-bundle '{$alias}', run:
+      zeroclaw config map-key-delete skill-bundles {$alias}
+
+    (Removes the config entry; the bundle's directory on disk is left in place.)
+
+cli-skills-bundle-list-empty =
+    No skill bundles configured.
+      Create one: zeroclaw config set skill-bundles.default.directory shared/skills/default
+cli-skills-bundle-list-header = Skill bundles ({$count}):
+cli-skills-bundle-entry = {$alias} -> {$dir}
+cli-skills-bundle-include = include: {$values}
+cli-skills-bundle-exclude = exclude: {$values}
+cli-skills-bundle-show-no-skills = (no skills installed)
+cli-skills-bundle-show-skills-header = skills ({$count}):
+cli-skills-bundle-show-skill = {$name}: {$description}
 
 cli-cron-list-about = List all scheduled tasks
 cli-cron-add-about = Add a new recurring scheduled task
@@ -274,6 +310,12 @@ cli-self-test-long-about =
     Examples:
       zeroclaw self-test             # full suite
       zeroclaw self-test --quick     # quick checks only (no network)
+
+cli-skills-install-suggestion =
+    It looks like this request needs the `{$name}` skill, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
 
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.

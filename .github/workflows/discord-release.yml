@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       release_tag:
-        description: "Stable release tag (e.g. v0.7.5)"
+        description: "Stable release tag (e.g. v0.8.0-beta-1)"
         required: true
         type: string
       release_url:
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. v0.7.5)"
+        description: "Release tag (e.g. v0.8.0-beta-1)"
         required: true
         type: string
       release_url:
@@ -29,7 +29,7 @@ jobs:
   discord:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 

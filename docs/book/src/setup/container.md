@@ -67,7 +67,7 @@ docker run -d --name zeroclaw \
   ghcr.io/zeroclaw-labs/zeroclaw:latest
 ```
 
-For container workloads, the onboarding wizard detects Docker/Podman/Kubernetes and rewrites `localhost` references in the config to `host.docker.internal` (Docker) or other container-appropriate aliases.
+For container workloads, set `uri` on each `[providers.models.<type>.<alias>]` to a container-reachable address (e.g. `http://host.docker.internal:11434` for an Ollama server on the Docker Desktop host). The `ZEROCLAW_providers__models__<type>__<alias>__uri=...` env override can do the same at runtime without editing `config.toml`.
 
 ## Channels that poll (Telegram, email) — just work
 
@@ -80,7 +80,7 @@ Discord, Slack, GitHub, and most webhook channels need inbound HTTP. Two options
 1. **Expose the gateway** — `-p 42617:42617` + reverse proxy with TLS in front, point the webhook URL at the public address
 2. **Use a tunnel** — ngrok, Cloudflare Tunnel, or Tailscale Funnel; set the tunnel URL as the webhook target
 
-The onboarding wizard's tunnel step handles ngrok and Cloudflare directly.
+`zeroclaw onboard tunnel` configures ngrok or Cloudflare tunnels directly; the resulting public URL is what you point your webhook senders at.
 
 ## Kubernetes
 
@@ -133,8 +133,9 @@ docker compose exec zeroclaw zeroclaw gateway get-paircode --new
 ## Gotchas
 
 - **macOS hostname quirks (Docker Desktop, colima, Rancher Desktop).** `host.docker.internal` works out of the box on **Docker Desktop** for macOS. On **colima**, it is only reachable if you installed with `colima start --network-address` (otherwise the container can't see the host at all — connect via the VM's gateway IP, usually `192.168.5.2`, or tunnel through a shared network). **Rancher Desktop** behaves like Docker Desktop for recent versions but has had `host.docker.internal` resolve-failures on older releases. If provider calls fail with `connection refused` to `host.docker.internal`, verify with `docker run --rm alpine getent hosts host.docker.internal` — empty output means the hostname isn't resolvable and you need an explicit IP.
-- **Host-side services.** If a provider is Ollama on the host, `base_url = "http://host.docker.internal:11434"` works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
+- **Host-side services.** If a provider is Ollama on the host, `uri = "http://host.docker.internal:11434"` (under `[providers.models.ollama.<alias>]`) works on Docker Desktop. On Linux Docker you may need `--add-host=host.docker.internal:host-gateway`.
 - **Memory persistence.** The SQLite memory file sits inside `/zeroclaw-data/workspace/`. If you don't mount that volume, every restart loses conversation history.
+- **Bind-mounting `/zeroclaw-data`.** A host bind mount on `/zeroclaw-data` replaces the entire image directory, including the default `config.toml` and (previously) the dashboard bundle. The dashboard is now installed at `/usr/share/zeroclawlabs/web/dist` — outside the mount — so a bind mount no longer hides it. On first run, mount an empty host directory and the container bootstraps a fresh config; the gateway auto-detects the dashboard from its image path.
 - **No hardware passthrough by default.** GPIO / USB need explicit `--device` flags (`--device /dev/ttyUSB0`), and the container user needs matching GID for `dialout`/`gpio` groups.
 
 ## Next

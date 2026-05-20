@@ -1,4 +1,4 @@
-// Composio Tool Provider — optional managed tool surface with 1000+ OAuth integrations.
+// Composio Tool ModelProvider — optional managed tool surface with 1000+ OAuth integrations.
 //
 // When enabled, ZeroClaw can execute actions on Gmail, Notion, GitHub, Slack, etc.
 // through Composio's API without storing raw OAuth tokens locally.
@@ -20,8 +20,6 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
-#[allow(dead_code)] // Used by WIP get_connection_url_v2
-const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api";
 const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
@@ -450,7 +448,14 @@ impl ComposioTool {
             Some(id) => id.to_string(),
             None => {
                 let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!("Missing 'app' or 'auth_config_id' for v3 connect")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "app_or_auth_config_id"})),
+                        "composio: v3 connect missing app or auth_config_id"
+                    );
+                    anyhow::Error::msg("Missing 'app' or 'auth_config_id' for v3 connect")
                 })?;
                 self.resolve_auth_config_id(app).await?
             }
@@ -479,46 +484,15 @@ impl ComposioTool {
             .json()
             .await
             .context("Failed to decode Composio v3 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
-        Ok(ComposioConnectionLink {
-            redirect_url,
-            connected_account_id: extract_connected_account_id(&result),
-        })
-    }
-
-    #[allow(dead_code)] // WIP: V2 connection API
-    async fn get_connection_url_v2(
-        &self,
-        app_name: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
-
-        let body = json!({
-            "integrationId": app_name,
-            "entityId": entity_id,
-        });
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 connect failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
+        let redirect_url = extract_redirect_url(&result).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "composio: v3 response missing redirect URL"
+            );
+            anyhow::Error::msg("No redirect URL in Composio v3 response")
+        })?;
         Ok(ComposioConnectionLink {
             redirect_url,
             connected_account_id: extract_connected_account_id(&result),
@@ -660,10 +634,16 @@ impl Tool for ComposioTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "composio: missing action parameter"
+            );
+            anyhow::Error::msg("Missing 'action' parameter")
+        })?;
 
         let entity_id = args
             .get("entity_id")
@@ -781,7 +761,19 @@ impl Tool for ComposioTool {
                     .or_else(|| args.get("action_name"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute")
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"missing": "action_name_or_tool_slug"})
+                            ),
+                            "composio: execute missing action_name/tool_slug"
+                        );
+                        anyhow::Error::msg("Missing 'action_name' (or 'tool_slug') for execute")
                     })?;
 
                 let app = args.get("app").and_then(|v| v.as_str());

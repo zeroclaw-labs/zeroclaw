@@ -5,7 +5,7 @@
 //! and SQLite (and future backends) share a common interface.
 
 use chrono::{DateTime, Utc};
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -20,6 +20,35 @@ pub struct SessionMetadata {
     pub last_activity: DateTime<Utc>,
     /// Total number of messages in the session.
     pub message_count: usize,
+    /// Alias of the agent that owned this session (HashMap key in
+    /// `config.agents`). `None` for sessions persisted before per-agent
+    /// attribution landed, or for backends that don't track it.
+    pub agent_alias: Option<String>,
+    /// Dotted ChannelRef the session belongs to (`<type>.<alias>`,
+    /// e.g. `discord.clamps`). `None` for non-channel sessions (CLI,
+    /// internal cron runs) or backends without routing columns.
+    pub channel_id: Option<String>,
+    /// Platform-side room / thread identifier (Discord channel id,
+    /// Matrix room id, Slack thread ts, ...). `None` for direct messages
+    /// or backends that don't track it.
+    pub room_id: Option<String>,
+    /// Inbound sender id verbatim (Discord username, phone number, ...).
+    /// Not an FK — sessions can survive deletion of the upstream user.
+    pub sender_id: Option<String>,
+}
+
+/// Structured routing context recorded alongside a session. Mirrors the
+/// `ChannelMessage` fields the orchestrator uses to compose
+/// `conversation_history_key` so the session row can be queried by
+/// channel / room / sender without re-parsing the synthetic key.
+#[derive(Debug, Clone, Default)]
+pub struct SessionContext<'a> {
+    /// `<type>.<alias>` ChannelRef (`discord.clamps`).
+    pub channel_id: Option<&'a str>,
+    /// Platform-side room / thread id.
+    pub room_id: Option<&'a str>,
+    /// Inbound sender id (channel-native username, phone, ...).
+    pub sender_id: Option<&'a str>,
 }
 
 /// Query parameters for listing sessions.
@@ -31,12 +60,34 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
+/// One persisted message with the optional `created_at` the backend
+/// stamped on it. JSONL / in-memory backends return `None`; SQLite
+/// returns the row's `created_at` column.
+#[derive(Debug, Clone)]
+pub struct TimestampedMessage {
+    pub message: ChatMessage,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// Trait for session persistence backends.
 ///
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
+
+    /// Same as `load`, but each row carries its persisted `created_at`
+    /// when the backend has one. Default impl falls back to `load`
+    /// without timestamps so non-SQLite backends keep working.
+    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
+        self.load(session_key)
+            .into_iter()
+            .map(|message| TimestampedMessage {
+                message,
+                created_at: None,
+            })
+            .collect()
+    }
 
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
@@ -74,6 +125,10 @@ pub trait SessionBackend: Send + Sync {
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
+                    agent_alias: None,
+                    channel_id: None,
+                    room_id: None,
+                    sender_id: None,
                 }
             })
             .collect()
@@ -123,6 +178,35 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Record the agent alias that owns a session. Called on WebSocket
+    /// handshake when the alias is known. No-op for backends that don't
+    /// track per-agent attribution.
+    fn set_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the agent alias associated with a session, if recorded.
+    fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Record the channel / room / sender routing context for a session.
+    /// Called by channel orchestrators right before the LLM dispatch so
+    /// the session row can be filtered by platform attribute in the
+    /// dashboard. No-op default; SQLite override fills the columns added
+    /// in the structured-routing migration.
+    fn set_session_context(
+        &self,
+        _session_key: &str,
+        _context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Look up metadata for a single session by key.
     ///
     /// The default impl loads all messages to derive the count and calls
@@ -140,6 +224,10 @@ pub trait SessionBackend: Send + Sync {
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: messages.len(),
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
         })
     }
 
@@ -193,6 +281,10 @@ mod tests {
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: 5,
+            agent_alias: None,
+            channel_id: None,
+            room_id: None,
+            sender_id: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);

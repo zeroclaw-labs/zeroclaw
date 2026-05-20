@@ -50,8 +50,15 @@ impl Tool for MemoryPurgeTool {
         let session_id = args.get("session_id").and_then(|v| v.as_str());
 
         if namespace.is_none() && session_id.is_none() {
-            return Err(anyhow::anyhow!(
-                "Must provide either 'namespace' or 'session_id' parameter"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "namespace_or_session_id"})),
+                "memory_purge: must provide namespace or session_id"
+            );
+            return Err(anyhow::Error::msg(
+                "Must provide either 'namespace' or 'session_id' parameter",
             ));
         }
 
@@ -127,7 +134,7 @@ mod tests {
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 

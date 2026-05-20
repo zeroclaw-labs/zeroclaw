@@ -9,16 +9,18 @@
 //! write-only over HTTP per the secrets-handling boundary defined in
 //! the issue body.
 //!
-//! See #6175 for the full surface and acceptance checklist.
+//! for the full surface and acceptance checklist.
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
-use zeroclaw_runtime::onboard::{Section, field_visibility};
+use zeroclaw_config::traits::MaskSecrets;
+use zeroclaw_runtime::onboard::{field_visibility, section_for_path};
 
 use super::AppState;
 use super::api::require_auth;
@@ -99,12 +101,85 @@ pub struct PatchResponse {
     pub results: Vec<PatchOpResult>,
     /// Non-fatal validation warnings against the post-save config state.
     /// Empty when nothing is flagged. Surfaces what the CLI prints on
-    /// stderr so dashboard callers see the same signal — e.g.
-    /// `providers.fallback` referencing a non-existent provider returns
-    /// HTTP 200 with the save committed, plus a `dangling_provider_fallback`
-    /// warning here.
+    /// stderr so dashboard callers see the same signal — e.g. an
+    /// `agents.<x>.model_provider` referencing an unconfigured model_provider
+    /// returns HTTP 200 with the save committed, plus a structured
+    /// validation warning here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<zeroclaw_config::validation_warnings::ValidationWarning>,
+}
+
+/// GET /api/config — compatibility whole-config read for older bundled
+/// dashboard pages. New clients should prefer the per-property API, but
+/// returning a masked snapshot here avoids a hard 405 when an older page is
+/// served by a newer gateway.
+pub async fn handle_config_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut cfg = state.config.read().clone();
+    cfg.mask_secrets();
+    Json(cfg).into_response()
+}
+
+fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
+    let ops = value.as_array().ok_or_else(|| {
+        ConfigApiError::new(
+            ConfigApiCode::ValueTypeMismatch,
+            "JSON Patch body must be a JSON array of operations",
+        )
+    })?;
+
+    let mut parsed = Vec::with_capacity(ops.len());
+    for (idx, op) in ops.iter().enumerate() {
+        let object = op.as_object().ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] must be an object"),
+            )
+            .with_op_index(idx)
+        })?;
+        let op_name = object.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] requires string `op` field"),
+            )
+            .with_op_index(idx)
+        })?;
+        let path = object.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                format!("JSON Patch op[{idx}] requires string `path` field"),
+            )
+            .with_op_index(idx)
+        })?;
+        let comment = match object.get("comment") {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        ConfigApiError::new(
+                            ConfigApiCode::ValueTypeMismatch,
+                            format!("JSON Patch op[{idx}] `comment` field must be a string"),
+                        )
+                        .with_path(json_pointer_to_dotted(path))
+                        .with_op_index(idx)
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        parsed.push(PatchOp {
+            op: op_name.to_string(),
+            path: path.to_string(),
+            value: object.get("value").cloned(),
+            comment,
+        });
+    }
+
+    Ok(parsed)
 }
 
 /// Response for a non-secret GET / PUT / DELETE.
@@ -155,6 +230,12 @@ pub struct ListEntry {
     pub value: Option<serde_json::Value>,
     pub populated: bool,
     pub is_secret: bool,
+    /// Whether this field was populated by a `ZEROCLAW_*` env-var override
+    /// at load time. The dashboard renders the 💉 badge and a persistent
+    /// warning *"Edits here won't take effect — overridden by ZEROCLAW_..."*
+    /// when this is `true`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_env_overridden: bool,
     /// Variants for `enum`-kind fields — non-empty means the frontend should
     /// render a `<select>` with these options. Empty for non-enum fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -272,9 +353,52 @@ fn lookup_prop_field(
 ///
 /// On save failure: best-effort restore the pre-write disk content (when
 /// readable), keep in-memory state untouched, return `reload_failed`.
+/// Run `validate()` and partition errors: if the failure path overlaps
+/// a dirty path on the working config, the save is rejected
+/// (`Err(Response)`); otherwise the error is downgraded to a
+/// non-fatal warning attached to the response. Saving a single field
+/// shouldn't be blocked by an unrelated pre-existing validation
+/// problem elsewhere in the config.
+fn scoped_validate(
+    working: &zeroclaw_config::schema::Config,
+) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
+    if let Err(e) = working.validate() {
+        let api_err = ConfigApiError::from_validation(e);
+        let err_path = api_err.path.as_deref().unwrap_or("");
+        let touches_dirty = !err_path.is_empty()
+            && working.dirty_paths.iter().any(|d| {
+                err_path == d.as_str()
+                    || err_path.starts_with(&format!("{d}."))
+                    || d.starts_with(&format!("{err_path}."))
+            });
+        if touches_dirty || err_path.is_empty() {
+            return Err(api_err);
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"path": err_path})),
+            &format!(
+                "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
+             surfacing as a warning: {}",
+                api_err.message
+            )
+        );
+        return Ok(vec![
+            zeroclaw_config::validation_warnings::ValidationWarning::new(
+                "pre_existing_validation_error",
+                api_err.message,
+                err_path.to_string(),
+            ),
+        ]);
+    }
+    Ok(Vec::new())
+}
+
 async fn persist_and_swap(
     state: &AppState,
-    new_config: zeroclaw_config::schema::Config,
+    mut new_config: zeroclaw_config::schema::Config,
 ) -> Result<(), ConfigApiError> {
     let config_path = new_config.config_path.clone();
 
@@ -288,11 +412,7 @@ async fn persist_and_swap(
         None
     };
 
-    if let Err(e) = new_config.save().await {
-        // Save failed — try to restore the pre-write snapshot. This isn't
-        // strictly necessary (Config::save uses an atomic-replace via tmp
-        // file) but defends against the rare case where save partially
-        // wrote then errored (e.g. fsync mid-write).
+    if let Err(e) = new_config.save_dirty().await {
         if let Some(prev) = snapshot {
             let _ = tokio::fs::write(&config_path, prev).await;
         } else if config_path.exists() {
@@ -304,8 +424,19 @@ async fn persist_and_swap(
         ));
     }
 
-    *state.config.lock() = new_config;
+    *state.config.write() = new_config;
+    state
+        .pending_reload
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// Fields the gateway owns end-to-end (mints, rotates, persists itself).
+/// They're skipped by [`compute_drift`] so the dashboard doesn't surface a
+/// banner the operator can't act on. Add new entries here when a similar
+/// gateway-managed field lands (e.g. webhook secret rotation).
+fn is_gateway_managed_field(name: &str) -> bool {
+    matches!(name, "gateway.paired-tokens")
 }
 
 /// Compute drift between the in-memory config and what's on disk right now.
@@ -355,28 +486,38 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
             .collect();
 
     let mut drift: Vec<DriftEntry> = Vec::new();
-    for (name, mem) in &in_memory_props {
-        let disk = match on_disk_props.get(name) {
-            Some(d) => d,
-            None => continue,
-        };
-        if mem.display_value == disk.display_value {
+    let mut all_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    all_names.extend(in_memory_props.keys().map(String::as_str));
+    all_names.extend(on_disk_props.keys().map(String::as_str));
+    for name in all_names {
+        // Gateway-managed internal state isn't operator-edited and the
+        // gateway persists it itself via `persist_pairing_tokens` /
+        // similar paths. Surfacing it as drift confuses operators who
+        // can't fix it from the dashboard and the banner sticks until
+        // the daemon happens to rewrite the file.
+        if is_gateway_managed_field(name) {
             continue;
         }
-        let is_sensitive = mem.is_secret || mem.derived_from_secret;
+        let mem = in_memory_props.get(name);
+        let disk = on_disk_props.get(name);
+        let mem_display = mem.map(|p| p.display_value.as_str()).unwrap_or("<unset>");
+        let disk_display = disk.map(|p| p.display_value.as_str()).unwrap_or("<unset>");
+        if mem_display == disk_display {
+            continue;
+        }
+        let is_sensitive = mem
+            .or(disk)
+            .map(|p| p.is_secret || p.derived_from_secret)
+            .unwrap_or(false);
         if is_sensitive {
-            // Hash-compare server-side so we don't conflate ciphertext-vs-
-            // plaintext display drift with real value drift. If the SHA-256
-            // hashes match, the underlying secret is the same and we hide
-            // the entry.
             use sha2::{Digest, Sha256};
-            let mem_hash = Sha256::digest(mem.display_value.as_bytes());
-            let disk_hash = Sha256::digest(disk.display_value.as_bytes());
+            let mem_hash = Sha256::digest(mem_display.as_bytes());
+            let disk_hash = Sha256::digest(disk_display.as_bytes());
             if mem_hash == disk_hash {
                 continue;
             }
             drift.push(DriftEntry {
-                path: name.clone(),
+                path: name.to_string(),
                 secret: true,
                 drifted: true,
                 in_memory_value: None,
@@ -384,11 +525,11 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
             });
         } else {
             drift.push(DriftEntry {
-                path: name.clone(),
+                path: name.to_string(),
                 secret: false,
                 drifted: true,
-                in_memory_value: Some(serde_json::Value::String(mem.display_value.clone())),
-                on_disk_value: Some(serde_json::Value::String(disk.display_value.clone())),
+                in_memory_value: Some(serde_json::Value::String(mem_display.to_string())),
+                on_disk_value: Some(serde_json::Value::String(disk_display.to_string())),
             });
         }
     }
@@ -400,7 +541,7 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/config/prop?path=providers.fallback
+/// GET /api/config/prop?path=agents.researcher.model_provider
 ///
 /// Returns the user's current value for non-secret fields. For secret fields,
 /// returns `{path, populated}` only — the value, length, and any encoded form
@@ -414,7 +555,7 @@ pub async fn handle_prop_get(
         return e.into_response();
     }
 
-    let config = state.config.lock().clone();
+    let config = state.config.read().clone();
     let info = match lookup_prop_field(&config, &q.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&q.path)),
@@ -461,7 +602,7 @@ pub async fn handle_prop_put(
         return e.into_response();
     }
 
-    let mut new_config = state.config.lock().clone();
+    let mut new_config = state.config.read().clone();
     let info = match lookup_prop_field(&new_config, &body.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&body.path)),
@@ -472,20 +613,18 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(e.with_path(&body.path)),
     };
 
-    if let Err(e) = new_config.set_prop(&body.path, &value_str) {
+    if let Err(e) = new_config.set_prop_persistent(&body.path, &value_str) {
         return error_response(map_prop_error(e, &body.path));
     }
 
-    if let Err(e) = new_config.validate() {
-        return error_response(ConfigApiError::from_validation(e).with_path(&body.path));
-    }
+    let scoped_validation_warnings = match scoped_validate(&new_config) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
     let config_path = new_config.config_path.clone();
-    // Collect non-fatal validation warnings against the post-save state
-    // before the config is moved into persist_and_swap. Warnings here are
-    // the same signal `validate()` emits via `tracing::warn!` — surfaced
-    // structured so dashboard callers see what CLI users see on stderr.
-    let warnings = new_config.collect_warnings();
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -494,7 +633,13 @@ pub async fn handle_prop_put(
         if let Err(e) =
             zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
         {
-            tracing::warn!(error = %e, "failed to apply PUT comment to config.toml");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to apply PUT comment to config.toml"
+            );
         }
     }
 
@@ -531,21 +676,23 @@ pub async fn handle_prop_delete(
         return e.into_response();
     }
 
-    let mut new_config = state.config.lock().clone();
+    let mut new_config = state.config.read().clone();
     let info = match lookup_prop_field(&new_config, &q.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&q.path)),
     };
 
-    if let Err(e) = new_config.set_prop(&q.path, "") {
+    if let Err(e) = new_config.set_prop_persistent(&q.path, "") {
         return error_response(map_prop_error(e, &q.path));
     }
 
-    if let Err(e) = new_config.validate() {
-        return error_response(ConfigApiError::from_validation(e).with_path(&q.path));
-    }
+    let scoped_validation_warnings = match scoped_validate(&new_config) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
-    let warnings = new_config.collect_warnings();
+    let mut warnings = new_config.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, new_config).await {
         return error_response(e);
     }
@@ -566,7 +713,7 @@ pub async fn handle_prop_delete(
     }
 }
 
-/// GET /api/config/list?prefix=providers
+/// GET /api/config/list?prefix=model_providers
 ///
 /// Enumerates every property the schema exposes. Secret entries appear as
 /// `{path, populated}` with `value: None`; non-secrets carry the display
@@ -580,11 +727,11 @@ pub async fn handle_list(
         return e.into_response();
     }
 
-    let config = state.config.lock().clone();
+    let config = state.config.read().clone();
     let prefix = q.prefix.as_deref();
 
     // Drop fields that don't apply to the current shape of the config —
-    // azure_* on a non-azure provider, qdrant.* when memory.backend is
+    // azure_* on a non-azure model_provider, qdrant.* when memory.backend is
     // sqlite, etc. Keeps the form scoped to relevant inputs only.
     let excluded = field_visibility::excluded_paths(&config, prefix.unwrap_or(""));
 
@@ -604,8 +751,9 @@ pub async fn handle_list(
             } else {
                 Some(serde_json::Value::String(info.display_value.clone()))
             };
-            let section = Section::from_path(&info.name).and_then(Section::as_path_prefix);
+            let section = section_for_path(&info.name).map(|s| s.as_str());
             let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
+            let is_env_overridden = config.prop_is_env_overridden(&info.name);
             ListEntry {
                 path: info.name,
                 category: info.category.to_string(),
@@ -614,6 +762,7 @@ pub async fn handle_list(
                 value,
                 populated,
                 is_secret: is_sensitive,
+                is_env_overridden,
                 enum_variants,
                 onboard_section: section,
             }
@@ -636,15 +785,38 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let config = state.config.lock().clone();
+    let config = state.config.read().clone();
     let drifted = compute_drift(&config).await;
     axum::Json(DriftResponse { drifted }).into_response()
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ReloadStatusResponse {
+    /// `true` when one or more config writes have landed since the last
+    /// `/admin/reload`. Distinct from disk-vs-memory drift: this fires on
+    /// in-process PATCHes even though `persist_and_swap` updates the
+    /// in-memory config, because some subsystems (channels, providers,
+    /// scheduler) need to be re-instantiated to actually apply the change.
+    pub pending_reload: bool,
+}
+
+/// `GET /api/config/reload-status` — pending-reload flag for the dashboard's
+/// reload banner. Goes true on any config write, false on `/admin/reload`.
+pub async fn handle_reload_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let pending_reload = state
+        .pending_reload
+        .load(std::sync::atomic::Ordering::Relaxed);
+    axum::Json(ReloadStatusResponse { pending_reload }).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeyQuery {
-    /// Map-keyed section path, e.g. `providers.models`, `agents`, `swarms`.
+    /// Map-keyed section path, e.g. `providers.models`, `agents`, `risk_profiles`.
     pub path: String,
     /// New key to insert under that section, e.g. `anthropic`.
     pub key: String,
@@ -704,6 +876,109 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
     axum::Json(TemplatesResponse { templates }).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct MapPathQuery {
+    pub path: String,
+}
+
+/// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
+/// a map-keyed section path, e.g. `channels.discord` → `["default","work"]`.
+pub async fn handle_get_map_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapPathQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.read().clone();
+    match cfg.get_map_keys(&q.path) {
+        Some(keys) => {
+            axum::Json(serde_json::json!({ "path": q.path, "keys": keys })).into_response()
+        }
+        None => error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("no map-keyed section at `{}`", q.path),
+            )
+            .with_path(&q.path),
+        ),
+    }
+}
+
+/// `DELETE /api/config/map-key?path=<section>&key=<alias>` — remove an alias
+/// from a map-keyed section. Persists on success.
+pub async fn handle_delete_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut working = state.config.read().clone();
+    let removed = match working.delete_map_key(&q.path, &q.key) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&q.path),
+            );
+        }
+    };
+    if removed {
+        // Agent alias removal archives `agents/<alias>/workspace/` to
+        // `agents/_deleted/<alias>-<ts>/` rather than rm -rf. The
+        // workspace may contain operator notes, IDENTITY.md edits, etc.
+        // Memory database rows for the alias are also purged through
+        // the storage adapter so a future reuse of the same alias
+        // doesn't inherit stale rows.
+        if q.path == "agents" {
+            let workspace = working.agent_workspace_dir(&q.key);
+            if workspace.exists()
+                && let Some(parent) = workspace.parent()
+            {
+                let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+                let archive_root = parent.join("_deleted");
+                let archive_dir = archive_root.join(format!("{}-{ts}", q.key));
+                if let Err(err) = tokio::fs::create_dir_all(&archive_root).await {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_root.display().to_string(), "err": err.to_string()})), "agent alias removed from config but archive dir creation failed");
+                } else if let Err(err) = tokio::fs::rename(&workspace, &archive_dir).await {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": q.key, "from": workspace.display().to_string(), "to": archive_dir.display().to_string(), "err": err.to_string()})), "agent alias removed from config but workspace archive failed");
+                } else {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": q.key, "archive": archive_dir.display().to_string()})), "agent workspace archived after alias removal");
+                }
+            }
+            match state.mem.purge_agent(&q.key).await {
+                Ok(rows) if rows > 0 => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"agent": q.key, "rows": rows})),
+                    "agent memory rows purged after alias removal"
+                ),
+                Ok(_) => {}
+                Err(err) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"agent": q.key, "err": err.to_string()})),
+                    "purge_agent failed (backend may not support it)"
+                ),
+            }
+        }
+        working.mark_dirty(&format!("{}.{}", q.path, q.key));
+        if let Err(e) = persist_and_swap(&state, working).await {
+            return error_response(e);
+        }
+    }
+    axum::Json(MapKeyResponse {
+        path: q.path,
+        key: q.key,
+        created: false,
+    })
+    .into_response()
+}
+
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
 /// entry under a map-keyed section with default values, or append to a
 /// list-shaped one with `key` as the new entry's natural identifier.
@@ -723,7 +998,7 @@ pub async fn handle_map_key(
         return e.into_response();
     }
 
-    let mut working = state.config.lock().clone();
+    let mut working = state.config.read().clone();
     let path = q.path.clone();
     let key = q.key.clone();
 
@@ -736,11 +1011,94 @@ pub async fn handle_map_key(
         }
     };
 
-    if created && let Err(e) = persist_and_swap(&state, working).await {
-        return error_response(e);
+    if created {
+        // skill-bundles: materialize the bundle's resolved directory so
+        // skills have a home immediately. Run before persist so a failed
+        // mkdir surfaces in logs alongside the config write.
+        if path == "skill-bundles" || path == "skill_bundles" {
+            let install_root = working.install_root_dir();
+            if let Ok(dir) =
+                zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &key)
+                && let Err(e) = tokio::fs::create_dir_all(&dir).await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "skill-bundle '{key}' directory creation failed at {}: {e}",
+                        dir.display().to_string()
+                    )
+                );
+            }
+        }
+
+        working.mark_dirty(&format!("{path}.{key}"));
+        if let Err(e) = persist_and_swap(&state, working).await {
+            return error_response(e);
+        }
     }
 
     axum::Json(MapKeyResponse { path, key, created }).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyBody {
+    /// Section path, e.g. `channels.discord` or `model_providers.anthropic`.
+    pub path: String,
+    /// Current alias name.
+    pub from: String,
+    /// New alias name.
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RenameMapKeyResponse {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+    pub renamed: bool,
+}
+
+/// `POST /api/config/rename-map-key` — rename an alias within a map-keyed
+/// section, preserving the entry's value. Atomic: persists only on success.
+pub async fn handle_rename_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<RenameMapKeyBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.read().clone();
+
+    let renamed = match working.rename_map_key(&body.path, &body.from, &body.to) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, msg).with_path(&body.path),
+            );
+        }
+    };
+
+    if renamed {
+        working.mark_dirty(&format!("{}.{}", body.path, body.from));
+        working.mark_dirty(&format!("{}.{}", body.path, body.to));
+        if let Err(e) = persist_and_swap(&state, working).await {
+            return error_response(e);
+        }
+    }
+
+    axum::Json(RenameMapKeyResponse {
+        path: body.path,
+        from: body.from,
+        to: body.to,
+        renamed,
+    })
+    .into_response()
 }
 
 /// PATCH /api/config — apply a JSON Patch document atomically.
@@ -758,13 +1116,18 @@ pub async fn handle_map_key(
 pub async fn handle_patch(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::Json(ops): axum::Json<Vec<PatchOp>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let working = state.config.lock().clone();
+    let ops = match parse_patch_ops(body) {
+        Ok(ops) => ops,
+        Err(e) => return error_response(e),
+    };
+
+    let working = state.config.read().clone();
 
     // Drift guard: if the on-disk file diverges from in-memory state on any
     // path the PATCH would touch, refuse with 409 ConfigChangedExternally
@@ -885,7 +1248,7 @@ pub async fn handle_patch(
                         return error_response(e.with_path(&path).with_op_index(idx));
                     }
                 };
-                if let Err(e) = working.set_prop(&path, &value_str) {
+                if let Err(e) = working.set_prop_persistent(&path, &value_str) {
                     return error_response(map_prop_error(e, &path).with_op_index(idx));
                 }
                 if is_sensitive {
@@ -907,7 +1270,7 @@ pub async fn handle_patch(
                 }
             }
             "remove" => {
-                if let Err(e) = working.set_prop(&path, "") {
+                if let Err(e) = working.set_prop_persistent(&path, "") {
                     return error_response(map_prop_error(e, &path).with_op_index(idx));
                 }
                 if is_sensitive {
@@ -927,6 +1290,34 @@ pub async fn handle_patch(
                         comment: op.comment.clone(),
                     });
                 }
+            }
+            "comment" => {
+                // Comment-only update: record the (path, comment) pair
+                // for `apply_comments` after the patch commits, but
+                // skip `set_prop` entirely. Lets the operator annotate
+                // a secret without rotating its ciphertext.
+                if info.is_none() {
+                    return error_response(
+                        ConfigApiError::path_not_found(&path).with_op_index(idx),
+                    );
+                }
+                let Some(comment) = op.comment.clone() else {
+                    return error_response(
+                        ConfigApiError::new(
+                            ConfigApiCode::ValueTypeMismatch,
+                            "JSON Patch `comment` op requires `comment` field",
+                        )
+                        .with_path(&path)
+                        .with_op_index(idx),
+                    );
+                };
+                results.push(PatchOpResult {
+                    op: op.op.clone(),
+                    path,
+                    value: None,
+                    populated: None,
+                    comment: Some(comment),
+                });
             }
             "move" | "copy" => {
                 return error_response(
@@ -948,9 +1339,12 @@ pub async fn handle_patch(
         }
     }
 
-    if let Err(e) = working.validate() {
-        return error_response(ConfigApiError::from_validation(e));
-    }
+    // Per-PATCH validation is scoped to the dirty paths. See
+    // `scoped_validate` for the contract.
+    let scoped_validation_warnings = match scoped_validate(&working) {
+        Ok(ws) => ws,
+        Err(err) => return error_response(err),
+    };
 
     // Collect (path, comment) pairs from any op that supplied a non-None
     // comment. Applied after save() so the comment-preserving sync_table
@@ -964,9 +1358,10 @@ pub async fn handle_patch(
     let config_path = working.config_path.clone();
     // Collect non-fatal validation warnings against the post-save state
     // before working is moved into persist_and_swap. Same signal as
-    // `tracing::warn!` from `validate()`, surfaced structured so dashboard
+    // `zeroclaw_log::record!` from `validate()`, surfaced structured so dashboard
     // callers see it.
-    let warnings = working.collect_warnings();
+    let mut warnings = working.collect_warnings();
+    warnings.extend(scoped_validation_warnings);
     if let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
     }
@@ -976,7 +1371,13 @@ pub async fn handle_patch(
     {
         // Comments are best-effort decoration; surface as a non-fatal warn.
         // The patch itself succeeded — return success but log the failure.
-        tracing::warn!(error = %e, "failed to apply PATCH op comments to config.toml");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "failed to apply PATCH op comments to config.toml"
+        );
     }
 
     axum::Json(PatchResponse {
@@ -987,10 +1388,11 @@ pub async fn handle_patch(
     .into_response()
 }
 
-/// Convert a JSON Pointer (`/providers/fallback`) to the dotted path the
-/// `Config::set_prop` machinery expects (`providers.fallback`). Accepts both
-/// forms — passing already-dotted paths through unchanged so dashboard clients
-/// can use whichever is more natural.
+/// Convert a JSON Pointer (`/agents/researcher/model_provider`) to the
+/// dotted path the `Config::set_prop` machinery expects
+/// (`agents.researcher.model_provider`). Accepts both forms — passing
+/// already-dotted paths through unchanged so dashboard clients can use
+/// whichever is more natural.
 fn json_pointer_to_dotted(path: &str) -> String {
     if path.starts_with('/') {
         path.trim_start_matches('/').replace('/', ".")
@@ -1002,7 +1404,7 @@ fn json_pointer_to_dotted(path: &str) -> String {
 #[derive(Debug, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct InitQuery {
-    /// Optional section prefix to scope the init pass (e.g. `providers`).
+    /// Optional section prefix to scope the init pass (e.g. `model_providers`).
     /// Without it, every uninitialized nested section gets its defaults.
     #[serde(default)]
     pub section: Option<String>,
@@ -1014,7 +1416,7 @@ pub struct InitResponse {
     pub initialized: Vec<String>,
 }
 
-/// POST /api/config/init?section=providers — instantiate `None` nested
+/// POST /api/config/init?section=model_providers — instantiate `None` nested
 /// sections with defaults. Mirrors `zeroclaw config init`. When every
 /// requested section is already configured, returns `{initialized: []}`.
 pub async fn handle_init(
@@ -1026,7 +1428,7 @@ pub async fn handle_init(
         return e.into_response();
     }
 
-    let mut working = state.config.lock().clone();
+    let mut working = state.config.read().clone();
     let initialized: Vec<String> = working
         .init_defaults(q.section.as_deref())
         .into_iter()
@@ -1037,8 +1439,12 @@ pub async fn handle_init(
         return axum::Json(InitResponse { initialized }).into_response();
     }
 
-    if let Err(e) = working.validate() {
-        return error_response(ConfigApiError::from_validation(e));
+    for section in &initialized {
+        working.mark_dirty(section);
+    }
+
+    if let Err(err) = scoped_validate(&working) {
+        return error_response(err);
     }
     if let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
@@ -1058,17 +1464,17 @@ pub struct MigrateResponse {
     pub schema_version: u32,
 }
 
-/// POST /api/config/migrate — apply V1→V2 migration to the on-disk
-/// config file in place. Mirrors `zeroclaw config migrate`. Backs up the
-/// previous content alongside the original (`config.toml.bak`) before
-/// writing the migrated form. Returns `{migrated: false}` when the config
-/// is already at the current schema version.
+/// POST /api/config/migrate — apply the schema migration chain to the
+/// on-disk config file in place. Mirrors `zeroclaw config migrate`. Backs
+/// up the previous content alongside the original (`config.toml.bak`)
+/// before writing the migrated form. Returns `{migrated: false}` when the
+/// config is already at the current schema version.
 pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let config_path = state.config.lock().config_path.clone();
+    let config_path = state.config.read().config_path.clone();
 
     let raw = match tokio::fs::read_to_string(&config_path).await {
         Ok(s) => s,
@@ -1092,18 +1498,95 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
 
     match migrated {
         Some(new_content) => {
+            // Atomic write path mirrors `Config::save()` and `migration::migrate_file_in_place`
+            //: write temp + fsync → backup → atomic rename → fsync directory.
+            // Without this sequence the documented durability guarantee on the comment above
+            // doesn't hold: a copy-then-write window leaves both the original and the new
+            // content vulnerable to power loss.
             let backup_path = config_path.with_extension("toml.bak");
+            let parent = match config_path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!(
+                            "config path has no parent: {}",
+                            config_path.display().to_string()
+                        ),
+                    ));
+                }
+            };
+            let file_name = match config_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!(
+                            "config path has no file name: {}",
+                            config_path.display().to_string()
+                        ),
+                    ));
+                }
+            };
+            let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+            // 1. Write migrated content to temp + fsync.
+            match tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .await
+            {
+                Ok(mut temp) => {
+                    use tokio::io::AsyncWriteExt;
+                    if let Err(e) = temp.write_all(new_content.as_bytes()).await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to write migrated config to temp: {e}"),
+                        ));
+                    }
+                    if let Err(e) = temp.sync_all().await {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return error_response(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("failed to fsync migrated config temp: {e}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::InternalError,
+                        format!("failed to create temp config file: {e}"),
+                    ));
+                }
+            }
+
+            // 2. Backup BEFORE replacing the original.
             if let Err(e) = tokio::fs::copy(&config_path, &backup_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
                     format!("failed to write backup: {e}"),
                 ));
             }
-            if let Err(e) = tokio::fs::write(&config_path, &new_content).await {
+
+            // 3. Atomic rename. On failure, restore from backup.
+            if let Err(e) = tokio::fs::rename(&temp_path, &config_path).await {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                if backup_path.exists() {
+                    let _ = tokio::fs::copy(&backup_path, &config_path).await;
+                }
                 return error_response(ConfigApiError::new(
                     ConfigApiCode::InternalError,
-                    format!("failed to write migrated config: {e}"),
+                    format!("failed to atomically replace config: {e}"),
                 ));
+            }
+
+            // 4. Fsync the parent directory so the rename is durable.
+            #[cfg(unix)]
+            if let Ok(dir) = tokio::fs::File::open(&parent).await {
+                let _ = dir.sync_all().await;
             }
 
             // Re-read into memory so subsequent requests see the migrated state.
@@ -1116,7 +1599,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                     ));
                 }
             };
-            *state.config.lock() = new_cfg;
+            *state.config.write() = new_cfg;
 
             axum::Json(MigrateResponse {
                 migrated: true,
@@ -1160,7 +1643,7 @@ pub async fn handle_options_config(headers: HeaderMap) -> Response {
     schema_response("zeroclaw_config_schema_full")
 }
 
-/// OPTIONS /api/config/prop?path=providers.fallback — per-field schema fragment.
+/// OPTIONS /api/config/prop?path=agents.researcher.model_provider — per-field schema fragment.
 ///
 /// Returns 404 with `path_not_found` if the path doesn't resolve against the
 /// in-memory config — same contract as `GET /api/config/prop`. Previously
@@ -1192,7 +1675,7 @@ pub async fn handle_options_prop(
 
     // Resolve the path against the in-memory config; 404 if it doesn't
     // exist. (No auth required for shape discovery — same as OPTIONS /api/config.)
-    let config = state.config.lock().clone();
+    let config = state.config.read().clone();
     let info = match lookup_prop_field(&config, &q.path) {
         Some(info) => info,
         None => return error_response(ConfigApiError::path_not_found(&q.path)),
@@ -1294,7 +1777,7 @@ mod tests {
 
     #[test]
     fn map_prop_error_classifies_unknown_property() {
-        let err = anyhow::anyhow!("Unknown property 'foo.bar'");
+        let err = anyhow::Error::msg("Unknown property 'foo.bar'");
         let api_err = map_prop_error(err, "foo.bar");
         assert_eq!(api_err.code, ConfigApiCode::PathNotFound);
     }
@@ -1303,24 +1786,20 @@ mod tests {
     fn map_prop_error_classifies_type_mismatch() {
         // The classifier (config::api_error::classify_validation_message) now
         // matches "type mismatch" → ValueTypeMismatch; was ValidationFailed.
-        let err = anyhow::anyhow!("type mismatch: expected u64");
+        let err = anyhow::Error::msg("type mismatch: expected u64");
         let api_err = map_prop_error(err, "scheduler.max_concurrent");
         assert_eq!(api_err.code, ConfigApiCode::ValueTypeMismatch);
     }
 
     #[test]
     fn map_prop_error_falls_back_to_validation_on_unknown_message() {
-        let err = anyhow::anyhow!("some completely unrecognized validator message");
+        let err = anyhow::Error::msg("some completely unrecognized validator message");
         let api_err = map_prop_error(err, "scheduler.max_concurrent");
         assert_eq!(api_err.code, ConfigApiCode::ValidationFailed);
     }
 
     #[test]
     fn json_pointer_to_dotted_handles_pointer_form() {
-        assert_eq!(
-            json_pointer_to_dotted("/providers/fallback"),
-            "providers.fallback"
-        );
         assert_eq!(
             json_pointer_to_dotted("/providers/models/openrouter/api-key"),
             "providers.models.openrouter.api-key"
@@ -1330,8 +1809,8 @@ mod tests {
     #[test]
     fn json_pointer_to_dotted_passes_dotted_through() {
         assert_eq!(
-            json_pointer_to_dotted("providers.fallback"),
-            "providers.fallback"
+            json_pointer_to_dotted("providers.models.openrouter.api-key"),
+            "providers.models.openrouter.api-key"
         );
         assert_eq!(
             json_pointer_to_dotted("scheduler.max_concurrent"),
@@ -1364,9 +1843,15 @@ mod tests {
     #[test]
     fn test_op_coercion_bool_typed_value_matches_stored() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop bool");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want_typed = json_to_setprop_string(&serde_json::json!(true), Some(PropKind::Bool))
             .expect("coerce bool true");
         assert_eq!(
@@ -1411,8 +1896,8 @@ mod tests {
         // test will need updating; that's fine — we just need one float to
         // pin the contract.
         let mut cfg = zeroclaw_config::schema::Config::default();
-        // autonomy doesn't carry floats today; use a provider temperature
-        // by setting a known model-provider entry. The model-providers map
+        // autonomy doesn't carry floats today; use a model_provider temperature
+        // by setting a known model provider entry. The model providers map
         // is set up via map keys, so use a path that's unambiguously float.
         // Fall back to set_prop on a known float location:
         match cfg.set_prop("providers.models.openai.temperature", "0.7") {
@@ -1449,50 +1934,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_warnings_surfaces_dangling_provider_fallback() {
-        // Pin the contract that drives the WARN-visibility fix: a config
-        // where `providers.fallback` references a key not present in
-        // `providers.models` returns a structured warning with a stable
-        // code, suitable for inclusion in PUT/PATCH/GET responses.
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("providers.fallback", "nonexistent")
-            .expect("set_prop fallback");
-
-        let warnings = cfg.collect_warnings();
-        let dangling = warnings
-            .iter()
-            .find(|w| w.code == "dangling_provider_fallback")
-            .expect("expected dangling_provider_fallback warning");
-        assert_eq!(dangling.path, "providers.fallback");
-        assert!(
-            dangling.message.contains("nonexistent"),
-            "warning message should name the dangling key, got {:?}",
-            dangling.message
-        );
-    }
-
-    #[test]
-    fn collect_warnings_empty_when_fallback_unset() {
-        // Default config has no `providers.fallback` set → no dangling
-        // warning (the check is gated on `Some(fallback_key)`). Pin the
-        // negative case so a regression that always-emits the warning
-        // gets caught.
-        let cfg = zeroclaw_config::schema::Config::default();
-        let warnings = cfg.collect_warnings();
-        assert!(
-            !warnings
-                .iter()
-                .any(|w| w.code == "dangling_provider_fallback"),
-            "default config should have no dangling-fallback warning, got {warnings:?}"
-        );
-    }
-
-    #[test]
     fn test_op_coercion_mismatched_value_correctly_fails() {
         let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.set_prop("autonomy.workspace-only", "true")
+        cfg.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.set_prop("risk-profiles.default.workspace-only", "true")
             .expect("set_prop");
-        let actual = cfg.get_prop("autonomy.workspace-only").expect("get_prop");
+        let actual = cfg
+            .get_prop("risk-profiles.default.workspace-only")
+            .expect("get_prop");
         let want = json_to_setprop_string(&serde_json::json!(false), Some(PropKind::Bool))
             .expect("coerce bool false");
         assert_ne!(
@@ -1726,14 +2178,15 @@ mod tests {
     fn list_entry_for_secret_omits_value_field() {
         let entry = ListEntry {
             path: "providers.models.ollama.api-key".into(),
-            category: "providers".into(),
+            category: "providers.models".into(),
             kind: "string",
             type_hint: "Option<String>",
             value: None,
             populated: true,
             is_secret: true,
+            is_env_overridden: false,
             enum_variants: vec![],
-            onboard_section: Some("providers"),
+            onboard_section: Some("providers.models"),
         };
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");

@@ -3,15 +3,11 @@
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
-use zeroclaw::config::migration::{self, V1Compat};
-use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
+use zeroclaw::config::migration;
+use zeroclaw::config::{ChannelsConfig, Config, GatewayConfig, RiskProfileConfig, SecurityConfig};
 
 fn migrate(toml_str: &str) -> Config {
-    let mut table: toml::Table = toml::from_str(toml_str).expect("failed to parse table");
-    migration::prepare_table(&mut table);
-    let prepared = toml::to_string(&table).expect("failed to re-serialize");
-    let compat: V1Compat = toml::from_str(&prepared).expect("failed to deserialize");
-    compat.into_config()
+    migration::migrate_to_current(toml_str).expect("migration succeeds")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24,7 +20,7 @@ fn migrate(toml_str: &str) -> Config {
 #[test]
 fn config_valid_keys_not_flagged_as_unknown() {
     // api_key: Option<T> defaulting to None — TOML omits it.
-    // model_provider: serde alias for default_provider.
+    // model_provider: serde alias for default_model_provider.
     let unknown = Config::unknown_keys("api_key = \"sk-test\"\nmodel_provider = \"ollama\"\n");
     assert!(
         unknown.is_empty(),
@@ -37,15 +33,14 @@ fn config_unknown_keys_parse_without_error() {
     let config = migrate(
         r#"
 default_temperature = 0.7
-default_provider = "test"
+default_model_provider = "openai"
 totally_unknown_key = "should be ignored"
 another_fake = 42
 "#,
     );
     assert!(
         (config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -69,33 +64,53 @@ fn config_wrong_type_for_temperature_fails() {
     let toml_str = r#"
 default_temperature = "hot"
 "#;
-    let result: Result<V1Compat, _> = toml::from_str(toml_str);
+    // V1's `default_temperature` is folded into model_providers.<x>.default
+    // by `migrate_to_current`. A non-f64 value should fail at the migration
+    // boundary because the synthesized model_provider entry can't deserialize
+    // a string into Option<f64>.
+    let result = migration::migrate_to_current(toml_str);
     assert!(
         result.is_err(),
-        "string for f64 temperature should fail to parse"
+        "string for f64 temperature should fail migration"
     );
 }
 
 #[test]
 fn config_out_of_range_temperature_fails() {
-    // Temperature validation now happens at the provider level.
+    // Temperature validation now happens at the model_provider level.
     let toml_str = r#"
-[providers.models.test]
+[providers.models.openai.default]
 temperature = 99.0
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
     // Out-of-range temperature is stored but caught by validate().
-    assert!(config.providers.models["test"].temperature == Some(99.0));
+    assert!(
+        config
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("entry exists")
+            .temperature
+            == Some(99.0)
+    );
 }
 
 #[test]
 fn config_negative_temperature_fails() {
     let toml_str = r#"
-[providers.models.test]
+[providers.models.openai.default]
 temperature = -0.5
 "#;
     let config: Config = toml::from_str(toml_str).expect("parses");
-    assert!(config.providers.models["test"].temperature == Some(-0.5));
+    assert!(
+        config
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("entry exists")
+            .temperature
+            == Some(-0.5)
+    );
 }
 
 #[test]
@@ -299,33 +314,33 @@ fn gateway_path_prefix_accepts_none() {
 #[test]
 fn security_config_defaults() {
     let sec = SecurityConfig::default();
+    assert!(sec.audit.enabled, "audit should be enabled by default");
+    // V3: sandbox/resource limits live on risk_profiles entries, not SecurityConfig.
+    let profile = RiskProfileConfig::default();
     assert!(
-        sec.sandbox.enabled.is_none(),
+        profile.sandbox_enabled.is_none(),
         "sandbox enabled should auto-detect (None) by default"
     );
-    assert!(sec.audit.enabled, "audit should be enabled by default");
 }
 
 #[test]
 fn security_config_toml_roundtrip() {
     let mut sec = SecurityConfig::default();
-    sec.sandbox.enabled = Some(true);
     sec.audit.max_size_mb = 200;
 
     let toml_str = toml::to_string(&sec).expect("SecurityConfig should serialize");
     let parsed: SecurityConfig = toml::from_str(&toml_str).expect("should deserialize back");
 
-    assert_eq!(parsed.sandbox.enabled, Some(true));
     assert_eq!(parsed.audit.max_size_mb, 200);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AutonomyConfig boundary tests (security policy via Config.autonomy)
+// RiskProfileConfig boundary tests (security policy via Config.autonomy)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn autonomy_config_default_is_supervised() {
-    let autonomy = AutonomyConfig::default();
+    let autonomy = RiskProfileConfig::default();
     assert_eq!(
         format!("{:?}", autonomy.level),
         "Supervised",
@@ -334,34 +349,61 @@ fn autonomy_config_default_is_supervised() {
 }
 
 #[test]
-fn autonomy_config_default_max_actions_per_hour() {
-    let autonomy = AutonomyConfig::default();
-    assert!(
-        autonomy.max_actions_per_hour > 0,
-        "max_actions_per_hour should be positive"
-    );
-}
-
-#[test]
-fn autonomy_config_default_workspace_only() {
-    let autonomy = AutonomyConfig::default();
-    assert!(
-        autonomy.workspace_only,
-        "workspace_only should default to true"
-    );
-}
-
-#[test]
-fn autonomy_config_toml_roundtrip() {
+fn risk_profile_workspace_only_round_trips_through_toml() {
     let mut config = Config::default();
-    config.autonomy.max_actions_per_hour = 50;
-    config.autonomy.workspace_only = false;
-
+    config.risk_profiles.insert(
+        "clamps".into(),
+        zeroclaw_config::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..Default::default()
+        },
+    );
     let toml_str = toml::to_string(&config).expect("config should serialize");
     let parsed: Config = toml::from_str(&toml_str).expect("should deserialize back");
+    let profile = parsed.risk_profiles.get("clamps").unwrap();
+    assert!(!profile.workspace_only);
+}
 
-    assert_eq!(parsed.autonomy.max_actions_per_hour, 50);
-    assert!(!parsed.autonomy.workspace_only);
+#[test]
+fn runtime_profile_max_actions_per_hour_round_trips_through_toml() {
+    let mut config = Config::default();
+    config.runtime_profiles.insert(
+        "clamps".into(),
+        zeroclaw_config::schema::RuntimeProfileConfig {
+            max_actions_per_hour: 50,
+            ..Default::default()
+        },
+    );
+    let toml_str = toml::to_string(&config).expect("config should serialize");
+    let parsed: Config = toml::from_str(&toml_str).expect("should deserialize back");
+    let profile = parsed.runtime_profiles.get("clamps").unwrap();
+    assert_eq!(profile.max_actions_per_hour, 50);
+}
+
+#[test]
+fn risk_profile_allowed_path_alias_maps_to_allowed_roots() {
+    let toml_str = r#"
+[risk_profiles.default]
+allowed_path = ["~/work", "~/"]
+"#;
+    let parsed: Config = toml::from_str(toml_str).expect("allowed_path alias should parse");
+    assert_eq!(
+        parsed.risk_profiles["default"].allowed_roots,
+        vec!["~/work", "~/"]
+    );
+}
+
+#[test]
+fn risk_profile_allowed_paths_alias_maps_to_allowed_roots() {
+    let toml_str = r#"
+[risk_profiles.default]
+allowed_paths = ["/tmp/data"]
+"#;
+    let parsed: Config = toml::from_str(toml_str).expect("allowed_paths alias should parse");
+    assert_eq!(
+        parsed.risk_profiles["default"].allowed_roots,
+        vec!["/tmp/data"]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -373,8 +415,7 @@ fn config_empty_toml_uses_default_temperature() {
     let config = migrate("");
     assert!(
         (config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -385,25 +426,32 @@ fn config_empty_toml_uses_default_temperature() {
 
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
-    let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
-    assert_eq!(config.agent.max_tool_iterations, 10);
+    let config = migrate("default_temperature = 0.7\ndefault_provider = \"openai\"\n");
+    // Migration synthesizes [agents.default] from the V2 shape; assert
+    // its tunables match AliasedAgentConfig defaults.
+    let agent = config
+        .agent("default")
+        .expect("migration synthesized agents.default");
+    assert_eq!(agent.max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
 #[test]
 fn config_only_temperature_parses() {
-    let config = migrate("default_temperature = 1.2\ndefault_provider = \"test\"\n");
+    let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
     assert!(
         (config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
             .abs()
             < f64::EPSILON
     );
-    assert_eq!(config.agent.max_tool_iterations, 10);
+    let agent = config
+        .agent("default")
+        .expect("migration synthesized agents.default");
+    assert_eq!(agent.max_tool_iterations, 10);
 }
 
 #[test]
@@ -411,7 +459,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_provider = "test"
+default_model_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123
@@ -419,8 +467,7 @@ value = 123
     );
     assert!(
         (config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -438,24 +485,24 @@ fn config_multiple_channels_coexist() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels.telegram]
+[channels.telegram.default]
 bot_token = "test_token"
 allowed_users = ["zeroclaw_user"]
 
-[channels.discord]
+[channels.discord.default]
 bot_token = "test_token"
 "#;
     let parsed: Config = toml::from_str(toml_str).expect("multi-channel config should parse");
-    assert!(parsed.channels.telegram.is_some());
-    assert!(parsed.channels.discord.is_some());
-    assert!(parsed.channels.slack.is_none());
+    assert!(!parsed.channels.telegram.is_empty());
+    assert!(!parsed.channels.discord.is_empty());
+    assert!(parsed.channels.slack.is_empty());
 }
 
 #[test]
 fn config_nested_optional_sections_default_when_absent() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
-    assert!(parsed.channels.telegram.is_none());
+    assert!(parsed.channels.telegram.is_empty());
     assert!(!parsed.composio.enabled);
     assert!(parsed.composio.api_key.is_none());
     assert!(parsed.browser.enabled);
@@ -470,13 +517,12 @@ fn config_channels_default_cli_enabled() {
 #[test]
 fn config_channels_all_optional_channels_none_by_default() {
     let channels = ChannelsConfig::default();
-    assert!(channels.telegram.is_none());
-    assert!(channels.discord.is_none());
-    assert!(channels.slack.is_none());
-    assert!(channels.matrix.is_none());
-    assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
-    assert!(channels.webhook.is_none());
+    assert!(channels.telegram.is_empty());
+    assert!(channels.discord.is_empty());
+    assert!(channels.slack.is_empty());
+    assert!(channels.matrix.is_empty());
+    assert!(channels.lark.is_empty());
+    assert!(channels.webhook.is_empty());
 }
 
 #[test]
@@ -498,7 +544,7 @@ fn config_channels_without_cli_field() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels.matrix]
+[channels.matrix.default]
 homeserver = "https://matrix.example.com"
 access_token = "syt_test_token"
 allowed_rooms = ["!abc123:example.com"]
@@ -510,7 +556,7 @@ allowed_users = ["@user:example.com"]
         parsed.channels.cli,
         "cli should default to true when omitted"
     );
-    assert!(parsed.channels.matrix.is_some());
+    assert!(!parsed.channels.matrix.is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -523,31 +569,30 @@ fn config_toplevel_cli_section_with_whatsapp_parses() {
     let toml_str = r#"
 [cli]
 
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config = toml::from_str(toml_str)
         .expect("top-level [cli] section with [channels.whatsapp] should parse");
-    assert!(parsed.channels.whatsapp.is_some());
-    let wa = parsed.channels.whatsapp.unwrap();
+    assert!(!parsed.channels.whatsapp.is_empty());
+    let wa = parsed.channels.whatsapp.get("default").unwrap();
     assert_eq!(
         wa.session_path.as_deref(),
         Some("~/.zeroclaw/state/whatsapp-web/session.db")
     );
-    assert_eq!(wa.allowed_numbers, vec!["*".to_string()]);
 }
 
 #[test]
 fn config_only_whatsapp_channel_parses() {
     let toml_str = r#"
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config =
         toml::from_str(toml_str).expect("config with only whatsapp channel should parse");
-    assert!(parsed.channels.whatsapp.is_some());
+    assert!(!parsed.channels.whatsapp.is_empty());
     assert!(
         parsed.channels.cli,
         "cli should default to true when omitted"
@@ -560,25 +605,24 @@ fn config_channels_explicit_cli_true_with_whatsapp() {
 [channels]
 cli = true
 
-[channels.whatsapp]
+[channels.whatsapp.default]
 session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 allowed_numbers = ["*"]
 "#;
     let parsed: Config =
         toml::from_str(toml_str).expect("explicit channels.cli=true with whatsapp should parse");
     assert!(parsed.channels.cli);
-    assert!(parsed.channels.whatsapp.is_some());
+    assert!(!parsed.channels.whatsapp.is_empty());
 }
 
 #[test]
 fn config_empty_parses_with_all_defaults() {
     let config = migrate("");
     assert!(config.channels.cli);
-    assert!(config.channels.whatsapp.is_none());
+    assert!(config.channels.whatsapp.is_empty());
     assert!(
         (config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)

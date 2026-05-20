@@ -5,7 +5,7 @@
 //! MiniMax `<invoke>` blocks, Perl-style `[TOOL_CALL]` blocks, markdown fences,
 //! OpenAI native format, and more.
 //!
-//! This crate has no dependency on agent state, memory, providers, or channels.
+//! This crate has no dependency on agent state, memory, model_providers, or channels.
 //! It is pure text transformation.
 
 use regex::Regex;
@@ -30,7 +30,7 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
-/// Why: Gemini (and some other providers) sometimes double-encode nested object/array
+/// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
 /// parameters as JSON strings inside the outer arguments payload, which breaks tools
 /// that expect `Value::Object` / `Value::Array` at those positions.
 fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
@@ -532,7 +532,7 @@ fn find_json_end(input: &str) -> Option<usize> {
 }
 
 /// Parse XML attribute-style tool calls from response text.
-/// This handles MiniMax and similar providers that output:
+/// This handles MiniMax and similar model_providers that output:
 /// ```xml
 /// <minimax:toolcall>
 /// <invoke name="shell">
@@ -725,7 +725,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Parse GLM-style tool calls from response text.
-/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// Map tool name aliases from various LLM model_providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     // Strip any dotted namespace prefix (keep only the final segment).
@@ -1012,7 +1012,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
 // LLM responses may contain tool calls in multiple formats depending on
-// the provider. Parsing follows a priority chain:
+// the model_provider. Parsing follows a priority chain:
 //   1. OpenAI-style JSON with `tool_calls` array (native API)
 //   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
 //   3. Markdown code blocks with `tool_call` language
@@ -1047,7 +1047,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut remaining = response;
 
     // First, try to parse as OpenAI-style JSON response with tool_calls array
-    // This handles providers like Minimax that return tool_calls in native JSON format
+    // This handles model_providers like Minimax that return tool_calls in native JSON format
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
         calls = parse_tool_calls_from_json_value(&json_value);
         if !calls.is_empty() {
@@ -1117,7 +1117,10 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
                 );
             }
@@ -1239,7 +1242,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Try ```tool <name> format used by some providers (e.g., xAI grok)
+    // Try ```tool <name> format used by some model_providers (e.g., xAI grok)
     // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
     if calls.is_empty() {
         static MD_TOOL_NAME_RE: LazyLock<Regex> =
@@ -1260,11 +1263,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             let json_values = extract_json_values(inner);
             if json_values.is_empty() {
                 // Log a warning if we found a tool block but couldn't parse arguments
-                tracing::warn!(
-                    tool_name = %tool_name,
-                    inner = %inner.chars().take(100).collect::<String>(),
-                    "Found ```tool <name> block but could not parse JSON arguments"
-                );
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
             } else {
                 for value in json_values {
                     let arguments = if value.is_object() {
@@ -1513,6 +1512,14 @@ pub fn build_native_assistant_history_from_parsed_calls(
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
 ) -> Option<String> {
+    // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
+    // assistant messages that carry `tool_calls: []`. When there are no
+    // parsed calls, return None so the caller falls through to a plain
+    // text assistant message. See #6298.
+    if tool_calls.is_empty() {
+        return None;
+    }
+
     let calls_json = tool_calls
         .iter()
         .map(|tc| {
@@ -1548,6 +1555,52 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls() {
+        // Regression: strict providers (DeepSeek V4, NVIDIA NIM) reject
+        // assistant messages carrying `tool_calls: []`. Empty input must
+        // not produce a serialised assistant message with an empty array.
+        // See #6298.
+        let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
+        assert!(
+            result.is_none(),
+            "expected None for empty tool_calls slice, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls_with_reasoning() {
+        // Even with reasoning_content set, an empty tool_calls slice must
+        // collapse to None — the caller falls back to a plain assistant
+        // message, and the reasoning round-trip happens through a separate
+        // path that does not produce `tool_calls: []`.
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer text",
+            &[],
+            Some("deep thought"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_emits_tool_calls_when_non_empty() {
+        // No-regression check: the normal path with a real parsed call
+        // still produces a serialised assistant message and the
+        // `tool_calls` field is a non-empty array.
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_1".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let s = result.expect("Some(_) for non-empty tool_calls");
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        let arr = parsed["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("shell"));
+    }
 
     #[test]
     fn parse_arguments_value_unwraps_nested_object_string() {
@@ -1687,7 +1740,7 @@ After text."#;
 
     #[test]
     fn parse_tool_calls_openai_format_without_content() {
-        // Some providers don't include content field with tool_calls
+        // Some model_providers don't include content field with tool_calls
         let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
         let (text, calls) = parse_tool_calls(response);
@@ -1889,7 +1942,7 @@ Done."#;
 
     #[test]
     fn parse_tool_calls_handles_tool_name_fence_format() {
-        // Issue #1420: xAI grok models use ```tool <name> format
+        //: xAI grok models use ```tool <name> format
         let response = r#"I'll write a test file.
 ```tool file_write
 {"path": "/home/user/test.txt", "content": "Hello world"}
@@ -1909,7 +1962,7 @@ Done."#;
 
     #[test]
     fn parse_tool_calls_handles_tool_name_fence_shell() {
-        // Issue #1420: Test shell command in ```tool shell format
+        //: Test shell command in ```tool shell format
         let response = r#"```tool shell
 {"command": "ls -la"}
 ```"#;

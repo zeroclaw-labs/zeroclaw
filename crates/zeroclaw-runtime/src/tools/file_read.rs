@@ -16,11 +16,12 @@ impl FileReadTool {
         Self { security }
     }
 
-    /// Validate and resolve a caller-supplied path to an absolute candidate.
-    /// Mirrors the logic in `FileWriteTool::resolve_candidate`.
+    /// Resolve a caller-supplied path to an absolute candidate. Reject
+    /// only path-shape attacks (null byte, `..` traversal); the
+    /// allowlist gate is `SecurityPolicy::is_resolved_path_readable`
+    /// after canonicalize, which already unions `allowed_roots` and
+    /// `allowed_roots_read_only`.
     fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
-        let workspace_dir = &self.security.workspace_dir;
-
         if path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");
         }
@@ -33,32 +34,10 @@ impl FileReadTool {
 
         let p = std::path::Path::new(path);
         if p.is_absolute() {
-            #[cfg(not(target_os = "windows"))]
-            if p == std::path::Path::new("/dev/null") {
-                return Ok(p.to_path_buf());
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let lower = path.to_ascii_lowercase();
-                if lower == "nul" || lower == r"\\.\nul" {
-                    return Ok(p.to_path_buf());
-                }
-            }
-            let workspace_canonical = workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_dir.clone());
-            if p.starts_with(&workspace_canonical) || p.starts_with(workspace_dir.as_path()) {
-                return Ok(p.to_path_buf());
-            }
-            for root in &self.security.allowed_roots {
-                let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-                if p.starts_with(&root_canonical) || p.starts_with(root.as_path()) {
-                    return Ok(p.to_path_buf());
-                }
-            }
-            anyhow::bail!("Path not allowed by security policy: {path}");
+            return Ok(p.to_path_buf());
         }
 
+        let workspace_dir = &self.security.workspace_dir;
         if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
             && let Ok(stripped) = p.strip_prefix(workspace_rootless)
         {
@@ -105,10 +84,17 @@ impl Tool for FileReadTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         // Cross-cutting rate limiting and path-allowlist checks live in the
         // RateLimitedTool + PathGuardedTool wrappers at registration time
@@ -149,8 +135,9 @@ impl Tool for FileReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
-            let _ = self.security.record_action();
+        // Read access: workspace + read-write allowlist + read-only allowlist
+        // + universal POSIX device files (/dev/null, etc.).
+        if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -243,9 +230,19 @@ impl Tool for FileReadTool {
             }
             Err(_) => {
                 // Not valid UTF-8 — read raw bytes and try to extract text
-                let bytes = tokio::fs::read(&resolved_path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
+                let bytes = tokio::fs::read(&resolved_path).await.map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "path": resolved_path.display().to_string(),
+                                "error": format!("{}", e),
+                            })),
+                        "file_read: raw byte fallback read failed"
+                    );
+                    anyhow::Error::msg(format!("Failed to read file: {e}"))
+                })?;
 
                 if let Some(text) = try_extract_pdf_text(&bytes) {
                     return Ok(ToolResult {
@@ -404,7 +401,7 @@ mod tests {
 
         let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
     }
 
     #[tokio::test]
@@ -523,7 +520,44 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_admits_absolute_path_under_read_only_root() {
+        let root =
+            std::env::temp_dir().join("zeroclaw_test_file_read_admits_absolute_path_under_ro_root");
+        let workspace = root.join("workspace");
+        let ro_root = root.join("shared");
+        let ro_file = ro_root.join("notes.txt");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&ro_root).await.unwrap();
+        tokio::fs::write(&ro_file, "cross-agent read")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            allowed_roots_read_only: vec![ro_root.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        let result = tool
+            .execute(json!({"path": ro_file.to_string_lossy().to_string()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "absolute path under read-only root must read: {result:?}"
+        );
+        assert!(result.output.contains("cross-agent read"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -696,28 +730,28 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use zeroclaw_config::schema::MemoryConfig;
         use zeroclaw_memory::{self, Memory};
-        use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
+        use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
 
         pub type SharedRequests = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
 
-        pub struct RecordingProvider {
+        pub struct RecordingModelProvider {
             responses: Mutex<Vec<ChatResponse>>,
             pub requests: SharedRequests,
         }
 
-        impl RecordingProvider {
+        impl RecordingModelProvider {
             pub fn new(responses: Vec<ChatResponse>) -> (Self, SharedRequests) {
                 let requests: SharedRequests = Arc::new(Mutex::new(Vec::new()));
-                let provider = Self {
+                let model_provider = Self {
                     responses: Mutex::new(responses),
                     requests: requests.clone(),
                 };
-                (provider, requests)
+                (model_provider, requests)
             }
         }
 
         #[async_trait::async_trait]
-        impl Provider for RecordingProvider {
+        impl ModelProvider for RecordingModelProvider {
             async fn chat_with_system(
                 &self,
                 _system_prompt: Option<&str>,
@@ -751,6 +785,18 @@ mod tests {
                 Ok(guard.remove(0))
             }
         }
+        impl ::zeroclaw_api::attribution::Attributable for RecordingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "RecordingModelProvider"
+            }
+        }
 
         pub fn make_memory() -> Arc<dyn Memory> {
             let cfg = MemoryConfig {
@@ -765,15 +811,15 @@ mod tests {
         }
     }
 
-    /// End-to-end test: scripted provider calls `file_read` on a real PDF
+    /// End-to-end test: scripted model_provider calls `file_read` on a real PDF
     /// fixture, the tool extracts text via pdf-extract, and the extracted
-    /// content reaches the provider in the tool result message.
+    /// content reaches the model_provider in the tool result message.
     #[tokio::test]
     async fn e2e_agent_file_read_pdf_extraction() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, Provider, ToolCall};
+        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
 
         // ── Set up workspace with PDF fixture ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_pdf");
@@ -794,9 +840,9 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Script provider: call file_read → then answer ──
-        let (provider, recorded) = RecordingProvider::new(vec![
-            // Turn 1 response: provider asks to read the PDF
+        // ── Script model_provider: call file_read → then answer ──
+        let (model_provider, recorded) = RecordingModelProvider::new(vec![
+            // Turn 1 response: model_provider asks to read the PDF
             ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -808,7 +854,7 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
             },
-            // Turn 1 continued: provider sees tool result and answers
+            // Turn 1 continued: model_provider sees tool result and answers
             ChatResponse {
                 text: Some("The PDF contains a greeting: Hello PDF".into()),
                 tool_calls: vec![],
@@ -818,7 +864,7 @@ mod tests {
         ]);
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
@@ -839,12 +885,12 @@ mod tests {
             "agent response must contain PDF content, got: {response}",
         );
 
-        // ── Verify provider received extracted PDF text in tool result ──
+        // ── Verify model_provider received extracted PDF text in tool result ──
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
                 all_requests.len() >= 2,
-                "expected at least 2 provider requests (initial + after tool), got {}",
+                "expected at least 2 model_provider requests (initial + after tool), got {}",
                 all_requests.len(),
             );
 
@@ -871,7 +917,7 @@ mod tests {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, Provider, ToolCall};
+        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
 
         // ── Set up workspace with binary file ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
@@ -890,7 +936,7 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        let (provider, recorded) = RecordingProvider::new(vec![
+        let (model_provider, recorded) = RecordingModelProvider::new(vec![
             ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -911,7 +957,7 @@ mod tests {
         ]);
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())
@@ -932,7 +978,7 @@ mod tests {
             let all_requests = recorded.lock().unwrap();
             assert!(
                 all_requests.len() >= 2,
-                "expected at least 2 provider requests, got {}",
+                "expected at least 2 model_provider requests, got {}",
                 all_requests.len(),
             );
 
@@ -956,7 +1002,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
-    /// Live e2e: real OpenAI Codex provider + real FileReadTool + PDF fixture.
+    /// Live e2e: real OpenAI Codex model_provider + real FileReadTool + PDF fixture.
     /// Verifies the model receives extracted PDF text and responds meaningfully.
     ///
     /// Requires valid OAuth credentials in `~/.zeroclaw/`.
@@ -967,8 +1013,8 @@ mod tests {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::XmlToolDispatcher;
         use e2e_helpers::*;
-        use zeroclaw_providers::openai_codex::OpenAiCodexProvider;
-        use zeroclaw_providers::{Provider, ProviderRuntimeOptions};
+        use zeroclaw_providers::openai_codex::OpenAiCodexModelProvider;
+        use zeroclaw_providers::{ModelProvider, ModelProviderRuntimeOptions};
 
         // ── Set up workspace with PDF fixture ──
         let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_live_file_read_pdf");
@@ -989,12 +1035,13 @@ mod tests {
         });
         let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
 
-        // ── Real provider (OpenAI Codex uses XML tool dispatch) ──
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
-            .expect("provider should initialize");
+        // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
+        let model_provider =
+            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
+                .expect("model_provider should initialize");
 
         let mut agent = Agent::builder()
-            .provider(Box::new(provider) as Box<dyn Provider>)
+            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
             .tools(vec![file_read_tool])
             .memory(make_memory())
             .observer(make_observer())

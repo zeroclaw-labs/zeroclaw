@@ -41,8 +41,7 @@ use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
-use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
@@ -61,24 +60,75 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
-/// Coerce a JSON value into the string form `Config::set_prop` accepts.
-///
-/// Thin wrapper over the shared `zeroclaw_config::typed_value::coerce_for_set_prop`
-/// helper that the gateway PATCH/PUT endpoints use. Looking up a path's
-/// declared `PropKind` requires a `Config` reference, which the patch handler
-/// has — so this looks the kind up against the live config and forwards.
+fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
+    config
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == path)
+        .map(|f| f.kind)
+}
+
 fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
     path: &str,
 ) -> Result<String> {
-    let kind = config
-        .prop_fields()
-        .into_iter()
-        .find(|f| f.name == path)
-        .map(|f| f.kind);
-    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
-        .map_err(|e| anyhow::anyhow!("{}", e.message))
+    let kind = config_patch_prop_kind(config, path);
+    zeroclaw_config::typed_value::coerce_for_set_prop(value, kind).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"path": path, "error": e.message.clone()})),
+            "config patch coercion rejected JSON value"
+        );
+        anyhow::Error::msg(e.message)
+    })
+}
+
+fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
+    let msg = err.to_string();
+    if msg.starts_with("Unknown property") {
+        ConfigApiError::path_not_found(path).with_op_index(op_index)
+    } else {
+        ConfigApiError::from_validation(err)
+            .with_path(path)
+            .with_op_index(op_index)
+    }
+}
+
+fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
+    eprintln!("{}", serde_json::to_string_pretty(err)?);
+    std::process::exit(1);
+}
+
+fn config_patch_json_value_type_error(
+    message: impl Into<String>,
+    path: Option<String>,
+    op_index: Option<usize>,
+) -> ConfigApiError {
+    let mut err = ConfigApiError::new(ConfigApiCode::ValueTypeMismatch, message.into());
+    if let Some(path) = path {
+        err = err.with_path(path);
+    }
+    if let Some(op_index) = op_index {
+        err = err.with_op_index(op_index);
+    }
+    err
+}
+
+fn config_patch_fail_json_or_human<T>(
+    json: bool,
+    err: ConfigApiError,
+    human: impl Into<String>,
+) -> Result<T>
+where
+    T: Sized,
+{
+    if json {
+        config_patch_json_error(&err)?;
+    }
+    anyhow::bail!("{}", human.into())
 }
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
@@ -143,6 +193,8 @@ mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
 }
+#[cfg(feature = "agent-runtime")]
+mod browse;
 mod config;
 #[cfg(feature = "agent-runtime")]
 mod cost;
@@ -210,7 +262,8 @@ use config::Config;
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
     ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands, SkillCommands,
+    SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -259,9 +312,9 @@ enum Commands {
     Onboard {
         /// Configure a specific section only. Omit to run the full flow.
         #[command(subcommand)]
-        section: Option<OnboardSection>,
+        section: Option<zeroclaw_config::sections::Section>,
 
-        /// Skip interactive prompts; read from --api-key/--provider/--model/--memory.
+        /// Skip interactive prompts; read from --api-key/--model-provider/--model/--memory.
         #[arg(long)]
         quick: bool,
 
@@ -281,13 +334,14 @@ enum Commands {
         #[arg(long)]
         reinit: bool,
 
-        /// API key for provider configuration.
+        /// API key for model_provider configuration.
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name (sets providers.fallback).
+        /// ModelProvider name. Used as the type key for the synthesized
+        /// `[model_providers.<type>.default]` entry.
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
         /// Model ID override.
         #[arg(long)]
@@ -309,23 +363,26 @@ enum Commands {
         hardware_only: bool,
         #[arg(long, hide = true)]
         tunnel_only: bool,
-        #[arg(long, hide = true)]
-        workspace_only: bool,
     },
 
     /// Start the AI agent loop
     #[command(long_about = "\
 Start the AI agent loop.
 
-Launches an interactive chat session with the configured AI provider. \
+Launches an interactive chat session with the configured AI model_provider. \
 Use --message for single-shot queries without entering interactive mode.
 
 Examples:
-  zeroclaw agent                              # interactive session
-  zeroclaw agent -m \"Summarize today's logs\"  # single message
-  zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
-  zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0")]
+  zeroclaw agent -a assistant                                          # interactive session
+  zeroclaw agent -a assistant -m \"Summarize today's logs\"              # single message
+  zeroclaw agent -a assistant -p anthropic --model claude-sonnet-4-20250514
+  zeroclaw agent -a assistant --peripheral nucleo-f401re:/dev/ttyACM0")]
     Agent {
+        /// Configured agent alias to run as (must match `[agents.<alias>]`).
+        /// Required — there is no default agent.
+        #[arg(short = 'a', long)]
+        agent: String,
+
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
@@ -334,15 +391,15 @@ Examples:
         #[arg(long)]
         session_state_file: Option<PathBuf>,
 
-        /// Provider to use (openrouter, anthropic, openai, openai-codex)
-        #[arg(short, long)]
-        provider: Option<String>,
+        /// Model provider to use (openrouter, anthropic, openai, openai-codex)
+        #[arg(short = 'p', long = "model-provider", alias = "provider")]
+        model_provider: Option<String>,
 
         /// Model to use
         #[arg(long)]
         model: Option<String>,
 
-        /// Temperature (0.0 - 2.0, defaults to config default_temperature)
+        /// Temperature (0.0 - 2.0, defaults to providers.models.<type>.<alias>.temperature)
         #[arg(short, long, value_parser = parse_temperature)]
         temperature: Option<f64>,
 
@@ -472,11 +529,13 @@ Examples:
 Configure and manage scheduled tasks.
 
 Schedule recurring, one-shot, or interval-based tasks using cron \
-expressions, RFC 3339 timestamps, durations, or fixed intervals.
+expressions, RFC3339 timestamps with explicit Z or offsets, durations, \
+or fixed intervals.
 
 Cron expressions use the standard 5-field format: \
-'min hour day month weekday'. Timezones default to UTC; \
-override with --tz and an IANA timezone name.
+'min hour day month weekday'. When --tz is omitted, cron schedules use \
+the runtime local timezone. For user-facing schedules, pass --tz with \
+an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
@@ -493,13 +552,13 @@ Examples:
         cron_command: CronCommands,
     },
 
-    /// Manage provider model catalogs
+    /// Manage model_provider model catalogs
     Models {
         #[command(subcommand)]
         model_command: ModelCommands,
     },
 
-    /// List supported AI providers
+    /// List supported AI model_providers
     Providers,
 
     /// Manage channels (telegram, discord, slack)
@@ -534,6 +593,23 @@ Examples:
         skill_command: SkillCommands,
     },
 
+    /// Browse the shared workspace one directory at a time
+    #[command(long_about = "\
+List children of a directory under <install>/shared/. Paths are relative \
+to the shared workspace root; `..` traversal that escapes the root is \
+rejected. Used by the dashboard's skill-bundle directory picker and by \
+operators who want to inspect what's installed.
+
+Examples:
+  zeroclaw browse                  # list shared/ root
+  zeroclaw browse skills           # list shared/skills/
+  zeroclaw browse skills/coding    # list shared/skills/coding/")]
+    Browse {
+        /// Path relative to `<install>/shared/`. Empty = root.
+        #[arg(default_value = "")]
+        path: String,
+    },
+
     /// Manage standard operating procedures (SOPs)
     Sop {
         #[command(subcommand)]
@@ -546,7 +622,7 @@ Examples:
         migrate_command: MigrateCommands,
     },
 
-    /// Manage provider subscription authentication profiles
+    /// Manage model_provider subscription authentication profiles
     Auth {
         #[command(subcommand)]
         auth_command: AuthCommands,
@@ -744,24 +820,11 @@ Examples:
     },
 }
 
-/// Section selector for `zeroclaw onboard <section>`.
-#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
-enum OnboardSection {
-    /// Workspace isolation settings.
-    Workspace,
-    /// Provider selection, credentials, and live model picker.
-    Providers,
-    /// Messaging channels (Telegram, Discord, Slack, Matrix, …).
-    Channels,
-    /// Memory backend (sqlite, lucid, markdown, none) + auto-save.
-    Memory,
-    /// Physical hardware transport (native GPIO, serial, probe).
-    Hardware,
-    /// Public tunnel provider (cloudflare, ngrok, tailscale, …).
-    Tunnel,
-    /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
-    Personality,
-}
+// `zeroclaw onboard <section>` parses its positional subcommand into
+// `zeroclaw_config::sections::Section` directly via clap's
+// `Subcommand` derive (gated on the `clap` feature there). No mirror
+// enum, no parallel variant list — the canonical `Section` enum IS
+// the clap surface.
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
 /// `zeroclaw props <anything>` and print a deprecation message.
@@ -771,6 +834,23 @@ enum DeprecatedPropsCommands {
     Any(Vec<String>),
 }
 
+/// Single source of truth for the retired `--*-only` boolean flags. Each
+/// row binds the legacy flag name, the new positional subcommand it
+/// became, and the canonical [`Section`] it routes to. The function
+/// below and its tests both walk this table — no magic positional
+/// bools, no parallel mapping.
+#[cfg(feature = "agent-runtime")]
+const LEGACY_ONBOARD_FLAGS: &[(zeroclaw_config::sections::Section, &str, &str)] = {
+    use zeroclaw_config::sections::Section;
+    &[
+        (Section::Channels, "--channels-only", "channels"),
+        (Section::ModelProviders, "--providers-only", "providers"),
+        (Section::Memory, "--memory-only", "memory"),
+        (Section::Hardware, "--hardware-only", "hardware"),
+        (Section::Tunnel, "--tunnel-only", "tunnel"),
+    ]
+};
+
 /// Resolve the onboard target from the positional `<section>` subcommand
 /// (if any) plus the legacy `--*-only` boolean flags. Returns the target
 /// section for the orchestrator plus an optional `(old_flag, new_subcommand)`
@@ -779,70 +859,29 @@ enum DeprecatedPropsCommands {
 /// Precedence: an explicit positional section always wins for target
 /// selection, even when a legacy flag is also set. The deprecation warning
 /// still fires in that case so the user learns the flag is retired.
+///
+/// `legacy_flags` parallels [`LEGACY_ONBOARD_FLAGS`] in order; the
+/// caller (clap entry point and tests) builds it once from the parsed
+/// CLI bools so the position-encoded mapping is no longer scattered.
 #[cfg(feature = "agent-runtime")]
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "Each bool maps 1:1 to a retired CLI flag; a struct would add call-site noise for a short-lived deprecation shim."
-)]
 fn resolve_onboard_target(
-    explicit: Option<OnboardSection>,
-    channels_only: bool,
-    providers_only: bool,
-    memory_only: bool,
-    hardware_only: bool,
-    tunnel_only: bool,
-    workspace_only: bool,
+    explicit: Option<zeroclaw_config::sections::Section>,
+    legacy_flags: &[bool],
 ) -> (
-    zeroclaw_runtime::onboard::Section,
+    zeroclaw_runtime::onboard::Target,
     Option<(&'static str, &'static str)>,
 ) {
-    use zeroclaw_runtime::onboard::Section;
-
-    let legacy = [
-        (
-            channels_only,
-            Section::Channels,
-            "--channels-only",
-            "channels",
-        ),
-        (
-            providers_only,
-            Section::Providers,
-            "--providers-only",
-            "providers",
-        ),
-        (memory_only, Section::Memory, "--memory-only", "memory"),
-        (
-            hardware_only,
-            Section::Hardware,
-            "--hardware-only",
-            "hardware",
-        ),
-        (tunnel_only, Section::Tunnel, "--tunnel-only", "tunnel"),
-        (
-            workspace_only,
-            Section::Workspace,
-            "--workspace-only",
-            "workspace",
-        ),
-    ]
-    .into_iter()
-    .find(|(flag, ..)| *flag);
-
-    let explicit_section = explicit.map(|s| match s {
-        OnboardSection::Workspace => Section::Workspace,
-        OnboardSection::Providers => Section::Providers,
-        OnboardSection::Channels => Section::Channels,
-        OnboardSection::Memory => Section::Memory,
-        OnboardSection::Hardware => Section::Hardware,
-        OnboardSection::Tunnel => Section::Tunnel,
-        OnboardSection::Personality => Section::Personality,
-    });
-
-    let target = explicit_section
-        .or(legacy.map(|(_, s, _, _)| s))
-        .unwrap_or(Section::All);
-    let deprecation = legacy.map(|(_, _, old, new)| (old, new));
+    debug_assert_eq!(
+        legacy_flags.len(),
+        LEGACY_ONBOARD_FLAGS.len(),
+        "legacy_flags must align with LEGACY_ONBOARD_FLAGS",
+    );
+    let legacy = LEGACY_ONBOARD_FLAGS
+        .iter()
+        .zip(legacy_flags.iter().copied())
+        .find_map(|(row, active)| active.then_some(*row));
+    let target = explicit.or(legacy.map(|(s, ..)| s));
+    let deprecation = legacy.map(|(_, old, new)| (old, new));
     (target, deprecation)
 }
 
@@ -874,8 +913,9 @@ enum ConfigCommands {
     /// the schema fragment for that property only — same payload `OPTIONS
     /// /api/config/prop?path=...` returns over HTTP.
     Schema {
-        /// Property path to scope the schema dump (e.g. `providers.fallback`).
-        /// Without it, dumps the whole-config schema.
+        /// Property path to scope the schema dump (e.g.
+        /// `agents.researcher.model_provider`). Without it, dumps the
+        /// whole-config schema.
         #[arg(long)]
         path: Option<String>,
     },
@@ -939,6 +979,22 @@ enum ConfigCommands {
     },
     /// Print the API explorer URL (plus a hint if the daemon isn't running).
     Docs,
+    /// Generate a canonical config at any supported schema version to stdout.
+    ///
+    /// Runs the embedded V1 fixture through the typed migration chain and
+    /// emits the result at the requested version. Useful for repros, doc
+    /// snippets, and seeding test installs. Valid versions are
+    /// `1..=CURRENT_SCHEMA_VERSION` — invalid inputs error out.
+    Generate {
+        /// Target schema version (e.g. 1, 2, 3). Defaults to current.
+        version: Option<u32>,
+        /// Encrypt secret-bearing string values in the output (api_key,
+        /// bot_token, access_token, password, refresh_token, etc.). Works
+        /// at every schema version via a key-name-based walker. Uses the
+        /// resolved config-dir's `.secret_key` (creates one if missing).
+        #[arg(long)]
+        encrypt: bool,
+    },
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -972,9 +1028,9 @@ enum EstopSubcommands {
 enum AuthCommands {
     /// Login with OAuth (OpenAI Codex or Gemini)
     Login {
-        /// Provider (`openai-codex` or `gemini`)
+        /// ModelProvider (`openai-codex` or `gemini`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -988,9 +1044,9 @@ enum AuthCommands {
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
-        /// Provider (`openai-codex`)
+        /// ModelProvider (`openai-codex`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -1000,9 +1056,9 @@ enum AuthCommands {
     },
     /// Paste setup token / auth token (for Anthropic subscription auth)
     PasteToken {
-        /// Provider (`anthropic`)
+        /// ModelProvider (`anthropic`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
@@ -1015,36 +1071,36 @@ enum AuthCommands {
     },
     /// Alias for `paste-token` (interactive by default)
     SetupToken {
-        /// Provider (`anthropic`)
+        /// ModelProvider (`anthropic`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
     },
     /// Refresh OpenAI Codex access token using refresh token
     Refresh {
-        /// Provider (`openai-codex`)
+        /// ModelProvider (`openai-codex`)
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name or profile id
         #[arg(long)]
         profile: Option<String>,
     },
     /// Remove auth profile
     Logout {
-        /// Provider
+        /// ModelProvider
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
     },
-    /// Set active profile for a provider
+    /// Set active profile for a model_provider
     Use {
-        /// Provider
+        /// ModelProvider
         #[arg(long)]
-        provider: String,
+        model_provider: String,
         /// Profile name or full profile id
         #[arg(long)]
         profile: String,
@@ -1057,13 +1113,13 @@ enum AuthCommands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
-    /// Refresh and cache provider models
+    /// Refresh and cache model_provider models
     Refresh {
-        /// Provider name (defaults to configured default provider)
+        /// ModelProvider name (defaults to configured default model_provider)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
-        /// Refresh all providers that support live model discovery
+        /// Refresh all model_providers that support live model discovery
         #[arg(long)]
         all: bool,
 
@@ -1071,11 +1127,11 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a provider
+    /// List cached models for a model_provider
     List {
-        /// Provider name (defaults to configured default provider)
+        /// ModelProvider name (defaults to configured default model_provider)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
     },
     /// Set the default model in config
     Set {
@@ -1088,11 +1144,11 @@ enum ModelCommands {
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
-    /// Probe model catalogs across providers and report availability
+    /// Probe model catalogs across model_providers and report availability
     Models {
-        /// Probe a specific provider only (default: all known providers)
+        /// Probe a specific model_provider only (default: all known model_providers)
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
 
         /// Prefer cached catalogs when available (skip forced live refresh)
         #[arg(long)]
@@ -1190,12 +1246,12 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
-    // Install default crypto provider for Rustls TLS.
+    // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
     #[cfg(feature = "agent-runtime")]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-        eprintln!("Warning: Failed to install default crypto provider: {e:?}");
+        eprintln!("Warning: Failed to install default crypto model_provider: {e:?}");
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -1257,17 +1313,10 @@ async fn main() -> Result<()> {
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
-    let subscriber = fmt::Subscriber::builder()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
-        )
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    zeroclaw_log::install_global_subscriber(default_log_level);
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
-    // provider flags were given, it runs the full interactive wizard; otherwise
+    // model_provider flags were given, it runs the full interactive wizard; otherwise
     // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
     // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
     // detection fails.  This means `curl … | bash` and
@@ -1282,7 +1331,7 @@ async fn main() -> Result<()> {
         force,
         reinit,
         api_key,
-        provider,
+        model_provider,
         model,
         memory,
         channels_only,
@@ -1290,7 +1339,6 @@ async fn main() -> Result<()> {
         memory_only,
         hardware_only,
         tunnel_only,
-        workspace_only,
     } = &cli.command
     {
         use zeroclaw_runtime::onboard::ui::{QuickUi, TermUi};
@@ -1298,12 +1346,16 @@ async fn main() -> Result<()> {
 
         let (target, deprecation) = resolve_onboard_target(
             *section,
-            *channels_only,
-            *providers_only,
-            *memory_only,
-            *hardware_only,
-            *tunnel_only,
-            *workspace_only,
+            // Order matches LEGACY_ONBOARD_FLAGS row order. Adding a
+            // legacy flag means: add a row to that const + a slot
+            // here, nowhere else.
+            &[
+                *channels_only,
+                *providers_only,
+                *memory_only,
+                *hardware_only,
+                *tunnel_only,
+            ],
         );
         if let Some((old, new)) = deprecation {
             eprintln!("warning: {old} is deprecated; use `zeroclaw onboard {new}` instead");
@@ -1336,13 +1388,12 @@ async fn main() -> Result<()> {
         }
 
         let mut cfg = Box::pin(Config::load_or_init()).await?;
-        cfg.apply_env_overrides();
 
         let flags = Flags {
             force: *force,
             reinit: *reinit,
             api_key: api_key.clone(),
-            provider: provider.clone(),
+            model_provider: model_provider.clone(),
             model: model.clone(),
             memory: memory.clone(),
         };
@@ -1358,11 +1409,11 @@ async fn main() -> Result<()> {
             (true, true) => bail!("--quick and --cli are mutually exclusive"),
             (true, false) => {
                 let mut ui = QuickUi::new();
-                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
             }
             (false, true) => {
                 let mut ui = TermUi;
-                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
             }
             (false, false) => {
                 // Default: prefer ratatui TUI. Fall back to TermUi on init
@@ -1374,39 +1425,46 @@ async fn main() -> Result<()> {
                     if std::io::stdout().is_terminal() {
                         match zeroclaw_tui::RatatuiUi::new() {
                             Ok(mut ui) => {
-                                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                                Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
                             }
                             Err(e) => {
-                                tracing::debug!("TUI init failed: {e:?}");
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                                    "TUI init failed"
+                                );
                                 eprintln!(
                                     "TUI init failed ({e}); falling back to terminal prompts."
                                 );
                                 let mut ui = TermUi;
-                                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                                Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
                             }
                         }
                     } else {
                         let mut ui = TermUi;
-                        run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                        Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
                     }
                 }
                 #[cfg(not(feature = "tui-onboarding"))]
                 {
                     let mut ui = TermUi;
-                    run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                    Box::pin(run_onboard(&mut cfg, &mut ui, target, &flags)).await?;
                 }
             }
         }
 
-        cfg.save().await?;
+        Box::pin(cfg.save_dirty()).await?;
         return Ok(());
     }
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
-    config.apply_env_overrides();
     #[cfg(feature = "agent-runtime")]
-    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -1427,39 +1485,71 @@ async fn main() -> Result<()> {
         // Kernel-only mode: minimal CLI agent without channels/tools/gateway
         match cli.command {
             Commands::Agent {
+                agent: agent_alias,
                 message,
-                provider,
+                model_provider,
                 model,
                 temperature,
                 ..
             } => {
-                let fallback = config.providers.fallback_provider();
-                let final_temperature = temperature
-                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
-                if let Some(p) = &provider {
-                    config.providers.fallback = Some(p.clone());
+                if config.agent(&agent_alias).is_none() {
+                    anyhow::bail!(
+                        "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                    );
                 }
-                if let Some(m) = &model {
-                    config.ensure_fallback_provider().model = Some(m.clone());
+                let final_temperature = temperature.unwrap_or_else(|| {
+                    config
+                        .first_model_provider()
+                        .and_then(|e| e.temperature)
+                        .unwrap_or(0.7)
+                });
+                if let Some(p) = &model_provider {
+                    // Upsert the requested model_provider type under "default" alias.
+                    let entry = config
+                        .providers
+                        .models
+                        .ensure(p, "default")
+                        .ok_or_else(|| {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"family": p})),
+                                "ask CLI refused: --model-provider names an unknown family"
+                            );
+                            anyhow::Error::msg(format!(
+                                "Unknown model_provider family: {p}. \
+                             Run `zeroclaw onboard model_providers` to see configured options."
+                            ))
+                        })?;
+                    if let Some(m) = &model {
+                        entry.model = Some(m.clone());
+                    }
+                    entry.temperature = Some(final_temperature);
+                } else if config.first_model_provider().is_none() {
+                    anyhow::bail!(
+                        "No model model_provider configured. Pass --model-provider <type> or run \
+                         `zeroclaw onboard model_providers` to configure one."
+                    );
                 }
-                config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
-                let provider = zeroclaw::providers::create_provider(
+                let provider_name = config.first_model_provider_type().unwrap_or("openai");
+                let model_provider = zeroclaw::providers::create_model_provider(
                     provider_name,
                     config
-                        .providers
-                        .fallback_provider()
+                        .first_model_provider()
                         .and_then(|e| e.api_key.as_deref()),
                 )?;
                 let model_name = config
-                    .providers
-                    .fallback_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
                 match message {
                     Some(msg) => {
-                        let response = provider
+                        let response = model_provider
                             .simple_chat(&msg, model_name, Some(final_temperature))
                             .await?;
                         println!("{response}");
@@ -1474,7 +1564,7 @@ async fn main() -> Result<()> {
                             if stdin.read_line(&mut line)? == 0 {
                                 break;
                             }
-                            let response = provider
+                            let response = model_provider
                                 .simple_chat(line.trim(), model_name, Some(final_temperature))
                                 .await?;
                             println!("{response}");
@@ -1505,10 +1595,10 @@ async fn main() -> Result<()> {
         // registered"). `register_delivery_fn` is idempotent (backed by
         // `OnceLock::set`), so calling it once here is safe.
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |config, channel, target, output| {
+            |config, channel, target, thread_id, output| {
                 Box::pin(async move {
                     zeroclaw_channels::orchestrator::deliver_announcement(
-                        &config, &channel, &target, &output,
+                        &config, &channel, &target, thread_id, &output,
                     )
                     .await
                 })
@@ -1524,36 +1614,46 @@ async fn main() -> Result<()> {
         | Commands::MarkdownSchema => unreachable!(),
 
         Commands::Agent {
+            agent: agent_alias,
             message,
             session_state_file,
-            provider,
+            model_provider,
             model,
             temperature,
             peripheral,
         } => {
-            let final_temperature = temperature.unwrap_or_else(|| {
+            let final_temperature: Option<f64> = temperature.or_else(|| {
                 config
-                    .providers
-                    .fallback_provider()
+                    .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.temperature)
-                    .unwrap_or(0.7)
             });
+
+            // Validate up-front: bail with a clear message if the alias
+            // isn't configured. The runtime would error too, but this
+            // catches typos before any subsystem spins up.
+            if config.agent(&agent_alias).is_none() {
+                anyhow::bail!(
+                    "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
+                );
+            }
 
             // Wire CLI channel for interactive mode
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+                Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
             Box::pin(agent::run(
                 config,
+                &agent_alias,
                 message,
-                provider,
+                model_provider,
                 model,
                 final_temperature,
                 peripheral,
                 true,
                 session_state_file,
                 None,
+                zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
             ))
             .await
             .map(|_| ())
@@ -1563,15 +1663,35 @@ async fn main() -> Result<()> {
             max_sessions,
             session_timeout,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig::default();
+            let mut acp_config = channels::acp_server::AcpServerConfig {
+                max_sessions: config.acp.max_sessions,
+                session_timeout_secs: config.acp.session_timeout_secs,
+            };
             if let Some(max) = max_sessions {
                 acp_config.max_sessions = max;
             }
             if let Some(timeout) = session_timeout {
                 acp_config.session_timeout_secs = timeout;
             }
-            let server =
-                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config));
+            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+                .map(std::sync::Arc::new)
+                .inspect_err(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Failed to open ACP session store"
+                    );
+                })
+                .ok();
+            let server = if let Some(store) = store {
+                std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
+                    config, acp_config, store,
+                ))
+            } else {
+                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
+            };
             server.run().await
         }
 
@@ -1580,13 +1700,26 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let addr = format!("{host}:{port}");
-                    info!("🔄 Restarting ZeroClaw Gateway on {addr}");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"addr": addr})),
+                        "🔄 Restarting ZeroClaw Gateway on"
+                    );
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
                     match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
                     {
                         Ok(()) => {
-                            info!("   ✓ Existing gateway on {addr} shut down gracefully");
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"addr": addr})),
+                                "✓ Existing gateway on shut down gracefully"
+                            );
                             // Poll until the port is free (connection refused) or timeout
                             let deadline =
                                 tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -1594,8 +1727,15 @@ async fn main() -> Result<()> {
                                 match tokio::net::TcpStream::connect(&addr).await {
                                     Err(_) => break, // port is free
                                     Ok(_) if tokio::time::Instant::now() >= deadline => {
-                                        warn!(
-                                            "   Timed out waiting for port {port} to be released"
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                            .with_attrs(::serde_json::json!({"port": port})),
+                                            "Timed out waiting for port to be released"
                                         );
                                         break;
                                     }
@@ -1607,20 +1747,27 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            info!("   No existing gateway to shut down: {e}");
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "   No existing gateway to shut down"
+                            );
                         }
                     }
 
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
-                    let host = &config.gateway.host;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                    match fetch_paircode(&host, port, config.gateway.path_prefix.as_deref(), new)
                         .await
                     {
                         Ok(Some(code)) => {
@@ -1691,25 +1838,47 @@ async fn main() -> Result<()> {
                     } else {
                         "Consider installing to /usr/local/bin for system-wide service."
                     };
-                    tracing::warn!(
-                        "Daemon running from user home directory: {}. {install_hint}",
-                        exe.display(),
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Daemon running from user home directory: {}. {install_hint}",
+                            exe.display()
+                        )
                     );
                 }
             }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
-                info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"host": host})),
+                    "🧠 Starting ZeroClaw Daemon on (random port)"
+                );
             } else {
-                info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"host": host, "port": port})),
+                    "🧠 Starting ZeroClaw Daemon on"
+                );
             }
 
             #[cfg(target_os = "linux")]
             {
                 use zeroclaw_config::schema::SandboxBackend;
-                let sandbox_docker =
-                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                // Any enabled agent whose risk_profile uses the docker
+                // sandbox triggers the warning — we just need to know
+                // *some* agent is using it.
+                let sandbox_docker = config
+                    .agents
+                    .iter()
+                    .filter(|(_, a)| a.enabled)
+                    .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
+                    .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
                 let runtime_docker_mem = config.runtime.kind == "docker"
                     && config
                         .runtime
@@ -1726,12 +1895,12 @@ async fn main() -> Result<()> {
                         (true, false) => "security.sandbox.backend = \"docker\"",
                         _ => "runtime.kind = \"docker\"",
                     };
-                    warn!(
-                        "Docker memory limits are configured but the Linux kernel has no memcg support. \
-                         Affected config: {which}. \
-                         Consequence: --memory limits are silently ignored; agents can OOM the host. \
-                         Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt \
-                         (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot."
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"which": which})),
+                        "Docker memory limits are configured but the Linux kernel has no memcg support. Affected config: . Consequence: --memory limits are silently ignored; agents can OOM the host. Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot."
                     );
                 }
             }
@@ -1739,7 +1908,7 @@ async fn main() -> Result<()> {
             // Wire CLI channel for interactive mode
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
-                Box::new(zeroclaw_channels::cli::CliChannel::new())
+                Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
             // Wire peripheral tools from zeroclaw-hardware
@@ -1757,7 +1926,7 @@ async fn main() -> Result<()> {
             // surface and the channel-server agents so canvas frames pushed
             // from Telegram / Discord / Slack reach the same subscribers the
             // web UI serves. Without this, channels build an orphaned
-            // CanvasStore::default() and frames are silently dropped (#5356).
+            // CanvasStore::default() and frames are silently dropped.
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
@@ -1792,12 +1961,13 @@ async fn main() -> Result<()> {
                     })),
                     #[cfg(not(feature = "gateway"))]
                     gateway_start: None,
-                    channels_start: Some(Box::new(move |config| {
+                    channels_start: Some(Box::new(move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_channels::orchestrator::start_channels(
                                 config,
                                 Some(canvas_store),
+                                cancel,
                             ))
                             .await
                         })
@@ -1808,7 +1978,7 @@ async fn main() -> Result<()> {
                         use zeroclaw_memory::NoneMemory;
                         use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
                         let sop_config = current_config.sop.clone();
-                        let workspace_dir = current_config.workspace_dir.clone();
+                        let workspace_dir = current_config.data_dir.clone();
                         move |mqtt_config| {
                             let engine = if sop_config.sops_dir.is_some() {
                                 let mut e = SopEngine::new(sop_config.clone());
@@ -1818,7 +1988,8 @@ async fn main() -> Result<()> {
                                 SopEngine::new(SopConfig::default())
                             };
                             let engine = Arc::new(Mutex::new(engine));
-                            let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+                            let audit =
+                                Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                             Box::pin(async move {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
@@ -1840,9 +2011,15 @@ async fn main() -> Result<()> {
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
-                        info!("🔄 Daemon reload — re-reading config from disk");
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "🔄 Daemon reload — re-reading config from disk"
+                        );
                         current_config = Box::pin(Config::load_or_init()).await?;
-                        current_config.apply_env_overrides();
                         // Continue loop: fresh subsystems with the new config.
                     }
                 }
@@ -1877,37 +2054,53 @@ async fn main() -> Result<()> {
             println!("🦀 ZeroClaw Status");
             println!();
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
-            println!("Workspace:   {}", config.workspace_dir.display());
+            println!("Workspace:   {}", config.data_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
             println!(
-                "🤖 Provider:      {}",
-                config.providers.fallback.as_deref().unwrap_or("openrouter")
+                "🤖 ModelProvider:      {}",
+                config.first_model_provider_type().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
                 config
-                    .providers
-                    .fallback_provider()
+                    .first_model_provider()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
                 "🧾 Trace storage:  {} ({})",
-                config.observability.runtime_trace_mode, config.observability.runtime_trace_path
+                config.observability.log_persistence, config.observability.log_persistence_path
             );
-            println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
+            // Per-agent autonomy: each enabled agent picks its own
+            // risk_profile, so list them rather than collapsing to one.
+            let mut agent_aliases: Vec<&String> = config
+                .agents
+                .iter()
+                .filter(|(_, a)| a.enabled)
+                .map(|(alias, _)| alias)
+                .collect();
+            agent_aliases.sort();
+            if agent_aliases.is_empty() {
+                println!("🛡️  Agents:        (none configured)");
+            } else {
+                let summary: Vec<String> = agent_aliases
+                    .iter()
+                    .map(|alias| match config.risk_profile_for_agent(alias) {
+                        Some(p) => format!("{alias}={:?}", p.level),
+                        None => format!("{alias}=<no risk_profile>"),
+                    })
+                    .collect();
+                println!("🛡️  Agents:        {}", summary.join(", "));
+            }
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             if service::is_running() {
                 println!("🟢 Service:       running");
             } else {
                 println!("🔴 Service:       stopped");
             }
-            let effective_memory_backend = memory::effective_memory_backend_name(
-                &config.memory.backend,
-                Some(&config.storage.provider.config),
-            );
+            let effective_memory_backend = config.resolve_active_storage().kind();
             println!(
                 "💓 Heartbeat:      {}",
                 if config.heartbeat.enabled {
@@ -1923,24 +2116,31 @@ async fn main() -> Result<()> {
             );
 
             println!();
-            println!("Security:");
-            println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!(
-                "  Allowed roots:     {}",
-                if config.autonomy.allowed_roots.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    config.autonomy.allowed_roots.join(", ")
-                }
-            );
-            println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
-            );
-            println!(
-                "  Max actions/hour:  {}",
-                config.autonomy.max_actions_per_hour
-            );
+            // Per-agent security: each enabled agent's risk profile.
+            for alias in &agent_aliases {
+                let Some(profile) = config.risk_profile_for_agent(alias) else {
+                    println!("Security ({alias}): <no risk_profile>");
+                    continue;
+                };
+                println!("Security ({alias}):");
+                println!("  Workspace only:    {}", profile.workspace_only);
+                println!(
+                    "  Allowed roots:     {}",
+                    if profile.allowed_roots.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        profile.allowed_roots.join(", ")
+                    }
+                );
+                println!(
+                    "  Allowed commands:  {}",
+                    profile.allowed_commands.join(", ")
+                );
+                let actions_cap = config
+                    .runtime_profile_for_agent(alias)
+                    .map_or(0, |r| r.max_actions_per_hour);
+                println!("  Max actions/hour:  {actions_cap}");
+            }
             println!(
                 "  Cost tracking:     {}",
                 if config.cost.enabled {
@@ -1952,7 +2152,7 @@ async fn main() -> Result<()> {
             println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
             println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
             if config.cost.enabled {
-                match cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+                match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
                     Ok(tracker) => match tracker.get_summary() {
                         Ok(summary) => {
                             println!(
@@ -2014,46 +2214,38 @@ async fn main() -> Result<()> {
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
         Commands::Models { model_command } => {
-            let provider = match &model_command {
-                ModelCommands::Refresh { provider, .. } | ModelCommands::List { provider } => {
-                    provider.as_deref()
-                }
+            let model_provider = match &model_command {
+                ModelCommands::Refresh { model_provider, .. }
+                | ModelCommands::List { model_provider } => model_provider.as_deref(),
                 _ => None,
             };
-            doctor::run_models(&config, provider, false).await
+            doctor::run_models(&config, model_provider, false).await
         }
 
         Commands::Providers => {
-            let providers = providers::list_providers();
+            let model_providers = zeroclaw_providers::list_model_providers();
             let current = config
-                .providers
-                .fallback
-                .as_deref()
+                .first_model_provider_type()
                 .unwrap_or("openrouter")
                 .trim()
                 .to_ascii_lowercase();
-            println!("Supported providers ({} total):\n", providers.len());
+            println!(
+                "Supported model model_providers ({} total):\n",
+                model_providers.len()
+            );
             println!("  ID (use in config)  DESCRIPTION");
             println!("  ─────────────────── ───────────");
-            for p in &providers {
-                let is_active = p.name.eq_ignore_ascii_case(&current)
-                    || p.aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(&current));
+            for p in &model_providers {
+                let is_active = p.name.eq_ignore_ascii_case(&current);
                 let marker = if is_active { " (active)" } else { "" };
                 let local_tag = if p.local { " [local]" } else { "" };
-                let aliases = if p.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!("  (aliases: {})", p.aliases.join(", "))
-                };
-                println!(
-                    "  {:<19} {}{}{}{}",
-                    p.name, p.display_name, local_tag, marker, aliases
-                );
+                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
             }
-            println!("\n  custom:<URL>   Any OpenAI-compatible endpoint");
-            println!("  anthropic-custom:<URL>  Any Anthropic-compatible endpoint");
+            println!(
+                "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [model_providers.anthropic.<alias>] \
+                 uri = \"<URL>\" for an Anthropic-compatible endpoint."
+            );
             Ok(())
         }
 
@@ -2067,9 +2259,9 @@ async fn main() -> Result<()> {
 
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
-                provider,
+                model_provider,
                 use_cache,
-            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
+            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
@@ -2086,7 +2278,10 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config, None)).await,
+            ChannelCommands::Start => {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                Box::pin(channels::start_channels(config, None, cancel)).await
+            }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
@@ -2095,7 +2290,9 @@ async fn main() -> Result<()> {
             integration_command,
         } => integrations::handle_command(integration_command, &config),
 
-        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+        Commands::Skills { skill_command } => skills::handle_command(skill_command, &config).await,
+
+        Commands::Browse { path } => browse::handle_browse(path, &config),
 
         Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 
@@ -2319,6 +2516,8 @@ async fn main() -> Result<()> {
             }
             ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();
+                println!("Legend: \u{1f489} env-overridden  \u{1f512} secret");
+                println!();
                 let mut current_category = "";
                 for entry in &entries {
                     if secrets && !entry.is_secret {
@@ -2336,9 +2535,14 @@ async fn main() -> Result<()> {
                         println!("{}:", entry.category);
                         current_category = entry.category;
                     }
+                    let env = if config.prop_is_env_overridden(&entry.name) {
+                        "\u{1f489} "
+                    } else {
+                        "  "
+                    };
                     let lock = if entry.is_secret { " \u{1f512}" } else { "" };
                     println!(
-                        "  {:<45} = {:<20} ({}){lock}",
+                        "{env}{:<45} = {:<20} ({}){lock}",
                         entry.name, entry.display_value, entry.type_hint
                     );
                 }
@@ -2387,7 +2591,7 @@ async fn main() -> Result<()> {
                             // uses; never hardcode a code at the call site.
                             let api_err =
                                 zeroclaw_config::api_error::ConfigApiError::from_validation(
-                                    anyhow::anyhow!("{e}"),
+                                    anyhow::Error::msg(e.to_string()),
                                 )
                                 .with_path(&path);
                             if json {
@@ -2407,13 +2611,21 @@ async fn main() -> Result<()> {
                 comment,
                 json,
             } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 if no_interactive {
                     let val = value.ok_or_else(|| {
-                        anyhow::anyhow!(
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"path": path})),
+                            "config set --no-interactive refused: positional value missing"
+                        );
+                        anyhow::Error::msg(format!(
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
-                        )
+                        ))
                     })?;
-                    config.set_prop(&path, &val)?;
+                    config.set_prop_persistent(&path, &val)?;
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -2427,9 +2639,9 @@ async fn main() -> Result<()> {
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop(&path, &secret_value)?;
+                    config.set_prop_persistent(&path, &secret_value)?;
                 } else if let Some(val) = value {
-                    config.set_prop(&path, &val)?;
+                    config.set_prop_persistent(&path, &val)?;
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
                     let variants = field_info.as_ref().and_then(|info| {
@@ -2447,7 +2659,7 @@ async fn main() -> Result<()> {
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop(&path, &variants[selected])?;
+                        config.set_prop_persistent(&path, &variants[selected])?;
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -2483,12 +2695,12 @@ async fn main() -> Result<()> {
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        config.set_prop(&path, &val)?;
+                        config.set_prop_persistent(&path, &val)?;
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
                 }
-                config.save().await?;
+                Box::pin(config.save_dirty()).await?;
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
                 {
@@ -2508,13 +2720,17 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
                     .into_iter()
                     .map(str::to_string)
                     .collect();
                 if !initialized.is_empty() {
-                    config.save().await?;
+                    for section in &initialized {
+                        config.mark_dirty(section);
+                    }
+                    Box::pin(config.save_dirty()).await?;
                 }
                 if json {
                     let envelope = serde_json::json!({"initialized": initialized});
@@ -2534,26 +2750,18 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Migrate { json } => {
-                let raw = tokio::fs::read_to_string(&config.config_path)
-                    .await
-                    .context("Failed to read config file")?;
-                match crate::config::migration::migrate_file(&raw)? {
-                    Some(migrated) => {
-                        let backup_path = config.config_path.with_extension("toml.bak");
-                        tokio::fs::copy(&config.config_path, &backup_path)
-                            .await
-                            .context("Failed to create config backup")?;
-                        tokio::fs::write(&config.config_path, &migrated).await?;
-                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                match crate::config::migration::migrate_file_in_place(&config.config_path)? {
+                    Some(report) => {
+                        let to = report.to_version;
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": true,
-                                "backup_path": backup_path.display().to_string(),
+                                "backup_path": report.backup_path.display().to_string(),
                                 "schema_version": to,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
-                            println!("Backed up to {}", backup_path.display());
+                            println!("Backed up to {}", report.backup_path.display());
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
@@ -2575,52 +2783,165 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
                         let mut buf = String::new();
-                        std::io::stdin()
-                            .read_to_string(&mut buf)
-                            .context("Failed to read JSON Patch from stdin")?;
+                        if let Err(err) = std::io::stdin().read_to_string(&mut buf) {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from stdin: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from stdin: {err}"),
+                            )?;
+                        }
                         buf
                     }
-                    Some(path) => tokio::fs::read_to_string(path)
-                        .await
-                        .with_context(|| format!("Failed to read JSON Patch from {path}"))?,
+                    Some(path) => match tokio::fs::read_to_string(path).await {
+                        Ok(body) => body,
+                        Err(err) => {
+                            let api_err = ConfigApiError::new(
+                                ConfigApiCode::InternalError,
+                                format!("failed to read JSON Patch from {path}: {err}"),
+                            );
+                            config_patch_fail_json_or_human(
+                                json,
+                                api_err,
+                                format!("Failed to read JSON Patch from {path}: {err}"),
+                            )?
+                        }
+                    },
                 };
 
-                let ops: Vec<serde_json::Value> = serde_json::from_str(body.trim())
-                    .context("JSON Patch body must be a JSON array of operations")?;
+                let parsed: serde_json::Value = match serde_json::from_str(body.trim()) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        let api_err = config_patch_json_value_type_error(
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            format!("JSON Patch body must be valid JSON: {err}"),
+                        )?
+                    }
+                };
+                let ops = match parsed.as_array() {
+                    Some(ops) => ops,
+                    None => {
+                        let api_err = config_patch_json_value_type_error(
+                            "JSON Patch body must be a JSON array of operations",
+                            None,
+                            None,
+                        );
+                        config_patch_fail_json_or_human(
+                            json,
+                            api_err,
+                            "JSON Patch body must be a JSON array of operations",
+                        )?
+                    }
+                };
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
-                    let op_name = op
-                        .get("op")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `op` field"))?;
-                    let raw_path = op
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("op[{idx}]: missing `path` field"))?;
+                    let object = match op.as_object() {
+                        Some(object) => object,
+                        None => {
+                            let message = format!("JSON Patch op[{idx}] must be an object");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let op_name = match object.get("op").and_then(|v| v.as_str()) {
+                        Some(op_name) => op_name,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `op` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
+                    let raw_path = match object.get("path").and_then(|v| v.as_str()) {
+                        Some(raw_path) => raw_path,
+                        None => {
+                            let message =
+                                format!("JSON Patch op[{idx}] requires string `path` field");
+                            let api_err = config_patch_json_value_type_error(
+                                message.clone(),
+                                None,
+                                Some(idx),
+                            );
+                            config_patch_fail_json_or_human(json, api_err, message)?
+                        }
+                    };
                     let path = if let Some(stripped) = raw_path.strip_prefix('/') {
                         stripped.replace('/', ".")
                     } else {
                         raw_path.to_string()
+                    };
+                    let comment = match object.get("comment") {
+                        Some(value) => match value.as_str() {
+                            Some(comment) => Some(comment),
+                            None => {
+                                let message = format!(
+                                    "JSON Patch op[{idx}] `comment` field must be a string"
+                                );
+                                let api_err = config_patch_json_value_type_error(
+                                    message.clone(),
+                                    Some(path.clone()),
+                                    Some(idx),
+                                );
+                                config_patch_fail_json_or_human(json, api_err, message)?
+                            }
+                        },
+                        None => None,
                     };
                     let is_secret = Config::prop_is_secret(&path);
 
                     let result_entry: serde_json::Value = match op_name {
                         "add" | "replace" => {
                             let value = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "op": op_name,
+                                            "op_index": idx,
+                                            "path": path,
+                                        })
+                                    ),
+                                    "config patch op rejected: missing `value` field"
+                                );
+                                anyhow::Error::msg(format!(
                                     "op[{idx}] `{op_name}` on `{path}`: missing `value` field"
-                                )
+                                ))
                             })?;
                             let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config.set_prop(&path, &value_str).with_context(|| {
-                                format!("op[{idx}] `{op_name}` on `{path}` failed")
-                            })?;
+                            config
+                                .set_prop_persistent(&path, &value_str)
+                                .with_context(|| {
+                                    format!("op[{idx}] `{op_name}` on `{path}` failed")
+                                })?;
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -2636,7 +2957,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop(&path, "").with_context(|| {
+                            config.set_prop_persistent(&path, "").with_context(|| {
                                 format!("op[{idx}] `remove` on `{path}` failed")
                             })?;
                             if is_secret {
@@ -2655,28 +2976,66 @@ async fn main() -> Result<()> {
                         }
                         "test" => {
                             if is_secret {
-                                anyhow::bail!(
+                                let err =
+                                    ConfigApiError::secret_test_forbidden(&path).with_op_index(idx);
+                                let human = format!(
                                     "op[{idx}] `test` on `{path}`: secret_test_forbidden \
                                      \u{2014} test ops are not allowed against secret paths"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
-                            let want = op.get("value").ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "op[{idx}] `test` on `{path}`: missing `value` field"
-                                )
-                            })?;
-                            let actual = config.get_prop(&path).with_context(|| {
-                                format!("op[{idx}] `test` on `{path}` failed to read current value")
-                            })?;
-                            let want_str = match want {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
+                            let want = match op.get("value") {
+                                Some(value) => value,
+                                None => {
+                                    let err = ConfigApiError::new(
+                                        ConfigApiCode::ValueTypeMismatch,
+                                        "JSON Patch `test` op requires `value` field",
+                                    )
+                                    .with_path(&path)
+                                    .with_op_index(idx);
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}`: missing `value` field"
+                                    );
+                                    config_patch_fail_json_or_human(json, err, human)?
+                                }
+                            };
+                            let actual = match config.get_prop(&path) {
+                                Ok(actual) => actual,
+                                Err(err) => {
+                                    let human = format!(
+                                        "op[{idx}] `test` on `{path}` failed to read current value: {err}"
+                                    );
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    config_patch_fail_json_or_human(json, api_err, human)?
+                                }
+                            };
+                            let want_str = match zeroclaw_config::typed_value::coerce_for_set_prop(
+                                want,
+                                config_patch_prop_kind(&config, &path),
+                            ) {
+                                Ok(want_str) => want_str,
+                                Err(err) => {
+                                    let err = err.with_path(&path).with_op_index(idx);
+                                    config_patch_fail_json_or_human(
+                                        json,
+                                        err.clone(),
+                                        err.message.clone(),
+                                    )?
+                                }
                             };
                             if actual != want_str {
-                                anyhow::bail!(
-                                    "op[{idx}] `test` on `{path}` failed: \
-                                     expected {want_str}, got {actual}"
+                                let err = ConfigApiError::new(
+                                    ConfigApiCode::ValidationFailed,
+                                    format!(
+                                        "`test` op failed: expected {want_str:?}, got {actual:?}"
+                                    ),
+                                )
+                                .with_path(&path)
+                                .with_op_index(idx);
+                                let human = format!(
+                                    "op[{idx}] `test` on `{path}` failed: expected {want_str}, got {actual}"
                                 );
+                                config_patch_fail_json_or_human(json, err, human)?;
                             }
                             serde_json::json!({
                                 "op": "test",
@@ -2685,13 +3044,24 @@ async fn main() -> Result<()> {
                             })
                         }
                         "move" | "copy" => {
-                            anyhow::bail!(
+                            let err = ConfigApiError::op_not_supported(op_name)
+                                .with_path(&path)
+                                .with_op_index(idx);
+                            let human = format!(
                                 "op[{idx}] `{op_name}` on `{path}`: op_not_supported \
                                  \u{2014} move/copy require a reference graph that is not built yet"
                             );
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                         other => {
-                            anyhow::bail!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            let err = ConfigApiError::new(
+                                ConfigApiCode::OpNotSupported,
+                                format!("unknown JSON Patch operation `{other}`"),
+                            )
+                            .with_path(&path)
+                            .with_op_index(idx);
+                            let human = format!("op[{idx}] unknown JSON Patch operation `{other}`");
+                            config_patch_fail_json_or_human(json, err, human)?
                         }
                     };
                     results.push(result_entry);
@@ -2700,7 +3070,7 @@ async fn main() -> Result<()> {
                 config
                     .validate()
                     .context("validation failed after applying patch \u{2014} no changes saved")?;
-                config.save().await?;
+                Box::pin(config.save_dirty()).await?;
 
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
@@ -2761,6 +3131,20 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
+            ConfigCommands::Generate { version, encrypt } => {
+                let target = version.unwrap_or(crate::config::migration::CURRENT_SCHEMA_VERSION);
+                let zeroclaw_dir = config
+                    .config_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf);
+                let opts = crate::config::migration::GenerateOptions {
+                    encrypt_secrets: encrypt,
+                    secret_store_dir: zeroclaw_dir.as_deref(),
+                };
+                let toml_out = crate::config::migration::generate(target, &opts)?;
+                print!("{toml_out}");
+                Ok(())
+            }
         },
 
         Commands::Props { .. } => {
@@ -2773,7 +3157,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("No plugins installed.");
@@ -2791,19 +3175,19 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 host.install(&source)?;
                 println!("Plugin installed from {source}");
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 host.remove(&name)?;
                 println!("Plugin '{name}' removed.");
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!("Plugin: {} v{}", info.name, info.version);
@@ -3011,7 +3395,9 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
                 r#"
 # Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
-    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    # Capture the original clap-generated function body so the wrapper
+    # can fall back to it without entering an infinite recursion loop.
+    eval "$(declare -f _zeroclaw | sed '1s/_zeroclaw/_zeroclaw_clap_orig/')"
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
         if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
@@ -3076,9 +3462,19 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 /// Log gateway startup message.
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
-        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"host": host})),
+            "🚀 Starting ZeroClaw Gateway on (random port)"
+        );
     } else {
-        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"host": host, "port": port})),
+            "🚀 Starting ZeroClaw Gateway on"
+        );
     }
 }
 
@@ -3095,11 +3491,31 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
         .await
     {
         Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => Err(anyhow::anyhow!(
-            "Gateway responded with status: {}",
-            response.status()
-        )),
-        Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
+        Ok(response) => {
+            let status = response.status();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"endpoint": url, "status": status.as_u16()})),
+                "gateway admin shutdown returned non-success status"
+            );
+            Err(anyhow::Error::msg(format!(
+                "Gateway responded with status: {status}"
+            )))
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"endpoint": url, "error": format!("{}", e)})),
+                "gateway admin shutdown: connect failed"
+            );
+            Err(anyhow::Error::msg(format!(
+                "Failed to connect to gateway: {e}"
+            )))
+        }
     }
 }
 
@@ -3132,19 +3548,39 @@ async fn fetch_paircode(
             .await
     };
 
-    let response = response.map_err(|e| anyhow::anyhow!("Failed to connect to gateway: {e}"))?;
+    let response = response.map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "gateway paircode fetch: connect failed"
+        );
+        anyhow::Error::msg(format!("Failed to connect to gateway: {e}"))
+    })?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Gateway responded with status: {}",
-            response.status()
-        ));
+        let status = response.status();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+            "gateway paircode fetch returned non-success status"
+        );
+        anyhow::bail!("Gateway responded with status: {status}");
     }
 
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}"))?;
+    let json: serde_json::Value = response.json().await.map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "gateway paircode response: JSON parse failed"
+        );
+        anyhow::Error::msg(format!("Failed to parse response: {e}"))
+    })?;
 
     if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(None);
@@ -3162,123 +3598,10 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
     format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
-// ─── Generic Pending OAuth Login ────────────────────────────────────────────
-
-/// Generic pending OAuth login state, shared across providers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingOAuthLogin {
-    provider: String,
-    profile: String,
-    code_verifier: String,
-    state: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingOAuthLoginFile {
-    #[serde(default)]
-    provider: Option<String>,
-    profile: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code_verifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    encrypted_code_verifier: Option<String>,
-    state: String,
-    created_at: String,
-}
-
-#[cfg(feature = "agent-runtime")]
-fn pending_oauth_login_path(config: &Config, provider: &str) -> std::path::PathBuf {
-    let filename = format!("auth-{}-pending.json", provider);
-    auth::state_dir_from_config(config).join(filename)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn pending_oauth_secret_store(config: &Config) -> security::secrets::SecretStore {
-    security::secrets::SecretStore::new(
-        &auth::state_dir_from_config(config),
-        config.secrets.encrypt,
-    )
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(feature = "agent-runtime")]
-fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
-    let path = pending_oauth_login_path(config, &pending.provider);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let secret_store = pending_oauth_secret_store(config);
-    let encrypted_code_verifier = secret_store.encrypt(&pending.code_verifier)?;
-    let persisted = PendingOAuthLoginFile {
-        provider: Some(pending.provider.clone()),
-        profile: pending.profile.clone(),
-        code_verifier: None,
-        encrypted_code_verifier: Some(encrypted_code_verifier),
-        state: pending.state.clone(),
-        created_at: pending.created_at.clone(),
-    };
-    let tmp = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    let json = serde_json::to_vec_pretty(&persisted)?;
-    std::fs::write(&tmp, json)?;
-    set_owner_only_permissions(&tmp)?;
-    std::fs::rename(tmp, &path)?;
-    set_owner_only_permissions(&path)?;
-    Ok(())
-}
-
-#[cfg(feature = "agent-runtime")]
-fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<PendingOAuthLogin>> {
-    let path = pending_oauth_login_path(config, provider);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(&path)?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let persisted: PendingOAuthLoginFile = serde_json::from_slice(&bytes)?;
-    let secret_store = pending_oauth_secret_store(config);
-    let code_verifier = if let Some(encrypted) = persisted.encrypted_code_verifier {
-        secret_store.decrypt(&encrypted)?
-    } else if let Some(plaintext) = persisted.code_verifier {
-        plaintext
-    } else {
-        bail!("Pending {} login is missing code verifier", provider);
-    };
-    Ok(Some(PendingOAuthLogin {
-        provider: persisted.provider.unwrap_or_else(|| provider.to_string()),
-        profile: persisted.profile,
-        code_verifier,
-        state: persisted.state,
-        created_at: persisted.created_at,
-    }))
-}
-
-#[cfg(feature = "agent-runtime")]
-fn clear_pending_oauth_login(config: &Config, provider: &str) {
-    let path = pending_oauth_login_path(config, provider);
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-        let _ = file.set_len(0);
-        let _ = file.sync_all();
-    }
-    let _ = std::fs::remove_file(path);
-}
+// Interactive CLI input helpers used by `auth paste-token` /
+// `auth setup-token` / `auth paste-redirect`. The dialoguer dep belongs
+// to the binary; auth/mod.rs in zeroclaw-providers shouldn't pull it in,
+// so reads live here and trait flows accept the resulting string.
 
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
@@ -3295,67 +3618,6 @@ fn read_plain_input(prompt: &str) -> Result<String> {
         .with_prompt(prompt)
         .interact_text()?;
     Ok(input.trim().to_string())
-}
-
-#[cfg(feature = "agent-runtime")]
-fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
-    let account_id = auth::openai_oauth::extract_account_id_from_jwt(access_token);
-    if account_id.is_none() {
-        warn!(
-            "Could not extract OpenAI account id from OAuth access token; \
-             requests may fail until re-authentication."
-        );
-    }
-    account_id
-}
-
-#[cfg(feature = "agent-runtime")]
-async fn import_openai_codex_auth_profile(
-    auth_service: &auth::AuthService,
-    profile: &str,
-    import_path: &std::path::Path,
-) -> Result<()> {
-    #[derive(Deserialize)]
-    struct CodexAuthTokens {
-        access_token: String,
-        #[serde(default)]
-        refresh_token: Option<String>,
-        #[serde(default)]
-        id_token: Option<String>,
-        #[serde(default)]
-        account_id: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct CodexAuthFile {
-        tokens: CodexAuthTokens,
-    }
-
-    let raw = std::fs::read_to_string(import_path)
-        .with_context(|| format!("Failed to read import file {}", import_path.display()))?;
-    let imported: CodexAuthFile = serde_json::from_str(&raw)
-        .with_context(|| format!("Failed to parse import file {}", import_path.display()))?;
-    let expires_at = auth::openai_oauth::extract_expiry_from_jwt(&imported.tokens.access_token);
-
-    let token_set = auth::profiles::TokenSet {
-        access_token: imported.tokens.access_token,
-        refresh_token: imported.tokens.refresh_token,
-        id_token: imported.tokens.id_token,
-        expires_at,
-        token_type: Some("Bearer".to_string()),
-        scope: None,
-    };
-
-    let account_id = imported
-        .tokens
-        .account_id
-        .or_else(|| extract_openai_account_id_for_profile(&token_set.access_token));
-
-    auth_service
-        .store_openai_tokens(profile, token_set, account_id, true)
-        .await?;
-
-    Ok(())
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -3385,316 +3647,53 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
     match auth_command {
         AuthCommands::Login {
-            provider,
+            model_provider,
             profile,
             device_code,
             import,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
-            if import.is_some() && provider != "openai-codex" {
-                bail!("`auth login --import` currently supports only --provider openai-codex");
-            }
+            let provider: auth::AuthProvider = model_provider.parse()?;
             let client = reqwest::Client::new();
-
-            match provider.as_str() {
-                "gemini" => {
-                    // Gemini OAuth flow
-                    if device_code {
-                        match auth::gemini_oauth::start_device_code_flow(&client).await {
-                            Ok(device) => {
-                                println!("Google/Gemini device-code login started.");
-                                println!("Visit: {}", device.verification_uri);
-                                println!("Code:  {}", device.user_code);
-                                if let Some(uri_complete) = &device.verification_uri_complete {
-                                    println!("Fast link: {uri_complete}");
-                                }
-
-                                let token_set =
-                                    auth::gemini_oauth::poll_device_code_tokens(&client, &device)
-                                        .await?;
-                                let account_id = token_set.id_token.as_deref().and_then(
-                                    auth::gemini_oauth::extract_account_email_from_id_token,
-                                );
-
-                                auth_service
-                                    .store_gemini_tokens(&profile, token_set, account_id, true)
-                                    .await?;
-
-                                println!("Saved profile {profile}");
-                                println!("Active profile for gemini: {profile}");
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Device-code flow unavailable: {e}. Falling back to browser flow."
-                                );
-                            }
-                        }
-                    }
-
-                    let pkce = auth::gemini_oauth::generate_pkce_state();
-                    let authorize_url = auth::gemini_oauth::build_authorize_url(&pkce)?;
-
-                    // Save pending login for paste-redirect fallback
-                    let pending = PendingOAuthLogin {
-                        provider: "gemini".to_string(),
-                        profile: profile.clone(),
-                        code_verifier: pkce.code_verifier.clone(),
-                        state: pkce.state.clone(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    save_pending_oauth_login(config, &pending)?;
-
-                    println!("Open this URL in your browser and authorize access:");
-                    println!("{authorize_url}");
-                    println!();
-
-                    let code = match auth::gemini_oauth::receive_loopback_code(
-                        &pkce.state,
-                        std::time::Duration::from_secs(180),
-                    )
-                    .await
-                    {
-                        Ok(code) => {
-                            clear_pending_oauth_login(config, "gemini");
-                            code
-                        }
-                        Err(e) => {
-                            println!("Callback capture failed: {e}");
-                            println!(
-                                "Run `zeroclaw auth paste-redirect --provider gemini --profile {profile}`"
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    let token_set =
-                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-                    let account_id = token_set
-                        .id_token
-                        .as_deref()
-                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
-
-                    auth_service
-                        .store_gemini_tokens(&profile, token_set, account_id, true)
-                        .await?;
-
-                    println!("Saved profile {profile}");
-                    println!("Active profile for gemini: {profile}");
-                    Ok(())
-                }
-                "openai-codex" => {
-                    if let Some(import_path) = import.as_deref() {
-                        import_openai_codex_auth_profile(&auth_service, &profile, import_path)
-                            .await?;
-                        println!("Imported auth profile from {}", import_path.display());
-                        println!("Active profile for openai-codex: {profile}");
-                        return Ok(());
-                    }
-
-                    // OpenAI Codex OAuth flow
-                    if device_code {
-                        match auth::openai_oauth::start_device_code_flow(&client).await {
-                            Ok(device) => {
-                                println!("OpenAI device-code login started.");
-                                println!("Visit: {}", device.verification_uri);
-                                println!("Code:  {}", device.user_code);
-                                if let Some(uri_complete) = &device.verification_uri_complete {
-                                    println!("Fast link: {uri_complete}");
-                                }
-                                if let Some(message) = &device.message {
-                                    println!("{message}");
-                                }
-
-                                let token_set =
-                                    auth::openai_oauth::poll_device_code_tokens(&client, &device)
-                                        .await?;
-                                let account_id =
-                                    extract_openai_account_id_for_profile(&token_set.access_token);
-
-                                auth_service
-                                    .store_openai_tokens(&profile, token_set, account_id, true)
-                                    .await?;
-                                clear_pending_oauth_login(config, "openai");
-
-                                println!("Saved profile {profile}");
-                                println!("Active profile for openai-codex: {profile}");
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Device-code flow unavailable: {e}. Falling back to browser/paste flow."
-                                );
-                            }
-                        }
-                    }
-
-                    let pkce = auth::openai_oauth::generate_pkce_state();
-                    let pending = PendingOAuthLogin {
-                        provider: "openai".to_string(),
-                        profile: profile.clone(),
-                        code_verifier: pkce.code_verifier.clone(),
-                        state: pkce.state.clone(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    save_pending_oauth_login(config, &pending)?;
-
-                    let authorize_url = auth::openai_oauth::build_authorize_url(&pkce);
-                    println!("Open this URL in your browser and authorize access:");
-                    println!("{authorize_url}");
-                    println!();
-                    println!("Waiting for callback at http://localhost:1455/auth/callback ...");
-
-                    let code = match auth::openai_oauth::receive_loopback_code(
-                        &pkce.state,
-                        std::time::Duration::from_secs(180),
-                    )
-                    .await
-                    {
-                        Ok(code) => code,
-                        Err(e) => {
-                            println!("Callback capture failed: {e}");
-                            println!(
-                                "Run `zeroclaw auth paste-redirect --provider openai-codex --profile {profile}`"
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    let token_set =
-                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
-
-                    auth_service
-                        .store_openai_tokens(&profile, token_set, account_id, true)
-                        .await?;
-                    clear_pending_oauth_login(config, "openai");
-
-                    println!("Saved profile {profile}");
-                    println!("Active profile for openai-codex: {profile}");
-                    Ok(())
-                }
-                _ => {
-                    bail!(
-                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
-                    );
-                }
-            }
+            let ctx = auth::AuthFlowContext {
+                config,
+                auth_service: &auth_service,
+                client: &client,
+            };
+            provider
+                .flow()
+                .login(&ctx, &profile, device_code, import.as_deref())
+                .await
         }
 
         AuthCommands::PasteRedirect {
-            provider,
+            model_provider,
             profile,
             input,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
-
-            match provider.as_str() {
-                "openai-codex" => {
-                    let pending = load_pending_oauth_login(config, "openai")?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No pending OpenAI login found. Run `zeroclaw auth login --provider openai-codex` first."
-                        )
-                    })?;
-
-                    if pending.profile != profile {
-                        bail!(
-                            "Pending login profile mismatch: pending={}, requested={}",
-                            pending.profile,
-                            profile
-                        );
-                    }
-
-                    let redirect_input = match input {
-                        Some(value) => value,
-                        None => read_plain_input("Paste redirect URL or OAuth code")?,
-                    };
-
-                    let code = auth::openai_oauth::parse_code_from_redirect(
-                        &redirect_input,
-                        Some(&pending.state),
-                    )?;
-
-                    let pkce = auth::openai_oauth::PkceState {
-                        code_verifier: pending.code_verifier.clone(),
-                        code_challenge: String::new(),
-                        state: pending.state.clone(),
-                    };
-
-                    let client = reqwest::Client::new();
-                    let token_set =
-                        auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-                    let account_id = extract_openai_account_id_for_profile(&token_set.access_token);
-
-                    auth_service
-                        .store_openai_tokens(&profile, token_set, account_id, true)
-                        .await?;
-                    clear_pending_oauth_login(config, "openai");
-
-                    println!("Saved profile {profile}");
-                    println!("Active profile for openai-codex: {profile}");
-                }
-                "gemini" => {
-                    let pending = load_pending_oauth_login(config, "gemini")?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No pending Gemini login found. Run `zeroclaw auth login --provider gemini` first."
-                        )
-                    })?;
-
-                    if pending.profile != profile {
-                        bail!(
-                            "Pending login profile mismatch: pending={}, requested={}",
-                            pending.profile,
-                            profile
-                        );
-                    }
-
-                    let redirect_input = match input {
-                        Some(value) => value,
-                        None => read_plain_input("Paste redirect URL or OAuth code")?,
-                    };
-
-                    let code = auth::gemini_oauth::parse_code_from_redirect(
-                        &redirect_input,
-                        Some(&pending.state),
-                    )?;
-
-                    let pkce = auth::gemini_oauth::PkceState {
-                        code_verifier: pending.code_verifier.clone(),
-                        code_challenge: String::new(),
-                        state: pending.state.clone(),
-                    };
-
-                    let client = reqwest::Client::new();
-                    let token_set =
-                        auth::gemini_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
-                    let account_id = token_set
-                        .id_token
-                        .as_deref()
-                        .and_then(auth::gemini_oauth::extract_account_email_from_id_token);
-
-                    auth_service
-                        .store_gemini_tokens(&profile, token_set, account_id, true)
-                        .await?;
-                    clear_pending_oauth_login(config, "gemini");
-
-                    println!("Saved profile {profile}");
-                    println!("Active profile for gemini: {profile}");
-                }
-                _ => {
-                    bail!("`auth paste-redirect` supports --provider openai-codex or gemini");
-                }
-            }
-            Ok(())
+            let provider: auth::AuthProvider = model_provider.parse()?;
+            let client = reqwest::Client::new();
+            let ctx = auth::AuthFlowContext {
+                config,
+                auth_service: &auth_service,
+                client: &client,
+            };
+            let input_str: Option<String> = match input {
+                Some(value) => Some(value),
+                None => Some(read_plain_input("Paste redirect URL or OAuth code")?),
+            };
+            provider
+                .flow()
+                .paste_redirect(&ctx, &profile, input_str.as_deref())
+                .await
         }
 
         AuthCommands::PasteToken {
-            provider,
+            model_provider,
             profile,
             token,
             auth_kind,
         } => {
-            let provider = auth::normalize_provider(&provider)?;
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
             let token = match token {
                 Some(token) => token.trim().to_string(),
                 None => read_auth_input("Paste token")?,
@@ -3711,15 +3710,18 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             );
 
             auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
             println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
-        AuthCommands::SetupToken { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
+        AuthCommands::SetupToken {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
             let token = read_auth_input("Paste token")?;
             if token.is_empty() {
                 bail!("Token cannot be empty");
@@ -3733,70 +3735,66 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             );
 
             auth_service
-                .store_provider_token(&provider, &profile, &token, metadata, true)
+                .store_model_provider_token(&model_provider, &profile, &token, metadata, true)
                 .await?;
             println!("Saved profile {profile}");
-            println!("Active profile for {provider}: {profile}");
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
-        AuthCommands::Refresh { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-
-            match provider.as_str() {
-                "openai-codex" => {
-                    match auth_service
-                        .get_valid_openai_access_token(profile.as_deref())
-                        .await?
-                    {
-                        Some(_) => {
-                            println!("OpenAI Codex token is valid (refresh completed if needed).");
-                            Ok(())
-                        }
-                        None => {
-                            bail!(
-                                "No OpenAI Codex auth profile found. Run `zeroclaw auth login --provider openai-codex`."
-                            )
-                        }
-                    }
+        AuthCommands::Refresh {
+            model_provider,
+            profile,
+        } => {
+            let provider: auth::AuthProvider = model_provider.parse()?;
+            let client = reqwest::Client::new();
+            let ctx = auth::AuthFlowContext {
+                config,
+                auth_service: &auth_service,
+                client: &client,
+            };
+            let status = provider
+                .flow()
+                .refresh_status(&ctx, profile.as_deref())
+                .await?;
+            match status {
+                auth::RefreshStatus::Refreshed { profile } => {
+                    println!("✓ Token refresh OK (profile {profile})");
+                    Ok(())
                 }
-                "gemini" => {
-                    match auth_service
-                        .get_valid_gemini_access_token(profile.as_deref())
-                        .await?
-                    {
-                        Some(_) => {
-                            let profile_name = profile.as_deref().unwrap_or("default");
-                            println!("✓ Gemini token refreshed successfully");
-                            println!("  Profile: gemini:{}", profile_name);
-                            Ok(())
-                        }
-                        None => {
-                            bail!(
-                                "No Gemini auth profile found. Run `zeroclaw auth login --provider gemini`."
-                            )
-                        }
-                    }
+                auth::RefreshStatus::NoProfile => {
+                    bail!(
+                        "No auth profile found. Run `zeroclaw auth login --model-provider <provider>` first.",
+                    )
                 }
-                _ => bail!("`auth refresh` supports --provider openai-codex or gemini"),
             }
         }
 
-        AuthCommands::Logout { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            let removed = auth_service.remove_profile(&provider, &profile).await?;
+        AuthCommands::Logout {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
+            let removed = auth_service
+                .remove_profile(&model_provider, &profile)
+                .await?;
             if removed {
-                println!("Removed auth profile {provider}:{profile}");
+                println!("Removed auth profile {model_provider}:{profile}");
             } else {
-                println!("Auth profile not found: {provider}:{profile}");
+                println!("Auth profile not found: {model_provider}:{profile}");
             }
             Ok(())
         }
 
-        AuthCommands::Use { provider, profile } => {
-            let provider = auth::normalize_provider(&provider)?;
-            auth_service.set_active_profile(&provider, &profile).await?;
-            println!("Active profile for {provider}: {profile}");
+        AuthCommands::Use {
+            model_provider,
+            profile,
+        } => {
+            let model_provider = auth::normalize_model_provider(&model_provider)?;
+            auth_service
+                .set_active_profile(&model_provider, &profile)
+                .await?;
+            println!("Active profile for {model_provider}: {profile}");
             Ok(())
         }
 
@@ -3810,7 +3808,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             for (id, profile) in &data.profiles {
                 let active = data
                     .active_profiles
-                    .get(&profile.provider)
+                    .get(&profile.model_provider)
                     .is_some_and(|active_id| active_id == id);
                 let marker = if active { "*" } else { " " };
                 println!("{marker} {id}");
@@ -3829,7 +3827,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             for (id, profile) in &data.profiles {
                 let active = data
                     .active_profiles
-                    .get(&profile.provider)
+                    .get(&profile.model_provider)
                     .is_some_and(|active_id| active_id == id);
                 let marker = if active { "*" } else { " " };
                 println!(
@@ -3844,8 +3842,8 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             println!();
             println!("Active profiles:");
-            for (provider, profile_id) in &data.active_profiles {
-                println!("  {provider}: {profile_id}");
+            for (model_provider, profile_id) in &data.active_profiles {
+                println!("  {model_provider}: {profile_id}");
             }
 
             Ok(())
@@ -3932,7 +3930,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zeroclaw",
             "onboard",
-            "--provider",
+            "--model-provider",
             "openrouter",
             "--model",
             "custom-model-946",
@@ -3946,13 +3944,13 @@ mod tests {
                 force,
                 channels_only,
                 api_key,
-                provider,
+                model_provider,
                 model,
                 ..
             } => {
                 assert!(!force);
                 assert!(!channels_only);
-                assert_eq!(provider.as_deref(), Some("openrouter"));
+                assert_eq!(model_provider.as_deref(), Some("openrouter"));
                 assert_eq!(model.as_deref(), Some("custom-model-946"));
                 assert_eq!(api_key.as_deref(), Some("sk-issue946"));
             }
@@ -3983,6 +3981,26 @@ mod tests {
         assert!(
             script.contains("zeroclaw"),
             "completion script should reference binary name"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn bash_completion_avoids_infinite_recursion() {
+        let mut output = Vec::new();
+        write_shell_completion(CompletionShell::Bash, &mut output)
+            .expect("completion generation should succeed");
+        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
+        // The wrapper must capture the original clap-generated function body
+        // (via declare -f) rather than calling _zeroclaw by name, which would
+        // create an infinite recursion loop after _zeroclaw is redefined.
+        assert!(
+            script.contains("declare -f _zeroclaw"),
+            "bash completion should use declare -f to capture the original _zeroclaw function body"
+        );
+        assert!(
+            !script.contains("_zeroclaw_clap_orig() { _zeroclaw \"$@\"; }"),
+            "bash completion must not define _zeroclaw_clap_orig as a simple forwarder to _zeroclaw"
         );
     }
 
@@ -4019,6 +4037,56 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--port",
+            "3001",
+            "--host",
+            "192.168.1.20",
+        ])
+        .expect("gateway get-paircode overrides should parse");
+
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+            } => {
+                assert!(new);
+                assert_eq!(port, Some(3001));
+                assert_eq!(host.as_deref(), Some("192.168.1.20"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    /// Regression for PR #6192: when the user passes `--port`/`--host` to
+    /// `gateway get-paircode`, the override must compose with the configured
+    /// `path_prefix` rather than bypass it. `fetch_paircode` threads
+    /// `path_prefix` through `gateway_admin_url`; this test pins that the URL
+    /// we'd actually send still hits `<prefix>/admin/paircode/new`.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_url_combines_host_port_override_with_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url(
+                "127.0.0.1",
+                9001,
+                Some("/agents/myagent"),
+                "/admin/paircode/new"
+            ),
+            "http://127.0.0.1:9001/agents/myagent/admin/paircode/new",
+        );
+        assert_eq!(
+            gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
+            "http://192.168.1.20:42617/gw/admin/paircode",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_quick_and_channels_only_conflict() {
         // --quick and --channels-only should both parse at the CLI level
         // (the conflict is checked at runtime), but we verify both flags parse.
@@ -4043,18 +4111,16 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn onboard_cli_positional_sections_parse() {
-        for (arg, expected) in [
-            ("providers", OnboardSection::Providers),
-            ("channels", OnboardSection::Channels),
-            ("memory", OnboardSection::Memory),
-            ("hardware", OnboardSection::Hardware),
-            ("tunnel", OnboardSection::Tunnel),
-            ("workspace", OnboardSection::Workspace),
-        ] {
-            let cli = Cli::try_parse_from(["zeroclaw", "onboard", arg])
-                .unwrap_or_else(|_| panic!("onboard {arg} should parse"));
+        // Drive from the canonical const so adding a section forces
+        // parser coverage here. clap subcommand names are the
+        // section's `as_str()` keys (snake_case) verbatim, set via
+        // `#[command(name = $key)]` inside the `sections!` macro that
+        // also defines the enum.
+        for w in zeroclaw_config::sections::ONBOARDING_SECTIONS {
+            let cli = Cli::try_parse_from(["zeroclaw", "onboard", w.as_str()])
+                .unwrap_or_else(|_| panic!("onboard {} should parse", w.as_str()));
             match cli.command {
-                Commands::Onboard { section, .. } => assert_eq!(section, Some(expected)),
+                Commands::Onboard { section, .. } => assert_eq!(section, Some(*w)),
                 other => panic!("expected onboard command, got {other:?}"),
             }
         }
@@ -4063,10 +4129,9 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn resolve_onboard_target_no_explicit_no_legacy_runs_all() {
-        use zeroclaw_runtime::onboard::Section;
-        let (target, deprecation) =
-            resolve_onboard_target(None, false, false, false, false, false, false);
-        assert_eq!(target, Section::All);
+        let none_set = vec![false; LEGACY_ONBOARD_FLAGS.len()];
+        let (target, deprecation) = resolve_onboard_target(None, &none_set);
+        assert_eq!(target, None);
         assert!(deprecation.is_none());
     }
 
@@ -4074,70 +4139,27 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn resolve_onboard_target_positional_wins_and_emits_no_warning() {
         use zeroclaw_runtime::onboard::Section;
-        let (target, deprecation) = resolve_onboard_target(
-            Some(OnboardSection::Channels),
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(target, Section::Channels);
+        let none_set = vec![false; LEGACY_ONBOARD_FLAGS.len()];
+        let (target, deprecation) = resolve_onboard_target(Some(Section::Channels), &none_set);
+        assert_eq!(target, Some(Section::Channels));
         assert!(deprecation.is_none());
     }
 
+    /// Drives directly off [`LEGACY_ONBOARD_FLAGS`] — every row in the
+    /// const generates one assertion. No magic positional bool array.
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn resolve_onboard_target_legacy_flag_routes_and_warns() {
-        use zeroclaw_runtime::onboard::Section;
-        for (mut flags, expected_section, expected_old, expected_new) in [
-            (
-                [true, false, false, false, false, false],
-                Section::Channels,
-                "--channels-only",
-                "channels",
-            ),
-            (
-                [false, true, false, false, false, false],
-                Section::Providers,
-                "--providers-only",
-                "providers",
-            ),
-            (
-                [false, false, true, false, false, false],
-                Section::Memory,
-                "--memory-only",
-                "memory",
-            ),
-            (
-                [false, false, false, true, false, false],
-                Section::Hardware,
-                "--hardware-only",
-                "hardware",
-            ),
-            (
-                [false, false, false, false, true, false],
-                Section::Tunnel,
-                "--tunnel-only",
-                "tunnel",
-            ),
-            (
-                [false, false, false, false, false, true],
-                Section::Workspace,
-                "--workspace-only",
-                "workspace",
-            ),
-        ] {
-            let [channels, providers, memory, hardware, tunnel, workspace] =
-                std::mem::take(&mut flags);
-            let (target, deprecation) = resolve_onboard_target(
-                None, channels, providers, memory, hardware, tunnel, workspace,
-            );
-            assert_eq!(target, expected_section, "{expected_old} target");
+        for (idx, (expected_section, expected_old, expected_new)) in
+            LEGACY_ONBOARD_FLAGS.iter().enumerate()
+        {
+            let mut flags = vec![false; LEGACY_ONBOARD_FLAGS.len()];
+            flags[idx] = true;
+            let (target, deprecation) = resolve_onboard_target(None, &flags);
+            assert_eq!(target, Some(*expected_section), "{expected_old} target");
             assert_eq!(
                 deprecation,
-                Some((expected_old, expected_new)),
+                Some((*expected_old, *expected_new)),
                 "{expected_old} deprecation pair",
             );
         }
@@ -4150,16 +4172,11 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn resolve_onboard_target_explicit_plus_legacy_warns_but_picks_explicit() {
         use zeroclaw_runtime::onboard::Section;
-        let (target, deprecation) = resolve_onboard_target(
-            Some(OnboardSection::Providers),
-            true, // --channels-only
-            false,
-            false,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(target, Section::Providers);
+        // Position 0 is --channels-only per LEGACY_ONBOARD_FLAGS row order.
+        let mut flags = vec![false; LEGACY_ONBOARD_FLAGS.len()];
+        flags[0] = true;
+        let (target, deprecation) = resolve_onboard_target(Some(Section::ModelProviders), &flags);
+        assert_eq!(target, Some(Section::ModelProviders));
         assert_eq!(deprecation, Some(("--channels-only", "channels")));
     }
 
@@ -4202,8 +4219,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
-            .expect("agent command with temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--temperature",
+            "0.5",
+        ])
+        .expect("agent command with temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4216,8 +4240,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_without_temperature() {
-        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
-            .expect("agent command without temperature should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--message",
+            "hello",
+        ])
+        .expect("agent command without temperature should parse");
 
         match cli.command {
             Commands::Agent { temperature, .. } => {
@@ -4230,9 +4261,15 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_session_state_file() {
-        let cli =
-            Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
-                .expect("agent command with session state file should parse");
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "agent",
+            "--agent",
+            "morning-shift",
+            "--session-state-file",
+            "session.json",
+        ])
+        .expect("agent command with session state file should parse");
 
         match cli.command {
             Commands::Agent {
@@ -4246,18 +4283,22 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn agent_fallback_uses_config_default_temperature() {
-        // Test that when user doesn't provide --temperature,
-        // the fallback logic works correctly
+    fn agent_uses_first_provider_temperature_when_unset() {
+        // When the user doesn't pass --temperature, the kernel-only agent
+        // CLI walks `config.first_model_provider().temperature` before
+        // bottoming out at 0.7.
         let mut config = Config::default();
-        config.ensure_fallback_provider().temperature = Some(1.5);
+        config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("known family")
+            .temperature = Some(1.5);
 
-        // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
-                .providers
-                .fallback_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
@@ -4275,8 +4316,7 @@ mod tests {
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
-                .providers
-                .fallback_provider()
+                .first_model_provider()
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
