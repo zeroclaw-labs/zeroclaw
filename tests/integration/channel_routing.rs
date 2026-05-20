@@ -23,6 +23,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         reply_target: "msg_0".into(),
         content: "test message".into(),
         channel: "telegram".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
@@ -47,6 +48,7 @@ fn channel_message_reply_target_distinct_from_sender() {
         reply_target: "channel_123".into(), // Discord channel ID for replies
         content: "test message".into(),
         channel: "discord".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
@@ -69,6 +71,7 @@ fn channel_message_fields_not_swapped() {
         reply_target: "target_value".into(),
         content: "payload".into(),
         channel: "test".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
@@ -97,6 +100,7 @@ fn channel_message_preserves_all_fields_on_clone() {
         reply_target: "target_456".into(),
         content: "cloned content".into(),
         channel: "test_channel".into(),
+        channel_alias: None,
         timestamp: 1700000001,
         thread_ts: None,
         interruption_scope_id: None,
@@ -174,6 +178,17 @@ impl CapturingChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for CapturingChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "test"
+    }
+}
+
 #[async_trait]
 impl Channel for CapturingChannel {
     fn name(&self) -> &str {
@@ -192,13 +207,14 @@ impl Channel for CapturingChannel {
             reply_target: "test_target".into(),
             content: "incoming".into(),
             channel: "capturing".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| anyhow::Error::msg(e.to_string()))
     }
 }
 

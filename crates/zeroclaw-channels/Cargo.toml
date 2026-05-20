@@ -10,9 +10,11 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
@@ -26,9 +28,9 @@ directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
+matrix-sdk = { version = "0.17", optional = true, default-features = false, features = ["e2e-encryption", "markdown", "sqlite"] }
 mime_guess = { version = "2", optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 parking_lot = "0.12"
@@ -47,7 +49,6 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
-tracing = { version = "0.1", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 hex = "0.4"
@@ -78,6 +79,7 @@ md5 = { version = "0.8", optional = true }
 
 [features]
 default = [
+    "channel-acp-server",
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
@@ -120,7 +122,6 @@ channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tempfile = "3.26"

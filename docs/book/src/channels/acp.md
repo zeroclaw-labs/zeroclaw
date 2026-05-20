@@ -24,10 +24,10 @@ Handshake. Returns server capabilities.
 ← {"jsonrpc":"2.0","id":1,"result":{
     "protocolVersion": 1,
     "agentCapabilities": {
-      "loadSession": false,
+      "loadSession": true,
       "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
       "mcpCapabilities": {"http": false, "sse": false},
-      "sessionCapabilities": {}
+      "sessionCapabilities": {"resume": {}, "close": {}}
     },
     "agentInfo": {
       "name": "zeroclaw-acp",
@@ -45,16 +45,23 @@ Handshake. Returns server capabilities.
   }}
 ```
 
+`loadSession: true` and `sessionCapabilities: {"resume": {}, "close": {}}` indicate that session persistence is active. If the SQLite store could not be opened at startup, all three are absent or false and `session/load`, `session/resume`, and `session/close` will return `SESSION_NOT_FOUND` errors.
+
 `_meta.zeroclaw` carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.
 
 The server always responds `protocolVersion: 1`. If you send a client-side `protocolVersion: 0`, you still get `1` back — v0 clients will see parse errors on the new message shapes; see [version compatibility](#version-compatibility) below.
 
 ### `session/new`
 
-Open an isolated agent session. The optional `cwd` parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary — it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
+Open an isolated agent session.
+
+**`agentAlias`** names which configured `[agents.<alias>]` entry to use. It is required when more than one agent is configured; when exactly one agent exists, it is auto-selected and the field may be omitted. The alias accepts the camelCase `agentAlias`, the snake_case `agent_alias`, or the short `agent` form.
+
+The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary — it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
 
 ```json
 → {"jsonrpc":"2.0","id":2,"method":"session/new","params":{
+    "agentAlias": "myagent",
     "cwd": "/path/to/project"
   }}
 ← {"jsonrpc":"2.0","id":2,"result":{
@@ -91,11 +98,11 @@ Send a prompt. The response is a sequence of `session/update` notifications stre
 ← {"jsonrpc":"2.0","id":3,"result":{
     "sessionId": "s-ab12cd",
     "stopReason": "end_turn",
-    "content": [{"type": "text", "text": "The last commit introduces..."}]
+    "content": "The last commit introduces..."
   }}
 ```
 
-`stopReason` is `"end_turn"` on normal completion. The `content` array mirrors the final assistant message.
+`stopReason` is `"end_turn"` on normal completion. The ACP completion signal is `stopReason`; ZeroClaw also includes the current final `content` string for existing clients.
 
 ### `session/update` notifications (agent → client)
 
@@ -148,6 +155,33 @@ If the client never replies (crash, network drop, user closes IDE), the request 
 
 `ask_user` uses the same `session/request_permission` mechanism, mapping the question's `choices` to permission options. Free-form (no-choices) `ask_user` is not supported until the [ACP elicitation RFD](https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx) lands. Calling `ask_user` without `choices` on an ACP session fast-fails with a clear error.
 
+### `session/cancel` _(ZeroClaw extension)_
+
+Abort an in-flight `session/prompt` turn. This method is a ZeroClaw extension,
+not part of the base ACP spec. If ACP later standardizes a conflicting
+`session/cancel`, ZeroClaw will move its extension to `_meta/session/cancel`.
+
+**Cancel vs. stop:** `session/cancel` aborts an in-flight prompt turn and returns `stopReason: "cancelled"` with any streamed text accumulated up to the interrupt point. `session/stop` gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.
+
+The canonical parameter is `sessionId`; `session_id` is accepted as a compatibility alias.
+
+```json
+→ {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type":"text","text":"partial..."}}
+  }}
+← {"jsonrpc":"2.0","id":3,"result":{
+    "sessionId": "s-ab12cd",
+    "stopReason": "cancelled",
+    "content": "partial...\n\n[interrupted by user]"
+  }}
+```
+
+Only one `session/prompt` may be active for a session at a time. A second prompt for the same session is rejected until the active turn completes or is cancelled.
+
+If no turn is active for the session, the cancel is a noop — it succeeds silently without error. This follows ACP notification semantics: notifications must not produce errors.
+
 ### `session/stop` _(ZeroClaw extension)_
 
 Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a future ACP spec revision adds `session/stop` with different semantics, this will be renamed `_meta/session/stop`.
@@ -161,13 +195,87 @@ Cleanly end a session. Not in the base ACP spec — ZeroClaw-specific. If a futu
 
 ZeroClaw also accepts inbound `session/update` (and the legacy `session/event` alias) notifications from the client for custom event injection. Not in the base ACP spec — ZeroClaw-specific. If the ACP spec later defines an inbound `session/update` with different semantics, this will be renamed `_meta/session/update`.
 
+## Session persistence
+
+ZeroClaw automatically persists ACP sessions to SQLite. No configuration is required — the store opens at `<workspace_dir>/sessions/acp-sessions.db` whenever `zeroclaw acp` starts or a gateway WebSocket ACP connection is accepted. If the file cannot be created (read-only filesystem, bad permissions), the server falls back to in-memory-only sessions and `loadSession` reports `false` in the `initialize` response.
+
+What is persisted:
+
+- Session metadata: `sessionId`, `workspaceDir`, `created_at`, `last_activity`
+- Full conversation history: every `ConversationMessage` written after each completed `session/prompt` turn, in one atomic transaction per turn
+
+Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
+
+Sessions are not automatically deleted. Use `session/close` to deactivate a session without deleting it, then `session/load` or `session/resume` to bring it back.
+
+### `session/load` _(ZeroClaw extension)_
+
+Restore a previously persisted session with **full history replay**. The server seeds the agent with the stored conversation history, then streams that history back to the client as a sequence of `session/update` notifications before returning. The client receives the same update stream it would have seen had the session never ended.
+
+```json
+→ {"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","method":"session/update","params":{
+    "sessionId": "s-ab12cd",
+    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type":"text","text":"The last commit..."}}
+  }}
+← ... (remaining stored messages replayed as session/update notifications)
+← {"jsonrpc":"2.0","id":5,"result":{}}
+```
+
+After `session/load` returns, the session is active and ready to accept `session/prompt` calls.
+
+`session_id` is accepted as a snake_case alias for `sessionId`.
+
+Errors:
+
+| Code | Meaning |
+|---|---|
+| `-32000` `SESSION_NOT_FOUND` | No record exists for the given `sessionId` in the store |
+| `-32001` `SESSION_LIMIT_REACHED` | `max_sessions` active sessions already in flight |
+| `-32602` `INVALID_PARAMS` | Session is already active — call `session/close` first |
+| `-32603` `INTERNAL_ERROR` | SQLite read failure |
+
+### `session/resume` _(ZeroClaw extension)_
+
+Restore a previously persisted session **without history replay**. The agent is seeded with the stored conversation history so it has full context for the next turn, but no `session/update` notifications are emitted. Use this when the client already has the history from a previous connection and only needs the agent state restored.
+
+```json
+→ {"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","id":5,"result":{}}
+```
+
+After `session/resume` returns, the session is active and ready to accept `session/prompt` calls. Same errors as `session/load`.
+
+**Load vs. resume:** use `session/load` when reconnecting after an unexpected disconnect and the client needs to rebuild its UI from the stored history. Use `session/resume` when the client already has the history (e.g., it stored it locally) and only needs the server-side agent state restored.
+
+### `session/close` _(ZeroClaw extension)_
+
+Deactivate an active session: cancels any in-flight turn, removes the session from the in-memory active set, and unregisters the ACP back-channel. The session record in the SQLite store is **not deleted** — the session can still be restored with `session/load` or `session/resume` later.
+
+```json
+→ {"jsonrpc":"2.0","id":6,"method":"session/close","params":{"sessionId":"s-ab12cd"}}
+← {"jsonrpc":"2.0","id":6,"result":{}}
+```
+
+`session_id` is accepted as a snake_case alias for `sessionId`.
+
+Returns `SESSION_NOT_FOUND` (`-32000`) if the session is not currently active (it may still exist in the store).
+
+**Close vs. stop:** `session/close` deactivates the session while preserving its persistent record for later reload. `session/stop` also removes the session from memory but has the same effect on the store. Neither deletes the SQLite record.
+
 ## Configuration
 
 ```toml
 [acp]
+# Which agent to use when session/new omits agentAlias.
+# Falls back to auto-select when exactly one agent is configured.
+default_agent = "myagent"
+
 max_sessions = 10
 session_timeout_secs = 3600       # idle sessions killed after 1 hour
 ```
+
+All three fields are optional. `default_agent` is consulted when `session/new` omits `agentAlias` and more than one agent is configured; if it is absent and exactly one `[agents.<alias>]` entry exists, that agent is auto-selected.
 
 When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required.
 
@@ -181,9 +289,23 @@ zeroclaw acp
 
 The binary reads stdin, writes stdout, exits on EOF.
 
-**As a WebSocket service (daemon mode):**
+**Via the daemon gateway (remote or same-host):**
 
-Start the daemon normally. The gateway always exposes ACP over WebSocket at the `/acp` endpoint — no extra config flag is required.
+Start the daemon normally. The gateway always exposes ACP over WebSocket at `/acp` — no extra config flag is required. Clients connect directly, or through `zeroclaw-acp-bridge`, which bridges the stdio ACP protocol to the gateway WebSocket:
+
+```bash
+zeroclaw-acp-bridge
+```
+
+The bridge reads the gateway address and auth token from the same `config.toml` as the daemon. When the daemon runs with a non-default config directory (e.g. `--config-dir /tmp/zeroclaw`), point the bridge at the same directory:
+
+```bash
+zeroclaw-acp-bridge --config-dir /tmp/zeroclaw
+# or equivalently:
+zeroclaw-acp-bridge --config-dir=/tmp/zeroclaw
+```
+
+You can also supply the bearer token directly via `ZEROCLAW_ACP_BRIDGE_TOKEN` if you prefer not to rely on the cached token file.
 
 ## Version compatibility
 
@@ -204,6 +326,8 @@ The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary use
 
 - ACP server: `crates/zeroclaw-channels/src/orchestrator/acp_server.rs`
 - ACP back-channel: `crates/zeroclaw-channels/src/acp_channel.rs`
+- Session store (SQLite): `crates/zeroclaw-infra/src/acp_session_store.rs`
+- Gateway ACP-over-WebSocket endpoint: `crates/zeroclaw-gateway/src/acp.rs`
 - Per-session path enforcement: `crates/zeroclaw-config/src/policy.rs` (`SecurityPolicy::from_config`), `crates/zeroclaw-runtime/src/agent/agent.rs` (`from_config_with_session_cwd_and_mcp`)
 - OS-level sandbox detection/backends: `crates/zeroclaw-runtime/src/security/detect.rs`, `landlock.rs`, `bubblewrap.rs`, `seatbelt.rs`
 

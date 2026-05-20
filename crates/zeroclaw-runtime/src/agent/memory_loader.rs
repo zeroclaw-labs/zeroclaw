@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::fmt::Write;
-use zeroclaw_memory::{self, Memory, decay};
+use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, decay};
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
@@ -53,7 +53,8 @@ impl MemoryLoader for DefaultMemoryLoader {
         // Apply time decay: older non-Core memories score lower
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
 
-        let mut context = String::from("[Memory context]\n");
+        let mut context = String::new();
+        let mut included = false;
         for entry in entries {
             if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                 continue;
@@ -69,15 +70,21 @@ impl MemoryLoader for DefaultMemoryLoader {
             {
                 continue;
             }
+            if !included {
+                context.push_str(MEMORY_CONTEXT_OPEN);
+                context.push('\n');
+                included = true;
+            }
             let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
         }
 
         // If all entries were below threshold, return empty
-        if context == "[Memory context]\n" {
+        if !included {
             return Ok(String::new());
         }
 
-        context.push_str("[/Memory context]\n\n");
+        context.push_str(MEMORY_CONTEXT_CLOSE);
+        context.push_str("\n\n");
         Ok(context)
     }
 }
@@ -86,7 +93,9 @@ impl MemoryLoader for DefaultMemoryLoader {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
+    use zeroclaw_memory::{
+        MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, MemoryEntry,
+    };
 
     struct MockMemory;
     struct MockMemoryWithEntries {
@@ -127,6 +136,8 @@ mod tests {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                agent_alias: None,
+                agent_id: None,
             }])
         }
 
@@ -146,6 +157,10 @@ mod tests {
             Ok(true)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
@@ -156,6 +171,41 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock"
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemory"
         }
     }
 
@@ -198,6 +248,10 @@ mod tests {
             Ok(true)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(self.entries.len())
         }
@@ -209,6 +263,41 @@ mod tests {
         fn name(&self) -> &str {
             "mock-with-entries"
         }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemoryWithEntries {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemoryWithEntries"
+        }
     }
 
     #[tokio::test]
@@ -218,8 +307,10 @@ mod tests {
             .load_context(&MockMemory, "hello", None)
             .await
             .unwrap();
-        assert!(context.contains("[Memory context]"));
-        assert!(context.contains("- k: v"));
+        assert_eq!(
+            context,
+            format!("{MEMORY_CONTEXT_OPEN}\n- k: v\n{MEMORY_CONTEXT_CLOSE}\n\n")
+        );
     }
 
     #[tokio::test]
@@ -238,6 +329,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -250,6 +343,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };
@@ -279,6 +374,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -291,6 +388,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };

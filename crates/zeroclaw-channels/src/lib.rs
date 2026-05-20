@@ -1,5 +1,13 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::explicit_auto_deref
+)]
+#![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
+
+pub mod allowlist;
 pub mod orchestrator;
 pub mod util;
 
@@ -20,8 +28,6 @@ pub mod clawdtalk;
 pub mod dingtalk;
 #[cfg(feature = "channel-discord")]
 pub mod discord;
-#[cfg(feature = "channel-discord")]
-pub mod discord_history;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
 #[cfg(feature = "channel-email")]

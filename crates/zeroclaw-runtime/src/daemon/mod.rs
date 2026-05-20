@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
+use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -42,26 +43,26 @@ async fn wait_for_exit_signal(
         loop {
             tokio::select! {
                 _ = sigint.recv() => {
-                    tracing::info!("Received SIGINT, shutting down...");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGINT, shutting down...");
                     return Ok(DaemonExit::Shutdown);
                 }
                 _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM, shutting down...");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGTERM, shutting down...");
                     return Ok(DaemonExit::Shutdown);
                 }
                 _ = sighup.recv() => {
-                    tracing::info!("Received SIGHUP, ignoring (daemon stays running)");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received SIGHUP, ignoring (daemon stays running)");
                 }
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
                         // Sender dropped — treat as shutdown (shouldn't
                         // happen in normal operation; the gateway holds a
                         // clone for the lifetime of the daemon).
-                        tracing::warn!("Reload sender dropped; shutting down");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
                         return Ok(DaemonExit::Shutdown);
                     }
                     if *reload_rx.borrow_and_update() {
-                        tracing::info!("Reload requested via /admin/reload");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         return Ok(DaemonExit::Reload);
                     }
                 }
@@ -75,16 +76,16 @@ async fn wait_for_exit_signal(
             tokio::select! {
                 res = tokio::signal::ctrl_c() => {
                     res?;
-                    tracing::info!("Received Ctrl+C, shutting down...");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Received Ctrl+C, shutting down...");
                     return Ok(DaemonExit::Shutdown);
                 }
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
-                        tracing::warn!("Reload sender dropped; shutting down");
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
                         return Ok(DaemonExit::Shutdown);
                     }
                     if *reload_rx.borrow_and_update() {
-                        tracing::info!("Reload requested via /admin/reload");
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         return Ok(DaemonExit::Reload);
                     }
                 }
@@ -114,9 +115,14 @@ pub struct DaemonSubsystems {
         >,
     >,
     /// Start supervised channels. Injected by the binary when channels crate is available.
+    /// The cancellation token is fired on reload so listener tasks drop their channel Arcs
+    /// before the new supervisor starts.
     pub channels_start: Option<
         Box<
-            dyn Fn(Config) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
+            dyn Fn(
+                    Config,
+                    tokio_util::sync::CancellationToken,
+                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -152,9 +158,8 @@ pub async fn run(
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
     if config.heartbeat.enabled {
-        let _ =
-            crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
-                .await;
+        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.data_dir)
+            .await;
     }
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
@@ -184,10 +189,13 @@ pub async fn run(
         ));
     }
 
+    let channels_cancel = tokio_util::sync::CancellationToken::new();
+
     if let Some(channels_start) = subsystems.channels_start {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
+            let cancel_for_supervisor = channels_cancel.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -195,39 +203,56 @@ pub async fn run(
                 move || {
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
-                    async move { start(cfg).await }
+                    let cancel = cancel_for_supervisor.clone();
+                    async move { start(cfg, cancel).await }
                 },
             ));
         } else {
             crate::health::mark_component_ok("channels");
-            tracing::info!("No channels configured; channel supervisor disabled");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "No channels configured; channel supervisor disabled"
+            );
         }
     } else {
         crate::health::mark_component_ok("channels");
-        tracing::info!("Channels subsystem not wired; channel supervisor disabled");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Channels subsystem not wired; channel supervisor disabled"
+        );
     }
 
-    // Wire up MQTT SOP listener if configured and enabled
+    // Wire up MQTT SOP listener if configured and referenced by an enabled agent
     if let Some(mqtt_start) = subsystems.mqtt_start {
-        if let Some(ref mqtt_config) = config.channels.mqtt {
-            if mqtt_config.enabled {
-                let mqtt_cfg = mqtt_config.clone();
-                let mqtt_start = std::sync::Arc::new(mqtt_start);
-                handles.push(spawn_component_supervisor(
-                    "mqtt",
-                    initial_backoff,
-                    max_backoff,
-                    move || {
-                        let cfg = mqtt_cfg.clone();
-                        let start = mqtt_start.clone();
-                        async move { start(cfg).await }
-                    },
-                ));
-            } else {
-                tracing::info!("MQTT channel configured but disabled (enabled = false)");
-                crate::health::mark_component_ok("mqtt");
+        let active_mqtt: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect();
+        let mut mqtt_started = false;
+        for (alias, mqtt_config) in &config.channels.mqtt {
+            if !active_mqtt.contains(&format!("mqtt.{alias}")) {
+                continue;
             }
-        } else {
+            let mqtt_cfg = mqtt_config.clone();
+            let mqtt_start = std::sync::Arc::new(mqtt_start);
+            handles.push(spawn_component_supervisor(
+                "mqtt",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = mqtt_cfg.clone();
+                    let start = mqtt_start.clone();
+                    async move { start(cfg).await }
+                },
+            ));
+            mqtt_started = true;
+            break;
+        }
+        if !mqtt_started {
             crate::health::mark_component_ok("mqtt");
         }
     } else {
@@ -247,7 +272,7 @@ pub async fn run(
         ));
     }
 
-    if config.cron.enabled {
+    if config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         let scheduler_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
@@ -262,7 +287,11 @@ pub async fn run(
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Cron disabled; scheduler supervisor not started"
+        );
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -283,11 +312,20 @@ pub async fn run(
         },
     );
 
+    // Fire channel cancellation before aborting supervisors so listener tasks
+    // get a chance to drop their `Arc<dyn Channel>` (and the matrix-sdk SQLite
+    // pools the Arc transitively pins).
+    channels_cancel.cancel();
     for handle in &handles {
         handle.abort();
     }
     for handle in handles {
         let _ = handle.await;
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
     }
 
     Ok(exit)
@@ -343,13 +381,27 @@ where
             match run_component().await {
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
-                    tracing::warn!("Daemon component '{name}' exited unexpectedly");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                        &format!("Daemon component '{name}' exited unexpectedly")
+                    );
                     // Clean exit — reset backoff since the component ran successfully
                     backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
                     crate::health::mark_component_error(name, e.to_string());
-                    tracing::error!("Daemon component '{name}' failed: {e}");
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "name": name})
+                            ),
+                        &format!("Daemon component '{name}' failed: {e}")
+                    );
                 }
             }
 
@@ -367,13 +419,21 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     };
     use std::sync::Arc;
 
+    let agent_alias = config.heartbeat.agent.trim().to_string();
+    if agent_alias.is_empty() {
+        anyhow::bail!(
+            "heartbeat worker requires `[heartbeat] agent = \"<alias>\"` naming a configured agent"
+        );
+    }
+    if config.agent(&agent_alias).is_none() {
+        anyhow::bail!(
+            "[heartbeat] agent = {agent_alias:?} is not configured ([agents.{agent_alias}] missing)"
+        );
+    }
+
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
+    let engine = HeartbeatEngine::new(config.heartbeat.clone(), config.data_dir.clone(), observer);
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;
@@ -412,14 +472,31 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         continue;
                     };
                     let delivery_fut = crate::cron::scheduler::deliver_announcement(
-                        &dm_config, &channel, &target, &alert,
+                        &dm_config, &channel, &target, None, &alert,
                     );
                     match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
                         Ok(Err(e)) => {
-                            tracing::warn!("Deadman alert delivery failed: {e}");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "Deadman alert delivery failed"
+                            );
                         }
                         Err(_) => {
-                            tracing::warn!("Deadman alert delivery timed out (30s)");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                "Deadman alert delivery timed out (30s)"
+                            );
                         }
                         Ok(Ok(())) => {}
                     }
@@ -475,14 +552,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             );
             let phase1_fut = Box::pin(crate::agent::run(
                 config.clone(),
+                &agent_alias,
                 Some(decision_prompt),
                 None,
                 None,
-                0.0,
+                Some(0.0),
                 vec![],
                 false,
                 None,
                 None,
+                crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -492,10 +571,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Phase 1 decision timed out ({}s)",
-                        config.heartbeat.task_timeout_secs
-                    )),
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Timeout
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "phase": "phase1_decision",
+                                "timeout_secs": config.heartbeat.task_timeout_secs,
+                            })),
+                            "heartbeat: phase1 decision timed out"
+                        );
+                        Err(anyhow::Error::msg(format!(
+                            "Phase 1 decision timed out ({}s)",
+                            config.heartbeat.task_timeout_secs
+                        )))
+                    }
                 }
             } else {
                 phase1_fut.await
@@ -504,25 +598,34 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Ok(response) => {
                     let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
                     if indices.is_empty() {
-                        tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "heartbeat phase 1: skip (nothing to do)"
+                        );
                         crate::health::mark_component_ok("heartbeat");
                         #[allow(clippy::cast_precision_loss)]
                         let elapsed = tick_start.elapsed().as_millis() as f64;
                         metrics.lock().record_success(elapsed);
                         continue;
                     }
-                    tracing::info!(
-                        "💓 Heartbeat Phase 1: run {} of {} tasks",
-                        indices.len(),
-                        tasks.len()
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"selected": indices.len(), "total": tasks.len()})), "heartbeat phase 1: running task subset");
                     indices
                         .into_iter()
                         .filter_map(|i| tasks.get(i).cloned())
                         .collect()
                 }
                 Err(e) => {
-                    tracing::warn!("💓 Heartbeat Phase 1 failed, running all tasks: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "heartbeat phase 1 failed; running all tasks"
+                    );
                     tasks
                 }
             }
@@ -543,10 +646,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let heartbeat_memory: Option<Box<dyn zeroclaw_memory::Memory>> =
             zeroclaw_memory::create_memory(
                 &config.memory,
-                &config.workspace_dir,
+                &config.data_dir,
                 config
-                    .providers
-                    .fallback_provider()
+                    .model_provider_for_agent(&agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
@@ -558,7 +660,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
             // Recall relevant memories so heartbeat tasks have context awareness.
             // Exclude `Conversation` memories to prevent chat context from
-            // leaking into scheduled executions (see #5415).
+            // leaking into scheduled executions.
             let memory_context = if let Some(ref mem) = heartbeat_memory {
                 match mem.recall(&task.text, 5, None, None, None).await {
                     Ok(entries) if !entries.is_empty() => {
@@ -576,7 +678,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         if ctx.is_empty() {
                             None
                         } else {
-                            Some(format!("[Memory context]\n{ctx}\n[/Memory context]\n\n"))
+                            Some(format!(
+                                "{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n"
+                            ))
                         }
                     }
                     _ => None,
@@ -591,13 +695,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
                 (None, None) => task_prompt,
             };
-            let temp = config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7);
+            let temp: Option<f64> = config
+                .model_provider_for_agent(&agent_alias)
+                .and_then(|e| e.temperature);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
+                &agent_alias,
                 Some(prompt),
                 None,
                 None,
@@ -606,6 +709,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -615,10 +719,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 .await
                 {
                     Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "Heartbeat task timed out ({}s)",
-                        config.heartbeat.task_timeout_secs
-                    )),
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Timeout
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "phase": "phase2_heartbeat",
+                                "timeout_secs": config.heartbeat.task_timeout_secs,
+                            })),
+                            "heartbeat task timed out"
+                        );
+                        Err(anyhow::Error::msg(format!(
+                            "Heartbeat task timed out ({}s)",
+                            config.heartbeat.task_timeout_secs
+                        )))
+                    }
                 }
             } else {
                 phase2_fut.await
@@ -630,7 +749,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     let duration_ms = task_start.elapsed().as_millis() as i64;
                     let now = chrono::Utc::now();
                     let _ = crate::heartbeat::store::record_run(
-                        &config.workspace_dir,
+                        &config.data_dir,
                         &task.text,
                         &task.priority.to_string(),
                         now - chrono::Duration::milliseconds(duration_ms),
@@ -678,6 +797,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                 &config,
                                 channel,
                                 target,
+                                None,
                                 &announcement,
                             ),
                         )
@@ -688,14 +808,31 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                     "heartbeat",
                                     format!("delivery failed: {e}"),
                                 );
-                                tracing::warn!("Heartbeat delivery failed: {e}");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Heartbeat delivery failed"
+                                );
                             }
                             Err(_) => {
                                 crate::health::mark_component_error(
                                     "heartbeat",
                                     "delivery timed out (30s)".to_string(),
                                 );
-                                tracing::warn!("Heartbeat delivery timed out (30s)");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                    "Heartbeat delivery timed out (30s)"
+                                );
                             }
                             Ok(Ok(())) => {}
                         }
@@ -707,7 +844,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     let duration_ms = task_start.elapsed().as_millis() as i64;
                     let now = chrono::Utc::now();
                     let _ = crate::heartbeat::store::record_run(
-                        &config.workspace_dir,
+                        &config.data_dir,
                         &task.text,
                         &task.priority.to_string(),
                         now - chrono::Duration::milliseconds(duration_ms),
@@ -718,7 +855,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         config.heartbeat.max_run_history,
                     );
                     crate::health::mark_component_error("heartbeat", e.to_string());
-                    tracing::warn!("Heartbeat task failed: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Heartbeat task failed"
+                    );
                 }
             }
         }
@@ -808,11 +951,16 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         .filter(|v| !v.is_empty())?;
 
     if channel.contains('/') || channel.contains('\\') || to.contains('/') || to.contains('\\') {
-        tracing::warn!("heartbeat session context: channel/to contains path separators, skipping");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "heartbeat session context: channel/to contains path separators, skipping"
+        );
         return None;
     }
 
-    let sessions_dir = config.workspace_dir.join("sessions");
+    let sessions_dir = config.data_dir.join("sessions");
 
     // Find the most recently modified JSONL file that belongs to this target.
     // Matches both `{channel}_{to}.jsonl` and `{channel}_{anything}_{to}.jsonl`.
@@ -840,7 +988,12 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         .map(|e| e.path())?;
 
     if !path.exists() {
-        tracing::debug!("💓 Heartbeat session context: no session file found for {channel}/{to}");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"channel": channel, "to": to})),
+            "heartbeat session context: no session file found"
+        );
         return None;
     }
 
@@ -865,7 +1018,9 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     // Monika's own messages back to her in a loop.
     let has_user_message = recent.iter().any(|m| m.role == "user");
     if !has_user_message {
-        tracing::debug!(
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "💓 Heartbeat session context: no user messages in recent history — skipping"
         );
         return None;
@@ -895,11 +1050,15 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         None => String::new(),
     };
 
-    tracing::debug!(
-        "💓 Heartbeat session context: {} messages from {}, silence: {}",
-        recent.len(),
-        path.display(),
-        silence_note.trim(),
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "💓 Heartbeat session context: {} messages from {}, silence: {}",
+            recent.len(),
+            path.display().to_string(),
+            silence_note.trim()
+        )
     );
 
     let mut ctx = format!(
@@ -964,22 +1123,26 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // Priority order: telegram > discord > slack > mattermost
-    if let Some(tg) = &config.channels.telegram {
-        // Use the first allowed_user as target, or fall back to empty (broadcast)
-        let target = tg.allowed_users.first().cloned().unwrap_or_default();
-        if !target.is_empty() {
-            return Some(("telegram".to_string(), target));
+    // Find the first external peer authorized on a telegram channel
+    // (peer authorization lives in peer_groups in V3, not on the
+    // channel block).
+    if !config.channels.telegram.is_empty() {
+        for alias in config.channels.telegram.keys() {
+            let peers = config.channel_external_peers("telegram", alias);
+            if let Some(target) = peers.into_iter().next() {
+                return Some(("telegram".to_string(), target));
+            }
         }
     }
-    if config.channels.discord.is_some() {
+    if !config.channels.discord.is_empty() {
         // Discord requires explicit target — can't auto-detect
         return None;
     }
-    if config.channels.slack.is_some() {
+    if !config.channels.slack.is_empty() {
         // Slack requires explicit target
         return None;
     }
-    if config.channels.mattermost.is_some() {
+    if !config.channels.mattermost.is_empty() {
         // Mattermost requires explicit target
         return None;
     }
@@ -989,28 +1152,28 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
-            if config.channels.telegram.is_none() {
+            if config.channels.telegram.is_empty() {
                 anyhow::bail!(
                     "heartbeat.target is set to telegram but channels.telegram is not configured"
                 );
             }
         }
         "discord" => {
-            if config.channels.discord.is_none() {
+            if config.channels.discord.is_empty() {
                 anyhow::bail!(
                     "heartbeat.target is set to discord but channels.discord is not configured"
                 );
             }
         }
         "slack" => {
-            if config.channels.slack.is_none() {
+            if config.channels.slack.is_empty() {
                 anyhow::bail!(
                     "heartbeat.target is set to slack but channels.slack is not configured"
                 );
             }
         }
         "mattermost" => {
-            if config.channels.mattermost.is_none() {
+            if config.channels.mattermost.is_empty() {
                 anyhow::bail!(
                     "heartbeat.target is set to mattermost but channels.mattermost is not configured"
                 );
@@ -1036,11 +1199,11 @@ mod tests {
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(&config.data_dir).unwrap();
         config
     }
 
@@ -1104,91 +1267,116 @@ mod tests {
     #[test]
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
-        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
-            enabled: true,
-            bot_token: "token".into(),
-            allowed_users: vec![],
-            stream_mode: zeroclaw_config::schema::StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "token".into(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
     #[test]
     fn detects_dingtalk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels.dingtalk = Some(zeroclaw_config::schema::DingTalkConfig {
-            enabled: true,
-            client_id: "client_id".into(),
-            client_secret: "client_secret".into(),
-            allowed_users: vec!["*".into()],
-            proxy_url: None,
-        });
+        config.channels.dingtalk.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DingTalkConfig {
+                enabled: true,
+                client_id: "client_id".into(),
+                client_secret: "client_secret".into(),
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
     #[test]
     fn detects_mattermost_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
-            enabled: true,
-            url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
-            channel_id: Some("channel-id".into()),
-            allowed_users: vec!["*".into()],
-            thread_replies: Some(true),
-            mention_only: Some(false),
-            interrupt_on_new_message: false,
-            proxy_url: None,
-        });
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                url: "https://mattermost.example.com".into(),
+                bot_token: Some("token".into()),
+                login_id: None,
+                password: None,
+                channel_ids: vec!["channel-id".into()],
+                team_ids: vec![],
+                discover_dms: None,
+                thread_replies: Some(true),
+                mention_only: Some(false),
+                interrupt_on_new_message: false,
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
     #[test]
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels.qq = Some(zeroclaw_config::schema::QQConfig {
-            enabled: true,
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            allowed_users: vec!["*".into()],
-            proxy_url: None,
-        });
+        config.channels.qq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::QQConfig {
+                enabled: true,
+                app_id: "app-id".into(),
+                app_secret: "app-secret".into(),
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
     #[test]
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels.nextcloud_talk = Some(zeroclaw_config::schema::NextcloudTalkConfig {
-            enabled: true,
-            base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
-            webhook_secret: None,
-            allowed_users: vec!["*".into()],
-            proxy_url: None,
-            bot_name: None,
-        });
+        config.channels.nextcloud_talk.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NextcloudTalkConfig {
+                enabled: true,
+                base_url: "https://cloud.example.com".into(),
+                app_token: "app-token".into(),
+                webhook_secret: None,
+                proxy_url: None,
+                bot_name: None,
+                excluded_tools: vec![],
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
     #[test]
     fn webhook_only_config_is_supervised() {
         let mut config = Config::default();
-        config.channels.webhook = Some(zeroclaw_config::schema::WebhookConfig {
-            enabled: true,
-            port: 8080,
-            listen_path: None,
-            send_url: None,
-            send_method: None,
-            auth_header: None,
-            secret: None,
-        });
+        config.channels.webhook.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: 8080,
+                listen_path: None,
+                send_url: None,
+                send_method: None,
+                auth_header: None,
+                secret: None,
+                excluded_tools: vec![],
+            },
+        );
         assert!(has_supervised_channels(&config));
     }
 
@@ -1250,18 +1438,21 @@ mod tests {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
-        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
-            enabled: true,
-            bot_token: "bot-token".into(),
-            allowed_users: vec![],
-            stream_mode: zeroclaw_config::schema::StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "bot-token".into(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+            },
+        );
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
@@ -1269,19 +1460,35 @@ mod tests {
 
     #[test]
     fn auto_detect_telegram_when_configured() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+
         let mut config = Config::default();
-        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
-            enabled: true,
-            bot_token: "bot-token".into(),
-            allowed_users: vec!["user123".into()],
-            stream_mode: zeroclaw_config::schema::StreamMode::default(),
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-            approval_timeout_secs: 120,
-        });
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "bot-token".into(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+            },
+        );
+        // Inbound peer authorization lives in peer_groups in V3.
+        // Auto-detect picks the first external peer of the synthesized
+        // `telegram_default` group as the heartbeat target.
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("user123")],
+                ..PeerGroupConfig::default()
+            },
+        );
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
         assert_eq!(

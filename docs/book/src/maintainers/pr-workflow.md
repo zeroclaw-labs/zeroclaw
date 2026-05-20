@@ -91,7 +91,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - Contract compatibility.
 - Security boundaries.
-- Error handling and fallback behavior.
+- Error handling.
 - Performance and memory regressions.
 - Whether the author can answer questions about behavior and blast radius (intent comprehension).
 

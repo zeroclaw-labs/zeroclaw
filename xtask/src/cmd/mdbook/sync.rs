@@ -5,7 +5,7 @@ use std::process::Command;
 pub fn run(
     locale: Option<&str>,
     force: bool,
-    provider: Option<&str>,
+    model_provider: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
@@ -26,6 +26,7 @@ pub fn run(
 
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
+    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &locale_entries())?;
     run_cmd(
         Command::new(mdbook_program()?)
             .args(["build", "-d", "po-extract"])
@@ -86,23 +87,23 @@ pub fn run(
         }
 
         if force {
-            if let Some(p) = provider {
+            if let Some(p) = model_provider {
                 println!("==> {locale}: --force: re-translating all entries");
                 fill(&root, &po_file, locale, true, p, batch)?;
             } else {
                 println!(
-                    "==> {locale}: --force requested but no --provider specified — skipping AI step"
+                    "==> {locale}: --force requested but no --model-provider specified — skipping AI step"
                 );
             }
         } else {
             let delta = count_delta(&po_file)?;
             if delta > 0 {
-                if let Some(p) = provider {
+                if let Some(p) = model_provider {
                     println!("==> {locale}: AI-filling {delta} entries");
                     fill(&root, &po_file, locale, false, p, batch)?;
                 } else {
                     println!(
-                        "==> {locale}: {delta} entries need translation (use --provider <name> to auto-fill)"
+                        "==> {locale}: {delta} entries need translation (use --model-provider <name> to auto-fill)"
                     );
                 }
             } else {
@@ -136,7 +137,7 @@ fn fill(
     po_file: &Path,
     locale: &str,
     force: bool,
-    provider: &str,
+    model_provider: &str,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     // Build and invoke the binary directly — `cargo run` wraps the child in a way that
@@ -151,7 +152,7 @@ fn fill(
     cmd.args(["--po"])
         .arg(po_file)
         .args(["--locale", locale])
-        .args(["--provider", provider]);
+        .args(["--model-provider", model_provider]);
     if let Some(b) = batch {
         cmd.args(["--batch", &b.to_string()]);
     }

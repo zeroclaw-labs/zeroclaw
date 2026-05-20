@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use std::sync::Arc;
 
-use zeroclaw_api::provider::{ChatMessage, Provider};
+use zeroclaw_api::model_provider::{ChatMessage, ModelProvider};
 use zeroclaw_memory::traits::Memory;
 use zeroclaw_providers::multimodal;
 
@@ -30,10 +30,6 @@ const PROBE_TIERS: &[usize] = &[
     2_000_000, 1_000_000, 512_000, 200_000, 128_000, 64_000, 32_000,
 ];
 
-/// Low temperature for near-deterministic summarization; history compression
-/// must faithfully reflect the source conversation, not invent or embellish.
-const SUMMARIZER_TEMPERATURE: f64 = 0.1;
-
 fn next_probe_tier(current: usize) -> usize {
     PROBE_TIERS
         .iter()
@@ -46,7 +42,7 @@ fn next_probe_tier(current: usize) -> usize {
 // Error message parsing
 // ---------------------------------------------------------------------------
 
-/// Try to extract the actual context window limit from a provider error message.
+/// Try to extract the actual context window limit from a model_provider error message.
 pub fn parse_context_limit_from_error(msg: &str) -> Option<usize> {
     // Match patterns like "maximum context length is 128000" or "limit of 200000 tokens"
     // or "context window of 131072" or "available context size (8448 tokens)"
@@ -190,11 +186,16 @@ impl ContextCompressor {
     }
 
     /// Main entry point. Compresses history in-place if over threshold.
+    ///
+    /// `temperature` is forwarded verbatim to the summarizer LLM call.
+    /// Pass `None` to let the provider decide (required for models that
+    /// reject `temperature`, e.g. claude-opus-4-7).
     pub async fn compress_if_needed(
         &self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
     ) -> Result<CompressionResult> {
         if !self.config.enabled {
             let tokens = estimate_tokens(history);
@@ -222,7 +223,12 @@ impl ContextCompressor {
         // Fast-trim pass — may resolve overflow without an LLM call
         let chars_saved = self.fast_trim_tool_results(history);
         if chars_saved > 0 {
-            tracing::info!(chars_saved, "Fast-trim saved chars from old tool results");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
+                "Fast-trim saved chars from old tool results"
+            );
             let recheck = estimate_tokens(history);
             if recheck <= threshold {
                 return Ok(CompressionResult {
@@ -236,7 +242,9 @@ impl ContextCompressor {
 
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
-            let did_compress = self.compress_once(history, provider, model).await?;
+            let did_compress = self
+                .compress_once(history, model_provider, model, temperature)
+                .await?;
             if did_compress {
                 passes_used += 1;
             }
@@ -259,8 +267,9 @@ impl ContextCompressor {
     pub async fn compress_on_error(
         &mut self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
         error_msg: &str,
     ) -> Result<bool> {
         // Try to extract actual limit from error message
@@ -271,12 +280,16 @@ impl ContextCompressor {
             self.context_window = next_probe_tier(self.context_window);
         }
 
-        tracing::info!(
-            context_window = self.context_window,
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"context_window": self.context_window})),
             "Context limit adjusted, re-compressing"
         );
 
-        let result = self.compress_if_needed(history, provider, model).await?;
+        let result = self
+            .compress_if_needed(history, model_provider, model, temperature)
+            .await?;
         Ok(result.compressed)
     }
 
@@ -284,8 +297,9 @@ impl ContextCompressor {
     async fn compress_once(
         &self,
         history: &mut Vec<ChatMessage>,
-        provider: &dyn Provider,
+        model_provider: &dyn ModelProvider,
         model: &str,
+        temperature: Option<f64>,
     ) -> Result<bool> {
         let n = history.len();
         let protected_total = self.config.protect_first_n + self.config.protect_last_n;
@@ -309,7 +323,7 @@ impl ContextCompressor {
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            provider.supports_vision(),
+            model_provider.supports_vision(),
         );
 
         if transcript.is_empty() {
@@ -334,24 +348,35 @@ impl ContextCompressor {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            provider.chat_with_system(
+            model_provider.chat_with_system(
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
                 summary_model,
-                Some(SUMMARIZER_TEMPERATURE),
+                temperature,
             ),
         )
         .await
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "Summarization LLM call failed, using transcript truncation");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Summarization LLM call failed, using transcript truncation"
+                );
                 truncate_chars(&transcript, self.config.summary_max_chars)
             }
             Err(_) => {
-                tracing::warn!(
-                    "Summarization timed out after {}s, using transcript truncation",
-                    self.config.timeout_secs
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Summarization timed out after {}s, using transcript truncation",
+                        self.config.timeout_secs
+                    )
                 );
                 truncate_chars(&transcript, self.config.summary_max_chars)
             }
@@ -372,10 +397,18 @@ impl ContextCompressor {
                 )
                 .await
             {
-                tracing::debug!("Failed to save compression summary to memory: {e}");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to save compression summary to memory"
+                );
             } else {
-                tracing::debug!(
-                    "Saved compression summary to memory before discarding {message_count} messages"
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"message_count": message_count})),
+                    "Saved compression summary to memory before discarding  messages"
                 );
             }
         }
@@ -503,11 +536,17 @@ fn build_summarizer_transcript(
 ) -> String {
     let transcript = build_transcript(messages, max_chars);
     if supports_vision {
+        // Vision-capable summarizer can read media markers; preserve them so
+        // visual content is reflected in the summary (per #6189 contract).
         return transcript;
     }
 
-    let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
-    if refs.is_empty() { transcript } else { cleaned }
+    // Non-vision summarizer cannot consume media markers. Strip ALL inbound
+    // attachment-kind markers (IMAGE, PHOTO, DOCUMENT, FILE, VIDEO, VOICE,
+    // AUDIO — case-insensitive) instead of just `[IMAGE:...]`, otherwise a
+    // local filesystem path can leak into the auxiliary `chat_with_system`
+    // payload and the upstream API rejects it as a malformed `image_url.url`.
+    multimodal::strip_media_markers(&transcript)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -541,13 +580,13 @@ mod tests {
         }
     }
 
-    struct CaptureSummarizerProvider {
+    struct CaptureSummarizerModelProvider {
         supports_vision: bool,
         seen_messages: Mutex<Vec<String>>,
     }
 
     #[async_trait]
-    impl Provider for CaptureSummarizerProvider {
+    impl ModelProvider for CaptureSummarizerModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -561,15 +600,27 @@ mod tests {
 
         async fn chat(
             &self,
-            _request: zeroclaw_api::provider::ChatRequest<'_>,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
-        ) -> Result<zeroclaw_api::provider::ChatResponse> {
+        ) -> Result<zeroclaw_api::model_provider::ChatResponse> {
             unreachable!("context compressor uses chat_with_system")
         }
 
         fn supports_vision(&self) -> bool {
             self.supports_vision
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CaptureSummarizerModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CaptureSummarizerModelProvider"
         }
     }
 
@@ -727,6 +778,43 @@ mod tests {
     }
 
     #[test]
+    fn test_build_summarizer_transcript_strips_all_attachment_kinds_for_non_vision_provider() {
+        // The non-vision summarizer branch must strip every inbound
+        // attachment-kind alias the channel parsers can emit, not just
+        // `[IMAGE:]`. Mirrors `ATTACHMENT_KINDS` in
+        // `crates/zeroclaw-channels/src/util.rs`. Regression: a `[PHOTO:]`
+        // or `[DOCUMENT:]` marker still leaking through would surface a
+        // local filesystem path in the auxiliary `chat_with_system` payload
+        // and the upstream API would reject it.
+        let messages = vec![msg(
+            "user",
+            "Take a look at [IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] \
+             [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav] please",
+        )];
+        let transcript = build_summarizer_transcript(&messages, 10_000, false);
+        for prefix in [
+            "[IMAGE:",
+            "[PHOTO:",
+            "[DOCUMENT:",
+            "[FILE:",
+            "[VIDEO:",
+            "[VOICE:",
+            "[AUDIO:",
+        ] {
+            assert!(
+                !transcript.contains(prefix),
+                "non-vision transcript should not contain raw {prefix} marker: {transcript}"
+            );
+        }
+        assert!(
+            transcript.contains("[media attachment]"),
+            "non-vision transcript should contain placeholder: {transcript}"
+        );
+        assert!(transcript.contains("Take a look at"));
+        assert!(transcript.contains("please"));
+    }
+
+    #[test]
     fn test_build_transcript_truncates() {
         let messages = vec![msg("user", &"x".repeat(1000))];
         let t = build_transcript(&messages, 100);
@@ -800,7 +888,7 @@ mod tests {
             ..Default::default()
         };
         let compressor = ContextCompressor::new(config, 64);
-        let provider = CaptureSummarizerProvider {
+        let model_provider = CaptureSummarizerModelProvider {
             supports_vision: false,
             seen_messages: Mutex::new(Vec::new()),
         };
@@ -812,12 +900,12 @@ mod tests {
         ];
 
         let result = compressor
-            .compress_if_needed(&mut history, &provider, "model")
+            .compress_if_needed(&mut history, &model_provider, "model", None)
             .await
             .expect("compression should succeed");
 
         assert!(result.compressed);
-        let seen = provider.seen_messages.lock();
+        let seen = model_provider.seen_messages.lock();
         let prompt = seen.last().expect("summarizer should be invoked");
         assert!(!prompt.contains("[IMAGE:"));
         assert!(!prompt.contains("/tmp/example.png"));

@@ -43,9 +43,19 @@ impl PushoverTool {
 
     async fn get_credentials(&self) -> anyhow::Result<(String, String)> {
         let env_path = self.workspace_dir.join(".env");
-        let content = tokio::fs::read_to_string(&env_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", env_path.display(), e))?;
+        let content = tokio::fs::read_to_string(&env_path).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": env_path.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "pushover: failed to read .env"
+            );
+            anyhow::Error::msg(format!("Failed to read {}: {}", env_path.display(), e))
+        })?;
 
         let mut token = None;
         let mut user_key = None;
@@ -68,9 +78,26 @@ impl PushoverTool {
             }
         }
 
-        let token = token.ok_or_else(|| anyhow::anyhow!("PUSHOVER_TOKEN not found in .env"))?;
-        let user_key =
-            user_key.ok_or_else(|| anyhow::anyhow!("PUSHOVER_USER_KEY not found in .env"))?;
+        let token = token.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "PUSHOVER_TOKEN"})),
+                "pushover: PUSHOVER_TOKEN missing from .env"
+            );
+            anyhow::Error::msg("PUSHOVER_TOKEN not found in .env")
+        })?;
+        let user_key = user_key.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "PUSHOVER_USER_KEY"})),
+                "pushover: PUSHOVER_USER_KEY missing from .env"
+            );
+            anyhow::Error::msg("PUSHOVER_USER_KEY not found in .env")
+        })?;
 
         Ok((token, user_key))
     }
@@ -133,7 +160,16 @@ impl Tool for PushoverTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "message"})),
+                    "pushover: missing message parameter"
+                );
+                anyhow::Error::msg("Missing 'message' parameter")
+            })?
             .to_string();
 
         let title = args.get("title").and_then(|v| v.as_str()).map(String::from);

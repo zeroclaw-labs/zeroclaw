@@ -2,8 +2,10 @@
 //!
 //! Each `SkillTool` with `kind = "shell"` or `kind = "script"` is converted
 //! into a `SkillShellTool` that implements the `Tool` trait. The tool name is
-//! prefixed with the skill name (e.g. `my_skill.run_lint`) to avoid collisions
-//! with built-in tools.
+//! prefixed with the skill name (e.g. `my_skill__run_lint`) to avoid collisions
+//! with built-in tools. The `__` separator matches the MCP server prefix
+//! convention and keeps names valid under OpenAI-compatible function-name
+//! rules (`^[a-zA-Z0-9_-]+$`), which reject `.`.
 
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -29,7 +31,7 @@ pub struct SkillShellTool {
 impl SkillShellTool {
     /// Create a new skill shell tool.
     ///
-    /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
+    /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
     pub fn new(
         skill_name: &str,
@@ -37,7 +39,7 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
-            tool_name: format!("{}.{}", skill_name, tool.name),
+            tool_name: format!("{}__{}", skill_name, tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -99,14 +101,11 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod). The
+        // PathGuardedTool wrapper cannot inspect the substituted command
+        // built by substitute_args, so the forbidden_path_argument check
+        // below remains tool-local.
 
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
@@ -126,14 +125,6 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -237,7 +228,7 @@ mod tests {
     #[test]
     fn skill_shell_tool_name_is_prefixed() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
-        assert_eq!(tool.name(), "my_skill.run_lint");
+        assert_eq!(tool.name(), "my_skill__run_lint");
     }
 
     #[test]
@@ -316,7 +307,7 @@ mod tests {
     fn skill_shell_tool_spec_roundtrip() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
         let spec = tool.spec();
-        assert_eq!(spec.name, "my_skill.run_lint");
+        assert_eq!(spec.name, "my_skill__run_lint");
         assert_eq!(spec.description, "Run the linter on a file");
         assert_eq!(spec.parameters["type"], "object");
     }

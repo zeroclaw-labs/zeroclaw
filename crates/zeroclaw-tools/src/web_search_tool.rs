@@ -7,7 +7,7 @@ use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
+/// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
@@ -15,8 +15,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
 pub struct WebSearchTool {
-    /// Provider selector as configured by user. Routed via provider aliases at runtime.
-    provider: String,
+    /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
+    model_provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
     /// Boot-time Tavily key snapshot.
@@ -33,13 +33,13 @@ pub struct WebSearchTool {
 
 impl WebSearchTool {
     pub fn new(
-        provider: String,
+        model_provider: String,
         brave_api_key: Option<String>,
         max_results: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
-            provider: provider.trim().to_lowercase(),
+            model_provider: model_provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             searxng_instance_url: None,
@@ -57,7 +57,7 @@ impl WebSearchTool {
     /// decrypted via `SecretStore`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
-        provider: String,
+        model_provider: String,
         brave_api_key: Option<String>,
         tavily_api_key: Option<String>,
         searxng_instance_url: Option<String>,
@@ -67,7 +67,7 @@ impl WebSearchTool {
         secrets_encrypt: bool,
     ) -> Self {
         Self {
-            provider: provider.trim().to_lowercase(),
+            model_provider: model_provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             searxng_instance_url,
@@ -97,24 +97,55 @@ impl WebSearchTool {
     /// Re-read `config.toml` and decrypt `[web_search] brave_api_key`.
     fn reload_brave_api_key(&self) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "brave",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Brave API key"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {} for Brave API key: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "brave",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to parse config for Brave API key"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to parse config file {} for Brave API key: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         let raw_key = config
             .web_search
             .brave_api_key
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "brave"})),
+                    "web_search: Brave API key not configured"
+                );
+                anyhow::Error::msg("Brave API key not configured")
+            })?;
 
         // Decrypt if necessary.
         if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
@@ -132,8 +163,20 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
+        self.search_duckduckgo_at("https://html.duckduckgo.com/html/", query)
+            .await
+    }
+
+    /// Inner DuckDuckGo request implementation, parameterized on the endpoint URL
+    /// so request-flow tests can target a local mock server. Production calls
+    /// always go through [`Self::search_duckduckgo`].
+    async fn search_duckduckgo_at(
+        &self,
+        endpoint_url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
         let encoded_query = urlencoding::encode(query);
-        let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+        let search_url = format!("{}?q={}", endpoint_url, encoded_query);
 
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
@@ -143,15 +186,25 @@ impl WebSearchTool {
         let client = builder.build()?;
 
         let response = client.get(&search_url).send().await?;
+        let status = response.status();
+        let final_url_is_block =
+            contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
 
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "DuckDuckGo search failed with status: {}",
-                response.status()
-            );
+        if !status.is_success() {
+            if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
+                anyhow::bail!(message);
+            }
+            anyhow::bail!("DuckDuckGo search failed with status: {}", status);
         }
 
         let html = response.text().await?;
+        let html_contains_block = contains_ascii_case_insensitive(&html, "/wr.do?")
+            || contains_ascii_case_insensitive(&html, "anomaly-modal");
+        if let Some(message) =
+            duckduckgo_block_message(status, final_url_is_block, html_contains_block)
+        {
+            anyhow::bail!(message);
+        }
         self.parse_duckduckgo_results(&html, query)
     }
 
@@ -247,24 +300,55 @@ impl WebSearchTool {
     /// Re-read `config.toml` and decrypt `[web_search] tavily_api_key`.
     fn reload_tavily_api_key(&self) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "tavily",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Tavily API key"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {} for Tavily API key: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "tavily",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to parse config for Tavily API key"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to parse config file {} for Tavily API key: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         let raw_key = config
             .web_search
             .tavily_api_key
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Tavily API key not configured"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "tavily"})),
+                    "web_search: Tavily API key not configured"
+                );
+                anyhow::Error::msg("Tavily API key not configured")
+            })?;
 
         if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
             let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -281,14 +365,35 @@ impl WebSearchTool {
     }
 
     async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
-        self.search_tavily_at("https://api.tavily.com/search", query)
+        let client = self.build_tavily_client()?;
+        self.search_tavily_with_client(&client, "https://api.tavily.com/search", query)
             .await
     }
 
-    /// Inner Tavily request implementation, parameterized on the endpoint URL
-    /// so request-shape tests can target a local mock server. Production calls
-    /// always go through [`Self::search_tavily`].
-    async fn search_tavily_at(&self, url: &str, query: &str) -> anyhow::Result<String> {
+    /// Build the production HTTP client for Tavily, wired through the
+    /// process-global runtime proxy state. Extracted so the
+    /// `search_tavily_with_client` test path can substitute a fresh
+    /// client and stay isolated from concurrent tests that mutate
+    /// `RUNTIME_PROXY_CONFIG` (a request built off a stale "enabled"
+    /// proxy snapshot otherwise routes through a non-existent proxy
+    /// and the wiremock connection fails).
+    fn build_tavily_client(&self) -> anyhow::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        Ok(builder.build()?)
+    }
+
+    /// Inner Tavily request implementation, parameterized on the HTTP
+    /// client and endpoint URL so request-shape tests can target a local
+    /// mock server with a client that doesn't read process-global proxy
+    /// state. Production calls always go through [`Self::search_tavily`].
+    async fn search_tavily_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
         let api_key = self.resolve_tavily_api_key()?;
 
         // Tavily authenticates via `Authorization: Bearer <key>` per
@@ -302,11 +407,6 @@ impl WebSearchTool {
             "include_answer": false,
             "include_raw_content": false,
         });
-
-        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
 
         let response = client
             .post(url)
@@ -331,7 +431,16 @@ impl WebSearchTool {
         let results = json
             .get("results")
             .and_then(|r| r.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid Tavily API response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "tavily"})),
+                    "web_search: invalid Tavily response"
+                );
+                anyhow::Error::msg("Invalid Tavily API response")
+            })?;
 
         if results.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -364,7 +473,16 @@ impl WebSearchTool {
             .get("web")
             .and_then(|w| w.get("results"))
             .and_then(|r| r.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid Brave API response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "brave"})),
+                    "web_search: invalid Brave response"
+                );
+                anyhow::Error::msg("Invalid Brave API response")
+            })?;
 
         if results.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -404,17 +522,39 @@ impl WebSearchTool {
 
         // Slow path: re-read config.toml to pick up values set after boot.
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "searxng",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for SearXNG URL"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {} for SearXNG instance URL: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "searxng",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to parse config for SearXNG URL"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to parse config file {} for SearXNG instance URL: {e}",
                 self.config_path.display()
-            )
+            ))
         })?;
 
         config
@@ -422,9 +562,16 @@ impl WebSearchTool {
             .searxng_instance_url
             .filter(|u| !u.is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "searxng"})),
+                    "web_search: SearXNG instance URL not configured"
+                );
+                anyhow::Error::msg(
                     "SearXNG instance URL not configured. Set [web_search] searxng_instance_url \
-                     in config.toml or the SEARXNG_INSTANCE_URL environment variable."
+                     in config.toml or the SEARXNG_INSTANCE_URL environment variable.",
                 )
             })
     }
@@ -468,7 +615,16 @@ impl WebSearchTool {
         let results = json
             .get("results")
             .and_then(|r| r.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid SearXNG API response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "searxng"})),
+                    "web_search: invalid SearXNG response"
+                );
+                anyhow::Error::msg("Invalid SearXNG API response")
+            })?;
 
         if results.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -507,6 +663,27 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
+const DUCKDUCKGO_BLOCK_MESSAGE: &str = "DuckDuckGo blocked the automated search request. Try configuring SearXNG, Brave, or Tavily as the web search provider.";
+
+fn duckduckgo_block_message(
+    status: reqwest::StatusCode,
+    final_url_is_block: bool,
+    html_contains_block: bool,
+) -> Option<&'static str> {
+    if status == reqwest::StatusCode::FORBIDDEN || final_url_is_block || html_contains_block {
+        Some(DUCKDUCKGO_BLOCK_MESSAGE)
+    } else {
+        None
+    }
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn strip_tags(content: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(content, "").to_string()
@@ -536,23 +713,37 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let query = args
-            .get("query")
-            .and_then(|q| q.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
+        let query = args.get("query").and_then(|q| q.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "query"})),
+                "web_search: missing query parameter"
+            );
+            anyhow::Error::msg("Missing required parameter: query")
+        })?;
 
         if query.trim().is_empty() {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        tracing::info!("Searching web for: {}", query);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Searching web for: {}", query)
+        );
 
-        let resolution = resolve_web_search_provider(&self.provider);
+        let resolution = resolve_web_search_provider(&self.model_provider);
         if resolution.used_fallback {
-            tracing::warn!(
-                "Unknown web search provider '{}'; falling back to '{}'",
-                self.provider,
-                resolution.canonical_provider
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Unknown web search model_provider '{}'; falling back to '{}'",
+                    self.model_provider, resolution.canonical_provider
+                )
             );
         }
 
@@ -632,6 +823,180 @@ mod tests {
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("https://example.com/path?a=1"));
         assert!(!result.contains("rut=test"));
+    }
+
+    #[test]
+    fn test_duckduckgo_block_detection_reports_forbidden_status() {
+        let message = duckduckgo_block_message(reqwest::StatusCode::FORBIDDEN, false, false)
+            .expect("403 responses should be classified as a DuckDuckGo block");
+
+        assert!(message.contains("DuckDuckGo blocked"));
+        assert!(message.contains("SearXNG"));
+    }
+
+    #[test]
+    fn test_duckduckgo_block_detection_reports_verification_redirect() {
+        let message = duckduckgo_block_message(reqwest::StatusCode::OK, true, false)
+            .expect("verification redirects should be classified as a DuckDuckGo block");
+
+        assert!(message.contains("DuckDuckGo blocked"));
+        assert!(message.contains("SearXNG"));
+    }
+
+    #[test]
+    fn test_duckduckgo_block_detection_reports_verification_form_in_html() {
+        let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, true)
+            .expect("verification form HTML should be classified as a DuckDuckGo block");
+
+        assert!(message.contains("DuckDuckGo blocked"));
+        assert!(message.contains("SearXNG"));
+    }
+
+    #[test]
+    fn test_duckduckgo_block_detection_ignores_normal_empty_results() {
+        let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, false);
+
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn test_duckduckgo_block_detection_is_case_insensitive_without_allocating_html() {
+        assert!(contains_ascii_case_insensitive(
+            r#"<form action="/WR.DO?u=https%3A%2F%2Fhtml.duckduckgo.com%2Fhtml%2F"></form>"#,
+            "/wr.do?"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_forbidden_status() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("403 should be reported as a DuckDuckGo block");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_verification_redirect_url() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/wr.do?u=blocked", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/wr.do"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("verification redirects should be reported as a DuckDuckGo block");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_verification_form_html() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<form action="/wr.do?u=https%3A%2F%2Fhtml.duckduckgo.com%2Fhtml%2F"></form>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("verification HTML should be reported as a DuckDuckGo block");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_anomaly_modal_block() {
+        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
+        // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
+        // no verification form), and the old detector slid past it,
+        // returning a misleading "No results found" message to the agent.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(
+                r#"<html><body><div class="anomaly-modal__title">Unusual Traffic Detected</div></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("anomaly-modal page should be reported as a DuckDuckGo block");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_preserves_normal_empty_results() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<html>No results here</html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let result = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect("normal empty result HTML should still parse");
+
+        assert!(result.contains("No results found"));
     }
 
     #[test]
@@ -938,8 +1303,15 @@ mod tests {
             false,
         );
 
+        // Isolated client so the request shape under test isn't affected
+        // by `RUNTIME_PROXY_CONFIG` mutations from sibling proxy_config
+        // tests running concurrently in the same process.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
         let result = tool
-            .search_tavily_at(&format!("{}/search", server.uri()), "what is rust")
+            .search_tavily_with_client(&client, &format!("{}/search", server.uri()), "what is rust")
             .await
             .expect("request should succeed against the mock");
         assert!(
@@ -1020,7 +1392,7 @@ mod tests {
     #[test]
     fn test_resolve_searxng_instance_url_from_boot() {
         let tool = WebSearchTool {
-            provider: "searxng".to_string(),
+            model_provider: "searxng".into(),
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),

@@ -12,7 +12,12 @@ const TWITTER_API_BASE: &str = "https://api.x.com/2";
 /// for sending tweets/DMs and filtered stream for receiving mentions.
 pub struct TwitterChannel {
     bearer_token: String,
-    allowed_users: Vec<String>,
+    /// The alias key under `[channels.twitter.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Message deduplication set.
     dedup: Arc<RwLock<HashSet<String>>>,
 }
@@ -21,12 +26,23 @@ pub struct TwitterChannel {
 const DEDUP_CAPACITY: usize = 10_000;
 
 impl TwitterChannel {
-    pub fn new(bearer_token: String, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bearer_token: String,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             bearer_token,
-            allowed_users,
+            alias: alias.into(),
+            peer_resolver,
             dedup: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Return the alias under `[channels.twitter.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -34,7 +50,8 @@ impl TwitterChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
     /// Check and insert tweet ID for deduplication.
@@ -80,7 +97,15 @@ impl TwitterChannel {
             .get("data")
             .and_then(|d| d.get("id"))
             .and_then(|id| id.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing user id in Twitter response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Missing user id in Twitter response"
+                );
+                anyhow::Error::msg("Missing user id in Twitter response")
+            })?
             .to_string();
 
         Ok(user_id)
@@ -149,6 +174,17 @@ impl TwitterChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for TwitterChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Twitter,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for TwitterChannel {
     fn name(&self) -> &str {
@@ -180,9 +216,18 @@ impl Channel for TwitterChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("Twitter: authenticating...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "authenticating..."
+        );
         let bot_user_id = self.get_authenticated_user_id().await?;
-        tracing::info!("Twitter: authenticated as user {bot_user_id}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"bot_user_id": bot_user_id})),
+            "authenticated as user"
+        );
 
         // Poll mentions timeline (filtered stream requires elevated access).
         // Using mentions timeline polling as a more accessible approach.
@@ -210,7 +255,16 @@ impl Channel for TwitterChannel {
                     let data: serde_json::Value = match resp.json().await {
                         Ok(d) => d,
                         Err(e) => {
-                            tracing::warn!("Twitter: failed to parse mentions response: {e}");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "failed to parse mentions response"
+                            );
                             tokio::time::sleep(poll_interval).await;
                             continue;
                         }
@@ -259,16 +313,20 @@ impl Channel for TwitterChannel {
 
                             if !self.is_user_allowed(&username) && !self.is_user_allowed(author_id)
                             {
-                                tracing::debug!(
-                                    "Twitter: ignoring mention from unauthorized user: {username}"
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"username": username})),
+                                    "ignoring mention from unauthorized user"
                                 );
                                 continue;
                             }
 
-                            // Strip the @mention from the text
-                            let clean_text = strip_at_mention(text, &bot_user_id);
-
-                            if clean_text.trim().is_empty() {
+                            let trimmed_text = text.trim();
+                            if trimmed_text.is_empty() {
                                 continue;
                             }
 
@@ -278,8 +336,9 @@ impl Channel for TwitterChannel {
                                 id: Uuid::new_v4().to_string(),
                                 sender: username,
                                 reply_target,
-                                content: clean_text,
+                                content: trimmed_text.to_string(),
                                 channel: "twitter".to_string(),
+                                channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -293,7 +352,15 @@ impl Channel for TwitterChannel {
                             };
 
                             if tx.send(channel_msg).await.is_err() {
-                                tracing::warn!("Twitter: message channel closed");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                    "message channel closed"
+                                );
                                 return Ok(());
                             }
 
@@ -317,15 +384,29 @@ impl Channel for TwitterChannel {
                     let status = resp.status();
                     if status.as_u16() == 429 {
                         // Rate limited — back off
-                        tracing::warn!("Twitter: rate limited, backing off 60s");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "rate limited, backing off 60s"
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         continue;
                     }
                     let err = resp.text().await.unwrap_or_default();
-                    tracing::warn!("Twitter: mentions request failed ({status}): {err}");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})), "mentions request failed");
                 }
                 Err(e) => {
-                    tracing::warn!("Twitter: mentions request error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "mentions request error"
+                    );
                 }
             }
 
@@ -336,20 +417,6 @@ impl Channel for TwitterChannel {
     async fn health_check(&self) -> bool {
         self.get_authenticated_user_id().await.is_ok()
     }
-}
-
-/// Strip @mention from the beginning of a tweet text.
-fn strip_at_mention(text: &str, _bot_user_id: &str) -> String {
-    // Remove all leading @mentions (Twitter includes @bot_name at start of replies)
-    let mut result = text;
-    while let Some(rest) = result.strip_prefix('@') {
-        // Skip past the username (until whitespace or end)
-        match rest.find(char::is_whitespace) {
-            Some(idx) => result = rest[idx..].trim_start(),
-            None => return String::new(),
-        }
-    }
-    result.to_string()
 }
 
 /// Split text into tweet-sized chunks, breaking at word boundaries.
@@ -383,32 +450,40 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = TwitterChannel::new("token".into(), vec![]);
+        let ch = TwitterChannel::new("token".into(), "twitter_test_alias", Arc::new(Vec::new));
         assert_eq!(ch.name(), "twitter");
     }
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = TwitterChannel::new("token".into(), vec!["*".into()]);
+        let ch = TwitterChannel::new(
+            "token".into(),
+            "twitter_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
-        let ch = TwitterChannel::new("token".into(), vec!["user123".into()]);
+        let ch = TwitterChannel::new(
+            "token".into(),
+            "twitter_test_alias",
+            Arc::new(|| vec!["user123".into()]),
+        );
         assert!(ch.is_user_allowed("user123"));
         assert!(!ch.is_user_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = TwitterChannel::new("token".into(), vec![]);
+        let ch = TwitterChannel::new("token".into(), "twitter_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[tokio::test]
     async fn test_dedup() {
-        let ch = TwitterChannel::new("token".into(), vec![]);
+        let ch = TwitterChannel::new("token".into(), "twitter_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_duplicate("tweet1").await);
         assert!(ch.is_duplicate("tweet1").await);
         assert!(!ch.is_duplicate("tweet2").await);
@@ -416,29 +491,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dedup_empty_id() {
-        let ch = TwitterChannel::new("token".into(), vec![]);
+        let ch = TwitterChannel::new("token".into(), "twitter_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_duplicate("").await);
         assert!(!ch.is_duplicate("").await);
-    }
-
-    #[test]
-    fn test_strip_at_mention_single() {
-        assert_eq!(strip_at_mention("@bot hello world", "123"), "hello world");
-    }
-
-    #[test]
-    fn test_strip_at_mention_multiple() {
-        assert_eq!(strip_at_mention("@bot @other hello", "123"), "hello");
-    }
-
-    #[test]
-    fn test_strip_at_mention_only() {
-        assert_eq!(strip_at_mention("@bot", "123"), "");
-    }
-
-    #[test]
-    fn test_strip_at_mention_no_mention() {
-        assert_eq!(strip_at_mention("hello world", "123"), "hello world");
     }
 
     #[test]
@@ -469,11 +524,9 @@ mod tests {
     fn test_config_serde() {
         let toml_str = r#"
 bearer_token = "AAAA"
-allowed_users = ["user1"]
 "#;
         let config: zeroclaw_config::schema::TwitterConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bearer_token, "AAAA");
-        assert_eq!(config.allowed_users, vec!["user1"]);
     }
 
     #[test]
@@ -482,6 +535,6 @@ allowed_users = ["user1"]
 bearer_token = "tok"
 "#;
         let config: zeroclaw_config::schema::TwitterConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.allowed_users.is_empty());
+        assert_eq!(config.bearer_token, "tok");
     }
 }

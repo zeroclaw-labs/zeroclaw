@@ -3,10 +3,9 @@ use std::time::Duration;
 use futures_util::{FutureExt, future::join_all};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
-use tracing::info;
 
 use zeroclaw_api::channel::ChannelMessage;
-use zeroclaw_api::provider::{ChatMessage, ChatResponse};
+use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
@@ -128,35 +127,35 @@ impl HookRunner {
 
     pub async fn run_before_model_resolve(
         &self,
-        mut provider: String,
+        mut model_provider: String,
         mut model: String,
     ) -> HookResult<(String, String)> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_model_resolve(provider.clone(), model.clone()))
+            match AssertUnwindSafe(h.before_model_resolve(model_provider.clone(), model.clone()))
                 .catch_unwind()
                 .await
             {
                 Ok(HookResult::Continue((p, m))) => {
-                    provider = p;
+                    model_provider = p;
                     model = m;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_model_resolve cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_model_resolve cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_model_resolve hook panicked; continuing with previous values"
                     );
                 }
             }
         }
-        HookResult::Continue((provider, model))
+        HookResult::Continue((model_provider, model))
     }
 
     pub async fn run_before_prompt_build(&self, mut prompt: String) -> HookResult<String> {
@@ -168,15 +167,15 @@ impl HookRunner {
             {
                 Ok(HookResult::Continue(p)) => prompt = p,
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_prompt_build cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_prompt_build cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_prompt_build hook panicked; continuing with previous value"
                     );
                 }
@@ -201,15 +200,15 @@ impl HookRunner {
                     model = mdl;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_llm_call cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_llm_call hook panicked; continuing with previous values"
                     );
                 }
@@ -234,15 +233,15 @@ impl HookRunner {
                     args = a;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_tool_call cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_tool_call cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_tool_call hook panicked; continuing with previous values"
                     );
                 }
@@ -263,15 +262,15 @@ impl HookRunner {
             {
                 Ok(HookResult::Continue(m)) => message = m,
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "on_message_received cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "on_message_received cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "on_message_received hook panicked; continuing with previous message"
                     );
                 }
@@ -302,15 +301,15 @@ impl HookRunner {
                     content = ct;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "on_message_sending cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "on_message_sending cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "on_message_sending hook panicked; continuing with previous message"
                     );
                 }

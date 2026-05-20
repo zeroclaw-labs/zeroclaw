@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use tracing::{info, warn};
 
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
@@ -73,7 +72,11 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
 /// If `target_version` is `Some`, fetch that specific version instead of latest.
 pub async fn run(target_version: Option<&str>) -> Result<()> {
     // Phase 1: Preflight
-    info!("Phase 1/6: Preflight checks...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 1/6: Preflight checks..."
+    );
     let update_info = check(target_version).await?;
 
     if !update_info.is_newer {
@@ -94,27 +97,49 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         std::env::current_exe().context("cannot determine current executable path")?;
 
     // Phase 2: Download
-    info!("Phase 2/6: Downloading...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 2/6: Downloading..."
+    );
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
     download_binary(&download_url, &download_path).await?;
 
     // Phase 3: Backup
-    info!("Phase 3/6: Creating backup...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 3/6: Creating backup..."
+    );
     let backup_path = current_exe.with_extension("bak");
     tokio::fs::copy(&current_exe, &backup_path)
         .await
         .context("failed to backup current binary")?;
 
     // Phase 4: Validate
-    info!("Phase 4/6: Validating download...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 4/6: Validating download..."
+    );
     validate_binary(&download_path).await?;
 
     // Phase 5: Swap
-    info!("Phase 5/6: Swapping binary...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 5/6: Swapping binary..."
+    );
     if let Err(e) = swap_binary(&download_path, &current_exe).await {
         // Rollback
-        warn!("Swap failed, rolling back: {e}");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Swap failed, rolling back"
+        );
         if let Err(rollback_err) = rollback_binary(&backup_path, &current_exe).await {
             eprintln!("CRITICAL: Rollback also failed: {rollback_err}");
             eprintln!(
@@ -127,7 +152,11 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     }
 
     // Phase 6: Smoke test
-    info!("Phase 6/6: Smoke test...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 6/6: Smoke test..."
+    );
     match smoke_test(&current_exe).await {
         Ok(()) => {
             // Cleanup backup on success
@@ -136,7 +165,13 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            warn!("Smoke test failed, rolling back: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Smoke test failed, rolling back"
+            );
             rollback_binary(&backup_path, &current_exe)
                 .await
                 .context("rollback after smoke test failure")?;
@@ -146,18 +181,20 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
 }
 
 fn find_asset_url(release: &serde_json::Value) -> Option<String> {
-    let target = current_target_triple();
+    let target = current_target_triple()?;
 
-    release["assets"]
-        .as_array()?
-        .iter()
-        .find(|asset| {
-            asset["name"]
-                .as_str()
-                .map(|name| name.contains(target))
-                .unwrap_or(false)
-        })
-        .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
+    release["assets"].as_array()?.iter().find_map(|asset| {
+        let name = asset["name"].as_str()?;
+        if !is_installable_release_asset(name, target) {
+            return None;
+        }
+        let url = asset["browser_download_url"].as_str()?.trim();
+        (!url.is_empty()).then(|| url.to_string())
+    })
+}
+
+fn is_installable_release_asset(name: &str, target: &str) -> bool {
+    name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz")
 }
 
 /// Return the exact Rust target triple for the current platform.
@@ -165,29 +202,24 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
 /// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
 /// shorter `aarch64-unknown-linux`) prevents substring matches from
 /// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
-fn current_target_triple() -> &'static str {
-    if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-apple-darwin"
-        } else {
-            "x86_64-apple-darwin"
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux-gnu"
-        } else {
-            "x86_64-unknown-linux-gnu"
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-pc-windows-msvc"
-        } else if cfg!(target_env = "gnu") {
-            "x86_64-pc-windows-gnu"
-        } else {
-            "x86_64-pc-windows-msvc"
-        }
-    } else {
-        "unknown"
+fn current_target_triple() -> Option<&'static str> {
+    target_triple_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "gnu"),
+    )
+}
+
+fn target_triple_for(os: &str, arch: &str, windows_gnu: bool) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("windows", "aarch64") => Some("aarch64-pc-windows-msvc"),
+        ("windows", "x86_64") if windows_gnu => Some("x86_64-pc-windows-gnu"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
     }
 }
 
@@ -422,12 +454,30 @@ mod tests {
 
     #[test]
     fn current_target_triple_is_not_empty() {
-        let triple = current_target_triple();
-        assert_ne!(triple, "unknown", "unsupported platform");
+        let triple = current_target_triple().expect("supported test platform");
         // The triple must contain at least two hyphens (arch-vendor-os or arch-vendor-os-env)
         assert!(
             triple.matches('-').count() >= 2,
             "triple should have at least two hyphens: {triple}"
+        );
+    }
+
+    #[test]
+    fn target_triple_for_rejects_unsupported_architectures() {
+        assert_eq!(target_triple_for("linux", "arm", false), None);
+        assert_eq!(target_triple_for("macos", "powerpc", false), None);
+        assert_eq!(target_triple_for("windows", "x86", false), None);
+    }
+
+    #[test]
+    fn target_triple_for_distinguishes_windows_envs() {
+        assert_eq!(
+            target_triple_for("windows", "x86_64", false),
+            Some("x86_64-pc-windows-msvc")
+        );
+        assert_eq!(
+            target_triple_for("windows", "x86_64", true),
+            Some("x86_64-pc-windows-gnu")
         );
     }
 
@@ -464,6 +514,70 @@ mod tests {
             !url.contains("android"),
             "should not select android binary, got: {url}"
         );
+    }
+
+    #[test]
+    fn find_asset_url_ignores_non_installable_assets() {
+        let target = current_target_triple().expect("supported test platform");
+        let release = make_release(&[
+            &format!("zeroclaw-{target}.tar.gz.sha256"),
+            &format!("zeroclaw-{target}.zip.sha256"),
+            &format!("zeroclaw-{target}.zip"),
+            &format!("zeroclaw-{target}.tar.gz"),
+        ]);
+
+        let url = find_asset_url(&release).expect("should select archive asset");
+        assert!(
+            url.ends_with(".tar.gz"),
+            "should select release archive, got: {url}"
+        );
+    }
+
+    #[test]
+    fn find_asset_url_skips_matching_asset_with_unusable_url() {
+        let target = current_target_triple().expect("supported test platform");
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": format!("zeroclaw-{target}.tar.gz"),
+                    "browser_download_url": ""
+                },
+                {
+                    "name": format!("zeroclaw-{target}.tgz"),
+                    "browser_download_url": null
+                },
+                {
+                    "name": format!("zeroclaw-{target}.tar.gz"),
+                    "browser_download_url": format!("https://example.com/zeroclaw-{target}.tar.gz")
+                }
+            ]
+        });
+
+        let url = find_asset_url(&release).expect("should skip unusable URLs");
+        assert_eq!(url, format!("https://example.com/zeroclaw-{target}.tar.gz"));
+    }
+
+    #[test]
+    fn find_asset_url_ignores_non_zeroclaw_assets() {
+        let target = current_target_triple().expect("supported test platform");
+        let release = make_release(&[
+            &format!("helper-{target}.tar.gz"),
+            &format!("zeroclaw-{target}.tar.gz"),
+        ]);
+
+        let url = find_asset_url(&release).expect("should select zeroclaw asset");
+        assert!(
+            url.contains(&format!("zeroclaw-{target}.tar.gz")),
+            "should select zeroclaw archive, got: {url}"
+        );
+    }
+
+    #[test]
+    fn installable_release_asset_rejects_unknown_target() {
+        assert!(!is_installable_release_asset(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "unknown"
+        ));
     }
 
     #[test]

@@ -9,19 +9,22 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
-    AgentStart { provider: String, model: String },
-    /// A request is about to be sent to an LLM provider.
+    AgentStart {
+        model_provider: String,
+        model: String,
+    },
+    /// A request is about to be sent to an LLM model_provider.
     ///
-    /// This is emitted immediately before a provider call so observers can print
+    /// This is emitted immediately before a model_provider call so observers can print
     /// user-facing progress without leaking prompt contents.
     LlmRequest {
-        provider: String,
+        model_provider: String,
         model: String,
         messages_count: usize,
     },
-    /// Result of a single LLM provider call.
+    /// Result of a single LLM model_provider call.
     LlmResponse {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
         success: bool,
@@ -31,9 +34,9 @@ pub enum ObserverEvent {
     },
     /// The agent session has finished.
     ///
-    /// Carries aggregate usage data (tokens, cost) when the provider reports it.
+    /// Carries aggregate usage data (tokens, cost) when the model_provider reports it.
     AgentEnd {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
         tokens_used: Option<u64>,
@@ -100,24 +103,10 @@ pub enum ObserverEvent {
     },
     /// An error occurred in a named component.
     Error {
-        /// Subsystem where the error originated (e.g., `"provider"`, `"gateway"`).
+        /// Subsystem where the error originated (e.g., `"model_provider"`, `"gateway"`).
         component: String,
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
-    },
-    /// A hand has started execution.
-    HandStarted { hand_name: String },
-    /// A hand has completed execution successfully.
-    HandCompleted {
-        hand_name: String,
-        duration_ms: u64,
-        findings_count: usize,
-    },
-    /// A hand has failed during execution.
-    HandFailed {
-        hand_name: String,
-        error: String,
-        duration_ms: u64,
     },
     /// A deployment has started.
     DeploymentStarted {
@@ -154,15 +143,6 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
-    /// Duration of a single hand run.
-    HandRunDuration {
-        hand_name: String,
-        duration: Duration,
-    },
-    /// Number of findings produced by a hand run.
-    HandFindingsCount { hand_name: String, count: u64 },
-    /// Records a hand run outcome for success-rate tracking.
-    HandSuccessRate { hand_name: String, success: bool },
     /// Time elapsed from commit to deployment (lead time for changes).
     DeploymentLeadTime(Duration),
     /// Time elapsed to recover from a failed deployment.
@@ -210,6 +190,35 @@ pub trait Observer: Send + Sync + 'static {
     /// Enables callers to access concrete observer types when needed
     /// (e.g., retrieving a Prometheus registry handle for custom metrics).
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Blanket implementation: `Arc<T>` delegates all `Observer` methods to `T`.
+///
+/// Lets a singleton observer be handed out as `Arc<MyObserver>` and still be
+/// used wherever `Box<dyn Observer>` is expected (e.g.
+/// `Box::new(MyObserver::shared())`). `as_any` deliberately delegates to the
+/// inner `T` so downcasts in handlers like `/metrics` recover the concrete
+/// type rather than the `Arc` wrapper.
+impl<T: Observer + ?Sized> Observer for std::sync::Arc<T> {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.as_ref().record_event(event);
+    }
+
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.as_ref().record_metric(metric);
+    }
+
+    fn flush(&self) {
+        self.as_ref().flush();
+    }
+
+    fn name(&self) -> &str {
+        self.as_ref().name()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.as_ref().as_any()
+    }
 }
 
 #[cfg(test)]
@@ -285,68 +294,5 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
-    }
-
-    #[test]
-    fn hand_events_recordable() {
-        let observer = DummyObserver::default();
-
-        observer.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
-        observer.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        observer.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
-
-        assert_eq!(*observer.events.lock(), 3);
-    }
-
-    #[test]
-    fn hand_metrics_recordable() {
-        let observer = DummyObserver::default();
-
-        observer.record_metric(&ObserverMetric::HandRunDuration {
-            hand_name: "review".into(),
-            duration: Duration::from_millis(1500),
-        });
-        observer.record_metric(&ObserverMetric::HandFindingsCount {
-            hand_name: "review".into(),
-            count: 3,
-        });
-        observer.record_metric(&ObserverMetric::HandSuccessRate {
-            hand_name: "review".into(),
-            success: true,
-        });
-
-        assert_eq!(*observer.metrics.lock(), 3);
-    }
-
-    #[test]
-    fn hand_event_and_metric_are_cloneable() {
-        let event = ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 500,
-            findings_count: 2,
-        };
-        let metric = ObserverMetric::HandRunDuration {
-            hand_name: "review".into(),
-            duration: Duration::from_millis(500),
-        };
-
-        let cloned_event = event.clone();
-        let cloned_metric = metric.clone();
-
-        assert!(matches!(cloned_event, ObserverEvent::HandCompleted { .. }));
-        assert!(matches!(
-            cloned_metric,
-            ObserverMetric::HandRunDuration { .. }
-        ));
     }
 }

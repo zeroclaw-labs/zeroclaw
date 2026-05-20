@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -14,7 +15,12 @@ pub struct WatiChannel {
     api_token: String,
     api_url: String,
     tenant_id: Option<String>,
-    allowed_numbers: Vec<String>,
+    /// The alias key under `[channels.wati.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     client: reqwest::Client,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
@@ -24,29 +30,38 @@ impl WatiChannel {
         api_token: String,
         api_url: String,
         tenant_id: Option<String>,
-        allowed_numbers: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        Self::new_with_proxy(api_token, api_url, tenant_id, allowed_numbers, None)
+        Self::new_with_proxy(api_token, api_url, tenant_id, alias, peer_resolver, None)
     }
 
     pub fn new_with_proxy(
         api_token: String,
         api_url: String,
         tenant_id: Option<String>,
-        allowed_numbers: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         proxy_url: Option<String>,
     ) -> Self {
         Self {
             api_token,
             api_url,
             tenant_id,
-            allowed_numbers,
+            alias: alias.into(),
+            peer_resolver,
             client: zeroclaw_config::schema::build_channel_proxy_client(
                 "channel.wati",
                 proxy_url.as_deref(),
             ),
             transcription_manager: None,
         }
+    }
+
+    /// Return the alias under `[channels.wati.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 
     pub fn with_transcription(
@@ -58,11 +73,30 @@ impl WatiChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Per-agent `transcription_provider` routes through the
+                // orchestrator's resolved-runtime path. For the
+                // `try_transcribe_audio` direct path (gateway WS handler /
+                // channel-side ingest), bind to the sole registered provider
+                // when only one is configured so the single-provider case
+                // dispatches without an agent context. Multi-provider setups
+                // still require explicit `agent.<alias>.transcription_provider`
+                // routing through the orchestrator.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, voice transcription disabled"
                 );
             }
         }
@@ -71,7 +105,8 @@ impl WatiChannel {
 
     /// Check if a phone number is allowed (E.164 format: +1234567890).
     fn is_number_allowed(&self, phone: &str) -> bool {
-        self.allowed_numbers.iter().any(|n| n == "*" || n == phone)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, phone, crate::allowlist::Match::Sensitive)
     }
 
     /// Extract and normalize the sender phone number from a WATI webhook payload.
@@ -99,10 +134,12 @@ impl WatiChannel {
 
         // Check allowlist
         if !self.is_number_allowed(&normalized_phone) {
-            tracing::warn!(
-                "WATI: ignoring message from unauthorized sender: {normalized_phone}. \
-                Add to channels.wati.allowed_numbers in config.toml, \
-                or run `zeroclaw onboard --channels-only` to configure interactively."
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"normalized_phone": normalized_phone})),
+                "ignoring message from unauthorized sender: . Add to channels.wati.allowed_numbers in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
             );
             return None;
         }
@@ -198,7 +235,11 @@ impl WatiChannel {
             .unwrap_or(false);
 
         if from_me {
-            tracing::debug!("WATI: skipping fromMe message");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping fromMe message"
+            );
             return messages;
         }
 
@@ -214,6 +255,7 @@ impl WatiChannel {
             sender: normalized_phone,
             content: text.to_string(),
             channel: "wati".to_string(),
+            channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
@@ -249,7 +291,13 @@ impl WatiChannel {
         match (api_host, media_host) {
             (Some(ref expected), Some(ref actual)) if actual == expected => {}
             _ => {
-                tracing::warn!("WATI: blocked media URL with unexpected host: {media_url}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"media_url": media_url})),
+                    "blocked media URL with unexpected host"
+                );
                 return None;
             }
         }
@@ -262,7 +310,11 @@ impl WatiChannel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if from_me {
-            tracing::debug!("WATI: skipping fromMe audio before download");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping fromMe audio before download"
+            );
             return None;
         }
 
@@ -285,13 +337,24 @@ impl WatiChannel {
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("WATI: media download request failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "media download request failed"
+                );
                 return None;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::warn!("WATI: media download failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("media download failed: {}", resp.status())
+            );
             return None;
         }
 
@@ -299,9 +362,11 @@ impl WatiChannel {
         while let Some(chunk) = resp.chunk().await.ok().flatten() {
             audio_bytes.extend_from_slice(&chunk);
             if audio_bytes.len() as u64 > MAX_WATI_AUDIO_BYTES {
-                tracing::warn!(
-                    "WATI: audio download exceeds {} byte limit",
-                    MAX_WATI_AUDIO_BYTES
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("audio download exceeds {} byte limit", MAX_WATI_AUDIO_BYTES)
                 );
                 return None;
             }
@@ -310,7 +375,13 @@ impl WatiChannel {
         match manager.transcribe(&audio_bytes, file_name).await {
             Ok(transcript) => Some(transcript),
             Err(e) => {
-                tracing::warn!("WATI: transcription failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "transcription failed"
+                );
                 None
             }
         }
@@ -336,12 +407,20 @@ impl WatiChannel {
             .unwrap_or(false);
 
         if from_me {
-            tracing::debug!("WATI: skipping fromMe audio message");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping fromMe audio message"
+            );
             return messages;
         }
 
         if transcript.trim().is_empty() {
-            tracing::debug!("WATI: skipping empty audio transcript");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping empty audio transcript"
+            );
             return messages;
         }
 
@@ -357,6 +436,7 @@ impl WatiChannel {
             sender: normalized_phone,
             content: transcript,
             channel: "wati".to_string(),
+            channel_alias: Some(self.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
@@ -364,6 +444,15 @@ impl WatiChannel {
         });
 
         messages
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WatiChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Wati)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -395,7 +484,7 @@ impl Channel for WatiChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            tracing::error!("WATI send failed: {status} — {error_body}");
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "send failed:");
             anyhow::bail!("WATI API error: {status}");
         }
 
@@ -405,7 +494,9 @@ impl Channel for WatiChannel {
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         // WATI uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /wati endpoint.
-        tracing::info!(
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "WATI channel active (webhook mode). \
             Configure WATI webhook to POST to your gateway's /wati endpoint."
         );
@@ -443,97 +534,102 @@ impl Channel for WatiChannel {
 mod tests {
     use super::*;
 
-    fn make_channel() -> WatiChannel {
-        WatiChannel {
-            api_token: "test-token".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: None,
-            allowed_numbers: vec!["+1234567890".into()],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        }
-    }
-
-    fn make_wildcard_channel() -> WatiChannel {
-        WatiChannel {
-            api_token: "test-token".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: None,
-            allowed_numbers: vec!["*".into()],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        }
-    }
-
     #[test]
     fn wati_channel_name() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert_eq!(ch.name(), "wati");
     }
 
     #[test]
     fn wati_number_allowed_exact() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9876543210"));
     }
 
     #[test]
     fn wati_number_allowed_wildcard() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
     #[test]
     fn wati_number_allowed_empty() {
-        let ch = WatiChannel {
-            api_token: "tok".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: None,
-            allowed_numbers: vec![],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        };
+        let ch = WatiChannel::new(
+            "tok".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(Vec::new),
+        );
         assert!(!ch.is_number_allowed("+1234567890"));
     }
 
     #[test]
     fn wati_build_target_with_tenant() {
-        let ch = WatiChannel {
-            api_token: "tok".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: Some("tenant1".into()),
-            allowed_numbers: vec![],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        };
+        let ch = WatiChannel::new(
+            "tok".into(),
+            "https://live-mt-server.wati.io".into(),
+            Some("tenant1".into()),
+            "wati_test_alias",
+            Arc::new(Vec::new),
+        );
         assert_eq!(ch.build_target("+1234567890"), "tenant1:1234567890");
     }
 
     #[test]
     fn wati_build_target_without_tenant() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert_eq!(ch.build_target("+1234567890"), "1234567890");
     }
 
     #[test]
     fn wati_build_target_already_prefixed() {
-        let ch = WatiChannel {
-            api_token: "tok".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: Some("tenant1".into()),
-            allowed_numbers: vec![],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        };
+        let ch = WatiChannel::new(
+            "tok".into(),
+            "https://live-mt-server.wati.io".into(),
+            Some("tenant1".into()),
+            "wati_test_alias",
+            Arc::new(Vec::new),
+        );
         // If the phone already has the tenant prefix, don't double it
         assert_eq!(ch.build_target("tenant1:1234567890"), "tenant1:1234567890");
     }
 
     #[test]
     fn wati_parse_valid_message() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "text": "Hello from WATI!",
             "waId": "1234567890",
@@ -552,7 +648,13 @@ mod tests {
 
     #[test]
     fn wati_parse_skip_from_me() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "text": "My own message",
             "waId": "1234567890",
@@ -565,7 +667,13 @@ mod tests {
 
     #[test]
     fn wati_parse_skip_no_text() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "waId": "1234567890",
             "fromMe": false
@@ -577,7 +685,13 @@ mod tests {
 
     #[test]
     fn wati_parse_alternative_field_names() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
 
         // wa_id instead of waId, message.body instead of text
         let payload = serde_json::json!({
@@ -595,7 +709,13 @@ mod tests {
 
     #[test]
     fn wati_parse_timestamp_seconds() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "text": "Test",
             "waId": "1234567890",
@@ -608,7 +728,13 @@ mod tests {
 
     #[test]
     fn wati_parse_timestamp_milliseconds() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "text": "Test",
             "waId": "1234567890",
@@ -621,7 +747,13 @@ mod tests {
 
     #[test]
     fn wati_parse_timestamp_iso() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "text": "Test",
             "waId": "1234567890",
@@ -634,14 +766,13 @@ mod tests {
 
     #[test]
     fn wati_parse_normalizes_phone() {
-        let ch = WatiChannel {
-            api_token: "tok".into(),
-            api_url: "https://live-mt-server.wati.io".into(),
-            tenant_id: None,
-            allowed_numbers: vec!["+1234567890".into()],
-            client: reqwest::Client::new(),
-            transcription_manager: None,
-        };
+        let ch = WatiChannel::new(
+            "tok".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
 
         // Phone without + prefix
         let payload = serde_json::json!({
@@ -657,7 +788,13 @@ mod tests {
 
     #[test]
     fn wati_parse_empty_payload() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({});
         let msgs = ch.parse_webhook_payload(&payload);
         assert!(msgs.is_empty());
@@ -665,7 +802,13 @@ mod tests {
 
     #[test]
     fn wati_parse_from_field_fallback() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         // Uses "from" instead of "waId"
         let payload = serde_json::json!({
             "text": "Fallback test",
@@ -680,7 +823,13 @@ mod tests {
 
     #[test]
     fn wati_parse_message_text_fallback() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         // Uses "message.text" instead of top-level "text"
         let payload = serde_json::json!({
             "message": { "text": "Nested text" },
@@ -695,7 +844,13 @@ mod tests {
 
     #[test]
     fn wati_parse_owner_field_as_from_me() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         // Uses "owner" field as fromMe indicator
         let payload = serde_json::json!({
             "text": "Test",
@@ -709,7 +864,13 @@ mod tests {
 
     #[test]
     fn wati_manager_none_when_not_configured() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert!(ch.transcription_manager.is_none());
     }
 
@@ -717,7 +878,6 @@ mod tests {
     fn wati_manager_some_when_valid_config() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "groq".to_string(),
             api_key: Some("test-key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -736,7 +896,8 @@ mod tests {
             "test-token".into(),
             "https://live-mt-server.wati.io".into(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 
@@ -747,7 +908,6 @@ mod tests {
     fn wati_manager_none_and_warn_on_init_failure() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "groq".to_string(),
             api_key: Some(String::new()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -766,7 +926,8 @@ mod tests {
             "test-token".into(),
             "https://live-mt-server.wati.io".into(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 
@@ -775,7 +936,13 @@ mod tests {
 
     #[tokio::test]
     async fn wati_try_transcribe_returns_none_when_manager_none() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "type": "audio",
             "mediaUrl": "https://example.com/audio.ogg",
@@ -790,7 +957,6 @@ mod tests {
     async fn wati_try_transcribe_returns_none_when_no_media_url() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: false,
-            default_provider: "groq".to_string(),
             api_key: Some("test-key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
@@ -809,7 +975,8 @@ mod tests {
             "test-token".into(),
             "https://live-mt-server.wati.io".into(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 
@@ -824,7 +991,13 @@ mod tests {
 
     #[test]
     fn wati_filename_voice_type() {
-        let _ch = make_channel();
+        let _ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "type": "voice",
             "mediaUrl": "https://example.com/media/123",
@@ -845,7 +1018,13 @@ mod tests {
 
     #[test]
     fn wati_filename_audio_type() {
-        let _ch = make_channel();
+        let _ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "type": "audio",
             "mediaUrl": "https://example.com/media/123",
@@ -866,7 +1045,13 @@ mod tests {
 
     #[test]
     fn wati_extract_sender_absent_returns_none() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "type": "audio"
         });
@@ -877,7 +1062,13 @@ mod tests {
 
     #[test]
     fn wati_extract_sender_not_in_allowlist_returns_none() {
-        let ch = make_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         let payload = serde_json::json!({
             "waId": "9999999999"
         });
@@ -888,7 +1079,13 @@ mod tests {
 
     #[test]
     fn wati_parse_audio_as_message_uses_transcript_as_content() {
-        let ch = make_wildcard_channel();
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            "wati_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         let payload = serde_json::json!({
             "type": "audio",
             "waId": "1234567890",
@@ -932,7 +1129,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             api_key: None,
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-1".to_string(),
@@ -956,7 +1152,8 @@ mod tests {
             "test-token".into(),
             media_server.uri(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 
@@ -985,7 +1182,6 @@ mod tests {
 
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             api_key: None,
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-1".to_string(),
@@ -1009,7 +1205,8 @@ mod tests {
             "test-token".into(),
             media_server.uri(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 
@@ -1041,7 +1238,6 @@ mod tests {
     async fn wati_try_transcribe_blocks_host_mismatch() {
         let config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".into(),
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
                 url: "http://localhost:8001/v1/transcribe".into(),
                 bearer_token: Some("test-token".into()),
@@ -1055,7 +1251,8 @@ mod tests {
             "test-token".into(),
             "https://live-mt-server.wati.io".into(),
             None,
-            vec!["+1234567890".into()],
+            "wati_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
         )
         .with_transcription(config);
 

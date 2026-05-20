@@ -7,6 +7,7 @@ import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { getAdminPairCode, getOnboardStatus } from './lib/api';
 import { basePath } from './lib/basePath';
+import { ConfigDraftProvider } from './lib/draftStore';
 import { setLocale, type Locale } from './lib/i18n';
 import { Router } from './router/router';
 
@@ -47,6 +48,16 @@ export class ErrorBoundary extends Component<
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('[ZeroClaw] Render error:', error, info.componentStack);
+    // Stale-chunk recovery: when Vite rebuilds, the loaded index.html
+    // still references the previous chunk hashes. A dynamic import for
+    // a lazy route then 404s with "error loading dynamically imported
+    // module". Reload once so the user gets the new index.html and the
+    // current chunk hashes; the sessionStorage marker prevents reload
+    // loops if reload doesn't actually help.
+    if (isChunkLoadError(error) && !sessionStorage.getItem('zeroclaw-chunk-reloaded')) {
+      sessionStorage.setItem('zeroclaw-chunk-reloaded', '1');
+      window.location.reload();
+    }
   }
 
   render() {
@@ -64,7 +75,10 @@ export class ErrorBoundary extends Component<
               {this.state.error.message}
             </pre>
             <button
-              onClick={() => this.setState({ error: null })}
+              onClick={() => {
+                sessionStorage.removeItem('zeroclaw-chunk-reloaded');
+                this.setState({ error: null });
+              }}
               className="btn-electric mt-6 px-4 py-2 text-sm font-medium"
             >
               Try again
@@ -75,6 +89,16 @@ export class ErrorBoundary extends Component<
     }
     return this.props.children;
   }
+}
+
+function isChunkLoadError(error: Error): boolean {
+  const m = error?.message ?? '';
+  return (
+    m.includes('dynamically imported module') ||
+    m.includes('Failed to fetch dynamically') ||
+    m.includes('Importing a module script failed') ||
+    error?.name === 'ChunkLoadError'
+  );
 }
 
 // Pairing dialog component
@@ -211,10 +235,12 @@ function AppContent() {
 
   return (
     <DraftContext.Provider value={draftStore}>
-      <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <FreshInstallRedirect />
-        <Router />
-      </LocaleContext.Provider>
+      <ConfigDraftProvider>
+        <LocaleContext.Provider value={{ locale, setAppLocale }}>
+          <FreshInstallRedirect />
+          <Router />
+        </LocaleContext.Provider>
+      </ConfigDraftProvider>
     </DraftContext.Provider>
   );
 }

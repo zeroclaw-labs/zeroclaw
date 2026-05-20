@@ -2,7 +2,7 @@
 
 The authoritative procedure for assembling `CHANGELOG-next.md` between stable releases. This page is loaded by the `changelog-generation` skill and read by maintainers running a release manually — both consume the same protocol.
 
-The release workflows (`release-stable-manual.yml`) automatically use `CHANGELOG-next.md` as the GitHub Release body if it's at the repo root when a release fires. After the stable release ships, the workflow deletes the file. No manual cleanup needed.
+The release workflows (`release-stable-manual.yml`) automatically use `CHANGELOG-next.md` as the GitHub Release body if it's at the repo root when a release fires. After the stable release ships, `CHANGELOG-next.md` is intentionally left on `master`; the next release cycle overwrites it with a fresh file. No manual cleanup is needed.
 
 ## 1. Establish the commit range
 
@@ -216,4 +216,4 @@ Don't push directly to `master`.
 
 `release-stable-manual.yml` checks for `CHANGELOG-next.md` at the start of the release job. If found, its content becomes the GitHub Release body. If not found, the workflow falls back to auto-generated `feat:`-only notes.
 
-After a successful stable release, the workflow automatically deletes `CHANGELOG-next.md` and commits the removal. No manual cleanup is required.
+After a successful stable release, `CHANGELOG-next.md` is intentionally left on `master`. The next release cycle will overwrite it. No manual cleanup is required.

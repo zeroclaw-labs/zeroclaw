@@ -7,27 +7,84 @@ use crate::traits::{PropFieldInfo, PropKind};
 /// return the HashMap key + the fully-qualified inner name that the value
 /// type's own `get_prop` / `set_prop` expects.
 ///
-/// Returns `None` when the path doesn't match, letting the derive's
-/// generated code fall through to the next nested field.
-pub fn route_hashmap_path<'a>(
+/// HashMap keys are user-controlled and may contain dots, URLs, or hostnames
+/// (for example `model_providers.custom:https://example.invalid/v1.api-key`).
+/// Inner values may themselves be deeply nested (`AliasedAgentConfig` has
+/// `agent.thinking.<...>` subpaths), so neither left-splitting nor
+/// right-splitting works in isolation. Match against the actual present
+/// keys and pick the longest prefix that is followed by `.` — this
+/// correctly handles dotted keys *and* deep inner paths in one parse.
+///
+/// `keys` is an iterator over the live HashMap's keys (typically
+/// `self.<field>.keys().map(String::as_str)` from the derive). Returns
+/// `None` when the path doesn't match, letting the derive's generated
+/// code fall through to the next nested field.
+pub fn route_hashmap_path<'a, 'k, I>(
     name: &'a str,
     my_prefix: &str,
     field_name: &str,
     inner_prefix: &str,
-) -> Option<(&'a str, String)> {
+    keys: I,
+) -> Option<(&'a str, String)>
+where
+    I: IntoIterator<Item = &'k str>,
+{
     let key_prefix = if my_prefix.is_empty() {
         field_name.to_string()
     } else {
         format!("{my_prefix}.{field_name}")
     };
     let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
-    let (hm_key, inner_suffix) = rest.split_once('.')?;
+    // Longest-match against present map keys. Dotted keys (URL-shaped
+    // custom provider entries) sort longer than their unprefixed siblings,
+    // so this also disambiguates `custom:https://x` vs. `custom`.
+    let mut best: Option<(usize, &'a str)> = None;
+    for k in keys {
+        if let Some(_suffix) = rest.strip_prefix(k).and_then(|s| s.strip_prefix('.'))
+            && best.is_none_or(|(len, _)| k.len() > len)
+        {
+            // Slice the original `rest` so we can keep the lifetime tied
+            // to `name` rather than to a transient `&str` from the keys
+            // iterator.
+            let hm_key = &rest[..k.len()];
+            best = Some((k.len(), hm_key));
+        }
+    }
+    let (key_len, hm_key) = best?;
+    let inner_suffix = &rest[key_len + 1..];
     let inner_name = if inner_prefix.is_empty() {
         inner_suffix.to_string()
     } else {
         format!("{inner_prefix}.{inner_suffix}")
     };
     Some((hm_key, inner_name))
+}
+
+/// For a `#[nested] HashMap<String, HashMap<String, T>>` field, parse a path
+/// `<my_prefix>.<field_name>.<outer_key>.<inner_key>.<inner_suffix>` and
+/// return (outer_key, inner_key, fully-qualified inner name for T::get_prop).
+///
+/// Returns `None` when the path doesn't match (wrong prefix or too few segments).
+pub fn route_double_hashmap_path<'a>(
+    name: &'a str,
+    my_prefix: &str,
+    field_name: &str,
+    inner_prefix: &str,
+) -> Option<(&'a str, &'a str, String)> {
+    let key_prefix = if my_prefix.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{my_prefix}.{field_name}")
+    };
+    let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
+    let (outer_key, rest2) = rest.split_once('.')?;
+    let (inner_key, inner_suffix) = rest2.split_once('.')?;
+    let inner_name = if inner_prefix.is_empty() {
+        inner_suffix.to_string()
+    } else {
+        format!("{inner_prefix}.{inner_suffix}")
+    };
+    Some((outer_key, inner_key, inner_name))
 }
 
 /// Return a comma-separated string of valid enum variant names for display in error messages.
@@ -156,27 +213,56 @@ fn prop_name_to_serde_field(prefix: &str, name: &str) -> anyhow::Result<String> 
     } else {
         name.strip_prefix(prefix)
             .and_then(|s| s.strip_prefix('.'))
-            .ok_or_else(|| anyhow::anyhow!("Unknown property '{name}'"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"prefix": prefix, "name": name})),
+                    "prop_name_to_serde_field: property name does not share the configured prefix"
+                );
+                anyhow::Error::msg(format!("Unknown property '{name}'"))
+            })?
     };
     let field_part = suffix.split('.').next().unwrap_or(suffix);
     Ok(field_part.replace('-', "_"))
 }
 
 fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Value> {
+    let reject = |reason: &'static str, attrs: serde_json::Value| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(attrs),
+            "parse_prop_value rejected input"
+        );
+        let _ = reason;
+    };
     match kind {
         PropKind::Bool => Ok(toml::Value::Boolean(value_str.parse().map_err(|_| {
-            anyhow::anyhow!("Invalid bool value '{value_str}' — expected 'true' or 'false'")
+            reject(
+                "bool",
+                ::serde_json::json!({"kind": "bool", "got_len": value_str.len()}),
+            );
+            anyhow::Error::msg(format!(
+                "Invalid bool value '{value_str}', expected 'true' or 'false'"
+            ))
         })?)),
-        PropKind::Integer => {
-            Ok(toml::Value::Integer(value_str.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid integer value '{value_str}'")
-            })?))
-        }
-        PropKind::Float => {
-            Ok(toml::Value::Float(value_str.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid float value '{value_str}'")
-            })?))
-        }
+        PropKind::Integer => Ok(toml::Value::Integer(value_str.parse().map_err(|_| {
+            reject(
+                "integer",
+                ::serde_json::json!({"kind": "integer", "got_len": value_str.len()}),
+            );
+            anyhow::Error::msg(format!("Invalid integer value '{value_str}'"))
+        })?)),
+        PropKind::Float => Ok(toml::Value::Float(value_str.parse().map_err(|_| {
+            reject(
+                "float",
+                ::serde_json::json!({"kind": "float", "got_len": value_str.len()}),
+            );
+            anyhow::Error::msg(format!("Invalid float value '{value_str}'"))
+        })?)),
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
         PropKind::StringArray => {
             let trimmed = value_str.trim();
@@ -198,13 +284,49 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
         }
         // `Vec<T>` of structs: round-trip a JSON array of objects to a
         // TOML array. JSON `null` (used by serde for `Option::None`) is
-        // dropped because TOML has no null — the absent key conveys the
+        // dropped because TOML has no null - the absent key conveys the
         // same meaning when the field deserializes back into `Option<T>`.
         PropKind::ObjectArray => {
-            let v: serde_json::Value = serde_json::from_str(value_str)
-                .map_err(|e| anyhow::anyhow!("invalid JSON array of objects: {e}"))?;
+            let v: serde_json::Value = serde_json::from_str(value_str).map_err(|e| {
+                reject(
+                    "object_array",
+                    ::serde_json::json!({"kind": "object_array", "error": format!("{}", e)}),
+                );
+                anyhow::Error::msg(format!("invalid JSON array of objects: {e}"))
+            })?;
             json_to_toml(v).ok_or_else(|| {
-                anyhow::anyhow!("JSON value contained only nulls — nothing to write")
+                reject(
+                    "object_array_nulls",
+                    ::serde_json::json!({"kind": "object_array", "reason": "all-null"}),
+                );
+                anyhow::Error::msg("JSON value contained only nulls, nothing to write")
+            })
+        }
+        // Struct-shaped scalar: parse the JSON object into a TOML table so
+        // the parent serde round-trip deserializes into the typed struct
+        // (e.g. `Option<ModelPricing>`). Inserting a raw String here would
+        // fail serde because the field is typed, not free-form text.
+        PropKind::Object => {
+            let v: serde_json::Value = serde_json::from_str(value_str).map_err(|e| {
+                reject(
+                    "object",
+                    ::serde_json::json!({"kind": "object", "error": format!("{}", e)}),
+                );
+                anyhow::Error::msg(format!("invalid JSON object: {e}"))
+            })?;
+            if !matches!(v, serde_json::Value::Object(_)) {
+                reject(
+                    "object_shape",
+                    ::serde_json::json!({"kind": "object", "got_shape": "non-object"}),
+                );
+                anyhow::bail!("Object field requires a JSON object; got {v}");
+            }
+            json_to_toml(v).ok_or_else(|| {
+                reject(
+                    "object_nulls",
+                    ::serde_json::json!({"kind": "object", "reason": "all-null"}),
+                );
+                anyhow::Error::msg("JSON object contained only nulls, nothing to write")
             })
         }
     }
@@ -242,9 +364,99 @@ fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
     }
 }
 
+/// Validate that an alias key is safe for use in TOML dotted paths, URLs,
+/// filesystem paths on Windows/macOS/Linux, and `ZEROCLAW_*` env-var grammar.
+///
+/// Allowed: lowercase ASCII alphanumeric plus single underscore, 1-63 chars.
+/// Must start AND end with alphanumeric. Adjacent underscores (`__`) are
+/// forbidden because they collide with the env-var grammar's path separator.
+///
+/// The env-var grammar uses `__` as path separator, which lets aliases keep
+/// single `_` literally (`prod_v2`, `staging_api`). Hyphens are forbidden
+/// because they are illegal in POSIX env-var identifiers; uppercase is
+/// forbidden so the bootstrap env-vars (`ZEROCLAW_WORKSPACE`,
+/// `ZEROCLAW_CONFIG_DIR`) stay disambiguated by case.
+pub fn validate_alias_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("alias must not be empty".to_string());
+    }
+    if key.len() > 63 {
+        return Err(format!(
+            "alias '{}' is too long ({} chars); maximum is 63",
+            key,
+            key.len()
+        ));
+    }
+    let first = key.chars().next().unwrap();
+    let last = key.chars().next_back().unwrap();
+    if !matches!(first, 'a'..='z' | '0'..='9') {
+        return Err(format!(
+            "alias '{key}' must start with a lowercase letter or digit"
+        ));
+    }
+    if !matches!(last, 'a'..='z' | '0'..='9') {
+        return Err(format!(
+            "alias '{key}' must end with a lowercase letter or digit"
+        ));
+    }
+    if key.contains("__") {
+        return Err(format!(
+            "alias '{key}' must not contain `__`; it is reserved as the env-var grammar's path separator"
+        ));
+    }
+    for ch in key.chars() {
+        if !matches!(ch, 'a'..='z' | '0'..='9' | '_') {
+            return Err(format!(
+                "alias '{}' contains invalid character {:?}; \
+                 only lowercase letters, digits, and single underscores are allowed (no hyphen, no uppercase)",
+                key, ch
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_hashmap_path_handles_deep_inner_paths() {
+        // Regression: AliasedAgentConfig has nested fields like
+        // `agent.thinking.<...>` (3+ segments under the alias key). The
+        // earlier rsplit-once parser would mis-route, yielding hm_key =
+        // "fake123.agent.thinking" instead of "fake123".
+        let keys = ["fake123"];
+        let got = route_hashmap_path(
+            "agents.fake123.agent.thinking.default-level",
+            "",
+            "agents",
+            "",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            Some(("fake123", "agent.thinking.default-level".to_string()))
+        );
+    }
+
+    #[test]
+    fn route_hashmap_path_picks_longest_dotted_key() {
+        // Custom-URL keys may contain dots; the longest matching key
+        // wins so `custom:https://example/v1` is preferred over `custom`.
+        let keys = ["custom", "custom:https://example/v1"];
+        let got = route_hashmap_path(
+            "providers.models.custom:https://example/v1.api-key",
+            "",
+            "providers.models",
+            "",
+            keys.iter().copied(),
+        );
+        assert_eq!(
+            got,
+            Some(("custom:https://example/v1", "api-key".to_string()))
+        );
+    }
 
     #[test]
     fn parse_string_array_splits_on_comma() {
@@ -277,5 +489,104 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("tok1"));
         assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
+    }
+
+    // ── validate_alias_key ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_alias_key_accepts_lowercase_alphanumeric_with_underscore() {
+        assert!(validate_alias_key("default").is_ok());
+        assert!(validate_alias_key("work").is_ok());
+        assert!(validate_alias_key("alias123").is_ok());
+        assert!(validate_alias_key("a").is_ok());
+        assert!(validate_alias_key("prod2024").is_ok());
+        // V0.8.0: env-var grammar uses `__` as separator, so single `_`
+        // inside an alias is unambiguous.
+        assert!(validate_alias_key("prod_v2").is_ok());
+        assert!(validate_alias_key("staging_api").is_ok());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_empty() {
+        assert!(validate_alias_key("").is_err());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_uppercase() {
+        // Leading uppercase trips the start-char rule.
+        let err = validate_alias_key("MyAlias").unwrap_err();
+        assert!(err.contains("must start with"), "{err}");
+        let err = validate_alias_key("A").unwrap_err();
+        assert!(err.contains("must start with"), "{err}");
+        // Embedded uppercase trips the per-char rule.
+        let err = validate_alias_key("myAlias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_leading_underscore() {
+        let err = validate_alias_key("_bad").unwrap_err();
+        assert!(err.contains("must start with"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_trailing_underscore() {
+        let err = validate_alias_key("bad_").unwrap_err();
+        assert!(err.contains("must end with"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_double_underscore() {
+        let err = validate_alias_key("foo__bar").unwrap_err();
+        assert!(err.contains("must not contain `__`"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_hyphen() {
+        // V0.8.0: hyphens are illegal in env-var identifiers.
+        let err = validate_alias_key("my-alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_dot() {
+        let err = validate_alias_key("my.alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_slash() {
+        let err = validate_alias_key("my/alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_space() {
+        let err = validate_alias_key("my alias").unwrap_err();
+        assert!(err.contains("invalid character"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_over_63_chars() {
+        let long = "a".repeat(64);
+        let err = validate_alias_key(&long).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn validate_alias_key_accepts_exactly_63_chars() {
+        let at_limit = "a".repeat(63);
+        assert!(validate_alias_key(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn validate_alias_key_rejects_windows_reserved_chars() {
+        for ch in [':', '*', '?', '"', '<', '>', '|', '\\'] {
+            let key = format!("alias{ch}name");
+            assert!(
+                validate_alias_key(&key).is_err(),
+                "expected rejection of char {ch:?} in alias key"
+            );
+        }
     }
 }

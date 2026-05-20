@@ -124,7 +124,16 @@ impl Tool for AskUserTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "question"})),
+                    "ask_user: missing question parameter"
+                );
+                anyhow::Error::msg("Missing 'question' parameter")
+            })?
             .to_string();
 
         let choices: Option<Vec<String>> = args.get("choices").and_then(|v| {
@@ -159,17 +168,32 @@ impl Tool for AskUserTool {
             }
             if let Some(ref name) = requested_channel {
                 let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
-                    let available: Vec<String> = channels.keys().cloned().collect();
-                    anyhow::anyhow!(
-                        "Channel '{}' not found. Available: {}",
-                        name,
-                        available.join(", ")
-                    )
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "ask_user: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
                 })?;
                 (name.clone(), ch)
             } else {
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
-                    anyhow::anyhow!("No channels available. Configure at least one channel.")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "ask_user: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
                 })?;
                 (name.clone(), ch.clone())
             }
@@ -288,6 +312,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for SilentChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for SilentChannel {
         fn name(&self) -> &str {
@@ -326,6 +361,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for RespondingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for RespondingChannel {
         fn name(&self) -> &str {
@@ -347,6 +393,7 @@ mod tests {
                 reply_target: "user".to_string(),
                 content: self.response.clone(),
                 channel: self.channel_name.clone(),
+                channel_alias: None,
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
