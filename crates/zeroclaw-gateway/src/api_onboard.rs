@@ -892,14 +892,12 @@ fn model_provider_alias_usable(
     if !has_model {
         return false;
     }
-    let has_credential = base
-        .api_key
+    base.api_key
         .as_deref()
         .map(str::trim)
         .is_some_and(|key| !key.is_empty())
         || base.requires_openai_auth
-        || local;
-    has_credential
+        || local
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
