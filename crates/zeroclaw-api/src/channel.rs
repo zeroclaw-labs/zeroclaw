@@ -38,6 +38,12 @@ pub struct ChannelMessage {
     pub reply_target: String,
     pub content: String,
     pub channel: String,
+    /// ZeroClaw channel alias (the `<alias>` half of `[channels.<type>.<alias>]`)
+    /// when the platform supports multiple bot instances. Used by
+    /// session_key construction so two bots on the same platform compute
+    /// distinct session IDs and don't share conversation history. `None`
+    /// for channels that don't have an alias concept yet (webhook, cli).
+    pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
@@ -116,9 +122,13 @@ impl SendMessage {
     }
 }
 
-/// Core channel trait — implement for any messaging platform
+/// Core channel trait — implement for any messaging platform.
+///
+/// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
+/// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
+/// inherit `channel = <type>.<alias>` from the trait object's role + alias.
 #[async_trait]
-pub trait Channel: Send + Sync {
+pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
@@ -146,6 +156,67 @@ pub trait Channel: Send + Sync {
     /// Whether this channel supports progressive message updates via draft edits.
     fn supports_draft_updates(&self) -> bool {
         false
+    }
+
+    /// Self-loop guard for multi-agent runs.
+    ///
+    /// Returns the bot's own handle/identity on this channel
+    /// (e.g. `@my_bot` for Telegram, the bot's user ID for Discord)
+    /// when known, so the orchestrator can drop inbound events whose
+    /// `sender` matches: a bot must never respond to its own
+    /// messages, even if a misconfigured peer group lists the bot's
+    /// handle as an external peer.
+    ///
+    /// **Channels that handle inbound traffic must override this.**
+    /// The default `None` makes both layers of the orchestrator's
+    /// self-loop guard (the SDK-side `drop_self_messages` here, and
+    /// the agent-loop fallback `peers::should_drop_self_loop`) into
+    /// no-ops — both layers consult the same `self_handle`, so a
+    /// channel that returns `None` has no protection from looping on
+    /// its own outbound. Outbound-only channels (webhook, gmail-push,
+    /// voice-call) never see inbound and can keep the default. The
+    /// in-tree overrides currently cover Telegram (`bot_username`
+    /// cache), IRC (configured nickname), Discord (decoded from token),
+    /// Slack (cached `auth.test` user_id); other inbound channels
+    /// remain on the default and rely on per-impl filtering instead
+    /// of the shared guard.
+    fn self_handle(&self) -> Option<String> {
+        None
+    }
+
+    /// The exact form the bot expects to see when addressed by users on
+    /// this channel. Discord wraps the snowflake as `<@1088...>`,
+    /// Telegram presents `@bot_username`, Matrix presents
+    /// `@bot:server`, Slack wraps the user ID as `<@U02...>`. Returned
+    /// verbatim into the per-channel system prompt so the agent
+    /// recognizes its own mention without guessing, and uses the same
+    /// form to tag itself or peers in outbound replies.
+    ///
+    /// Default `None` for channels that have no inbound mention
+    /// concept (CLI, webhook, hardware, ACP elicitation). Channels
+    /// that override `self_handle` should usually override this too,
+    /// applying their platform-native mention wrapper to the handle.
+    fn self_addressed_mention(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether the orchestrator should drop an inbound message as
+    /// self-authored (multi-agent self-loop guard).
+    ///
+    /// Default implementation compares `msg.sender` against
+    /// [`Self::self_handle`] case-insensitively, after stripping a
+    /// leading `@` from each side so Telegram-style handles match
+    /// regardless of which form the SDK delivers. Override only for
+    /// platforms whose identity comparison is non-string (e.g. a
+    /// numeric Discord user ID is `as_str` already; this default
+    /// works there too).
+    fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
+        let Some(handle) = self.self_handle() else {
+            return false;
+        };
+        let handle_norm = handle.trim_start_matches('@').to_ascii_lowercase();
+        let sender_norm = msg.sender.trim_start_matches('@').to_ascii_lowercase();
+        !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
     /// Whether this channel supports multi-message streaming delivery.
@@ -287,5 +358,99 @@ pub trait Channel: Send + Sync {
     /// fast with a useful error instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stub channel that overrides `self_handle` so the default
+    /// `drop_self_messages` implementation can be exercised.
+    struct StubChannel {
+        handle: Option<String>,
+    }
+
+    impl crate::attribution::Attributable for StubChannel {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Channel(crate::attribution::ChannelKind::Webhook)
+        }
+        fn alias(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StubChannel {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn self_handle(&self) -> Option<String> {
+            self.handle.clone()
+        }
+    }
+
+    fn msg_from(sender: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: "1".into(),
+            sender: sender.into(),
+            reply_target: String::new(),
+            content: "hi".into(),
+            channel: "stub".into(),
+            channel_alias: None,
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn drop_self_messages_default_returns_false_when_handle_unknown() {
+        let channel = StubChannel { handle: None };
+        assert!(!channel.drop_self_messages(&msg_from("@anyone")));
+    }
+
+    #[test]
+    fn drop_self_messages_matches_exact_handle() {
+        let channel = StubChannel {
+            handle: Some("@my_bot".into()),
+        };
+        assert!(channel.drop_self_messages(&msg_from("@my_bot")));
+        assert!(!channel.drop_self_messages(&msg_from("@other_bot")));
+    }
+
+    #[test]
+    fn drop_self_messages_normalizes_at_prefix_and_case() {
+        let channel = StubChannel {
+            handle: Some("My_Bot".into()),
+        };
+        // SDK delivered with @ prefix, handle stored without. Match.
+        assert!(channel.drop_self_messages(&msg_from("@my_bot")));
+        // Both with @, mixed case. Match.
+        let channel = StubChannel {
+            handle: Some("@My_Bot".into()),
+        };
+        assert!(channel.drop_self_messages(&msg_from("@MY_BOT")));
+    }
+
+    #[test]
+    fn drop_self_messages_does_not_match_empty_handle() {
+        // A handle of "@" (effectively empty after normalization) must
+        // not match every inbound message; the guard only fires when
+        // the bot has a real handle to compare against.
+        let channel = StubChannel {
+            handle: Some("@".into()),
+        };
+        assert!(!channel.drop_self_messages(&msg_from("@anyone")));
     }
 }

@@ -335,7 +335,7 @@ The 20+ feature flags in the current `Cargo.toml` fall into three buckets as the
 
 | Bucket | Flags | Outcome |
 |---|---|---|
-| **Retire → plugin** | `channel-nostr`, `channel-matrix`, `channel-lark`, `channel-feishu`, `whatsapp-web`, `browser-native` | Removed from the kernel. Each becomes a WASM plugin crate published to the plugin registry. No compile-time decision required. |
+| **Retire → plugin** | `channel-nostr`, `channel-matrix`, `channel-lark`, `whatsapp-web`, `browser-native` | Removed from the kernel. Each becomes a WASM plugin crate published to the plugin registry. No compile-time decision required. |
 | **Always-on** | `plugins-wasm`, `skill-creation` | Compiled into every kernel binary unconditionally. `plugins-wasm` is the kernel's core mechanism; `skill-creation` is a zero-overhead code path. Neither belongs behind a flag. |
 | **Stay → platform/infrastructure flag** | `peripheral-rpi`, `hardware`, `sandbox-landlock`, `sandbox-bubblewrap`, `voice-wake`, `probe` | Remain as compile-time flags because they require native library linking or OS-level access that cannot be provided by a WASM plugin. `peripheral-rpi` and `hardware` appear only in platform-specific release targets. |
 

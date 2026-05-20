@@ -260,7 +260,7 @@ This walks you through provider auth, gateway config, and creates `~/.zeroclaw/c
 
 ```bash
 zeroclaw doctor
-zeroclaw agent -m "what's 2+2?"
+zeroclaw agent -a assistant -m "what's 2+2?"
 ```
 
 ### 3. Run as a persistent service

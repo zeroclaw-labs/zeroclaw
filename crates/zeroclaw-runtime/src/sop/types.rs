@@ -341,6 +341,15 @@ pub struct SopRun {
     pub llm_calls_saved: u64,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for SopRun {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Sop
+    }
+    fn alias(&self) -> &str {
+        &self.sop_name
+    }
+}
+
 // ── Deterministic workflow state (persistence + resume) ──────────
 
 /// Persisted state for a deterministic workflow run, enabling resume

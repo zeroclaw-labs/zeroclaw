@@ -312,7 +312,7 @@ impl LeakDetector {
         // segments are not mistaken for high-entropy credentials.
         // Media markers like [IMAGE:/path/to/file.png] contain filesystem paths
         // that look like high-entropy tokens when `/` is included in the token
-        // character set (#4604).
+        // character set.
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -321,7 +321,7 @@ impl LeakDetector {
         });
         // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
         // intentionally appear in output. Strip them before entropy scanning so
-        // they are not redacted as leaked credentials. See #4830.
+        // they are not redacted as leaked credentials.
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let receipt_re =
             RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());

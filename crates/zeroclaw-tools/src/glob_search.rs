@@ -46,7 +46,16 @@ impl Tool for GlobSearchTool {
         let pattern = args
             .get("pattern")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "pattern"})),
+                    "glob_search: missing pattern parameter"
+                );
+                anyhow::Error::msg("Missing 'pattern' parameter")
+            })?;
 
         // Rate limiting and path-allowlist checks are applied by the
         // RateLimitedTool + PathGuardedTool wrappers at registration time
@@ -118,8 +127,8 @@ impl Tool for GlobSearchTool {
                 Err(_) => continue, // skip broken symlinks / unresolvable paths
             };
 
-            if !self.security.is_resolved_path_allowed(&resolved) {
-                continue; // silently filter symlink escapes
+            if !self.security.is_resolved_path_readable(&resolved) {
+                continue;
             }
 
             // Only include files, not directories
@@ -397,6 +406,40 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Invalid glob pattern")
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_search_filters_symlink_into_write_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let sibling = TempDir::new().unwrap();
+        std::fs::write(sibling.path().join("secret.txt"), "secret").unwrap();
+
+        let symlink_path = workspace.path().join("siblings");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(sibling.path(), &symlink_path).unwrap();
+        #[cfg(not(unix))]
+        return;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_write_only: vec![sibling.path().to_path_buf()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+
+        let result = tool
+            .execute(json!({"pattern": "siblings/*"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("secret.txt"),
+            "write-only root must not surface through glob_search even via a workspace symlink; got: {}",
+            result.output
         );
     }
 }

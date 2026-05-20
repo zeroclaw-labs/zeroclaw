@@ -160,8 +160,19 @@ fn probe_board_info(chip: &str) -> anyhow::Result<String> {
     use probe_rs::config::MemoryRegion;
     use probe_rs::{Session, SessionConfig};
 
-    let session = Session::auto_attach(chip, SessionConfig::default())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let session = Session::auto_attach(chip, SessionConfig::default()).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "error": format!("{}", e),
+                })),
+            "hardware_board_info: probe-rs auto_attach failed"
+        );
+        anyhow::Error::msg(format!("{}", e))
+    })?;
     let target = session.target();
     let arch = session.architecture();
 

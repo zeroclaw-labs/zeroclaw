@@ -2551,8 +2551,8 @@ msgid "`zeroclawlabs/zeroclaw:latest` — latest stable"
 msgstr "`zeroclawlabs/zeroclaw:latest` — última versión estable"
 
 #: src/setup/container.md:10
-msgid "`zeroclawlabs/zeroclaw:v0.7.5` — pinned"
-msgstr "`zeroclawlabs/zeroclaw:v0.7.5` — fijado"
+msgid "`zeroclawlabs/zeroclaw:v0.8.0-beta-1` — pinned"
+msgstr "`zeroclawlabs/zeroclaw:v0.8.0-beta-1` — fijado"
 
 #: src/setup/container.md:11
 msgid ""
@@ -2772,8 +2772,8 @@ msgid "containers"
 msgstr "contenedores"
 
 #: src/setup/container.md:94
-msgid "zeroclawlabs/zeroclaw:v0.7.5"
-msgstr "zeroclawlabs/zeroclaw:v0.7.5"
+msgid "zeroclawlabs/zeroclaw:v0.8.0-beta-1"
+msgstr "zeroclawlabs/zeroclaw:v0.8.0-beta-1"
 
 #: src/setup/container.md:96
 msgid "containerPort"
@@ -24570,8 +24570,8 @@ msgid "The gateway exposes three health views:"
 msgstr "La puerta de enlace expone tres vistas de salud:"
 
 #: src/ops/observability.md:151
-msgid "# { \"status\": \"ok\", \"version\": \"0.7.5\" }\n"
-msgstr "# { \"status\": \"ok\", \"version\": \"0.7.5\" }\n"
+msgid "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-1\" }\n"
+msgstr "# { \"status\": \"ok\", \"version\": \"0.8.0-beta-1\" }\n"
 
 #: src/ops/observability.md:152
 msgid "# per-channel status\n"

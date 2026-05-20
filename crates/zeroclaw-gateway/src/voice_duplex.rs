@@ -55,23 +55,38 @@ pub fn try_parse_voice_event(text: &str) -> Option<VoiceEvent> {
 pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
     match event {
         VoiceEvent::SpeechStart => {
-            tracing::debug!("voice duplex: speech_start received");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "voice duplex: speech_start received"
+            );
             None
         }
         VoiceEvent::SpeechEnd { transcript } => {
-            tracing::debug!(
-                transcript = ?transcript,
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"transcript": transcript})),
                 "voice duplex: speech_end received"
             );
             None
         }
         VoiceEvent::BargeIn => {
-            tracing::debug!("voice duplex: barge_in received");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "voice duplex: barge_in received"
+            );
             // TODO: wire into session abort mechanism (ref upstream PR #5705)
             None
         }
         VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } => {
-            tracing::warn!("voice duplex: received server-side event from client");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "voice duplex: received server-side event from client"
+            );
             Some(serde_json::json!({
                 "type": "error",
                 "code": "invalid_event_direction",
