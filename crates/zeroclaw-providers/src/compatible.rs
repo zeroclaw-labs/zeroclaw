@@ -1762,20 +1762,21 @@ impl OpenAiCompatibleModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    // Accept both `reasoning_content` (canonical) and
-                    // `reasoning` (OpenRouter / vLLM >= v0.16.0). See #6584.
                     let reasoning_content = value
                         .get("reasoning_content")
-                        .or_else(|| value.get("reasoning"))
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
                         .map(ToString::to_string);
 
-                    let reasoning = value
-                        .get("reasoning")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .map(ToString::to_string);
+                    let reasoning = if reasoning_content.is_some() {
+                        None
+                    } else {
+                        value
+                            .get("reasoning")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                    };
 
                     return NativeMessage {
                         role: "assistant".to_string(),
