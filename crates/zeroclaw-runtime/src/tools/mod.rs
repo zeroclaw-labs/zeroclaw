@@ -301,15 +301,19 @@ pub fn register_skill_tools(
     // gateway bind, etc.). Without this, a skill that audited clean,
     // parsed cleanly, and registered N tools leaves zero signal in the
     // log, which makes SKILL.toml / SKILL.md authoring painful to debug.
-    tracing::info!(
-        "Registered {} skill tool(s) from {} skill(s): {}",
-        registered,
-        skills.len(),
-        skills
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "Registered {} skill tool(s) from {} skill(s): {}",
+            registered,
+            skills.len(),
+            skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     );
 }
 
