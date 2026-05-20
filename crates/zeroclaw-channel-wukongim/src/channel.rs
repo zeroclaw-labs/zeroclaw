@@ -318,8 +318,6 @@ impl WuKongIMChannel {
                     tracing::info!("  - [History] from {}: {}", m.from_uid, summary);
                 }
             }
-            // Clear unread after fetch
-            let _ = self.clear_unread(&conv.channel_id, conv.channel_type, conv.last_msg_seq).await;
             // Update version based on conversation
             self.update_sync_state(&conv.channel_id, conv.channel_type, conv.last_msg_seq, conv.version).await?;
         }
@@ -553,6 +551,178 @@ impl WuKongIMChannel {
         let _: serde_json::Value = self.send_rpc("send", params).await?;
         Ok(())
     }
+
+    async fn process_offline_batch(
+        &self,
+        messages: Vec<RecvNotificationParams>,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        // Sort messages chronologically by timestamp to guarantee correct timeline ordering
+        let mut sorted_messages = messages;
+        sorted_messages.sort_by_key(|m| m.timestamp);
+
+        let first = sorted_messages.first().unwrap();
+        let last = sorted_messages.last().unwrap();
+        let last_seq = last.message_seq;
+        let channel_id = first.channel_id.clone();
+        let channel_type = first.channel_type;
+        let is_group = channel_type == WkChannelType::GROUP;
+
+        let is_silent = if is_group && self.mention_only {
+            // Check if at least one message in the batch mentions the bot
+            let mut has_mention = false;
+            for m in &sorted_messages {
+                let payload_json: serde_json::Value = if m.payload.is_string() {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(m.payload.as_str().unwrap_or_default())
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or_default()
+                } else {
+                    m.payload.clone()
+                };
+                let content = payload_json
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+
+                if is_mentioned(&self.uid, &payload_json, content) {
+                    has_mention = true;
+                    break;
+                }
+            }
+            !has_mention // If no mention is found, send it silently to build conversation context
+        } else {
+            false // Personal chat or non-mention-only: send normally
+        };
+
+        tracing::info!(
+            "WuKongIM: processing offline batch channel={}:{} count={}, is_silent={}",
+            channel_id,
+            channel_type,
+            sorted_messages.len(),
+            is_silent
+        );
+
+        self.send_offline_batch_as_single_message(sorted_messages, is_silent, tx).await?;
+
+        // Clear unread up to the latest sequence number in the batch
+        self.clear_unread(&channel_id, channel_type, last_seq).await?;
+        Ok(())
+    }
+
+    async fn send_offline_batch_as_single_message(
+        &self,
+        messages: Vec<RecvNotificationParams>,
+        silent: bool,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let mut sorted = messages;
+        sorted.sort_by_key(|m| m.timestamp);
+
+        let first = sorted.first().unwrap();
+        let last = sorted.last().unwrap();
+        let channel_id = &first.channel_id;
+        let channel_type = first.channel_type;
+        let target_id = if channel_type == WkChannelType::PERSONAL {
+            &first.from_uid
+        } else {
+            channel_id
+        };
+
+        let mut lines: Vec<String> = Vec::with_capacity(sorted.len());
+        for m in &sorted {
+            let payload_json: serde_json::Value = if m.payload.is_string() {
+                base64::engine::general_purpose::STANDARD
+                    .decode(m.payload.as_str().unwrap_or_default())
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_default()
+            } else {
+                m.payload.clone()
+            };
+            let msg_type = payload_json
+                .get("type")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let content = match msg_type as u32 {
+                WkMessageType::IMAGE => {
+                    let url = payload_json
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or_default();
+                    match download_image_as_base64(url).await {
+                        Some(data) => format!("[图片]{}", data),
+                        None => format!("[图片下载失败]{}", url),
+                    }
+                }
+                WkMessageType::FILE => {
+                    let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or_default();
+                    let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
+                    match download_file_to_workspace(url, &self.downloads_dir, Some(name)).await {
+                        Ok(local_path) => format!("[文件]{}: {}", name, local_path),
+                        Err(err) => format!("[文件]{}: {} [下载失败: {}]", name, url, err),
+                    }
+                }
+                WkMessageType::MARKDOWN => payload_json
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => payload_json
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            lines.push(format!("[{}] {}", m.from_uid, content));
+        }
+        let combined_content = lines.join("\n");
+
+        let ch_msg = ChannelMessage {
+            id: first.message_id.clone(),
+            sender: target_id.clone(),
+            reply_target: format!("{}:{}", channel_type, target_id),
+            content: if silent {
+                format!("<!-- zeroclaw:silent -->{}", combined_content)
+            } else {
+                combined_content
+            },
+            channel: "wukongim".to_string(),
+            timestamp: last.timestamp.max(0) as u64,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        if tx.send(ch_msg).await.is_ok() {
+            tracing::info!(
+                "WuKongIM: offline batch sent (silent={}), updating sync state: channel={}:{} seq={}",
+                silent,
+                channel_id,
+                channel_type,
+                last.message_seq
+            );
+            self.update_sync_state(
+                channel_id,
+                channel_type,
+                last.message_seq,
+                last.timestamp * 1_000_000_000,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
 }
 
 fn phase_to_content(phase: &zeroclaw_api::channel::StatusPhase) -> &'static str {
@@ -666,8 +836,23 @@ impl Channel for WuKongIMChannel {
         tracing::info!("WuKongIM: connected as {}", self.uid);
 
         // 3. Process History (now that WS is connected, Agent can reply)
+        // Group offline messages by conversation and batch process them
+        use std::collections::HashMap;
+        let mut grouped: HashMap<(String, u8), Vec<RecvNotificationParams>> = HashMap::new();
         for msg in history {
-            let _ = self.process_inbound_message(msg, &tx).await;
+            let key = (msg.channel_id.clone(), msg.channel_type);
+            grouped.entry(key).or_default().push(msg);
+        }
+        for ((channel_id, channel_type), messages) in grouped {
+            tracing::info!(
+                "WuKongIM: processing offline batch for channel={}:{} count={}",
+                channel_id,
+                channel_type,
+                messages.len()
+            );
+            let _ = self
+                .process_offline_batch(messages, &tx)
+                .await;
         }
 
         // 4. Start Live Listening

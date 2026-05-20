@@ -104,7 +104,7 @@ pub struct SendParams {
     pub topic: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecvNotificationParams {
     #[serde(rename = "messageId")]
     pub message_id: String,
