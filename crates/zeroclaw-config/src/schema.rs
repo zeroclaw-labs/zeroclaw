@@ -476,6 +476,11 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub progress_observer: ProgressObserverConfig,
+
+    /// Logging configuration — log level and optional file output (`[logging]`).
+    #[serde(default)]
+    #[nested]
+    pub logging: LoggingConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -1802,6 +1807,61 @@ impl Default for PacingConfig {
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
         }
     }
+}
+
+/// Logging configuration (`[logging]` section).
+///
+/// Controls the tracing log level and optional file output.
+/// The `RUST_LOG` environment variable always takes precedence over `level`.
+///
+/// Example:
+/// ```toml
+/// [logging]
+/// level    = "debug"
+/// dir      = "/var/zeroclaw/log"
+/// out_file = "zeroclaw.log"      # daily-rotated → zeroclaw.YYMMDD.log
+/// err_file = "zeroclaw-err.log"  # WARN/ERROR only
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "logging"]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Log level filter using RUST_LOG syntax. Default: `"info"`.
+    /// Examples: `"debug"`, `"warn"`, `"info,some_crate=debug"`.
+    #[serde(default = "default_logging_level")]
+    pub level: String,
+
+    /// Directory where log files are written. Required when `out_file` or
+    /// `err_file` is set.
+    #[serde(default)]
+    pub dir: Option<String>,
+
+    /// File name for all-levels log output (daily rotating).
+    /// Rotated files are named `{stem}.{YYMMDD}.{ext}`.
+    /// Only active when `dir` is also set.
+    #[serde(default)]
+    pub out_file: Option<String>,
+
+    /// File name for WARN/ERROR-only log output (daily rotating).
+    /// Only active when `dir` is also set.
+    #[serde(default)]
+    pub err_file: Option<String>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_logging_level(),
+            dir: None,
+            out_file: None,
+            err_file: None,
+        }
+    }
+}
+
+fn default_logging_level() -> String {
+    "info".to_string()
 }
 
 /// Configuration for the sidelined progress observer that streams agent
@@ -3276,6 +3336,14 @@ pub struct WebSearchConfig {
     /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
+    /// Yumc-Search API key (required if provider is `"yumc-search"`)
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub yumc_search_api_key: Option<String>,
+    /// Yumc-Search base URL (required if provider is `"yumc-search"`)
+    #[serde(default)]
+    pub yumc_search_base_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -3304,6 +3372,8 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             tavily_api_key: None,
             searxng_instance_url: None,
+            yumc_search_api_key: None,
+            yumc_search_base_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -9916,6 +9986,7 @@ impl Default for Config {
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -12959,7 +13030,7 @@ auto_save = true
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             swarms: HashMap::new(),
-hooks: HooksConfig::default(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
@@ -12986,6 +13057,7 @@ hooks: HooksConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         };
         let toml_str = toml::to_string(&config).expect("config serializes to TOML");
         let parsed: Config = toml::from_str(&toml_str).expect("TOML round-trips back to Config");
@@ -13556,6 +13628,7 @@ default_temperature = 0.7
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
             progress_observer: ProgressObserverConfig::default(),
+            logging: LoggingConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.

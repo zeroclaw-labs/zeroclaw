@@ -835,6 +835,54 @@ fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
+/// Unwrap a single layer of `powershell|pwsh -Command "<inner>"` or
+/// `cmd /c "<inner>"` so that the security policy can validate the actual
+/// cmdlets the operator is invoking rather than the outer wrapper. Returns
+/// `None` when the command is not a recognised wrapper, when no `-Command`
+/// is present, or when `-EncodedCommand` is used (base64 payloads cannot
+/// be inspected — those must go through the normal allowlist and will be
+/// rejected unless the wrapper executable itself is allowed).
+fn unwrap_shell_wrapper(command: &str) -> Option<String> {
+    let tokens = shell_words::split(command.trim()).ok()?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let exe_lower = tokens[0].to_ascii_lowercase();
+    let exe_base_owned = command_basename(&exe_lower).to_owned();
+    let exe_base = strip_windows_exe_suffix(&exe_base_owned);
+
+    if matches!(exe_base, "powershell" | "pwsh") {
+        for i in 1..tokens.len() {
+            let t = tokens[i].to_ascii_lowercase();
+            // Encoded command can't be validated — fall through so the outer
+            // wrapper is checked against the allowlist (where it will fail
+            // unless powershell itself is explicitly allowed).
+            if t == "-encodedcommand" || t == "-ec" {
+                return None;
+            }
+            if t == "-command" || t == "-c" {
+                let rest: Vec<&str> = tokens[i + 1..].iter().map(String::as_str).collect();
+                if rest.is_empty() {
+                    return None;
+                }
+                return Some(rest.join(" "));
+            }
+        }
+        return None;
+    }
+
+    if exe_base == "cmd" && tokens.len() >= 3 {
+        let flag = tokens[1].to_ascii_lowercase();
+        if flag == "/c" || flag == "/k" {
+            let rest: Vec<&str> = tokens[2..].iter().map(String::as_str).collect();
+            return Some(rest.join(" "));
+        }
+    }
+
+    None
+}
+
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. On non-Windows platforms this
 /// is a no-op that returns the input unchanged.
@@ -869,16 +917,17 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
-        return true;
-    }
-
+    // On Windows, command names are case-insensitive (both cmd.exe and
+    // PowerShell treat "Get-ChildItem" and "get-childitem" as the same).
+    // Also match when the executable has a .exe/.cmd/.bat suffix that the
+    // allowlist entry omits (e.g., allowlist "git" matches "git.exe").
     #[cfg(target_os = "windows")]
     {
         let base_lower = executable_base.to_ascii_lowercase();
         let allowed_lower = allowed.to_ascii_lowercase();
+        if base_lower == allowed_lower {
+            return true;
+        }
         for ext in &[".exe", ".cmd", ".bat"] {
             if base_lower == format!("{allowed_lower}{ext}") {
                 return true;
@@ -887,6 +936,11 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
                 return true;
             }
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if allowed == executable_base {
+        return true;
     }
 
     false
@@ -1144,6 +1198,23 @@ impl SecurityPolicy {
         if has_wildcard && !self.block_high_risk_commands {
             return true;
         }
+
+        // Peel shell wrappers (`powershell -Command "..."`, `cmd /c "..."`,
+        // and nested combinations) so the allowlist is enforced against the
+        // actual cmdlets the operator is running, not the wrapper itself.
+        // Without this, an LLM that wraps every command in
+        // `powershell -Command "..."` either bypasses the per-cmdlet
+        // allowlist entirely (when "powershell" is allowed) or is blocked
+        // even when every inner cmdlet is allowlisted (when it isn't).
+        // Cap at 4 unwraps to bound work on adversarial input.
+        let mut working = command.to_owned();
+        for _ in 0..4 {
+            match unwrap_shell_wrapper(&working) {
+                Some(inner) => working = inner,
+                None => break,
+            }
+        }
+        let command = working.as_str();
 
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
@@ -1759,15 +1830,28 @@ impl SecurityPolicy {
 
         // Workspace constraint
         if self.workspace_only {
-            let _ = writeln!(
-                out,
-                "**Workspace boundary**: file operations are restricted to `{}`.",
-                self.workspace_dir.display()
-            );
-        }
-
-        // Allowed roots
-        if !self.allowed_roots.is_empty() {
+            if self.allowed_roots.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "**Workspace boundary**: file operations are restricted to `{}`.",
+                    self.workspace_dir.display()
+                );
+            } else {
+                let roots: Vec<String> = self
+                    .allowed_roots
+                    .iter()
+                    .map(|p| format!("`{}`", p.display()))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "**Workspace boundary**: file operations are restricted to `{}` (workspace) \
+                     and the following additional allowed paths: {}. \
+                     You MAY read and write files in any of these locations.",
+                    self.workspace_dir.display(),
+                    roots.join(", ")
+                );
+            }
+        } else if !self.allowed_roots.is_empty() {
             let roots: Vec<String> = self
                 .allowed_roots
                 .iter()
@@ -1978,6 +2062,86 @@ mod tests {
 
         assert!(p.is_command_allowed("/usr/bin/antigravity"));
         assert!(!p.is_command_allowed("antigravity"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_command_matching_is_case_insensitive() {
+        // PowerShell cmdlets are case-insensitive: "Get-ChildItem" == "get-childitem".
+        // Config typically stores lowercase names; LLMs may use canonical PascalCase.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["get-childitem".into(), "select-object".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("Get-ChildItem -Force 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("get-childitem -Force 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("GET-CHILDITEM 'C:\\Users\\foo'"));
+        assert!(p.is_command_allowed("Get-ChildItem | Select-Object Name"));
+        assert!(!p.is_command_allowed("Remove-Item 'C:\\Users\\foo'"));
+    }
+
+    #[test]
+    fn powershell_wrapper_is_unwrapped_and_inner_validated() {
+        // Defence in depth: an LLM that wraps every command in
+        // `powershell -Command "..."` should still be validated against
+        // the per-cmdlet allowlist, NOT bypass it (if powershell is allowed)
+        // and NOT be rejected wholesale (if it isn't).
+        let p = SecurityPolicy {
+            allowed_commands: vec![
+                "get-childitem".into(),
+                "select-object".into(),
+                "format-table".into(),
+            ],
+            ..SecurityPolicy::default()
+        };
+
+        // Note: "powershell" is NOT in allowed_commands. The unwrap path
+        // must look past the wrapper and validate the inner cmdlets.
+        assert!(p.is_command_allowed(
+            r#"powershell -NoProfile -Command "Get-ChildItem -Force 'C:\Users\foo' | Select-Object Mode, LastWriteTime, Length, Name | Format-Table -AutoSize""#
+        ));
+        assert!(p.is_command_allowed(
+            r#"pwsh -NoProfile -NonInteractive -Command "Get-ChildItem 'C:\Users\foo'""#
+        ));
+        assert!(p.is_command_allowed(
+            r#"powershell -Command "Get-ChildItem""#
+        ));
+
+        // Wrapper around a disallowed cmdlet must still be rejected.
+        assert!(!p.is_command_allowed(
+            r#"powershell -Command "Remove-Item 'C:\Users\foo'""#
+        ));
+    }
+
+    #[test]
+    fn cmd_c_wrapper_is_unwrapped_and_inner_validated() {
+        // Same principle for `cmd /c "..."`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["dir".into(), "type".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // "cmd" is NOT in allowed_commands; validation must look past it.
+        assert!(p.is_command_allowed(r#"cmd /c "dir C:\Users\foo""#));
+        assert!(p.is_command_allowed(r#"cmd /c "type file.txt""#));
+
+        // Inner disallowed command still blocked.
+        assert!(!p.is_command_allowed(r#"cmd /c "del C:\Users\foo\file""#));
+    }
+
+    #[test]
+    fn powershell_encoded_command_is_not_unwrapped() {
+        // -EncodedCommand carries a base64 payload we cannot inspect, so
+        // the wrapper must NOT be unwrapped. Validation falls through to
+        // the outer wrapper check, which fails unless `powershell` itself
+        // is allowlisted.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["get-childitem".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed(
+            "powershell -NoProfile -EncodedCommand RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQA="
+        ));
     }
 
     #[test]

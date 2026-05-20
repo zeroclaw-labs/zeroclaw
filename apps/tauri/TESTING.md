@@ -36,25 +36,23 @@ open /Applications/ZeroClaw.app
 - `osascript` bridge for Automation
 - `open x-apple.systempreferences:...?Privacy_*` for deep-linking
 
-## Linux (NOT YET IMPLEMENTED — tracked in #6501)
+## Linux
 
-### What works today
-- App builds (cfg gates skip macOS-only code)
-- Tauri shell, windows, tray, app icon (`icon.png`), bundle as `.deb`/`.AppImage`
-- Onboarding wizard renders
+### What works now
+- App builds with Linux-specific permission probes and onboarding sections.
+- Onboarding is simplified to a short Linux flow (welcome + ready).
+- Screen capture reports **denied** on Linux for now (capture is still macOS-only in the desktop capability layer):
+  - **X11**: denied
+  - **Wayland + xdg-desktop-portal available**: denied
+  - **Wayland without portal**: denied
+- Notifications report granted (no centralized Linux privacy gate).
+- Bundle targets remain `.deb` and `.AppImage`.
 
-### What does NOT work today
-- Every permission reports a stub "granted" status — wizard becomes 8 click-throughs of no-ops
-- No real permission gates exist on most Linux setups; some are gated by:
-  - **xdg-desktop-portal** (Wayland) — for screen capture, file picker, etc.
-  - **PipeWire/PulseAudio** — for mic/camera (just device access, no prompt)
-  - **D-Bus + libnotify** — for notifications (no permission gate)
-  - **AT-SPI** for accessibility — open, no permission concept
-
-### What to test once #6501 lands
-- Fresh `.deb` install on Ubuntu 22.04+ → onboarding shows simplified flow → tray works
+### What to test
+- Fresh `.deb` install on Ubuntu 22.04+ → onboarding shows simplified ~2-step flow → tray works
 - Fresh `.AppImage` on Fedora/Arch → same
-- xdg-desktop-portal screen capture prompt fires once on Wayland
+- Wayland host with portal: screen capture remains Denied (no Linux capture path yet)
+- X11 host: screen capture remains Denied
 - Notification appears via D-Bus
 
 ### How to attempt a build today (will compile, won't be useful)
@@ -65,26 +63,23 @@ cargo build --release --target x86_64-unknown-linux-gnu   # needs cross toolchai
 cargo tauri build
 ```
 
-## Windows (NOT YET IMPLEMENTED — tracked in #6501)
+## Windows
 
-### What works today
-- App builds (cfg gates skip macOS-only code)
-- Tauri shell, windows, system tray, app icon (`icon.ico`), bundle as `.exe`/`.msi`
-- Onboarding wizard renders
+### What works now
+- App builds with Windows-specific permission probes and onboarding sections.
+- Onboarding is Windows-focused: Mic + Camera + optional Input Monitoring + Notifications.
+- Mic and Camera status are surfaced from CapabilityAccessManager consent-store keys.
+- Requesting Mic/Camera opens the matching `ms-settings:` privacy pages.
+- Input Monitoring status reflects admin elevation state.
+- Notifications report granted for Action Center.
+- Bundle targets remain `.exe` and `.msi`.
 
-### What does NOT work today
-- Same stub "granted" problem as Linux
-- Windows permissions live in:
-  - **App manifest** (UWP capability declarations) — required at build time for mic/camera
-  - **Settings → Privacy** (system-wide app permissions)
-  - **Action Center** for notifications (no permission gate)
-  - **Admin elevation** for low-level keyboard hooks (Input Monitoring equivalent)
-
-### What to test once #6501 lands
-- Fresh `.msi` install on Windows 11 → onboarding shows simplified flow → system tray works
-- Mic/camera consent dialog fires from Privacy panel
+### What to test
+- Fresh `.msi` install on Windows 11 → onboarding shows ~3–4-step Windows flow → system tray works
+- Clicking Grant for Mic/Camera opens corresponding Privacy settings pages
+- Toggling privacy settings updates status pills in the wizard polling loop
 - Notifications appear in Action Center
-- Admin-elevation prompt for global keyboard hook
+- Non-admin run reports Input Monitoring as denied; admin run reports granted
 
 ### How to attempt a build today (will compile, won't be useful)
 ```sh

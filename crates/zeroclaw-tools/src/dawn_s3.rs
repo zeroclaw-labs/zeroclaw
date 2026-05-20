@@ -175,10 +175,7 @@ impl Tool for DawnS3Tool {
         }
 
         let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-            Some(p) => {
-                tracing::debug!(target: "dawn_s3", "file_path: {}", p);
-                p
-            }
+            Some(p) => p,
             None => {
                 tracing::error!(target: "dawn_s3", "missing required parameter: file_path");
                 return Ok(ToolResult {
@@ -189,17 +186,45 @@ impl Tool for DawnS3Tool {
             }
         };
 
+        // Security: resolve and validate file path
+        let full_path = self.security.resolve_tool_path(file_path);
+
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(target: "dawn_s3", "file not found or inaccessible: {}", e);
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(json!({
+                        "error": format!("File not found: {}", file_path),
+                        "suggestion": "Check the file path is correct and the file exists",
+                        "path": file_path
+                    }).to_string()),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            tracing::warn!(target: "dawn_s3", "path not allowed: {}", resolved_path.display());
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.security.resolved_path_violation_message(&resolved_path)),
+            });
+        }
+
         let content_type = args
             .get("content_type")
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| {
-                let ct = guess_content_type(file_path);
+                let ct = guess_content_type(resolved_path.to_string_lossy().as_ref());
                 tracing::debug!(target: "dawn_s3", "auto-detected content_type: {}", ct);
                 ct
             });
 
-        let file_name = Path::new(file_path)
+        let file_name = resolved_path
             .file_name()
             .and_then(|n| n.to_str())
             .map(String::from)
@@ -207,7 +232,7 @@ impl Tool for DawnS3Tool {
 
         tracing::debug!(target: "dawn_s3", "file_name extracted: {}", file_name);
 
-        let ext = Path::new(file_path)
+        let ext = resolved_path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| format!(".{}", e))
@@ -216,8 +241,8 @@ impl Tool for DawnS3Tool {
         let remote_path = format!("assistant/{}{}", uuid::Uuid::new_v4(), ext);
         tracing::debug!(target: "dawn_s3", "remote_path generated: {}", remote_path);
 
-        tracing::info!(target: "dawn_s3", "reading file: {}", file_path);
-        let content = match tokio::fs::read(file_path).await {
+        tracing::info!(target: "dawn_s3", "reading file: {}", resolved_path.display());
+        let content = match tokio::fs::read(&resolved_path).await {
             Ok(c) => {
                 tracing::debug!(target: "dawn_s3", "file read success, size: {} bytes", c.len());
                 c

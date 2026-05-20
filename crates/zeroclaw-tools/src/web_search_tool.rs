@@ -23,6 +23,10 @@ pub struct WebSearchTool {
     boot_tavily_api_key: Option<String>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
+    /// Boot-time Yumc-Search key snapshot.
+    boot_yumc_search_api_key: Option<String>,
+    /// Boot-time Yumc-Search base URL.
+    yumc_search_base_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -43,6 +47,8 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             searxng_instance_url: None,
+            boot_yumc_search_api_key: None,
+            yumc_search_base_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -61,6 +67,8 @@ impl WebSearchTool {
         brave_api_key: Option<String>,
         tavily_api_key: Option<String>,
         searxng_instance_url: Option<String>,
+        yumc_search_api_key: Option<String>,
+        yumc_search_base_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
         config_path: PathBuf,
@@ -71,6 +79,8 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             searxng_instance_url,
+            boot_yumc_search_api_key: yumc_search_api_key,
+            yumc_search_base_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -514,6 +524,131 @@ impl WebSearchTool {
 
         Ok(lines.join("\n"))
     }
+
+    /// Resolve the Yumc-Search API key from the boot-time snapshot, falling back
+    /// to a fresh config read + decryption when the boot-time value is absent.
+    fn resolve_yumc_search_api_key(&self) -> anyhow::Result<String> {
+        if let Some(ref key) = self.boot_yumc_search_api_key
+            && !key.is_empty()
+            && !zeroclaw_config::secrets::SecretStore::is_encrypted(key)
+        {
+            return Ok(key.clone());
+        }
+        self.reload_yumc_search_api_key()
+    }
+
+    /// Re-read `config.toml` and decrypt `[web_search] yumc_search_api_key`.
+    fn reload_yumc_search_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for Yumc-Search API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Yumc-Search API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let raw_key = config
+            .web_search
+            .yumc_search_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Yumc-Search API key not configured"))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Yumc-Search API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_yumc_search(&self, query: &str) -> anyhow::Result<String> {
+        let api_key = self.resolve_yumc_search_api_key()?;
+        let url = self
+            .yumc_search_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Yumc-Search base URL not configured"))?;
+
+        let body = serde_json::json!({
+            "queries": [query],
+            "count": self.max_results,
+        });
+
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+
+        let response = client
+            .post(url)
+            .bearer_auth(&api_key)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Yumc-Search failed with status: {}", response.status());
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_yumc_search_results(&json, query)
+    }
+
+    fn parse_yumc_search_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let data = json.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+            anyhow::anyhow!("Invalid Yumc-Search API response: missing or invalid data field")
+        })?;
+
+        if data.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let results = data[0]
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Invalid Yumc-Search API response: missing results array")
+            })?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Yumc-Search)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let name = result
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let snippet = result.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, name));
+            lines.push(format!("   {}", url));
+            if !snippet.is_empty() {
+                lines.push(format!("   {}", snippet));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -603,6 +738,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
             WebSearchProviderRoute::Tavily => self.search_tavily(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
+            WebSearchProviderRoute::YumcSearch => self.search_yumc_search(query).await?,
         };
 
         Ok(ToolResult {

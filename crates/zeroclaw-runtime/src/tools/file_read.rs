@@ -89,7 +89,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
+                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace or a configured allowed_roots path."
                 },
                 "offset": {
                     "type": "integer",

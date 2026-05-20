@@ -432,27 +432,27 @@ impl WuKongIMChannel {
         // Send quick acknowledgment message only if:
         // 1. ack_reactions is enabled AND
         // 2. More than 60 seconds have passed since the last message from this sender
-        if self.ack_reactions {
-            let sender_key = format!("{}:{}", params.channel_id, params.from_uid);
-            let now = Instant::now();
-            let should_send = {
-                let last_time = self.last_message_time.read().await;
-                match last_time.get(&sender_key) {
-                    Some(last) if now.duration_since(*last) < Duration::from_secs(self.ack_reactions_delay_secs) => false,
-                    _ => true,
-                }
-            };
-            if should_send {
-                let ack_msg = self.ack_reactions_message.clone();
-                let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
-                let _ = self.send_text_message(target_id, params.channel_type, &ack_msg).await;
-            }
-            // Update last message time
-            {
-                let mut last_time = self.last_message_time.write().await;
-                last_time.insert(sender_key, now);
-            }
-        }
+        // [DISABLED] if self.ack_reactions {
+        // [DISABLED]     let sender_key = format!("{}:{}", params.channel_id, params.from_uid);
+        // [DISABLED]     let now = Instant::now();
+        // [DISABLED]     let should_send = {
+        // [DISABLED]         let last_time = self.last_message_time.read().await;
+        // [DISABLED]         match last_time.get(&sender_key) {
+        // [DISABLED]             Some(last) if now.duration_since(*last) < Duration::from_secs(self.ack_reactions_delay_secs) => false,
+        // [DISABLED]             _ => true,
+        // [DISABLED]         }
+        // [DISABLED]     };
+        // [DISABLED]     if should_send {
+        // [DISABLED]         let ack_msg = self.ack_reactions_message.clone();
+        // [DISABLED]         let target_id = if params.channel_type == WkChannelType::PERSONAL { &params.from_uid } else { &params.channel_id };
+        // [DISABLED]         let _ = self.send_text_message(target_id, params.channel_type, &ack_msg).await;
+        // [DISABLED]     }
+        // [DISABLED]     // Update last message time
+        // [DISABLED]     {
+        // [DISABLED]         let mut last_time = self.last_message_time.write().await;
+        // [DISABLED]         last_time.insert(sender_key, now);
+        // [DISABLED]     }
+        // [DISABLED] }
 
         let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
@@ -835,6 +835,11 @@ impl Channel for WuKongIMChannel {
         }
         tracing::info!("WuKongIM: connected as {}", self.uid);
 
+        // 3. Process History (now that WS is connected, Agent can reply).
+        //    Spawn each entry: process_inbound_message awaits send_text_message
+        //    (ack reactions) etc., which depend on the live read loop below
+        //    draining RPC responses. Awaiting inline before the read loop
+        //    starts would deadlock waiting for responses no one is reading.
         // 3. Process History (now that WS is connected, Agent can reply)
         // Group offline messages by conversation and batch process them
         use std::collections::HashMap;
@@ -843,19 +848,14 @@ impl Channel for WuKongIMChannel {
             let key = (msg.channel_id.clone(), msg.channel_type);
             grouped.entry(key).or_default().push(msg);
         }
-        for ((channel_id, channel_type), messages) in grouped {
-            tracing::info!(
-                "WuKongIM: processing offline batch for channel={}:{} count={}",
-                channel_id,
-                channel_type,
-                messages.len()
-            );
-            let _ = self
-                .process_offline_batch(messages, &tx)
-                .await;
-        }
 
-        // 4. Start Live Listening
+        // 4. Start Live Listening.
+        //    INVARIANT: this loop must NOT await any operation that ultimately
+        //    waits on `pending_responses` — those oneshots are resolved here
+        //    (in the `frame = read.next()` arm), so blocking on one of them
+        //    inside the loop deadlocks the channel. In particular,
+        //    `process_inbound_message` is awaited in a spawned task, never
+        //    inline. See the `tokio::spawn` call below for the rationale.
         let mut hb = tokio::time::interval(PING_INTERVAL);
         let mut last_activity = Instant::now();
 
@@ -899,7 +899,21 @@ impl Channel for WuKongIMChannel {
 
                     if val.get("method").and_then(|m| m.as_str()) != Some("recv") { continue; }
                     let notif: JsonRpcNotification<RecvNotificationParams> = serde_json::from_value(val)?;
-                    let _ = self.process_inbound_message(notif.params, &tx).await;
+                    // Spawn — see SAFETY note above the listen loop. process_inbound_message
+                    // itself awaits RPC responses (send_text_message for "收到", media
+                    // downloads, etc.), and the oneshots backing those responses are
+                    // resolved by THIS read loop. Awaiting it inline would deadlock the
+                    // entire channel until each inbound message's outgoing RPCs time out.
+                    let self_clone = self.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone
+                            .process_inbound_message(notif.params, &tx_clone)
+                            .await
+                        {
+                            tracing::warn!("WuKongIM: inbound processing failed: {}", e);
+                        }
+                    });
                 }
             }
         }

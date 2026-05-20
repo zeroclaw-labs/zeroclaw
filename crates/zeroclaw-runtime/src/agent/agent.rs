@@ -36,6 +36,7 @@ pub struct Agent {
     config: zeroclaw_config::schema::AgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
+    provider_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: zeroclaw_config::schema::IdentityConfig,
@@ -135,6 +136,7 @@ pub struct AgentBuilder {
     config: Option<zeroclaw_config::schema::AgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
+    provider_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
@@ -173,6 +175,7 @@ impl AgentBuilder {
             config: None,
             multimodal_config: None,
             model_name: None,
+            provider_name: None,
             temperature: None,
             workspace_dir: None,
             identity_config: None,
@@ -243,6 +246,11 @@ impl AgentBuilder {
 
     pub fn model_name(mut self, model_name: String) -> Self {
         self.model_name = Some(model_name);
+        self
+    }
+
+    pub fn provider_name(mut self, provider_name: String) -> Self {
+        self.provider_name = Some(provider_name);
         self
     }
 
@@ -385,6 +393,7 @@ impl AgentBuilder {
             // keeps the field non-empty so accidental dispatch surfaces a clear 4xx
             // rather than misrouting to a real vendor model.
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
+            provider_name: self.provider_name.unwrap_or_default(),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -432,6 +441,13 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    /// Replace the observer at runtime. Used by the WebSocket gateway to inject
+    /// the shared `BroadcastObserver` after agent construction so that
+    /// `turn_streamed` events reach the SSE `/api/events` stream.
+    pub fn set_observer(&mut self, observer: Arc<dyn Observer>) {
+        self.observer = observer;
     }
 
     fn should_send_tool_specs(&self) -> bool {
@@ -769,6 +785,7 @@ impl Agent {
             .config(config.agent.clone())
             .multimodal_config(config.multimodal.clone())
             .model_name(model_name)
+            .provider_name(provider_name.to_string())
             .temperature(
                 fallback_provider_ag
                     .and_then(|e| e.temperature)
@@ -1387,14 +1404,28 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        let turn_started_at = Instant::now();
+        self.observer.record_event(&ObserverEvent::AgentStart {
+            provider: self.provider_name.clone(),
+            model: effective_model.clone(),
+        });
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
-            // Early exit if the caller cancelled this turn (e.g. user abort)
+            // Early exit if the caller cancelled this turn (e.g. user abort).
+            // Emit AgentEnd so the observer sequence is balanced even on an
+            // already-cancelled token (common in rapid user-abort scenarios).
             if cancel_token
                 .as_ref()
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                });
                 return Err(crate::agent::loop_::ToolLoopCancelled.into());
             }
 
@@ -1433,6 +1464,14 @@ impl Agent {
                             cached.clone(),
                         )));
                     self.trim_history();
+                    self.observer.record_event(&ObserverEvent::TurnComplete);
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: turn_started_at.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -1440,7 +1479,29 @@ impl Agent {
                 });
             }
 
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+            // Expand the error case so AgentEnd is emitted before propagating;
+            // the bare `?` would leave AgentStart unmatched on any preparation
+            // failure (context compression error, MCP tool spec fetch, etc.).
+            let prepared_messages = match self.prepare_provider_messages(&messages).await {
+                Ok(msgs) => msgs,
+                Err(err) => {
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: turn_started_at.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
+                    return Err(err);
+                }
+            };
+
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: self.history.len(),
+            });
 
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
@@ -1572,6 +1633,13 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         partial.clone(),
                     )));
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                });
                 return Err(crate::agent::loop_::ToolLoopCancelled.into());
             }
 
@@ -1603,6 +1671,13 @@ impl Agent {
                     tokio::select! {
                         biased;
                         () = token.cancelled() => {
+                            self.observer.record_event(&ObserverEvent::AgentEnd {
+                                provider: self.provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: turn_started_at.elapsed(),
+                                tokens_used: None,
+                                cost_usd: None,
+                            });
                             return Err(crate::agent::loop_::ToolLoopCancelled.into());
                         }
                         result = chat_fut => result,
@@ -1612,9 +1687,50 @@ impl Agent {
                 };
                 match chat_result {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(safe_error),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                        self.observer.record_event(&ObserverEvent::AgentEnd {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: turn_started_at.elapsed(),
+                            tokens_used: None,
+                            cost_usd: None,
+                        });
+                        return Err(err);
+                    }
                 }
             };
+
+            // Emit LlmResponse through the observer so SSE dashboard clients
+            // watching /api/events receive llm_response events for WS-path turns.
+            // This closes the coverage gap identified in PR #5986: the WS path
+            // calls turn_streamed directly without going through loop_::run(), so
+            // observer events must be emitted here.
+            {
+                let (llm_input, llm_output) = response
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: llm_input,
+                    output_tokens: llm_output,
+                });
+            }
 
             // Forward per-call token usage so the WS gateway (and any other
             // consumer) can include aggregated usage in the final done frame
@@ -1663,7 +1779,14 @@ impl Agent {
                         final_text.clone(),
                     )));
                 self.trim_history();
-
+                self.observer.record_event(&ObserverEvent::TurnComplete);
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: turn_started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                });
                 return Ok(final_text);
             }
 
@@ -1712,6 +1835,13 @@ impl Agent {
             self.trim_history();
         }
 
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            provider: self.provider_name.clone(),
+            model: effective_model.clone(),
+            duration: turn_started_at.elapsed(),
+            tokens_used: None,
+            cost_usd: None,
+        });
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
@@ -3321,6 +3451,82 @@ mod tests {
         );
     }
 
+    /// Regression test: if the `CancellationToken` is already cancelled
+    /// before the first loop iteration, `turn_streamed` must emit a matching
+    /// `AgentEnd` for every `AgentStart` so observer consumers (SSE dashboard,
+    /// metrics backends) see a properly closed turn. See PR #6553 review.
+    #[tokio::test]
+    async fn turn_streamed_pre_cancelled_token_emits_balanced_agent_start_end() {
+        struct RecordingObserver {
+            events: Mutex<Vec<&'static str>>,
+        }
+
+        impl Observer for RecordingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                let tag = match event {
+                    ObserverEvent::AgentStart { .. } => "AgentStart",
+                    ObserverEvent::AgentEnd { .. } => "AgentEnd",
+                    _ => return,
+                };
+                self.events.lock().push(tag);
+            }
+
+            fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let recorder = Arc::new(RecordingObserver {
+            events: Mutex::new(Vec::new()),
+        });
+        let observer: Arc<dyn Observer> = recorder.clone();
+
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Pre-cancel the token BEFORE the call so the first-iteration
+        // cancel guard fires immediately after AgentStart.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let (event_tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let result = agent.turn_streamed("hello", event_tx, Some(token)).await;
+
+        assert!(result.is_err(), "expected Err on pre-cancelled token");
+
+        let events = recorder.events.lock();
+        assert_eq!(
+            events.as_slice(),
+            &["AgentStart", "AgentEnd"],
+            "observer must receive AgentStart then AgentEnd even when the \
+             token is pre-cancelled; got: {events:?}"
+        );
+    }
+
     /// Reproduction test for the orphan-tool_results trim bug.
     ///
     /// `trim_history` previously dropped the oldest N entries blindly. When
@@ -3673,6 +3879,7 @@ mod tests {
                     kind: "shell".to_string(),
                     command: format!("echo {t}"),
                     args: std::collections::HashMap::new(),
+                    timeout_secs: None,
                 })
                 .collect(),
             prompts: vec![],
@@ -3690,21 +3897,21 @@ mod tests {
         tools::register_skill_tools(&mut tools, &skills, security);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, &["builtin_a", "deploy.run", "deploy.status"]);
+        assert_eq!(names, &["builtin_a", "deploy__run", "deploy__status"]);
     }
 
     #[test]
     fn register_skill_tools_skips_shadowed_builtins() {
         let security = Arc::new(crate::security::SecurityPolicy::default());
         // Pre-populate with a tool whose name matches what the skill would produce.
-        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("my_skill.run"))];
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("my_skill__run"))];
 
         let skills = vec![make_skill("my_skill", &["run"])];
         tools::register_skill_tools(&mut tools, &skills, security);
 
         // Should still be just 1 tool — the duplicate was skipped.
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name(), "my_skill.run");
+        assert_eq!(tools[0].name(), "my_skill__run");
     }
 
     #[test]
@@ -3773,7 +3980,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            &["file_read", "web_fetch", "ops.deploy", "ops.rollback"]
+            &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
         );
     }
 }
