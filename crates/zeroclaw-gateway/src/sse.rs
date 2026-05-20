@@ -254,8 +254,11 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: std::time::Duration::from_millis(42),
             success: true,
+            arguments: None,
+            result: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -274,6 +277,7 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "mcp_filesystem__read_file".into(),
+            tool_call_id: None,
             arguments: None,
         });
 
@@ -338,8 +342,11 @@ mod tests {
 
         observer.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: std::time::Duration::from_millis(7),
             success: true,
+            arguments: None,
+            result: None,
         });
 
         let value = rx
