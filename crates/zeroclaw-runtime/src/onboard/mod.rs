@@ -1490,16 +1490,15 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
     }
 
     loop {
-        // ModelProvider list derived from the schema: each `tunnel.<name>.*` field
-        // in prop_fields() names a real model_provider. "none" is always valid and
-        // has no sub-config, so it's prepended.
+        // Provider list from nested_option_entries() — statically enumerates
+        // every Option<T> sub-config on TunnelConfig regardless of whether it
+        // is currently Some. prop_fields() skips None options so it would
+        // only show already-configured providers.
         let mut provider_names: Vec<String> = cfg
-            .prop_fields()
-            .iter()
-            .filter_map(|f| f.name.strip_prefix("tunnel."))
-            .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
-            .collect::<std::collections::BTreeSet<_>>()
+            .tunnel
+            .nested_option_entries()
             .into_iter()
+            .map(|e| e.field.to_string())
             .collect();
         provider_names.insert(0, "none".to_string());
 

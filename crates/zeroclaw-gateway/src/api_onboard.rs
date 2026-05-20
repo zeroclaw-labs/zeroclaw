@@ -788,11 +788,7 @@ fn picker_items_for(
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
-        Section::Tunnel => PickerDispatch::Items(schema_walk_picker_with_none(
-            cfg,
-            "tunnel",
-            "tunnel.tunnel-provider",
-        )),
+        Section::Tunnel => PickerDispatch::Items(tunnel_picker(cfg)),
         Section::Agents => PickerDispatch::Items(agents_picker(cfg)),
         // Storage is two-tier (`storage.<kind>.<alias>`) — same shape
         // and walker as channels and the typed-provider families.
@@ -1110,15 +1106,14 @@ fn first_alias_preferring_default<'a>(aliases: impl Iterator<Item = &'a String>)
         .map(|alias| (*alias).clone())
 }
 
-/// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
-/// `none` entry at the top, marked active when the current `tunnel.tunnel_provider`
-/// matches. Mirrors the TUI's tunnel section.
-fn schema_walk_picker_with_none(
-    cfg: &zeroclaw_config::schema::Config,
-    section: &str,
-    active_prop_path: &str,
-) -> Vec<PickerItem> {
-    let active = cfg.get_prop(active_prop_path).unwrap_or_default();
+/// Tunnel section picker — enumerates providers via `nested_option_entries()`
+/// on `TunnelConfig` so that unconfigured providers (whose `Option` fields are
+/// `None`) still appear. `schema_walk_picker` uses `map_key_sections()` which
+/// only covers `HashMap`/`Vec` sections and misses `Option<T>` sub-configs.
+fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    let active = cfg
+        .get_prop("tunnel.tunnel-provider")
+        .unwrap_or_default();
     let mut items = vec![PickerItem {
         key: "none".to_string(),
         label: "none".to_string(),
@@ -1129,16 +1124,27 @@ fn schema_walk_picker_with_none(
             None
         },
     }];
-    let mut rest = schema_walk_picker(cfg, section);
-    // Re-mark the active one in the schema-walk results.
-    for item in &mut rest {
-        if item.key == active {
-            item.badge = Some("active".to_string());
-        }
+    for entry in cfg.tunnel.nested_option_entries() {
+        items.push(PickerItem {
+            key: entry.field.to_string(),
+            label: entry.display_name.to_string(),
+            description: if entry.description.is_empty() {
+                None
+            } else {
+                Some(entry.description.to_string())
+            },
+            badge: if entry.field == active {
+                Some("active".to_string())
+            } else if entry.present {
+                Some("configured".to_string())
+            } else {
+                None
+            },
+        });
     }
-    items.extend(rest);
     items
 }
+
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1850,13 +1856,21 @@ mod tests {
     #[test]
     fn tunnel_picker_includes_synthetic_none() {
         let cfg = empty_cfg();
-        let items = schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.tunnel-provider");
+        let items = tunnel_picker(&cfg);
         assert_eq!(
             items[0].key, "none",
             "`none` must be the first entry in the tunnel picker"
         );
         // `none` is the active default for a fresh config.
         assert_eq!(items[0].badge.as_deref(), Some("active"));
+        // All known providers must be present even when their Option is None.
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        for expected in ["tailscale", "cloudflare", "ngrok", "openvpn", "pinggy", "custom"] {
+            assert!(
+                keys.contains(&expected),
+                "tunnel_picker must include `{expected}` for unconfigured configs"
+            );
+        }
     }
 
     /// Empty OneTierAliasMap section yields zero picker items. No
