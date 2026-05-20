@@ -215,109 +215,211 @@
     </footer>
 
     <script>
-      const STEPS = [
-        {
-          id: "welcome",
-          icon: "👋",
-          title: "Welcome to ZeroClaw",
-          subtitle:
-            "ZeroClaw is a menu-bar agent that can act on your Mac on your behalf. " +
-            "On the next few screens you'll grant the macOS permissions it needs. " +
-            "You can change any of these later in System Settings.",
-          perms: [],
-          ctaLabel: "Get Started",
-        },
-        {
-          id: "accessibility",
-          icon: "🖱️",
-          title: "Accessibility",
-          subtitle:
-            "Lets ZeroClaw click, type, and read other apps' UI on your behalf. " +
-            "This is the most important permission for an agent that controls your Mac. " +
-            "Click Grant to open System Settings → Privacy & Security → Accessibility, then toggle ZeroClaw on.",
-          perms: [
-            { name: "accessibility", label: "Accessibility" },
-          ],
-        },
-        {
-          id: "screen_input",
-          icon: "🖥️",
-          title: "See & observe the screen",
-          subtitle:
-            "Screen Recording lets the agent see what's on screen so it can act on the current context. " +
-            "Input Monitoring lets it receive global hotkeys and observe keyboard/mouse activity outside its own windows.",
-          perms: [
-            { name: "screen_recording", label: "Screen Recording" },
-            { name: "input_monitoring", label: "Input Monitoring" },
-          ],
-        },
-        {
-          id: "automation",
-          icon: "🤖",
-          title: "Drive other apps",
-          subtitle:
-            "Automation lets ZeroClaw control Finder, Mail, Safari, Calendar, Reminders, Notes, Music, and other " +
-            "scriptable apps via AppleScript. macOS asks for confirmation per-app the first time you use it.",
-          perms: [
-            { name: "automation", label: "Automation (AppleScript)" },
-          ],
-        },
-        {
-          id: "voice_vision",
-          icon: "🎙️",
-          title: "Voice & vision",
-          subtitle:
-            "Enable voice commands and vision input. " +
-            "Optional — skip if you only use the chat by typing.",
-          perms: [
-            { name: "microphone", label: "Microphone" },
-            { name: "camera", label: "Camera" },
-            { name: "speech_recognition", label: "Speech Recognition" },
-          ],
-          optional: true,
-        },
-        {
-          id: "notifications",
-          icon: "🔔",
-          title: "Notifications",
-          subtitle:
-            "Let ZeroClaw notify you when long-running tasks finish or attention is needed. " +
-            "macOS will show banner alerts; you can configure delivery in System Settings.",
-          perms: [
-            { name: "notifications", label: "Notifications" },
-          ],
-          optional: true,
-        },
-        {
-          id: "advanced",
-          icon: "⚙️",
-          title: "Advanced (optional)",
-          subtitle:
-            "These give the agent broader access to your system. " +
-            "Most users can skip — you can grant them later from System Settings if a feature needs them.",
-          perms: [
-            { name: "full_disk_access", label: "Full Disk Access" },
-            { name: "local_network", label: "Local Network" },
-          ],
-          optional: true,
-        },
-        {
-          id: "done",
-          icon: "✅",
-          title: "You're ready",
-          subtitle:
-            "ZeroClaw lives in your menu bar. Click the icon up top anytime to start a chat. " +
-            "Below is what you granted just now — you can revisit any of these in System Settings.",
-          perms: [],
-          isFinal: true,
-        },
-      ];
+      async function detectPlatform() {
+        try {
+          return await tauriInvoke("get_runtime_platform");
+        } catch (err) {
+          console.warn("get_runtime_platform failed, falling back to userAgent", err);
+          // Fallback for browser-only preview without Tauri IPC.
+          const ua = navigator.userAgent.toLowerCase();
+          if (ua.includes("windows")) return "windows";
+          if (ua.includes("linux")) return "linux";
+          return "macos";
+        }
+      }
+
+      function buildSteps(platform) {
+        if (platform === "linux") {
+          return [
+            {
+              id: "welcome",
+              icon: "🐧",
+              title: "Welcome to ZeroClaw",
+              subtitle:
+                "You're almost ready. Linux has fewer privacy gates than macOS. " +
+                "We'll quickly confirm desktop notifications. Screen capture remains macOS-only for now.",
+              perms: [
+                { name: "screen_recording", label: "Screen Capture (macOS-only for now)" },
+                { name: "notifications", label: "Notifications" },
+              ],
+              ctaLabel: "Continue",
+            },
+            {
+              id: "done",
+              icon: "✅",
+              title: "You're ready",
+              subtitle:
+                "ZeroClaw now runs in your system tray. Open it anytime from the tray icon to start chatting.",
+              perms: [],
+              isFinal: true,
+            },
+          ];
+        }
+
+        if (platform === "windows") {
+          return [
+            {
+              id: "welcome",
+              icon: "🪟",
+              title: "Welcome to ZeroClaw",
+              subtitle:
+                "We'll walk through the Windows permissions ZeroClaw uses most: microphone, camera, and optional input monitoring.",
+              perms: [],
+              ctaLabel: "Get Started",
+            },
+            {
+              id: "av",
+              icon: "🎙️",
+              title: "Microphone & Camera",
+              subtitle:
+                "Grant access in Windows Privacy settings so ZeroClaw can support voice and visual workflows.",
+              perms: [
+                { name: "microphone", label: "Microphone" },
+                { name: "camera", label: "Camera" },
+              ],
+            },
+            {
+              id: "input",
+              icon: "⌨️",
+              title: "Input Monitoring (optional)",
+              subtitle:
+                "Global input hooks require administrator elevation on Windows. " +
+                "If you skip this, ZeroClaw still works normally for standard desktop control.",
+              perms: [
+                { name: "input_monitoring", label: "Input Monitoring (Admin)" },
+              ],
+              optional: true,
+            },
+            {
+              id: "notifications",
+              icon: "🔔",
+              title: "Notifications",
+              subtitle:
+                "Windows notifications are available through Action Center. " +
+                "We'll keep this enabled so ZeroClaw can alert you when tasks complete.",
+              perms: [
+                { name: "notifications", label: "Notifications" },
+              ],
+              optional: true,
+            },
+            {
+              id: "done",
+              icon: "✅",
+              title: "You're ready",
+              subtitle:
+                "ZeroClaw now lives in your system tray. Open it anytime from the tray icon to start chatting.",
+              perms: [],
+              isFinal: true,
+            },
+          ];
+        }
+
+        return [
+          {
+            id: "welcome",
+            icon: "👋",
+            title: "Welcome to ZeroClaw",
+            subtitle:
+              "ZeroClaw is a menu-bar agent that can act on your Mac on your behalf. " +
+              "On the next few screens you'll grant the macOS permissions it needs. " +
+              "You can change any of these later in System Settings.",
+            perms: [],
+            ctaLabel: "Get Started",
+          },
+          {
+            id: "accessibility",
+            icon: "🖱️",
+            title: "Accessibility",
+            subtitle:
+              "Lets ZeroClaw click, type, and read other apps' UI on your behalf. " +
+              "This is the most important permission for an agent that controls your Mac. " +
+              "Click Grant to open System Settings → Privacy & Security → Accessibility, then toggle ZeroClaw on.",
+            perms: [
+              { name: "accessibility", label: "Accessibility" },
+            ],
+          },
+          {
+            id: "screen_input",
+            icon: "🖥️",
+            title: "See & observe the screen",
+            subtitle:
+              "Screen Recording lets the agent see what's on screen so it can act on the current context. " +
+              "Input Monitoring lets it receive global hotkeys and observe keyboard/mouse activity outside its own windows.",
+            perms: [
+              { name: "screen_recording", label: "Screen Recording" },
+              { name: "input_monitoring", label: "Input Monitoring" },
+            ],
+          },
+          {
+            id: "automation",
+            icon: "🤖",
+            title: "Drive other apps",
+            subtitle:
+              "Automation lets ZeroClaw control Finder, Mail, Safari, Calendar, Reminders, Notes, Music, and other " +
+              "scriptable apps via AppleScript. macOS asks for confirmation per-app the first time you use it.",
+            perms: [
+              { name: "automation", label: "Automation (AppleScript)" },
+            ],
+          },
+          {
+            id: "voice_vision",
+            icon: "🎙️",
+            title: "Voice & vision",
+            subtitle:
+              "Enable voice commands and vision input. " +
+              "Optional — skip if you only use the chat by typing.",
+            perms: [
+              { name: "microphone", label: "Microphone" },
+              { name: "camera", label: "Camera" },
+              { name: "speech_recognition", label: "Speech Recognition" },
+            ],
+            optional: true,
+          },
+          {
+            id: "notifications",
+            icon: "🔔",
+            title: "Notifications",
+            subtitle:
+              "Let ZeroClaw notify you when long-running tasks finish or attention is needed. " +
+              "macOS will show banner alerts; you can configure delivery in System Settings.",
+            perms: [
+              { name: "notifications", label: "Notifications" },
+            ],
+            optional: true,
+          },
+          {
+            id: "advanced",
+            icon: "⚙️",
+            title: "Advanced (optional)",
+            subtitle:
+              "These give the agent broader access to your system. " +
+              "Most users can skip — you can grant them later from System Settings if a feature needs them.",
+            perms: [
+              { name: "full_disk_access", label: "Full Disk Access" },
+              { name: "local_network", label: "Local Network" },
+            ],
+            optional: true,
+          },
+          {
+            id: "done",
+            icon: "✅",
+            title: "You're ready",
+            subtitle:
+              "ZeroClaw lives in your menu bar. Click the icon up top anytime to start a chat. " +
+              "Below is what you granted just now — you can revisit any of these in System Settings.",
+            perms: [],
+            isFinal: true,
+          },
+        ];
+      }
+
+      let STEPS = [];
 
       function resolveInvoke() {
         return window.__TAURI__?.core?.invoke ?? null;
       }
 
-      async function callInvoke(cmd, args) {
+      async function tauriInvoke(cmd, args) {
         const invoke = resolveInvoke();
         if (!invoke) {
           throw new Error(
@@ -336,6 +438,7 @@
 
       let currentIndex = 0;
       let statusMap = {};
+      let refreshIntervalId = null;
 
       function el(tag, className, text) {
         const node = document.createElement(tag);
@@ -460,7 +563,7 @@
 
       async function refresh() {
         try {
-          const list = await callInvoke("get_permissions_status");
+          const list = await tauriInvoke("get_permissions_status");
           const map = {};
           for (const p of list) map[p.name] = p.status;
           statusMap = map;
@@ -473,7 +576,7 @@
 
       async function grant(name) {
         try {
-          await callInvoke("request_permission", { name });
+          await tauriInvoke("request_permission", { name });
         } catch (err) {
           console.error("request_permission failed:", err);
           footerStatus.textContent = `Grant ${name}: ${String(err.message ?? err)}`;
@@ -488,7 +591,7 @@
           renderStep();
         } else {
           // Final step CTA → close wizard.
-          callInvoke("complete_onboarding").catch((err) => {
+          tauriInvoke("complete_onboarding").catch((err) => {
             footerStatus.textContent = String(err.message ?? err);
             footerStatus.style.color = "var(--bad)";
           });
@@ -511,10 +614,19 @@
       skipBtn.addEventListener("click", skip);
       nextBtn.addEventListener("click", next);
 
+      async function init() {
+        const platform = await detectPlatform();
+        STEPS = buildSteps(platform);
+        currentIndex = 0;
+        statusMap = {};
+        renderStep();
+        await refresh();
+        if (refreshIntervalId) clearInterval(refreshIntervalId);
+        refreshIntervalId = setInterval(refresh, 2000);
+      }
+
       // Initial render + polling.
-      renderStep();
-      refresh();
-      setInterval(refresh, 2000);
+      init();
     </script>
   </body>
 </html>

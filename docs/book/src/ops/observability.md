@@ -1,206 +1,262 @@
-# Logs & Observability
+# Logs & observability
 
-ZeroClaw emits structured logs, Prometheus metrics, and OpenTelemetry traces. All three are on by default in a release build.
+Every event ZeroClaw emits flows through one crate: `zeroclaw-log`. The crate
+owns the on-disk JSONL schema, the in-process broadcast stream the dashboard
+reads, the bridge to the typed `Observer` (Prometheus / OTel), and the
+macros (`record!`, `scope!`, `spawn!`) that subsystems call.
 
-## Logs
+This page covers what an operator needs: configuration, where the log lives,
+the shape of the events, and how to query them.
 
-### Where they go
-
-| Platform | Default destination |
-|---|---|
-| Linux (systemd) | journald — `journalctl --user -u zeroclaw` |
-| macOS (launchd) | `~/Library/Logs/ZeroClaw/zeroclaw.log` (stdout), `zeroclaw.err` (stderr) |
-| Homebrew on macOS | `$HOMEBREW_PREFIX/var/log/zeroclaw.log` |
-| Windows | `%LOCALAPPDATA%\ZeroClaw\logs\zeroclaw.log` |
-| Docker | container stdout — `docker logs zeroclaw` |
-| Foreground (`zeroclaw daemon` without service) | stderr |
-
-### Levels
-
-Set via the `RUST_LOG` env var. Leave it unset for ZeroClaw's built-in default (`info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn`). Examples:
-
-```bash
-RUST_LOG=debug                                       # verbose — per tool call, per provider call
-RUST_LOG=zeroclaw_runtime::agent=trace               # very verbose — just the agent loop
-RUST_LOG=warn,zeroclaw_runtime::security=debug       # quiet except security subsystem
-```
-
-For persistent changes, put the value in your service unit:
-
-```ini
-# ~/.config/systemd/user/zeroclaw.service.d/override.conf
-[Service]
-Environment=RUST_LOG=info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,zeroclaw_runtime::security=debug
-```
-
-### Format
-
-JSON by default in service mode (easier for Loki/ELK ingestion). Pretty-print on a TTY (interactive `zeroclaw daemon`).
-
-Force one or the other:
+## Config (`[observability]`)
 
 ```toml
 [observability]
-log_format = "json"        # or "pretty"
+# Storage policy for the JSONL log.
+# "none"    — in-process broadcast only (no disk writes).
+# "rolling" — append + trim once `log_persistence_max_entries` is exceeded.
+# "full"    — append forever, operator manages rotation.
+log_persistence = "rolling"
+
+# Workspace-relative path (or absolute).
+log_persistence_path = "state/runtime-trace.jsonl"
+
+# Cap for "rolling".
+log_persistence_max_entries = 200
+
+# Tool input/output capture policy.
+# "off"      — only tool name + outcome + duration; no I/O bodies.
+# "redacted" — bodies are leak-scanned and truncated at `log_tool_io_truncate_bytes`.
+# "full"     — bodies are leak-scanned; no truncation.
+log_tool_io = "redacted"
+log_tool_io_truncate_bytes = 8192
+
+# Tool names whose I/O is never persisted beyond name + outcome + duration,
+# regardless of `log_tool_io`. For tools whose I/O is intrinsically sensitive.
+log_tool_io_denylist = []
+
+# OTel / Prometheus backend (independent of the JSONL log).
+backend = "none"            # "none" | "log" | "verbose" | "prometheus" | "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw"
+# otel_headers = { Authorization = "Bearer …" }
 ```
 
-### What's logged at `info`
+Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
+`log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 8192`. A fresh
+install produces a 200-event rolling JSONL at
+`~/.zeroclaw/state/runtime-trace.jsonl`, and the dashboard's Logs page
+works without further configuration.
 
-- Service lifecycle (start, stop, config reload)
-- Channel connect / disconnect events
-- Provider calls with latency and token counts
-- Tool calls (name, outcome — success / blocked / denied) — *not* arguments or results, which are sensitive
-- Approval requests, grants, denials
+`log_persistence = "none"` disables persistence entirely. The broadcast
+stream (dashboard SSE) and the typed `Observer` bridge still receive
+events; only the JSONL writer is gated.
 
-At `debug`:
+## On-disk format
 
-- Full tool args and results (redacted — credentials stripped)
-- Every streaming chunk
-- Memory retrieval scores
-- Security-policy evaluation details
+JSONL: one event per line, UTF-8, `0o600` permissions on Unix. Every
+line is `sync_data`'d after write — the line is durable before the
+emitting code returns.
 
-At `trace`:
+Line shape mirrors `zeroclaw_log::event::LogEvent`. Top-level keys:
 
-- Model context window construction
-- Per-token streaming events
-- All HTTP request/response headers (still credential-redacted)
+| Key | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID v4 string | Persistent event id. |
+| `@timestamp` | RFC 3339 + ms, UTC | Lexicographic-sortable; the reader sorts on this. |
+| `severity_number` | u8 | OTel: 1 TRACE, 5 DEBUG, 9 INFO, 13 WARN, 17 ERROR. |
+| `severity_text` | string | Bucket label for `severity_number`. |
+| `event.category` | string | `agent`, `channel`, `cron`, `memory`, `tool`, `provider`, `session`, `system`, or `internal`. |
+| `event.action` | string | Stable identifier (`llm_request`, `channel_message_inbound`, …). |
+| `event.outcome` | string \| omitted | `success`, `failure`, `unknown` (omitted when `unknown`). |
+| `service.name` | string | Constant `"zeroclaw"`. |
+| `service.version` | string | Crate version of the running daemon. |
+| `trace_id` | hex string \| omitted | Per-turn correlation. One agent turn = one trace_id. |
+| `span_id` | hex string \| omitted | Sub-span within a turn. |
+| `zeroclaw.*` | flat string map | Alias-bound attribution (see below). |
+| `message` | string \| omitted | Human-readable line body. |
+| `attributes` | object \| omitted | Free-form per-action payload. |
+| `schema_version` | u8 | Currently `2`. v1 rows migrate in-place on startup. |
 
-### Credential redaction
+### `zeroclaw.*` attribution
 
-The logger redacts known secret patterns (`sk-*`, `ghp_*`, `xox[baprs]-*`, `ya29.*`, `AIza*`, etc.) regardless of log level. Redaction happens at the logger layer — your log files and the journal never see them.
+The Rust source of truth is `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES`
+in `crates/zeroclaw-log/src/event.rs`. The `/api/logs` response carries
+the canonical list as `attribution_keys`; fetch it instead of
+hard-coding.
 
-Audit this with:
+Plain fields (`ATTRIBUTION_FIELDS`) carry a single string each.
+Composite prefixes get three keys: `<prefix>`, `<prefix>_type`,
+`<prefix>_alias` (e.g. `channel = "discord.glados"`,
+`channel_type = "discord"`, `channel_alias = "glados"`). Filters can
+match either coarse or precise.
+
+When a tracing call sets a composite-prefix field to a bare type (no
+`.`), only the `_type` slot is populated — that way a
+`tracing::*!(model_provider = name, …)` call inside a span that
+already carries the full `<type>.<alias>` composite doesn't clobber it
+on the leaf→root merge.
+
+## Querying
+
+The dashboard's Logs page is the primary surface. Underneath:
+
+```
+GET /api/logs
+```
+
+Top-level filters (query params): `since_ts`, `until_ts`, `until_id`,
+`action`, `category`, `outcome`, `severity_min`, `trace_id`, `q`
+(substring across `message` + `attributes`), `hide_internal` (drops
+`event.category = "internal"`), `limit`.
+
+Every other `?<key>=<value>` is treated as a per-attribution equality
+filter — the gateway validates the key against `is_attribution_field`
+and rejects unknowns with `400`. The response includes
+`attribution_keys: string[]`, so callers don't have to guess.
+
+Examples:
 
 ```bash
-grep -E 'sk-|ghp_|xox[baprs]' /path/to/log/file | head
-# should return zero results in a normal run
+# All WARN+ events since the daemon started.
+curl "$ZEROCLAW_GATEWAY/api/logs?severity_min=13"
+
+# A specific agent's events:
+curl "$ZEROCLAW_GATEWAY/api/logs?agent_alias=glados"
+
+# Discord traffic for one bot:
+curl "$ZEROCLAW_GATEWAY/api/logs?channel=discord.glados"
+
+# A single agent turn:
+curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 ```
 
-If you see an unredacted secret, file an issue — the redaction list is in `crates/zeroclaw-infra/src/redact.rs`.
+Pagination is reverse-cursor. The response includes
+`next_cursor: [timestamp, id] | null`; pass these back as `until_ts` +
+`until_id` to load older. `at_end: true` means the reader scanned the
+whole file for the current filter.
 
-## Metrics
+The `/api/status` response includes `daemon_started_at: string` (RFC
+3339), so a dashboard can default to "since daemon start" without an
+extra round-trip.
 
-Prometheus exposition on the gateway:
+## External log viewers
 
-```
-curl -s http://localhost:42617/metrics
-```
+The JSONL schema is an OTel-logs + ECS hybrid: `@timestamp`,
+`severity_number` + `severity_text`, `event.{category,action,outcome}`,
+`service.{name,version}`, `attributes`, plus the `zeroclaw.*` vendor
+namespace. Most log viewers ingest it with little or no transform.
+Replace `<install>` with the absolute path to your install dir in the
+examples below (typically `~/.zeroclaw` expanded).
 
-Key metrics:
+### Grafana Loki
 
-| Metric | Labels | What it measures |
-|---|---|---|
-| `zeroclaw_provider_calls_total` | `provider`, `outcome` | Provider calls by outcome (ok / timeout / error) |
-| `zeroclaw_provider_latency_ms` | `provider` | Histogram of provider call latency |
-| `zeroclaw_tokens_total` | `provider`, `kind` (input/output) | Token counters |
-| `zeroclaw_tool_calls_total` | `tool`, `outcome` | Tool invocations by outcome |
-| `zeroclaw_tool_duration_ms` | `tool` | Tool-execution histogram |
-| `zeroclaw_channel_events_total` | `channel`, `direction` (inbound/outbound) | Message flow |
-| `zeroclaw_channel_errors_total` | `channel`, `kind` | Disconnects, rate limits, auth failures |
-| `zeroclaw_memory_searches_total` |  | Memory retrieval calls |
-| `zeroclaw_policy_blocks_total` | `policy`, `tool` | Security-policy denials |
-
-A minimal Prometheus scrape config:
+Promtail labels lift `agent_alias`, `channel`, and `severity_text` so
+they're filterable in Grafana:
 
 ```yaml
 scrape_configs:
   - job_name: zeroclaw
     static_configs:
-      - targets: ["localhost:42617"]
+      - targets: [localhost]
+        labels:
+          job: zeroclaw
+          __path__: <install>/data/state/runtime-trace.jsonl
+    pipeline_stages:
+      - json:
+          expressions:
+            agent: zeroclaw.agent_alias
+            channel: zeroclaw.channel
+            level: severity_text
+      - labels:
+          agent:
+          channel:
+          level:
+      - timestamp:
+          source: '@timestamp'
+          format: RFC3339
 ```
 
-The [Grafana dashboard](https://github.com/zeroclaw-labs/zeroclaw-templates/tree/master/grafana) (in the templates repo) visualises the above.
+### OpenTelemetry Collector
 
-## Traces
+The `filelog` receiver maps the schema directly. Export to any OTel
+sink afterward (Tempo, Honeycomb, Datadog, etc.):
 
-OpenTelemetry over OTLP/HTTP. Off by default — enable in config:
-
-```toml
-[observability.otel]
-enabled = true
-endpoint = "http://localhost:4318"
-service_name = "zeroclaw"
+```yaml
+receivers:
+  filelog/zeroclaw:
+    include: [<install>/data/state/runtime-trace.jsonl]
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes["@timestamp"]
+          layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+        severity:
+          parse_from: attributes.severity_number
 ```
 
-Spans you'll see:
+### Kibana / Elastic
 
-- `agent.loop` — one per inbound message, covers the whole turn
-- `provider.chat` — a provider call, with attributes for model, token counts, and retry count
-- `tool.invoke` — a tool call, with outcome and duration
-- `security.validate` — policy check with decision
-- `memory.search` — retrieval with hit count and max score
+Ingest works as-is. Strict ECS pipelines expect `log.level` in place
+of `severity_text`. A Filebeat ingest pipeline that renames
+`severity_text` to `log.level` (and `severity_number` to
+`log.syslog.severity.code`) covers the gap. `@timestamp` and
+`event.{category,action,outcome}` are already in canonical positions.
 
-Pair with Jaeger or Tempo for distributed tracing if you run multiple ZeroClaw instances or are instrumenting downstream services.
+### Vector / Fluent Bit
 
-## Receipts audit log
+Both tail JSONL with a JSON parser stage; no schema transforms needed
+before shipping to any backend.
 
-Separate from the general logs, tool receipts are written to:
+## Terminal format
 
-```
-<workspace>/receipts/<yyyy-mm-dd>.ndjson
-```
+The daemon's stderr formatter prefixes every line with the closest
+enclosing alias-bound identity:
 
-One JSON line per tool invocation. Greppable, append-only, persistent across restarts. See [Tool receipts](../security/tool-receipts.md).
+- agent context → `[<agent_alias>]`
+- channel-only context (channel listener, no agent yet) → `[<channel_composite>]` (e.g. `[discord.glados]`)
+- otherwise → `[system]`
 
-## Cost & token tracking
+The span chain follows: `channel_listener{channel=discord.glados}: …`.
+Span fields are visible inline.
 
-Every gateway-served turn (WebSocket chat, channel webhook, simple webhook) records its token usage and computed cost to:
+## Schema migration
 
-```
-<workspace>/state/costs.jsonl
-```
+On startup, if `log_persistence` is enabled and the file exists, the
+writer streams any schema-1 rows through an in-place migration to
+schema-2 before the first append. Pure streaming — bounded by a
+single line's allocation regardless of file size. The migrated file is
+atomically renamed into place. Files already at v2 are left untouched.
 
-One JSON line per LLM call, with input/output token counts and cost in USD. The accumulator behind `GET /api/cost` reads from the same source — call it any time for a session, daily, and monthly summary.
+If migration fails, the daemon logs a `warn` and continues writing v2
+appends; the old v1 rows remain readable by tools that still
+understand v1 but won't pass the v2 reader's deserializer.
 
-Per-model pricing comes from `[cost.prices]` in `config.toml`. Models without an entry record token counts with a zero cost; budget enforcement still works on the recorded counts. The WebSocket `done` frame echoes the same numbers so browser clients can show usage without a second round-trip:
+## What is `internal`?
 
-```json
-{
-  "type": "done",
-  "full_response": "...",
-  "input_tokens": 142,
-  "output_tokens": 87,
-  "tokens_used": 229,
-  "cost_usd": 0.000456,
-  "model": "claude-sonnet-4-20250514",
-  "provider": "anthropic"
-}
-```
+`event.category = "internal"` is the bucket for ops noise an operator
+doesn't need on the dashboard by default: heartbeat ticks, idle
+broadcasts, lossy sync retries, and the like. The dashboard's "Hide
+internal" toggle (on by default) filters these.
 
-Token fields are `null` when the upstream provider does not surface usage in streaming responses (most OpenAI-compatible providers do; Anthropic streaming reports usage too, but only via its native event format — non-OpenAI-shaped providers may not).
+Use it when you have a high-frequency event whose presence matters for
+forensics but whose absence is the normal state. Don't use it as a
+volume governor for genuine errors.
 
-## Health endpoints
+## Files of interest
 
-The gateway exposes three health views:
+- `crates/zeroclaw-log/src/event.rs` — the canonical `LogEvent` shape.
+- `crates/zeroclaw-log/src/layer.rs` — the `tracing-subscriber` Layer
+  that captures every `tracing::*` call and feeds the pipeline.
+- `crates/zeroclaw-log/src/macro.rs` — `record!`, `scope!`, `spawn!`.
+- `crates/zeroclaw-log/src/writer.rs` — append + rolling trim.
+- `crates/zeroclaw-log/src/reader.rs` — `/api/logs` reader.
+- `crates/zeroclaw-log/src/config.rs` — `StoragePolicy`, `ToolIoPolicy`,
+  `ResolvedPolicy`.
+- `crates/zeroclaw-log/src/migrate.rs` — schema-1 → schema-2 streaming
+  migration.
+- `crates/zeroclaw-log/src/observer_bridge.rs` — typed `Observer`
+  projection for Prometheus / OTel consumers.
+- `crates/zeroclaw-gateway/src/api_logs.rs` — the HTTP adapter.
 
-```bash
-curl -s http://localhost:42617/health              # { "status": "ok", "version": "0.7.5" }
-curl -s http://localhost:42617/health/channels     # per-channel status
-curl -s http://localhost:42617/health/providers    # per-provider status + error rate
-```
-
-Point Uptime Kuma / your monitor at `/health` for a binary liveness check.
-
-## Log retention
-
-ZeroClaw doesn't rotate its own logs — the OS handles that:
-
-- systemd-journald rotates by size and age (`/etc/systemd/journald.conf`)
-- launchd / macOS ASL rotates daily by default
-- Docker's default `json-file` driver rotates at 10 MB with 3 retained files; configure in daemon.json
-
-For the receipts log, rotate manually or via logrotate if the file grows faster than you want to retain:
-
-```
-<workspace>/receipts/2026-04-25.ndjson
-<workspace>/receipts/2026-04-26.ndjson
-...
-```
-
-Day-sharded means you can drop old files individually.
-
-## See also
-
-- [Operations → Overview](./overview.md)
-- [Troubleshooting](./troubleshooting.md)
-- [Security → Tool receipts](../security/tool-receipts.md)
+Touch the source before you trust the prose on this page.

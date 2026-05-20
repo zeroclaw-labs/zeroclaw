@@ -124,9 +124,13 @@ impl Tool for ToolSearchTool {
         output.push_str("</functions>\n");
         drop(guard);
 
-        tracing::debug!(
-            "tool_search: query={query:?}, matched={}, activated={activated_count}",
-            results.len()
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "tool_search: query={query:?}, matched={}, activated={activated_count}",
+                results.len()
+            )
         );
 
         Ok(ToolResult {
@@ -177,10 +181,14 @@ impl ToolSearchTool {
             let _ = write!(output, "\nNot found: {}", not_found.join(", "));
         }
 
-        tracing::debug!(
-            "tool_search select: requested={}, activated={activated_count}, not_found={}",
-            names.len(),
-            not_found.len()
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "tool_search select: requested={}, activated={activated_count}, not_found={}",
+                names.len(),
+                not_found.len()
+            )
         );
 
         Ok(ToolResult {

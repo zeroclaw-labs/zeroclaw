@@ -95,7 +95,7 @@ pub async fn handle_register_start(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }
@@ -149,7 +149,7 @@ pub async fn handle_register_finish(
         .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }
@@ -186,7 +186,7 @@ pub async fn handle_auth_start(
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }
@@ -235,7 +235,7 @@ pub async fn handle_auth_finish(
         Ok(()) => Json(serde_json::json!({"status": "authenticated"})).into_response(),
         Err(e) => (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }
@@ -279,7 +279,7 @@ pub async fn handle_list_credentials(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }
@@ -314,7 +314,7 @@ pub async fn handle_delete_credential(
         Ok(()) => Json(serde_json::json!({"status": "deleted"})).into_response(),
         Err(e) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("{}", e)})),
         )
             .into_response(),
     }

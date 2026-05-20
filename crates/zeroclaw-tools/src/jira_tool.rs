@@ -125,11 +125,16 @@ impl JiraTool {
             .get(&url)
             .query(&query)
             .timeout(std::time::Duration::from_secs(self.timeout_secs));
-        let resp = self
-            .authenticated(req)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira get_ticket request failed: {e}"))?;
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira get_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira get_ticket request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -140,10 +145,16 @@ impl JiraTool {
             );
         }
 
-        let raw: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira get_ticket response: {e}"))?;
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira get_ticket response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira get_ticket response: {e}"))
+        })?;
 
         let shaped = match level {
             LevelOfDetails::Basic => shape_basic(&raw),
@@ -207,11 +218,16 @@ impl JiraTool {
                 .post(&url)
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(self.timeout_secs));
-            let resp = self
-                .authenticated(req)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
+            let resp = self.authenticated(req).send().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira search_tickets request failed"
+                );
+                anyhow::Error::msg(format!("Jira search_tickets request failed: {e}"))
+            })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -222,10 +238,16 @@ impl JiraTool {
                 );
             }
 
-            let raw: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse Jira search response: {e}"))?;
+            let raw: Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira search response"
+                );
+                anyhow::Error::msg(format!("Failed to parse Jira search response: {e}"))
+            })?;
 
             if let Some(page) = raw["issues"].as_array() {
                 issues.extend(page.iter().map(shape_basic_search));
@@ -268,11 +290,16 @@ impl JiraTool {
                 .post(&url)
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(self.timeout_secs));
-            let resp = self
-                .authenticated(req)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
+            let resp = self.authenticated(req).send().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira search_tickets request failed"
+                );
+                anyhow::Error::msg(format!("Jira search_tickets request failed: {e}"))
+            })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -283,10 +310,16 @@ impl JiraTool {
                 );
             }
 
-            let raw: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse Jira search response: {e}"))?;
+            let raw: Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira search response"
+                );
+                anyhow::Error::msg(format!("Failed to parse Jira search response: {e}"))
+            })?;
 
             let page = raw["issues"].as_array();
             let page_len = page.map_or(0, |p| p.len());
@@ -336,11 +369,16 @@ impl JiraTool {
             .post(&url)
             .json(&body)
             .timeout(std::time::Duration::from_secs(self.timeout_secs));
-        let resp = self
-            .authenticated(req)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira comment_ticket request failed: {e}"))?;
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira comment_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira comment_ticket request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -351,10 +389,16 @@ impl JiraTool {
             );
         }
 
-        let response: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira comment response: {e}"))?;
+        let response: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira comment response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira comment response: {e}"))
+        })?;
 
         let shaped = shape_comment_response(&response);
         Ok(ToolResult {
@@ -372,11 +416,16 @@ impl JiraTool {
             .http
             .get(&url)
             .timeout(std::time::Duration::from_secs(self.timeout_secs));
-        let resp = self
-            .authenticated(req)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira list_projects request failed"
+            );
+            anyhow::Error::msg(format!("Jira list_projects request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -387,10 +436,16 @@ impl JiraTool {
             );
         }
 
-        let projects: Vec<Value> = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects response: {e}"))?;
+        let projects: Vec<Value> = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira list_projects response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira list_projects response: {e}"))
+        })?;
 
         let keys: Vec<String> = projects
             .iter()
@@ -412,15 +467,29 @@ impl JiraTool {
                 ("maxResults", "50"),
             ])
             .timeout(std::time::Duration::from_secs(self.timeout_secs));
-        let users_resp = self
-            .authenticated(users_req)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
+        let users_resp = self.authenticated(users_req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira list_projects users request failed"
+            );
+            anyhow::Error::msg(format!("Jira list_projects users request failed: {e}"))
+        })?;
 
         let users: Vec<Value> = if users_resp.status().is_success() {
             users_resp.json().await.map_err(|e| {
-                anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}")
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira list_projects users response"
+                );
+                anyhow::Error::msg(format!(
+                    "Failed to parse Jira list_projects users response: {e}"
+                ))
             })?
         } else {
             let status = users_resp.status();
@@ -440,8 +509,16 @@ impl JiraTool {
                 let Some(Ok((idx, result))) = set.join_next().await else {
                     continue;
                 };
-                statuses_results[idx] =
-                    result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+                statuses_results[idx] = result.map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "jira: Jira statuses failed"
+                    );
+                    anyhow::Error::msg(format!("Jira statuses failed: {e}"))
+                })?;
             }
 
             let client = self.http.clone();
@@ -459,18 +536,37 @@ impl JiraTool {
                         Some(e) => req.basic_auth(e, Some(&token)),
                         None => req.bearer_auth(&token),
                     };
-                    let resp = req
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("statuses request failed: {e}"))?;
+                    let resp = req.send().await.map_err(|e| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "jira: statuses request failed"
+                        );
+                        anyhow::Error::msg(format!("statuses request failed: {e}"))
+                    })?;
 
                     if !resp.status().is_success() {
                         anyhow::bail!("statuses request returned {}", resp.status());
                     }
 
-                    resp.json::<Value>()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to parse statuses response: {e}"))
+                    resp.json::<Value>().await.map_err(|e| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "jira: failed to parse statuses response"
+                        );
+                        anyhow::Error::msg(format!("failed to parse statuses response: {e}"))
+                    })
                 }
                 .await;
                 (i, result)
@@ -478,8 +574,16 @@ impl JiraTool {
         }
 
         while let Some(Ok((idx, result))) = set.join_next().await {
-            statuses_results[idx] =
-                result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+            statuses_results[idx] = result.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira statuses failed"
+                );
+                anyhow::Error::msg(format!("Jira statuses failed: {e}"))
+            })?;
         }
 
         let shaped_projects = shape_projects(&projects, &statuses_results);
@@ -508,11 +612,16 @@ impl JiraTool {
             .http
             .get(&url)
             .timeout(std::time::Duration::from_secs(self.timeout_secs));
-        let resp = self
-            .authenticated(req)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira myself request failed"
+            );
+            anyhow::Error::msg(format!("Jira myself request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -523,10 +632,16 @@ impl JiraTool {
             );
         }
 
-        let raw: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira myself response: {e}"))?;
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira myself response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira myself response: {e}"))
+        })?;
 
         let shaped = json!({
             "accountId":    raw["accountId"],

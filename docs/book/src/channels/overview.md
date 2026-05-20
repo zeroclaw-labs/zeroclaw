@@ -87,7 +87,7 @@ Channel-specific options live under the same block. Common keys across channels:
 
 ## Pairing
 
-Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. The onboarding wizard handles pairing for channels you configure during `zeroclaw onboard`; use `zeroclaw channel add` and `zeroclaw channel bind-telegram` (for Telegram specifically) to pair additional identities post-onboard. Without pairing, the channel rejects everything.
+Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. `zeroclaw onboard channels` walks you through pairing each channel you configure; use `zeroclaw channel add` and `zeroclaw channel bind-telegram` (for Telegram specifically) to pair additional identities later. Without pairing, the channel rejects everything.
 
 The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
 

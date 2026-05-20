@@ -58,9 +58,44 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
+const LOCAL_PROVIDER_NAMES: Record<string, string> = {
+  atomic_chat: 'Atomic Chat',
+  gemini_cli: 'Gemini CLI',
+  kilocli: 'KiloCLI',
+  lmstudio: 'LM Studio',
+  llamacpp: 'llama.cpp server',
+  ollama: 'Ollama',
+  opencode: 'OpenCode',
+  osaurus: 'Osaurus',
+  sglang: 'SGLang',
+  synthetic: 'Synthetic',
+  vllm: 'vLLM',
+};
 
-export function AgentProvider({ children }: { children: React.ReactNode }) {
-  const sessionIdRef = useRef(getOrCreateSessionId());
+function friendlyAgentError(message?: string): string {
+  const raw = message?.trim() || t('agent.unknown_error');
+  const localConnectFailure = raw.match(
+    /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
+  );
+  if (localConnectFailure) {
+    const provider = localConnectFailure[1] ?? '';
+    const model = localConnectFailure[2] ?? 'the selected model';
+    const url = localConnectFailure[3] ?? 'the configured endpoint';
+    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
+  }
+  return raw;
+}
+
+export interface AgentProviderProps {
+  /** Configured agent alias this provider is bound to. The WebSocket
+   * connection, session ID, and chat history are all scoped to this alias. */
+  agentAlias: string;
+  children: React.ReactNode;
+}
+
+export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
+  const sessionIdRef = useRef(getOrCreateSessionId(agentAlias));
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const persisted = loadChatHistory(sessionIdRef.current);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
@@ -84,20 +119,22 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  const localMessageMutationVersionRef = useRef(0);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
     const sid = sessionIdRef.current;
+    const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     let cancelled = false;
 
     (async () => {
       try {
         const res = await getSessionMessages(sid);
         if (cancelled) return;
-        if (res.session_persistence && res.messages.length > 0) {
-          setMessages((prev) =>
-            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
-          );
+        if (res.session_persistence) {
+          if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
+            setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+          }
         } else if (!res.session_persistence) {
           setMessages((prev) => {
             if (prev.length > 0) return prev;
@@ -183,6 +220,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
         if (content) {
+          localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
             {
@@ -207,6 +245,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       case 'tool_call': {
         const toolName = msg.name ?? 'unknown';
         const toolArgs = msg.args;
+        localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const argsKey = JSON.stringify(toolArgs ?? {});
           if (pendingContentRef.current) {
@@ -234,6 +273,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'tool_result': {
+        localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
           if (idx !== -1) {
@@ -262,6 +302,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       case 'cron_result': {
         const cronOutput = msg.output ?? '';
         if (cronOutput) {
+          localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
             {
@@ -306,17 +347,19 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       }
 
       case 'error':
+        const friendlyMessage = friendlyAgentError(msg.message);
+        localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
           {
             id: generateUUID(),
             role: 'agent',
-            content: `${t('agent.error_prefix')} ${msg.message ?? t('agent.unknown_error')}`,
+            content: `${t('agent.error_prefix')} ${friendlyMessage}`,
             timestamp: new Date(),
           },
         ]);
         if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${msg.message}. ${t('agent.check_provider_settings')}.`);
+          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
         } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
@@ -394,9 +437,10 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     };
   }, [handleWsMessage]);
 
-  // Global WebSocket connection — survives route changes.
+  // WebSocket bound to the configured agent. Re-keys (via the outer
+  // <AgentProvider key={alias}>) when the alias changes.
   useEffect(() => {
-    const ws = new WebSocketClient();
+    const ws = new WebSocketClient({ agentAlias });
     attachSocketCallbacks(ws);
     ws.connect();
     wsRef.current = ws;
@@ -404,7 +448,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
     return () => {
       ws.disconnect();
     };
-  }, [attachSocketCallbacks]);
+  }, [attachSocketCallbacks, agentAlias]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -466,6 +510,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       setTyping(true);
       pendingContentRef.current = '';
       pendingThinkingRef.current = '';
+      localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,
         {
@@ -543,7 +588,7 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
         oldWs.disconnect();
       }
 
-      const ws = new WebSocketClient();
+      const ws = new WebSocketClient({ agentAlias });
       attachSocketCallbacks(ws);
       ws.connect();
       wsRef.current = ws;
@@ -556,13 +601,15 @@ export function AgentProvider({ children }: { children: React.ReactNode }) {
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias]);
 
   const deleteMessage = useCallback((id: string) => {
+    localMessageMutationVersionRef.current += 1;
     setMessages((prev) => prev.filter((m) => m.id !== id));
   }, []);
 
   const clearAllMessages = useCallback(() => {
+    localMessageMutationVersionRef.current += 1;
     setMessages([]);
   }, []);
 
