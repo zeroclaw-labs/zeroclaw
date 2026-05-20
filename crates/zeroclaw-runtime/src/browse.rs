@@ -116,7 +116,7 @@ fn list_under_root(root: &std::path::Path, raw: &str) -> Result<BrowseResult, Br
 /// Top-level shared/ entries that the runtime owns and the operator must
 /// not be able to remove via the dashboard. Backend-enforced so a
 /// compromised or buggy frontend cannot bypass this. Names match what
-/// the install scaffolds via `migrate_legacy_workspace_to_default_agent`
+/// the install scaffolds via `migrate_v2_to_v3_install_filesystem`
 /// and the `<install>/shared/` initializer.
 const PROTECTED_SHARED_TOP_LEVEL: &[&str] = &["skills", "skill-bundles", "knowledge"];
 

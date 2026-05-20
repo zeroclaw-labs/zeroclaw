@@ -34,9 +34,12 @@ fn legacy_install_upgrades_cleanly_with_backup() {
     std::fs::create_dir_all(&legacy_db).unwrap();
     std::fs::write(legacy_db.join("brain.db"), b"sqlite-bytes").unwrap();
 
-    let ran = zeroclaw_config::migration::migrate_legacy_workspace_to_default_agent(install_root)
+    let report = zeroclaw_config::schema::v2::migrate_v2_to_v3_install_filesystem(install_root)
         .expect("migration must succeed on populated legacy install");
-    assert!(ran, "populated legacy install → split migration runs");
+    assert!(
+        report.entries_relocated > 0 && report.backup_dir.is_some(),
+        "populated legacy install → split migration runs"
+    );
 
     // Legacy dir is gone; both target dirs are populated with the right
     // pieces of the legacy tree.
@@ -91,12 +94,12 @@ fn legacy_install_upgrades_cleanly_with_backup() {
         "backup must retain the shared-db subdir too"
     );
 
-    // Idempotent re-run: legacy gone → no-op (returns false).
-    let ran_again =
-        zeroclaw_config::migration::migrate_legacy_workspace_to_default_agent(install_root)
+    // Idempotent re-run: legacy gone → no-op (no backup, nothing moved).
+    let report_again =
+        zeroclaw_config::schema::v2::migrate_v2_to_v3_install_filesystem(install_root)
             .expect("idempotent re-run must succeed");
     assert!(
-        !ran_again,
+        report_again.backup_dir.is_none() && report_again.entries_relocated == 0,
         "second run is a no-op when the legacy dir is already gone"
     );
 }
