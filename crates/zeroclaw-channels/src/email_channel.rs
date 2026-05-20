@@ -914,7 +914,6 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             poll_interval_secs: 60,
-            allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
         };
@@ -941,14 +940,12 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
-            allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
-        assert_eq!(cloned.allowed_senders, config.allowed_senders);
         assert_eq!(cloned.default_subject, config.default_subject);
     }
 
@@ -1304,7 +1301,7 @@ mod tests {
             smtp_password: None,
             ..Default::default()
         };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         let creds = channel.smtp_credentials();
         // Credentials doesn't expose fields directly, so round-trip via a
         // fresh construction for comparison
@@ -1322,7 +1319,7 @@ mod tests {
             smtp_password: Some("smtp_pass".to_string()),
             ..Default::default()
         };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         let creds = channel.smtp_credentials();
         let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
         assert_eq!(creds, expected);
