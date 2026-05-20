@@ -54,6 +54,11 @@ export interface ToolSpec {
   parameters: any;
 }
 
+export type CronSchedule =
+  | { kind: "cron"; expr: string; tz?: string | null }
+  | { kind: "every"; every_ms: number }
+  | { kind: "at"; at: string };
+
 export interface CronDeliveryConfig {
   mode: string;
   channel?: string | null;
