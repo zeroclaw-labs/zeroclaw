@@ -35,13 +35,13 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     results.push(check_config(config));
 
     // 2. Workspace directory is writable
-    results.push(check_workspace(&config.workspace_dir).await);
+    results.push(check_workspace(&config.data_dir).await);
 
     // 3. SQLite memory backend opens
-    results.push(check_sqlite(&config.workspace_dir));
+    results.push(check_sqlite(&config.data_dir));
 
-    // 4. Provider registry has entries
-    results.push(check_provider_registry());
+    // 4. ModelProvider registry has entries
+    results.push(check_model_provider_registry());
 
     // 5. Tool registry has entries
     results.push(check_tool_registry(config));
@@ -150,29 +150,50 @@ fn check_sqlite(workspace_dir: &Path) -> CheckResult {
     }
 }
 
-fn check_provider_registry() -> CheckResult {
-    let providers = crate::providers::list_providers();
-    if providers.is_empty() {
-        CheckResult::fail("providers", "no providers registered")
+fn check_model_provider_registry() -> CheckResult {
+    let model_providers = crate::providers::list_model_providers();
+    if model_providers.is_empty() {
+        CheckResult::fail("model_providers", "no model providers registered")
     } else {
         CheckResult::pass(
-            "providers",
-            format!("{} providers available", providers.len()),
+            "model_providers",
+            format!("{} model providers available", model_providers.len()),
         )
     }
 }
 
 fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
-    let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
-    let tools = crate::tools::default_tools(security);
-    if tools.is_empty() {
-        CheckResult::fail("tools", "no tools registered")
-    } else {
-        CheckResult::pass("tools", format!("{} core tools available", tools.len()))
+    // Probe one tool registry per enabled agent. V3 has no global default —
+    // tools are bound to a specific agent's risk profile.
+    let enabled_agents: Vec<&String> = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias)
+        .collect();
+    if enabled_agents.is_empty() {
+        return CheckResult::fail("tools", "no enabled agents configured");
     }
+    let mut total_tools = 0usize;
+    for alias in &enabled_agents {
+        let security = match crate::security::SecurityPolicy::for_agent(config, alias) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => return CheckResult::fail("tools", format!("agent {alias}: {e}")),
+        };
+        let tools = crate::tools::default_tools(security);
+        if tools.is_empty() {
+            return CheckResult::fail("tools", format!("agent {alias}: no tools registered"));
+        }
+        total_tools = tools.len();
+    }
+    CheckResult::pass(
+        "tools",
+        format!(
+            "{} enabled agent(s); {} core tools per registry",
+            enabled_agents.len(),
+            total_tools
+        ),
+    )
 }
 
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
@@ -189,12 +210,33 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
 }
 
 fn check_security_policy(config: &crate::config::Config) -> CheckResult {
-    let _policy =
-        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    CheckResult::pass(
-        "security",
-        format!("autonomy level: {:?}", config.autonomy.level),
-    )
+    // Probe the security policy of every enabled agent. V3 binds policy
+    // to risk_profile per agent; there is no global "active" policy.
+    let enabled_agents: Vec<&String> = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias)
+        .collect();
+    if enabled_agents.is_empty() {
+        return CheckResult::fail("security", "no enabled agents configured");
+    }
+    let mut summaries = Vec::new();
+    for alias in &enabled_agents {
+        let Some(profile) = config.risk_profile_for_agent(alias) else {
+            return CheckResult::fail(
+                "security",
+                format!(
+                    "agents.{alias}.risk_profile does not name a configured risk_profiles entry"
+                ),
+            );
+        };
+        if let Err(e) = crate::security::SecurityPolicy::for_agent(config, alias) {
+            return CheckResult::fail("security", format!("agent {alias}: {e}"));
+        }
+        summaries.push(format!("{alias}={:?}", profile.level));
+    }
+    CheckResult::pass("security", summaries.join(", "))
 }
 
 fn check_version() -> CheckResult {
@@ -206,7 +248,7 @@ fn check_version() -> CheckResult {
 /// loopback target so the probe can actually connect — and report the
 /// configured value alongside so the user isn't confused about why the
 /// output says `127.0.0.1` when their `config.toml` says `0.0.0.0`
-/// (#6051). Returns `(probe_host, display_host)` where `display_host`
+///. Returns `(probe_host, display_host)` where `display_host`
 /// is `Some(_)` only when a rewrite happened.
 fn resolve_probe_host(configured: &str) -> (&str, Option<&str>) {
     match configured {
@@ -252,10 +294,9 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
     let mem = match crate::memory::create_memory(
         &config.memory,
-        &config.workspace_dir,
+        &config.data_dir,
         config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.api_key.as_deref()),
     ) {
         Ok(m) => m,

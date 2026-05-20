@@ -29,13 +29,25 @@ impl OnboardUi for TermUi {
         .await?
     }
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
+    async fn string(
+        &mut self,
+        prompt: &str,
+        current: Option<&str>,
+        placeholder: Option<&str>,
+    ) -> Result<Answer<String>> {
         // dialoguer 0.12 dropped `_opt` variants for Input, so Esc on a text
         // prompt is a no-op here (the ratatui backend supports Back fully).
         // The main navigation points — Confirm / FuzzySelect — still honor
         // Esc, which is where Back matters most.
         let prompt = prompt.to_string();
-        let default = current.map(ToOwned::to_owned);
+        // dialoguer doesn't distinguish a pre-filled buffer from a
+        // shown-but-not-committed default; either way the value lands
+        // in `input.default(...)` and Enter accepts it. Prefer `current`
+        // when set, otherwise fall back to the placeholder so dialoguer
+        // users at least see the default and can press Enter to take it.
+        let default = current
+            .map(ToOwned::to_owned)
+            .or_else(|| placeholder.map(ToOwned::to_owned));
         tokio::task::spawn_blocking(move || -> Result<Answer<String>> {
             let mut input = Input::<String>::new().with_prompt(prompt).allow_empty(true);
             if let Some(value) = default {

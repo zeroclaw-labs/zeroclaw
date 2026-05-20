@@ -169,7 +169,16 @@ impl Tool for PollTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "question"})),
+                    "poll: missing question parameter"
+                );
+                anyhow::Error::msg("Missing 'question' parameter")
+            })?
             .to_string();
 
         let options = match validate_options(&args) {
@@ -209,17 +218,33 @@ impl Tool for PollTool {
             let channels = self.channels.read();
             if let Some(ref name) = requested_channel {
                 let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Channel '{}' not found. Available: {}",
-                        name,
-                        channels.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "poll: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
                 })?;
                 (name.clone(), ch)
             } else {
                 // Fall back to first available channel
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
-                    anyhow::anyhow!("No channels available. Configure at least one channel.")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "poll: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
                 })?;
                 (name.clone(), ch.clone())
             }
@@ -282,6 +307,17 @@ mod tests {
                 name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StubChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 

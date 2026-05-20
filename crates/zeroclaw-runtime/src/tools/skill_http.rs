@@ -27,10 +27,6 @@ impl SkillHttpTool {
     ///
     /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
-    ///
-    /// Note: `timeout_secs` from the manifest is intentionally ignored here;
-    /// HTTP tools use the fixed `HTTP_TIMEOUT_SECS` client timeout. Per-tool
-    /// HTTP timeout support is tracked as a follow-up.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
             tool_name: format!("{}__{}", skill_name, tool.name),
@@ -108,7 +104,16 @@ impl Tool for SkillHttpTool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "skill_http tool: reqwest client build failed"
+                );
+                anyhow::Error::msg(format!("Failed to build HTTP client: {e}"))
+            })?;
 
         let response = match client.get(&url).send().await {
             Ok(resp) => resp,
@@ -171,7 +176,6 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
-            timeout_secs: None,
         }
     }
 
@@ -221,7 +225,6 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
-            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

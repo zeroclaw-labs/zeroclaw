@@ -100,7 +100,7 @@ zeroclaw daemon --host 127.0.0.1 --port 42617
 Or use the agent directly:
 
 ```bash
-zeroclaw agent --message "Turn on the LED on pin 13"
+zeroclaw agent -a assistant --message "Turn on the LED on pin 13"
 ```
 
 Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
@@ -115,7 +115,7 @@ Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
 | 2 | `cargo install probe-rs-tools --locked` |
 | 3 | `zeroclaw peripheral flash-nucleo` |
 | 4 | `zeroclaw onboard` → hardware step (or `zeroclaw config set peripherals.boards.0.path <serial-port>`) |
-| 5 | `zeroclaw daemon` or `zeroclaw agent -m "Turn on LED"` |
+| 5 | `zeroclaw daemon` or `zeroclaw agent -a assistant -m "Turn on LED"` |
 
 ---
 

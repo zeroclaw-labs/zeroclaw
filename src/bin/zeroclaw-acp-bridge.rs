@@ -85,7 +85,11 @@ async fn run() -> Result<()> {
 }
 
 async fn load_acp_bridge_target() -> Result<BridgeTarget> {
-    let (config_dir, _) = resolve_runtime_dirs_for_onboarding().await?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config_dir = match config_dir_from_args(args.iter().cloned())? {
+        Some(dir) => PathBuf::from(dir),
+        None => resolve_runtime_dirs_for_onboarding().await?.0,
+    };
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
         anyhow::bail!(CONFIG_NOT_FOUND_ERROR);
@@ -97,8 +101,7 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let config: BridgeConfig = toml::from_str(&contents)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
-    let pair_code = pair_code_from_args(std::env::args().skip(1))?
-        .or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
+    let pair_code = pair_code_from_args(args)?.or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
     resolve_acp_bridge_target(&config.gateway, &config_dir, pair_code.as_deref()).await
 }
 
@@ -168,13 +171,41 @@ fn env_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn config_dir_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--config-dir" {
+            let dir = args.next().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "acp-bridge args rejected: --config-dir missing value"
+                );
+                anyhow::Error::msg("--config-dir requires a path value")
+            })?;
+            return Ok(Some(dir));
+        }
+        if let Some(dir) = arg.strip_prefix("--config-dir=") {
+            return Ok(Some(dir.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 fn pair_code_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--pair-code" {
-            let code = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--pair-code requires a code value"))?;
+            let code = args.next().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "acp-bridge args rejected: --pair-code missing value"
+                );
+                anyhow::Error::msg("--pair-code requires a code value")
+            })?;
             return Ok(Some(code));
         }
         if let Some(code) = arg.strip_prefix("--pair-code=") {
@@ -221,6 +252,9 @@ async fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
     Ok(())
 }
 
@@ -422,8 +456,8 @@ mod tests {
     use super::{
         BridgeGatewayConfig, BridgeGatewayTlsConfig, CONFIG_NOT_FOUND_ERROR,
         PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_websocket_url, cached_token_path,
-        exchange_pairing_code, fetch_pairing_code, http_gateway_url, pair_code_from_args,
-        read_cached_token, token_from_env, write_cached_token, write_frame,
+        config_dir_from_args, exchange_pairing_code, fetch_pairing_code, http_gateway_url,
+        pair_code_from_args, read_cached_token, token_from_env, write_cached_token, write_frame,
     };
 
     struct EnvGuard {
@@ -564,6 +598,19 @@ mod tests {
         assert_eq!(
             read_cached_token(&path).await.unwrap().as_deref(),
             Some("zc_new")
+        );
+    }
+
+    #[test]
+    fn config_dir_from_args_supports_flag_forms() {
+        assert_eq!(
+            config_dir_from_args(["--config-dir".to_string(), "/tmp/zeroclaw".to_string()])
+                .unwrap(),
+            Some("/tmp/zeroclaw".to_string())
+        );
+        assert_eq!(
+            config_dir_from_args(["--config-dir=/tmp/zeroclaw".to_string()]).unwrap(),
+            Some("/tmp/zeroclaw".to_string())
         );
     }
 

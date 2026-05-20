@@ -133,12 +133,19 @@ fn with_connection<T>(workspace_dir: &Path, f: impl FnOnce(&Connection) -> Resul
     let path = db_path(workspace_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create heartbeat directory: {}", parent.display())
+            format!(
+                "Failed to create heartbeat directory: {}",
+                parent.display().to_string()
+            )
         })?;
     }
 
-    let conn = Connection::open(&path)
-        .with_context(|| format!("Failed to open heartbeat history DB: {}", path.display()))?;
+    let conn = Connection::open(&path).with_context(|| {
+        format!(
+            "Failed to open heartbeat history DB: {}",
+            path.display().to_string()
+        )
+    })?;
 
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;

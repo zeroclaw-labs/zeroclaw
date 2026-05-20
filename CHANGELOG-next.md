@@ -1,466 +1,223 @@
-# Changelog — v0.7.4 → v0.7.5
+# Changelog: v0.7.5 → v0.8.0-beta-1
 
-> v0.7.5 is a substantial follow-on to v0.7.4. The headline is in-browser
-> onboarding and configuration: a schema-driven `/onboard` flow, a per-property
-> gateway CRUD surface backed by an OpenAPI 3.1 spec and a typed CLI, a
-> three-surface personality editor (CLI / TUI / web), and live drift detection
-> for hand-edited config files. ACP picks up real cancellation and a
-> tool-approval back-channel, per-provider pricing finally makes cost tracking
-> accurate, the installer ships presets and a TTY feature picker, and the web
-> dashboard learns hot model switching plus a stop button. Around 71 commits
-> from 24 contributors.
-
----
+v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. One install now runs many named agents side by side, each with its own identity, workspace, memory, model provider, channels, and security profile, and they can talk to each other through peer groups or spawn scoped sub-agents. Delivering that meant a ground-up config rewrite (schema **V3**) plus a new on-disk layout, so this is a large, breaking release. Upgrades migrate automatically on first boot; **read the Breaking Changes section before upgrading a production install**, especially if you run Postgres or Qdrant memory.
 
 ## Highlights
 
-- **Web onboarding, per-property config CRUD, and a personality editor — all
-  schema-driven.** A new `/onboard` route renders the full first-run flow in
-  the browser (Workspace, Providers, Channels, Memory, Hardware, Tunnel,
-  Personality), driven by per-property `OPTIONS`/`GET`/`PUT`/`DELETE`/`PATCH`
-  endpoints under `/api/config/*` that share their core (`Config::set_prop`)
-  with the CLI and any third-party tool. The runtime emits an OpenAPI 3.1 spec
-  at `/api/openapi.json` (Scalar explorer at `/api/docs`), the dashboard
-  TypeScript client is generated from it via `openapi-typescript`, and the CLI
-  picks up matching `config patch`, `config docs`, `config schema --path`, and
-  `--json` envelopes on the existing `get`/`set`/`init`/`migrate` commands. A
-  drift banner surfaces hand-edits to `config.toml` with per-row in-memory vs
-  on-disk diffs and a one-click reload, and a personality system lets each of
-  the seven runtime markdown files (`SOUL.md`, `IDENTITY.md`, `USER.md`,
-  `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`) be edited from CLI
-  (`$EDITOR`), TUI, or the web UI's CodeMirror editor (#6179).
-
-- **ACP gets cancellation, a tool-approval back-channel, and concurrency
-  safety.** ACP protocol v1 now exposes `session/cancel` to abort an in-flight
-  turn (#6374), the gateway WebSocket carries tool approvals over a dedicated
-  back-channel (#6387), and concurrent `session/prompt` requests are rejected
-  with a clear error instead of racing (#6408).
-
-- **Live model switching and a real stop button in the web dashboard.** Pick a
-  different model from the chat dropdown without losing context (#6101), open
-  the agent chat directly from a memory row (#6217), trigger any cron job from
-  the UI (#6164), and use the new chat-input lock plus running indicator and
-  stop button while a turn is in flight (#6220). OpenRouter free models are
-  flagged in the dropdown (#6218) and themes/sessions/CSS tokens behave
-  consistently across pages (#5207).
-
-- **Per-provider pricing makes cost tracking real.** `ModelProviderConfig` now
-  carries pricing per provider profile (#6357), the gateway records cost and
-  token usage on every turn (#6159), and missing pricing logs a single WARN per
-  `(provider, model)` pair instead of spamming the log (#6356).
-
-- **Installer overhaul.** `zeroclaw install` learns preset and gateway flags, a
-  TTY-driven feature picker, web/dist building, and an onboarding gate (#6385);
-  Linux MUSL static binaries are back in the release artifacts (#6411); the web
-  dashboard installs to platform-correct data directories on macOS and Windows
-  (78d2cd6c0); and the prebuilt path correctly extracts the dashboard again
-  (821fbfcfc, a2c1e2bb2).
-
-- **HMAC tool receipts wired up end-to-end.** The receipt-signing path stripped
-  out of #5168 is now active (#6214), giving each tool result a verifiable HMAC
-  trail when the feature is enabled.
-
----
+- **Multi-agent, for real.** Declare any number of agents under `[agents.<alias>]`. Each gets its own identity files, its own `agents/<alias>/workspace/` (which is also its security boundary), its own memory scope, model provider, channels, and risk/runtime profiles. Old single-agent installs migrate into one `default` agent on first boot.
+- **Per-agent memory isolation.** Every memory backend (SQLite, Postgres, Qdrant, markdown) is wrapped so an agent only sees its own rows by default. Controlled sharing is opt-in via `read_memory_from`. Memory is keyed by `(agent, key)`, so two agents can use the same key without collision.
+- **Peer groups + sub-agents.** Agents bound to the same channel type can message each other in-process through a `[peer_groups.<alias>]` membership list; non-members are rejected with a reason. Agents can spawn depth-limited sub-agents (`spawn_subagent`) that can never escalate beyond the parent's risk profile, and cron jobs now run as agent-scoped sub-agents.
+- **Agents know their own identity in shared channels.** Each bot's platform-native mention (Discord `<@id>`, Slack `<@id>`, Telegram `@user`) is injected into its system prompt, and the lookup is fixed for aliased channels. Co-resident agents that share a channel no longer mistake another agent's @-mention for their own or reply with the wrong user ID.
+- **System prompt calibrated against over-refusal.** Agents previously erred toward silence and would decline a request because the answer was "already in memory." The prompt now skews toward replying and treats memory as supplementary context, not a gate on whether to respond; ACP sessions always produce a reply.
+- **Schema V3 with automatic migration.** A typed V1→V2→V3 migration chain rewrites your config in memory on every load and writes a `.backup` when you commit it with `zeroclaw config migrate`. The install tree is split into `data/` (shared databases), `shared/` (host-wide skills), and `agents/<alias>/workspace/`, with timestamped backups.
+- **Rebuilt observability.** A new `zeroclaw-log` crate and unified `record!` macro carry alias-bound, structured attribution through every log and trace. New `/api/logs` endpoint and a Web Logs page surface it live.
+- **Reworked web dashboard.** A multi-agent dashboard with per-agent status/memory/cost/sessions, an in-browser agent workspace explorer, a tool-approval UI for supervised mode, skill-bundle editing, and a cross-section draft store with an unsaved-changes banner.
+- **More providers and channels.** GitHub Models, Morph, Manifest, and atomic-chat join the provider lineup; ~36 providers gained typed-family config with OAuth refresh. ACP sessions now persist; Mattermost gained multi-channel polling and DM auto-discovery.
+- **Provider fallback is gone.** No more fallback-provider chains. Each agent names one provider, retries handle transient failures, and routing is explicit. If your config carries `reliability.fallback_providers` or `reliability.model_fallbacks`, drop those keys before upgrading (see Breaking Changes).
 
 ## What's New
 
-### Channels
+### Multi-Agent & Runtime
 
-- **ACP (Agent Client Protocol):** `session/cancel` aborts in-flight turns
-  (#6374); concurrent `session/prompt` requests are rejected rather than
-  raced (#6408); ACP protocol v1 picks up tool-call permission and a back-channel
-  for structured prompts (#6167).
-- **Matrix:** attachments are uploaded when finalizing partial drafts (#6200);
-  device identity is derived from the `whoami` response when an access token is
-  used directly (242ef2404), and access-token sessions now require an explicit
-  device identity (21d0c5d6b).
-- **WhatsApp:** `fromMe` replies are scoped to self-chat or trigger prefixes
-  (#6353); LID→phone resolution failures are logged so debugging session
-  drops is possible (#6354).
-- **Discord:** inbound image attachments are preserved through the provider
-  pipeline (#6184).
-- **Jira:** API v2 server mode is supported alongside cloud (#6116).
+The multi-agent epic (#6272) is the spine of this release:
+
+- **Agent aliasing**: agents are explicit, named map entries (`[agents.<alias>]`) with their own `model_provider`, `risk_profile`, `runtime_profile`, `channels`, and `identity`. The schema, migration, orchestrator, and onboarding all speak aliases end to end.
+- **Per-agent identity & workspace**: each agent loads its own `IDENTITY.md`/`SOUL.md` and runs against `agents/<alias>/workspace/`, which doubles as its security boundary via path-subset enforcement (`SecurityPolicy::for_agent`).
+- **Per-agent memory**: the `Memory` trait gained an agent-aware surface on every backend; `AgentScopedMemory<M>` enforces the cross-agent boundary on every method, and `AgentScopedMarkdownMemory` does the same for the markdown backend. Alias deletes purge the agent's rows.
+- **Peer groups**: a peer-group resolver and `ResolvedPeers` type let agents on a shared channel *type* reach each other; external peers are matched case- and `@`-insensitively. Delivery between co-resident agents is in-process by design (the channel's bot identity is shared).
+- **Sub-agents**: `spawn_subagent` agent-loop tool with a depth-1 cap and a `risk_profile` gate; `SecurityPolicy::ensure_no_escalation_beyond` enforces parent-subset authorization. Cron `JobType::Agent` dispatch now routes through the sub-agent spawn path; cron stays depth-0.
+- **Lifecycle & CLI**: a per-agent lifecycle module + session registry, `DeleteReport` that surfaces active sessions and warns on force-delete, and new `zeroclaw agents create / delete / list` commands.
+- **Tool authorization**: `Tool : Attributable` supertrait with per-tool role and alias; a policy-driven tool filter at the dispatch site; `SecurityPolicy.allowed_tools` / `excluded_tools` with `is_tool_allowed`.
+
+### Configuration & Schema (V3)
+
+- Typed migration chain rebuilt as partial lenses (`V1Config`, `V2Config`) covering every nested V1→V2 and V2→V3 transform, wired into runtime, CLI, and end-to-end tests.
+- `zeroclaw config generate <version>` and `zeroclaw migrate generate <version>` produce a canonical config at any schema version from a comprehensive V1 fixture.
+- RFC #5890 model-provider aliasing: nested `[providers.models.<type>.<alias>]`, with ~36 typed provider families and a `for_each_model_provider_slot!` macro driving factory dispatch and validation.
+- TTS and transcription gained the same typed-family split (`[providers.tts.<type>.<alias>]`, `[providers.transcription.<type>.<alias>]`) with per-agent `tts_provider` / `transcription_provider` fields and cross-validation.
+- Per-category typed alias-ref newtypes (`ModelProviderRef`, `TtsProviderRef`, `TranscriptionProviderRef`, `ChannelRef`) make dotted `<type>.<alias>` references first-class.
+- New `[acp]` config section; risk/runtime/bundle profile synthesis on migration; `#[secret]`-driven `MaskSecrets`; pricing moved onto provider config as a `[costs.providers.models]` rate sheet.
+- Defaulted fields are pruned from the saved `config.toml`; schema defaults render as ghost text in the TUI and the dashboard.
 
 ### Web Dashboard
 
-- **Schema-driven `/onboard` flow** — first-run users complete provider auth,
-  channels, memory, hardware, tunnel, and personality entirely in the browser,
-  with forms rendered from `GET /api/config/list`'s `kind` / `type_hint` /
-  `enum_variants` (no value-sniffing). Fresh installs auto-redirect from `/`
-  to `/onboard` (#6179).
-- **Schema-driven config editor** at `/config` with per-section forms, drift
-  banner, and per-row drift diff (in-memory vs on-disk; secrets surface only
-  the *fact* of drift). One-click "Restart daemon to apply" reloads via the
-  in-process watch channel (#6179).
-- **Live model switching with chat context preserved on navigation** (#6101).
-- **Chat input lock, running indicator, and stop button** while a turn is
-  active (#6220), with `tool_call`/`tool_result` rendering off by default and a
-  toolbar toggle to opt back in (#6388).
-- **Open agent chat directly from a memory row** when `session_id` is present
-  (#6217).
-- **OpenRouter free models marked** in the default-model dropdown (#6218).
-- **Manual cron trigger** from the web UI (#6164).
-- **Theme switching, session crash, and CSS token consistency fixes** unify the
-  visual surface across pages (#5207).
-- **Agent tool button height** matches sibling controls (#6369).
+- Multi-agent reframe: per-agent status, memory counts, cost, and session routing; RAM/CPU widgets for the ZeroClaw process.
+- Cost moved into a Dashboard tab with time-range filters, daily-scoped rollups, per-agent/per-model token splits, cached-input tokens, and a schema-driven rate-sheet editor.
+- Agent workspace explorer with jailed read/delete/move and mkdir/rmdir; lazy file browser for `shared/`.
+- Tool-approval UI for supervised-mode execution; Memories tab; Skills drill-in with `SKILL.md` editor inside skill bundles.
+- Cross-section draft store, unsaved-changes banner, tombstone unset, URL-driven alias routing (no modals), and alias pickers replacing `window.prompt`.
+- Live Logs page over the new `/api/logs` endpoint; global reload banner driven by a `pending_reload` signal; version shown in the sidebar footer.
 
 ### Providers
 
-- **Anthropic:** `base_url` is honored for the default provider (#6314).
-- **Bedrock:** `credential_process` support enables enterprise-friendly auth
-  flows (#6168).
-- **Groq:** per-profile `native_tools` override on `ModelProviderConfig`
-  (#6380).
-- **StepFun:** new `stepfun-intl` endpoint (#6310).
-- **xAI:** model listing is restored (9bd95a0c9).
-- **OpenAI-compatible:** `tool_call` `extra_content` is preserved so Gemini's
-  `thoughtSignature` survives round-tripping (#6264); model id normalization
-  has test coverage (cc8f0e7bd).
+- New providers: **GitHub Models** (#6445), **Morph** (#6440), **Manifest** open-source LLM router (#6268), **atomic-chat** local provider (#6513).
+- MiniMax split into Global and China picker entries (#6758); llama.cpp promoted to a dedicated provider kind (#6417).
+- OpenRouter prompt caching (#6008); Codex native Responses tool calls (#6117); Ollama `num_ctx`/`num_predict`/`temperature` tuning (#6178).
+- Trait-driven provider dispatch with OAuth refresh on the per-alias schema; Azure rewired to typed config (and `AZURE_OPENAI_*` env vars retired); `models.dev` keys pre-populate the model picker.
 
-### Configuration
+### Channels
 
-- **Per-property gateway CRUD** under `/api/config/*` (`GET`/`PUT`/`DELETE`/
-  `PATCH`/`OPTIONS`/`list`/`init`/`migrate`/`drift`). Comment-preserving PATCH
-  attaches a per-op `comment` field to the on-disk TOML key; PATCH/PUT are
-  validator-gated with snapshot revert on failure; structured `ConfigApiError`
-  surfaces stable codes for invalid range, enum variant, format, dangling
-  reference, and required-field-empty (#6179).
-- **Drift detection** compares in-memory state to on-disk `config.toml` via
-  server-side SHA-256 hashing (secrets never leave the server). 409
-  `config_changed_externally` blocks a write against a drifted path; explicit
-  `X-ZeroClaw-Override-Drift: true` overrides (#6179).
-- **OpenAPI 3.1 spec** at `/api/openapi.json`, Scalar explorer at `/api/docs`,
-  committed snapshot at `crates/zeroclaw-gateway/openapi.json` regenerated by
-  `cargo xtask gen-openapi` and CI-checked for staleness (#6179).
-- **TypeScript client codegen** for the dashboard via `openapi-typescript`
-  (`npm run gen-api`, wired into `npm run build`); tsc fails when the generated
-  shape stops matching consumers (#6179).
-- **CLI parity:** `zeroclaw config patch` (JSON Patch over the same core),
-  `config docs`, `config schema --path <prop>`, `set --comment`, `--json`
-  envelopes on `get`/`set`/`init`/`migrate` matching HTTP shapes (#6179).
-- **Per-provider pricing** on `ModelProviderConfig` (#6357).
-- **Dotted provider map keys preserved** across config round-trips (#6317).
-- **Encrypted-secret mismatch surfaced clearly** when `.secret_key` doesn't
-  match the encrypted blob (#6379).
+- **Mattermost** multi-channel polling, DM auto-discovery, and `mention_only` bypass; **Nextcloud Talk** draft-update streaming (#6048).
+- Bot self-mention injected into the per-channel system prompt (`self_addressed_mention()` in each channel's platform syntax), with the lookup fixed to resolve composite `<type>.<alias>` keys so aliased and multi-agent channels actually receive it; closure-resolver peer auth unified across all 24 channels; per-channel `self_handle` overrides; standardized inbound/outbound channel log shape.
+- Reply-calibration nudge added to both the per-channel prompt and the base system prompt (so direct CLI chat gets it too): agents had been erring toward silence and treating memory as a reason not to answer, so the prompt now skews toward replying and frames memory as supplementary context rather than a gate on whether to respond.
 
-### Agent & Runtime
+### ACP (Agent Client Protocol)
 
-- **Cost and token usage recorded on every gateway turn** (#6159).
-- **Cost-pricing WARN once per `(provider, model)`** instead of per-turn
-  (#6356).
-- **Conversation memories excluded from `build_context` recall** to keep prior
-  conversation chunks from leaking into recall results (#6316, follow-up to
-  #5415).
-- **Autosaved conversation memories recalled on subsequent turns** (#6363).
-- **Reasoning content captured from streaming responses** (#6107).
-- **Image markers stripped** from non-vision context-compression payloads
-  (#6189).
-- **Wildcard memory recall** is treated as a recent-memory query (#6296).
-- **Daemon canvas store shared across subsystems** (gateway, channels, daemon)
-  (#6221).
-- **Cancel-tokens evicted when sessions are deleted mid-turn** to prevent stale
-  approval state (#6216).
-- **Session backend unified behind one factory** across runtime and channels
-  (#6384).
+ACP mode (the `zeroclaw acp` subprocess and the `zeroclaw-acp-bridge` editor bridge) got a substantial pass this release:
 
-### Tools
+- **Sessions persist across restarts** (#6649). A SQLite-backed `AcpSessionStore` records each session on `session/new` and appends every successful prompt turn; on reconnect the agent's conversation history is restored full-fidelity, so a daemon restart no longer drops in-flight ACP conversations.
+- **New `[acp]` config section.** `max_sessions` (default 10) and `session_timeout_secs` (default 3600) cap concurrent sessions and idle lifetime; `default_agent` names the agent to use when a client omits `agentAlias`. These wire into both the `zeroclaw acp` subprocess and the gateway WebSocket path; CLI flags still override the config for the subprocess.
+- **Agent resolution when `agentAlias` is omitted.** Clients such as toad send `session/new` without an alias; resolution is now explicit alias, then `acp.default_agent`, then auto-select when exactly one agent is configured. With multiple agents and no hint, the server still requires an explicit alias.
+- **`zeroclaw-acp-bridge --config-dir`.** Clients that spawn the bridge as a subprocess don't forward `ZEROCLAW_CONFIG_DIR`, so the bridge accepts `--config-dir <path>` (and `--config-dir=<path>`) to locate config off the default `~/.zeroclaw`.
+- **Always-respond in ACP sessions.** The chatroom NoReply heuristic that suppresses bot chatter in broadcast channels is bypassed for ACP: every inbound is a direct request, so it always produces a reply.
+- **Workspace access retained when the session cwd differs** (#6532). ACP sessions keep ZeroClaw workspace access even when the client opens the session in a different working directory.
 
-- **`zeroclaw memory reindex` CLI** for rebuilding the embedding index in place
-  (#6046).
-- **Tavily search backend** for `tools/web_search`, with bearer-header
-  authentication and encrypted-key support (3205f0a, 46cb4510c, 3014e355c).
-- **`tool_timeout_secs` honoured for HTTP SSE tool calls** (#5945) and used to
-  derive the HTTP client timeout (#6397).
-- **`allow_scripts` plumbed through `ReadSkillTool`** to the skill loader so
-  declared scripts can actually run (#5981, closes #5697).
-- **DockerSandbox bind-mount support** for workspace mounts (#5905, closes
-  #5720).
+### Skills
 
-### Personality
-
-- **Three-surface personality editor** for the seven runtime markdown files
-  (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`,
-  `MEMORY.md`) the runtime injects into the system prompt. CLI uses `$EDITOR`,
-  TUI suspends and hands off to `$EDITOR`, web UI ships a CodeMirror 6 editor
-  (one-dark theme + markdown grammar) with Edit/Preview toggle, per-tab Insert
-  / Replace template buttons, char counter, and 409 `personality_disk_drift`
-  resolution UX (`take theirs` / `keep mine`). Backed by a 7-file backend
-  allowlist enforced in `crates/zeroclaw-gateway/src/api_personality.rs` —
-  `BOOTSTRAP.md` is intentionally excluded as a first-run scaffold (#6179).
-
-### Gateway
-
-- **Tool-approval back-channel** via `WsApprovalChannel` so approvals don't
-  fight the main message stream (#6387).
-- **Fail-loud model resolution** at request time across gateway and channels
-  (#6215, refined in #6493 to keep `/onboard` reachable on fresh installs).
-  Misconfigured providers surface a clear error on the first chat call rather
-  than silently substituting a vendor default.
-- **Daemon boots without a configured model** so the browser onboarding flow
-  at `/onboard` is reachable on fresh installs and partially-configured
-  states. The gateway logs a `WARN` pointing at `/onboard` and chat dispatch
-  refuses with a structured `needs_onboarding` marker until at least one
-  `[providers.models.<name>] model = "..."` is set; `POST /webhook` returns
-  `503 {"error":"needs_onboarding","url":"/onboard"}` instead of a generic
-  `500`, and the WhatsApp / Linq / WATI / Nextcloud Talk channel handlers
-  send a Fluent-localized "agent isn't fully set up yet" reply rather than
-  the generic LLM-error fallback. The channels supervisor exits cleanly
-  instead of restart-looping (#6493).
-- **Connect-time `cwd` parameter** on the WebSocket pins the per-session
-  security sandbox root (#6179, follow-on to #6167).
+- New `SkillsService` with a canonical `SKILL.md` scaffold; bundle-aware `skills add/edit` and `bundle list/show`; `zeroclaw skills bundle add/remove` route through config CRUD.
+- `shared/skills` default to read-only; tier banner on `zeroclaw skills install` (#6409); missing-capability suggestions (#6676); `timeout_secs` honored from `SKILL.toml` (#6054); install output localized with Fluent (#6674).
 
 ### Security
 
-- **HMAC tool receipts activated** — the wiring stripped out of #5168 is now
-  live and verifying receipts end-to-end (#6214).
-- **`git -C` vs `git -c` distinction in the security policy** — case-preserved
-  argument lists prevent legitimate `git -C <dir>` invocations from being
-  blocked as `-c` config overrides (0bc0dc676, closes #5809).
+- `SecurityPolicy` read / read-write allowlist split; sub-agent escalation validator with path-subset matching; write-only roots stay unreadable; destructive session operations scoped.
 
 ### Installation & Distribution
 
-- **Installer presets, gateway flags, TTY feature picker, web/dist build,
-  onboarding gate** (#6385). The TTY feature picker now writes its prompts
-  to stderr so command substitution doesn't capture them and freeze the
-  terminal (#6496).
-- **MUSL static binaries restored** for the Linux release artifacts (#6411).
-- **Platform-correct web data directory** on macOS and Windows (78d2cd6c0).
-- **Web dashboard extraction restored** in the prebuilt install path
-  (821fbfcfc, a2c1e2bb2).
-- **Workspace-member resolution** unbroken in `Dockerfile` and
-  `Dockerfile.debian` (#6305).
-- **`xtask:web` re-runs `npm install`** when `node_modules` is stale relative
-  to the lockfile (#6355).
+- NixOS module + test for `services.zeroclaw.instances` (#6562).
+- Desktop (Tauri): macOS onboarding wizard with permission primitives and capability sync (#6506), Linux/Windows permission onboarding (#6710), and `take_screenshot` / `run_applescript` commands (#6507).
 
 ### Internationalization
 
-- **Translations synced** for fr, ja, es, with new zh-CN coverage (#6170).
-- **Chinese WeChat CLI strings** added (#6242).
+- CLI skill handlers and install output routed through Fluent; en/fr/ja catalog upkeep.
 
 ### Documentation
 
-- **Raspberry Pi setup guide** (25e77cc52, closes #4704).
-- **Hardware page revisions:** Podman recommendation now justifies its memory
-  budget (f595de532); macOS cross-compile recipe and install destination fixed
-  per #6203 review (96a7f0018, dd535fb72).
-- **Custom OpenAI-compatible provider syntax** clarified (#6300).
-- **YOLO config examples** updated (#6194).
-- **Philosophy page** links the RFCs and Fluent (#6232).
+- New multi-agent architecture page and setup walkthrough (#6272 P14); SubAgents page derived from code; rewritten provider docs for the typed-family schema; fresh `[cost.rates.*]` cost-tracking guide; logging docs rewritten from source; V1/V2 holdovers scrubbed from operator docs.
 
 ### Improvements
 
-- **Integrations registry refactored** to a single schema-driven for-loop
-  (#6386).
-- **Doctor self-test** now reports both the configured host and the probed
-  loopback so port-binding issues are easier to diagnose (#6219).
-- **Workspace `default-run` set** to keep docs CI green (46235824e).
-
----
+- Every `anyhow!` site routed through `record!`; `tracing::*` / `log::*` macros banned workspace-wide in favor of the unified macro; one canonical, dependency-ordered config Section list driving every wizard surface.
 
 ## Bug Fixes
 
 | Area | Fix |
 |---|---|
-| ACP | Reject concurrent `session/prompt` requests instead of racing them (#6408). |
-| Agent / runtime | Exclude Conversation memories from `build_context` recall (#6316). |
-| Agent / runtime | Capture `reasoning_content` from streaming responses (#6107). |
-| Agent / runtime | Strip image markers from non-vision context compression (#6189). |
-| Agent / runtime | Treat bare-wildcard recall as a recent-memory query (#6296). |
-| Channels | Recall autosaved conversation memories on subsequent turns (#6363). |
-| Channels (Discord) | Preserve inbound image attachments for providers (#6184). |
-| Channels (Jira) | Support API v2 server mode (#6116). |
-| Channels (Matrix) | Require explicit device identity for access-token sessions (21d0c5d6b); derive identity from `whoami` (242ef2404). |
-| Channels (WhatsApp) | Scope `fromMe` replies to self-chat or trigger prefixes (#6353); surface LID→phone resolution failures in logs (#6354). |
-| CI / docs build | Track `lang-switcher.js.tpl`, generate `.js` at build time (#6395); set workspace `default-run` to unblock docs CI (46235824e); remove the obsolete `CHANGELOG-next.md` cleanup step (#6265). |
-| Config | Preserve dotted provider map keys (#6317); surface `.secret_key` mismatch on enc2 decrypt (#6379). |
-| Docker | Unbreak workspace-member resolution in `Dockerfile` and `Dockerfile.debian` (#6305). |
-| Gateway | Record cost and token usage on every turn (#6159); evict `cancel_tokens` when a session is deleted mid-turn (#6216); fail-loud model resolution mirrored across gateway and channels (#6215); daemon boots without a configured model so `/onboard` stays reachable on fresh installs and partially-configured states, with `POST /webhook` returning `503 needs_onboarding` and channel handlers sending a Fluent-localized reply (#6493). |
-| Installation | Use platform-correct web data directory on macOS and Windows (78d2cd6c0); restore web-dashboard extraction in prebuilt install (821fbfcfc, a2c1e2bb2); installer feature picker no longer freezes the terminal (prompts now go to stderr instead of being captured by `$()`) (#6496). |
-| Providers (Anthropic) | Respect `base_url` config for the default provider (#6314). |
-| Providers (compatible) | Preserve `tool_call` `extra_content` so Gemini `thoughtSignature` round-trips cleanly (#6264). |
-| Providers (xAI) | Restore model listing (9bd95a0c9). |
-| Runtime / channels | Unify session backend behind one factory (#6384); share canvas store across daemon subsystems (#6221). |
-| Runtime / cost | WARN once per `(provider, model)` for missing pricing (#6356). |
-| Security | Distinguish `git -C` from `git -c` in security policy (0bc0dc676). |
-| Skills (config) | Reject unknown fields in `[skill]` block to surface silent typo drops (#6128); relocate SkillForge provenance to a sibling `[forge]` table and surface `SKILL.toml` parse failures via `tracing::warn` instead of swallowing them silently (#6210). |
-| Tools | Honour `tool_timeout_secs` for HTTP SSE tool calls (#5945); derive HTTP client timeout from `tool_timeout_secs` (#6397); pass `allow_scripts` through `ReadSkillTool` to the skill loader (#5981). |
-| Tools (web_search) | Authenticate Tavily via Bearer header rather than body (46cb4510c). |
-| Web | Fix theme switching, session crash, and CSS token consistency (#5207); agent tool button height (#6369); default `tool_call`/`tool_result` rendering off with toolbar toggle (#6388). |
-| xtask:web | Re-run `npm install` when `node_modules` is stale vs lockfile (#6355). |
-| Doctor | Self-test report shows configured host alongside probed loopback (#6219). |
-
----
+| Config / V3 | V2→V3 migration correctness: provider-globals fold lands on the right V3 paths, channel `enabled` restored, dotted `model_provider` aliases resolve in routes and channel paths, Feishu V2 block migrates to `lark.feishu`, JSON-patch errors emitted for CLI patch (#6617) |
+| Channels | Telegram tool calls; Matrix honors global `ack_reactions`; localized runtime command replies (#6550); media uploads routed into the owning agent's workspace |
+| Providers | Skip unresolvable multimodal images (#6743); Ollama routed through `compatible.rs` at `/v1/chat/completions`; error source chain included in retry logs; GLM/compat fixes |
+| Gateway / Web | Boot degrades (not crashes) when an enabled agent has an unresolved `risk_profile`; CronSchedule union restored; reload-banner and cron-modal fixes; OpenAPI re-export cleanup |
+| Cron | Timezone preserved through the cron API (#6741, #6740); `cmd.exe` on Windows instead of hardcoded `sh` (#6713) |
+| Memory | Composite `(agent_id, key)` uniqueness across SQL + Qdrant; tolerate concurrent SQLite schema migrations (#6432); residual isolation gaps closed |
+| Skills | ClawHub install runs on the async runtime (#6682); strict `SkillMeta` + SkillForge provenance under `[forge]` (#6209); `__` separator in tool names for OpenAI-compat function calling (#6732) |
+| Service / Update | Valid macOS launchd plist (#6738); release asset selection tightened (#6585); Windows snapshot TTL vs. polling interval (#6750) |
+| Onboard | Interactive-flag compatibility restored (#6673); reachable model catalogs surfaced; SQLite-default storage help |
 
 ## Breaking Changes
 
-### Ollama provider sends explicit `num_ctx` / `num_predict` on every request
+v0.8.0 is a pre-1.0 breaking release. Your config is **auto-migrated in memory on every load**, and the install filesystem is migrated on first boot with timestamped backups. To commit the config migration to disk (preserving comments, writing a `.backup`):
 
-The Ollama provider now stamps `num_ctx=8192` and `num_predict=2048` into the
-`options` block of every `/api/chat` request body. Previously these fields were
-unset on the wire, defaulting to Ollama's server-side `num_ctx=2048` and
-`num_predict=128` — which silently truncated prompts and responses on any
-structured tool-calling workflow (200 OK with garbage rather than an error).
-
-For most deployments this is strictly an improvement. **Operators on tight VRAM
-budgets** should be aware that jumping from server-default `num_ctx=2048` to
-the new `8192` increases the model's context-allocation footprint and can OOM
-the GPU on small cards. Pin lower values via the new optional fields under
-`[providers.models.<name>]` if needed:
-
-```toml
-[providers.models.my-ollama-llama3]
-kind = "ollama"
-ollama_num_ctx = 4096           # default 8192
-ollama_num_predict = 1024       # default 2048
-ollama_temperature_override = 0.1   # optional; when unset, per-call temperature wins
+```bash
+zeroclaw config migrate          # add --json for a machine-readable report
 ```
 
-The new defaults are sent on every `/api/chat` request unless lower numeric
-values are pinned via `ollama_num_ctx` / `ollama_num_predict` as shown above.
-There is no in-config way to omit these keys from the wire body in this
-release: VRAM-constrained operators (or operators whose server caps these
-values lower than `8192` / `2048`) should pin lower supported numerics via
-the fields above. Operators running an Ollama build old enough to outright
-reject the keys themselves will need to upgrade Ollama or wait on a
-follow-up that introduces a true omit mode. (`ollama_temperature_override`
-is the one knob with a true `None` semantic — when it is unset, the
-per-call temperature passed through `Provider::chat_with_system` wins and
-`temperature` on the wire continues to reflect the call site rather than
-this config.)
+**Back up first.** SQLite memory is backed up automatically (`brain.db.backup-<ts>`), and the install tree is copied to `backup-<ts>/` before the split. **Postgres and Qdrant are NOT backed up for you. Dump them yourself before upgrading.**
 
----
+### Schema V3 and the install layout
 
-## Behavior Changes
+- The on-disk tree is split: shared databases (memory, sessions, state) move to `<install>/data/`, host-wide skills to `<install>/shared/skills/`, and per-agent identity/markdown to `<install>/agents/default/workspace/`. `Config.workspace_dir` is renamed to `Config.data_dir` (`<config-dir>/workspace/` → `<config-dir>/data/`). (#6272)
+- Single-agent installs are migrated into one `default` agent; `default` is the migration bridge alias and never appears on a fresh install.
 
-### Tool outputs that mention local image paths are now uploaded to the provider
+### Agents are now explicit
 
-Tool results — including `shell` and skill output — that print real local
-image paths (e.g. `ls /pictures`, `find . -name '*.png'`, an image-generation
-tool that prints the saved file path) are now canonicalized into
-`[IMAGE:...]` markers before history replay and base64-inlined into the next
-provider request. This is the fix for #6097 (local image reading failed) and
-#5453 (WebSocket `/ws/chat` did not process `[IMAGE:]` markers), and brings
-the agent and provider sides of the multimodal pipeline back into parity.
+- `[identity]` is demoted from a top-level block to per-agent `agents.<alias>.identity`; each agent picks its own format and source.
+- Top-level provider maps collapse under one `[providers]` key: `[model_providers.*]` → `[providers.models.*]`, `[tts_providers.*]` → `[providers.tts.*]`, `[transcription_providers.*]` → `[providers.transcription.*]`.
+- `MemoryEntry.agent_id` is renamed to `agent_alias` (a serde alias keeps existing Qdrant/JSON payloads readable, no data migration needed).
 
-The behavior shift is real and worth flagging: image bytes that previously
-stayed on the local filesystem when surfaced by a shell-style tool are now
-uploaded to whichever provider the next turn dispatches to. Only paths where
-`Path::is_file()` returns `true` and the extension is one of `png`, `jpg`,
-`jpeg`, `webp`, `gif`, `bmp` are wrapped, and existing `[IMAGE:...]` markers
-are not double-wrapped, but operators running shell tools over directories
-of personal or sensitive images should be aware.
+### Removed / relocated config
 
-The per-request image budget (`max_images`, default `4`) and the LRU
-`trim_old_images` policy bound the cumulative upload cost — older images are
-dropped before the cap is exceeded — but the privacy posture has shifted.
-See `docs/book/src/contributing/privacy.md` and the new doc note on
-`MultimodalConfig.max_images` for the current upload semantics. Operators
-who do not want this behavior can keep tool outputs free of literal image
-paths, or scope shell tools away from image-bearing directories. (#6183)
+- **`[autonomy]` is gone.** Its fields move to per-agent `[risk_profiles.<alias>]` (authorization) and `[runtime_profiles.<alias>]` (budgets/timeouts); the active profile resolves via the agent's `risk_profile`.
+- **`[security.sandbox]` and `[security.resources]` are gone.** Sandbox and resource fields now live flat on the risk profile.
+- **Provider fallback is eradicated.** `reliability.fallback_providers` and `reliability.model_fallbacks` are removed; retries handle transient failures, routing is explicit.
+- **Swarms are removed entirely**, deferred to a later release with a new shape; `[swarms.*]` tables are dropped on migration with a warning.
+- **Channel-level peer-auth fields are removed** (`allowed_users`, `allowed_contacts`, `allowed_from`, `allowed_numbers`, `allowed_senders`, `allowed_pubkeys` across all 24 channels). Inbound authorization lives exclusively in `[peer_groups]` now; migration synthesizes `[peer_groups.<type>_default]` from your old allowlists (wildcard-only/empty lists are skipped).
+- **Feishu folds into Lark.** `[channels.feishu]` migrates to `[channels.lark]` with `use_feishu = true`; conflicting `app_id`s drop the Feishu side with a warning.
+- **`claude-code` is removed as a model provider** (folds under `anthropic.claude-code` on migration).
+- Schema cleanups: `PeerExternal` flattened to `PeerUsername`; `RuntimeProfile.api_key` and `ModelProviderConfig.name` dropped.
 
----
+### Environment-variable grammar rewrite
 
-### `[skill]` block in SKILL.toml rejects unknown fields; SkillForge provenance moves to `[forge]`
+Every legacy override is replaced by a single schema-mirror grammar (#6375):
 
-Three coordinated changes that ship together so the strictness in #6128 is
-safe for users with `auto_integrate = true`:
-
-**1. `[skill]` is strict.** The `SkillMeta` struct backing the `[skill]` block of
-`SKILL.toml` now carries `#[serde(deny_unknown_fields)]`. Previously, unrecognised
-keys inside `[skill]` were silently dropped during deserialization — a typo in a
-field name would be accepted without error while the intended value was ignored.
-This is the bug class tracked in #6128, identified as a follow-up to the
-`SkillManifest` parsing refactor in #5972.
-
-Any `SKILL.toml` whose `[skill]` block contains a key not defined in the current
-schema will now fail to load with a descriptive serde error. Example:
-
-```toml
-[skill]
-name = "my-skill"
-descriptin = "Fixes a common issue"  # typo — was silently ignored, now an error
+```
+ZEROCLAW_<lowercase_dotted_path_with_underscores>=<value>
 ```
 
-There is no per-field opt-out. The strictness is intentional: a skill that loads
-with a silently-dropped typo is harder to debug than one that fails loudly.
-Operators must correct or remove unrecognised fields from the `[skill]` block of
-their `SKILL.toml` before upgrading.
+The lowercase tail mirrors the dotted prop-path `config set` accepts (each `_` is either a path separator or a kebab joiner inside a snake-case field). Only the bootstrap vars `ZEROCLAW_WORKSPACE` and `ZEROCLAW_CONFIG_DIR` keep their uppercase form. All previous override names (including `AZURE_OPENAI_*`) are gone. See `docs/book/src/reference/env-vars.md` for per-variable recipes.
 
-**2. SkillForge provenance moves to a top-level `[forge]` table.** The SkillForge
-integrator (`auto_integrate = true`) previously emitted `source`, `owner`,
-`language`, `license`, `stars`, `updated_at` and the sub-tables
-`[skill.requirements]` / `[skill.metadata]` directly inside `[skill]`. With
-`SkillMeta` now strict, those keys would be rejected — every auto-integrated
-skill would fail to load. The integrator now emits a sibling top-level `[forge]`
-table instead, with `[forge.requirements]` and `[forge.metadata]` underneath.
-This keeps the runtime's canonical skill identity contract (`SkillMeta`) decoupled
-from the integrator's emit format (FND-001 §4.2 dependency rule). `[forge]` is
-optional on hand-authored skills and also strict (`deny_unknown_fields`) so
-typos in the provenance namespace surface the same way typos in `[skill]` do.
+### Internals
 
-**3. `SKILL.toml` parse failures are now logged.** The skill loader at both
-`load_skills_from_directory` and `load_open_skills_from_directory` previously
-swallowed every error from `load_skill_toml` silently. With `[skill]` now strict,
-that swallow would have flipped the failure mode from "field value silently
-ignored" to "skill silently never loads." Both sites now emit a structured
-`tracing::warn!` with `path` and `err` fields when a `SKILL.toml` fails to
-deserialize, so an operator running `RUST_LOG=warn zeroclaw` can identify the
-offending file.
+- Observability: `runtime_trace::record_event` retired in favor of `record!` everywhere; the `record!` shape is locked and carries alias-bound attribution through spans.
+- Cron: the `agent_alias` fallback to `DEFAULT_AGENT_ALIAS` is removed; jobs must name their agent.
+- TTS/transcription `default_*_provider` fields are deleted; each agent declares its own.
 
-#### Migration for users with `auto_integrate = true`
+## Known Issues
 
-If you have `SKILL.toml` files on disk that were generated by SkillForge before
-this release, run the bundled migration script to move the provenance fields
-from `[skill]` into the new `[forge]` table layout. The script is idempotent —
-re-running it on already-migrated files is a no-op. Dry-run by default; pass
-`--apply` to write changes:
+This is a beta. The following are known-broken or unfinished and will be addressed before the stable release:
 
-```sh
-# Inspect the planned changes (dry-run):
-python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills
-
-# Apply the migration in place:
-python3 scripts/migrate-skill-toml.py ~/.zeroclaw/workspace/skills --apply
-```
-
-The script can also target a single file (`scripts/migrate-skill-toml.py
-path/to/skill/SKILL.toml --apply`) and uses standard library only (Python 3.8+,
-no `tomli` / `tomli_w` required). Hand-authored `SKILL.toml` files without
-SkillForge provenance are left untouched.
-
-If you do not run the migration before upgrading, auto-integrated skills will
-fail to load and the failure will surface as a `tracing::warn` line naming the
-offending path.
-
----
+- **Channel tool-approval timeouts default to 0s.** In practice the per-channel `approval_timeout_secs` resolves to `0` rather than the documented 300s (120s for Telegram), so an `always_ask` tool prompt can auto-deny immediately instead of waiting for an operator. Set `approval_timeout_secs` explicitly on each channel as a workaround.
+- **Onboarding and agent-assignment UX is not final.** Expect rough edges in the onboarding flow and in how agents are assigned during setup.
+- **Web gateway UI is not finalized.** The dashboard is functional but still changing; layout, controls, and routes may shift before stable.
 
 ## Contributors
 
+- @0disoft
 - @abhinavmathur-atlan
+- @alexandme
 - @aliasliao
-- @aredridel
-- @ArgenisDLR
+- @Alix-007
 - @Audacity88
-- @dahungkee
-- @donut-wenzhang
 - @drbparadise
+- @flyin1600
+- @fresh-fx59
+- @FTDGRT
+- @guitaripod
 - @ilteoood
+- @joe2643
+- @johnrspeer83-png
 - @JordanTheJet
-- @jscholz
-- @MestreY0d4-Uninter
-- @nanyuantingfeng
+- @kapelame
+- @kmsquire
+- @markuman
+- @mminkus
+- @mn13
 - @nebullii
-- @nxajh
+- @ninenox
+- @NiuBlibing
+- @ozzyfly
 - @patrickzzz
-- @perlowja
+- @plodsoft
+- @Project516
+- @rareba
+- @roywong10
+- @RyanHoldren
+- @SebConejo
+- @SimianAstronaut7
 - @singlerider
-- @songchao0421
+- @SpectreMercury
+- @TeoConnexioh
 - @theonlyhennygod
+- @thezillo
 - @tidux
-- @tredondo
+- @TJUEZ
 - @WareWolf-MoonWall
-- @xiongzubiao
+- @whtiehack
+- @xydigitLybnnnn
+- @xydigit-sj
+- @yanalialiuk
+- @yijunyu
+- @Yyukan
+- @zwffff
 
 ---
 
-*Full diff: `git log v0.7.4..v0.7.5 --oneline`*
+*Full diff: `git log v0.7.5..v0.8.0-beta-1 --oneline`*

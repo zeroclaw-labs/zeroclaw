@@ -21,6 +21,7 @@ lidar = []            # LIDAR support
 vision = []           # Camera + vision model
 
 [dependencies]
+zeroclaw-log.workspace = true
 # Re-use zeroclaw's tool trait (optional - can also be standalone)
 # zeroclaw = { path = "../..", optional = true }
 
@@ -46,7 +47,6 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Logging
-tracing = "0.1"
 
 # Time handling
 chrono = { version = "0.4", features = ["clock", "std"] }

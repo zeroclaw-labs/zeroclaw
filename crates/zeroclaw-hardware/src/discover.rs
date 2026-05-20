@@ -70,9 +70,16 @@ pub struct UsbDeviceInfo {
 pub fn list_usb_devices() -> Result<Vec<UsbDeviceInfo>> {
     let mut devices = Vec::new();
 
-    let iter = nusb::list_devices()
-        .wait()
-        .map_err(|e| anyhow::anyhow!("USB enumeration failed: {e}"))?;
+    let iter = nusb::list_devices().wait().map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "USB device enumeration failed"
+        );
+        anyhow::Error::msg(format!("USB enumeration failed: {e}"))
+    })?;
 
     for dev in iter {
         let vid = dev.vendor_id();

@@ -201,17 +201,19 @@ export default function SectionPicker({
                 <span
                   className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
                   style={{
-                    background:
-                      item.badge === 'configured' || item.badge === 'active'
-                        ? 'rgba(0, 230, 138, 0.12)'
+                    background: badgeIsGood(item.badge)
+                      ? 'rgba(0, 230, 138, 0.12)'
+                      : item.badge === 'needs setup'
+                        ? 'rgba(245, 180, 0, 0.12)'
                         : 'var(--pc-bg-elevated)',
-                    color:
-                      item.badge === 'configured' || item.badge === 'active'
-                        ? 'var(--color-status-success)'
+                    color: badgeIsGood(item.badge)
+                      ? 'var(--color-status-success)'
+                      : item.badge === 'needs setup'
+                        ? 'var(--color-status-warning, #f5b400)'
                         : 'var(--pc-text-secondary)',
                   }}
                 >
-                  {(item.badge === 'configured' || item.badge === 'active') && (
+                  {badgeIsGood(item.badge) && (
                     <Check className="h-3 w-3" />
                   )}
                   {item.badge}
@@ -236,4 +238,8 @@ export default function SectionPicker({
       )}
     </div>
   );
+}
+
+function badgeIsGood(badge: string | undefined): boolean {
+  return badge === 'configured' || badge === 'active' || badge === 'set';
 }

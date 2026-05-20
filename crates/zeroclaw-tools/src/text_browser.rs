@@ -115,18 +115,29 @@ impl TextBrowserTool {
                 if installed {
                     return Ok(preferred);
                 }
-                tracing::warn!(
-                    "Configured preferred text browser '{preferred}' is not installed, falling back to auto-detect"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"preferred": preferred})),
+                    "Configured preferred text browser '' is not installed, falling back to auto-detect"
                 );
             }
         }
 
         // Auto-detect
         Self::detect_browser().await.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No text browser found. Install one of: {}",
-                SUPPORTED_BROWSERS.join(", ")
-            )
+            let supported = SUPPORTED_BROWSERS.join(", ");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"supported": &supported})),
+                "text_browser: no text browser installed"
+            );
+            anyhow::Error::msg(format!(
+                "No text browser found. Install one of: {supported}"
+            ))
         })
     }
 
@@ -168,10 +179,16 @@ impl Tool for TextBrowserTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+        let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "url"})),
+                "text_browser: missing url parameter"
+            );
+            anyhow::Error::msg("Missing 'url' parameter")
+        })?;
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -216,7 +233,12 @@ impl Tool for TextBrowserTool {
         let dump_args = Self::build_dump_args(&browser, &url);
 
         let timeout = Duration::from_secs(if self.timeout_secs == 0 {
-            tracing::warn!("text_browser: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "text_browser: timeout_secs is 0, using safe default of 30s"
+            );
             30
         } else {
             self.timeout_secs
