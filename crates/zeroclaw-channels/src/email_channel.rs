@@ -916,6 +916,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -942,6 +943,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
