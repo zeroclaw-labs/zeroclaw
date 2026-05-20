@@ -30,9 +30,17 @@ impl SecurityOpsTool {
 
     /// Triage an alert: classify severity and recommend response.
     fn triage_alert(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let alert = args
-            .get("alert")
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'alert' parameter"))?;
+        let alert = args.get("alert").ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "alert"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing required 'alert' parameter")
+        })?;
 
         // Extract key fields for classification
         let alert_type = alert
@@ -98,13 +106,39 @@ impl SecurityOpsTool {
         let playbook_name = args
             .get("playbook")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'playbook' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "playbook"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing required 'playbook' parameter")
+            })?;
 
         let step_index =
             usize::try_from(args.get("step").and_then(|v| v.as_u64()).ok_or_else(|| {
-                anyhow::anyhow!("Missing required 'step' parameter (0-based index)")
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "step"})),
+                    "security_ops tool: missing 'step' parameter"
+                );
+                anyhow::Error::msg("Missing required 'step' parameter (0-based index)")
             })?)
-            .map_err(|_| anyhow::anyhow!("'step' parameter value too large for this platform"))?;
+            .map_err(|_| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "step"})),
+                    "security_ops tool: 'step' parameter too large for usize on this platform"
+                );
+                anyhow::Error::msg("'step' parameter value too large for this platform")
+            })?;
 
         let alert_severity = args
             .get("alert_severity")
@@ -115,7 +149,16 @@ impl SecurityOpsTool {
             .playbooks
             .iter()
             .find(|p| p.name == playbook_name)
-            .ok_or_else(|| anyhow::anyhow!("Playbook '{}' not found", playbook_name))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"playbook": playbook_name})),
+                    "security_ops tool: playbook not found"
+                );
+                anyhow::Error::msg(format!("Playbook '{playbook_name}' not found"))
+            })?;
 
         let result = evaluate_step(
             playbook,
@@ -147,9 +190,17 @@ impl SecurityOpsTool {
 
     /// Parse vulnerability scan results.
     fn parse_vulnerability(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let scan_data = args
-            .get("scan_data")
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'scan_data' parameter"))?;
+        let scan_data = args.get("scan_data").ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "scan_data"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing required 'scan_data' parameter")
+        })?;
 
         let json_str = if scan_data.is_string() {
             scan_data.as_str().unwrap().to_string()
@@ -268,7 +319,17 @@ impl SecurityOpsTool {
         let alerts = args
             .get("alerts")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'alerts' array parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "alerts"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing required 'alerts' array parameter")
+            })?;
 
         let total = alerts.len();
         let mut by_severity = std::collections::HashMap::new();
@@ -409,10 +470,17 @@ impl Tool for SecurityOpsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing required 'action' parameter")
+        })?;
 
         match action {
             "triage_alert" => self.triage_alert(&args),

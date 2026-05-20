@@ -96,11 +96,29 @@ pub fn load_playbooks(dir: &Path) -> Vec<Playbook> {
                     Ok(contents) => match serde_json::from_str::<Playbook>(&contents) {
                         Ok(pb) => playbooks.push(pb),
                         Err(e) => {
-                            tracing::warn!("Failed to parse playbook {}: {e}", path.display());
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                &format!("Failed to parse playbook {}", path.display().to_string())
+                            );
                         }
                     },
                     Err(e) => {
-                        tracing::warn!("Failed to read playbook {}: {e}", path.display());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            &format!("Failed to read playbook {}", path.display().to_string())
+                        );
                     }
                 }
             }

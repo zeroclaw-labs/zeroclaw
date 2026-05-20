@@ -76,10 +76,16 @@ impl Tool for GeminiCliTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "gemini_cli_tool: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory — require both paths to exist (reject
         // non-existent paths instead of falling back to the raw value, which

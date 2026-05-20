@@ -1,10 +1,10 @@
-use crate::ProviderRuntimeOptions;
+use crate::ModelProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -18,8 +18,6 @@ use std::path::PathBuf;
 use zeroclaw_api::tool::ToolSpec;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
-const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
 /// OpenAI Codex speaks the "responses" wire protocol, not chat_completions.
@@ -28,7 +26,9 @@ const RESPONSES_HISTORY_PROVIDER: &str = "openai_codex";
 const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
 
 #[derive(Clone)]
-pub struct OpenAiCodexProvider {
+pub struct OpenAiCodexModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     auth: AuthService,
     auth_profile_override: Option<String>,
     responses_url: String,
@@ -111,9 +111,10 @@ struct ResponsesTurnResult {
     reasoning_content: Option<String>,
 }
 
-impl OpenAiCodexProvider {
+impl OpenAiCodexModelProvider {
     pub fn new(
-        options: &ProviderRuntimeOptions,
+        alias: &str,
+        options: &ModelProviderRuntimeOptions,
         gateway_api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let state_dir = options
@@ -124,6 +125,7 @@ impl OpenAiCodexProvider {
         let responses_url = resolve_responses_url(options)?;
 
         Ok(Self {
+            alias: alias.to_string(),
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
@@ -152,8 +154,16 @@ fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
         anyhow::bail!("OpenAI Codex endpoint override cannot be empty");
     }
 
-    let mut parsed = reqwest::Url::parse(candidate)
-        .map_err(|_| anyhow::anyhow!("OpenAI Codex endpoint override must be a valid URL"))?;
+    let mut parsed = reqwest::Url::parse(candidate).map_err(|_| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"candidate": candidate})),
+            "openai_codex: endpoint override is not a valid URL"
+        );
+        anyhow::Error::msg("OpenAI Codex endpoint override must be a valid URL")
+    })?;
 
     match parsed.scheme() {
         "http" | "https" => {}
@@ -176,21 +186,7 @@ fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
     Ok(parsed.to_string())
 }
 
-fn resolve_responses_url(options: &ProviderRuntimeOptions) -> anyhow::Result<String> {
-    if let Some(endpoint) = std::env::var(CODEX_RESPONSES_URL_ENV)
-        .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
-    {
-        return build_responses_url(&endpoint);
-    }
-
-    if let Some(base_url) = std::env::var(CODEX_BASE_URL_ENV)
-        .ok()
-        .and_then(|value| first_nonempty(Some(&value)))
-    {
-        return build_responses_url(&base_url);
-    }
-
+fn resolve_responses_url(options: &ModelProviderRuntimeOptions) -> anyhow::Result<String> {
     if let Some(api_url) = options
         .provider_api_url
         .as_deref()
@@ -223,11 +219,6 @@ fn first_nonempty(text: Option<&str>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
-}
-
-#[allow(dead_code)]
-fn resolve_instructions(system_prompt: Option<&str>) -> String {
-    first_nonempty(system_prompt).unwrap_or_else(|| DEFAULT_CODEX_INSTRUCTIONS.to_string())
 }
 
 fn normalize_model_id(model: &str) -> &str {
@@ -492,11 +483,9 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
 
 fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String {
     let raw = configured
-        .map(ToString::to_string)
-        .or_else(|| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT").ok())
-        .and_then(|value| first_nonempty(Some(&value)))
-        .unwrap_or_else(|| "xhigh".to_string())
-        .to_ascii_lowercase();
+        .and_then(|value| first_nonempty(Some(value)))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "xhigh".to_string());
     clamp_reasoning_effort(model_id, &raw)
 }
 
@@ -869,10 +858,21 @@ fn process_sse_chunk(
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
-            anyhow::anyhow!(
-                "OpenAI Codex SSE data parse failed: {err}. Payload: {}",
-                super::sanitize_api_error(line)
-            )
+            let sanitized = super::sanitize_api_error(line);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "sse_parse",
+                        "payload": &sanitized,
+                        "error": format!("{}", err),
+                    })),
+                "openai_codex: SSE data parse failed"
+            );
+            anyhow::Error::msg(format!(
+                "OpenAI Codex SSE data parse failed: {err}. Payload: {sanitized}"
+            ))
         })?;
         emitted.extend(process_responses_stream_event(event, state)?);
     }
@@ -987,9 +987,19 @@ fn append_utf8_stream_chunk(
             }
 
             if err.error_len().is_some() {
-                return Err(anyhow::anyhow!(
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "utf8_decode",
+                            "error": format!("{}", err),
+                        })),
+                    "openai_codex: response contained invalid UTF-8"
+                );
+                return Err(anyhow::Error::msg(format!(
                     "OpenAI Codex response contained invalid UTF-8: {err}"
-                ));
+                )));
             }
 
             // `error_len == None` means we have a valid prefix and an incomplete
@@ -999,53 +1009,53 @@ fn append_utf8_stream_chunk(
     }
 }
 
-#[allow(dead_code)]
-fn decode_utf8_stream_chunks<'a, I>(chunks: I) -> anyhow::Result<String>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-{
-    let mut body = String::new();
-    let mut pending = Vec::new();
-
-    for chunk in chunks {
-        append_utf8_stream_chunk(&mut body, &mut pending, chunk)?;
-    }
-
-    if !pending.is_empty() {
-        let err = std::str::from_utf8(&pending).expect_err("pending bytes should be invalid UTF-8");
-        return Err(anyhow::anyhow!(
-            "OpenAI Codex response ended with incomplete UTF-8: {err}"
-        ));
-    }
-
-    Ok(body)
-}
-
 fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     let body_trimmed = body.trim_start();
     let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
     if looks_like_sse {
         let result = parse_sse_turn(body)?;
         return ensure_nonempty_responses_turn(result, || {
-            anyhow::anyhow!(
-                "No response from OpenAI Codex stream payload: {}",
-                super::sanitize_api_error(body)
-            )
+            let sanitized = super::sanitize_api_error(body);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"payload": &sanitized})),
+                "openai_codex: empty SSE stream payload"
+            );
+            anyhow::Error::msg(format!(
+                "No response from OpenAI Codex stream payload: {sanitized}"
+            ))
         });
     }
 
     let parsed: ResponsesResponse = serde_json::from_str(body).map_err(|err| {
-        anyhow::anyhow!(
-            "OpenAI Codex JSON parse failed: {err}. Payload: {}",
-            super::sanitize_api_error(body)
-        )
+        let sanitized = super::sanitize_api_error(body);
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "payload": &sanitized,
+                    "error": format!("{}", err),
+                })),
+            "openai_codex: JSON parse failed"
+        );
+        anyhow::Error::msg(format!(
+            "OpenAI Codex JSON parse failed: {err}. Payload: {sanitized}"
+        ))
     })?;
     let result = responses_turn_from_response(&parsed);
     ensure_nonempty_responses_turn(result, || {
-        anyhow::anyhow!(
-            "No response from OpenAI Codex: {}",
-            super::sanitize_api_error(body)
-        )
+        let sanitized = super::sanitize_api_error(body);
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"payload": &sanitized})),
+            "openai_codex: empty response"
+        );
+        anyhow::Error::msg(format!("No response from OpenAI Codex: {sanitized}"))
     })
 }
 
@@ -1061,23 +1071,41 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk
-            .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
+        let bytes = chunk.map_err(|err| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "stream_read",
+                        "error": format!("{}", err),
+                    })),
+                "openai_codex: error reading response stream"
+            );
+            anyhow::Error::msg(format!("error reading OpenAI Codex response stream: {err}"))
+        })?;
         append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
     }
 
     if !pending_utf8.is_empty() {
         let err = std::str::from_utf8(&pending_utf8)
             .expect_err("pending bytes should be invalid UTF-8 at end of stream");
-        return Err(anyhow::anyhow!(
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "openai_codex: response ended with incomplete UTF-8"
+        );
+        return Err(anyhow::Error::msg(format!(
             "OpenAI Codex response ended with incomplete UTF-8: {err}"
-        ));
+        )));
     }
 
     parse_responses_body(&body)
 }
 
-impl OpenAiCodexProvider {
+impl OpenAiCodexModelProvider {
     fn responses_request_builder(
         &self,
         bearer_token: &str,
@@ -1129,8 +1157,11 @@ impl OpenAiCodexProvider {
         {
             Ok(profile) => profile,
             Err(err) if use_gateway_api_key_auth => {
-                tracing::warn!(
-                    error = %err,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
                 );
                 None
@@ -1144,8 +1175,11 @@ impl OpenAiCodexProvider {
         {
             Ok(token) => token,
             Err(err) if use_gateway_api_key_auth => {
-                tracing::warn!(
-                    error = %err,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
                 );
                 None
@@ -1162,8 +1196,15 @@ impl OpenAiCodexProvider {
             oauth_access_token
         } else {
             Some(oauth_access_token.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
+                    "openai_codex: auth profile not found"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
                 )
             })?)
         };
@@ -1171,8 +1212,15 @@ impl OpenAiCodexProvider {
             account_id
         } else {
             Some(account_id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "account_id"})),
+                    "openai_codex: account_id not found in profile/token"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
                 )
             })?)
         };
@@ -1231,8 +1279,11 @@ impl OpenAiCodexProvider {
                     return Err(stream_err);
                 }
 
-                tracing::warn!(
-                    error = %stream_err,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", stream_err)})),
                     "OpenAI Codex streaming response decode failed, retrying without streaming"
                 );
 
@@ -1256,9 +1307,19 @@ impl OpenAiCodexProvider {
                 decode_responses_body(non_streaming_response)
                     .await
                     .map_err(|fallback_err| {
-                        anyhow::anyhow!(
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "stream_err": format!("{}", stream_err),
+                                    "fallback_err": format!("{}", fallback_err),
+                                })),
+                            "openai_codex: stream + non-stream fallback both failed"
+                        );
+                        anyhow::Error::msg(format!(
                             "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
-                        )
+                        ))
                     })
             }
         }
@@ -1266,7 +1327,7 @@ impl OpenAiCodexProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiCodexProvider {
+impl ModelProvider for OpenAiCodexModelProvider {
     // ── Provider-family defaults ──
     fn default_wire_api(&self) -> &str {
         WIRE_API
@@ -1378,7 +1439,9 @@ impl Provider for OpenAiCodexProvider {
                 match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
                     Ok(prepared) => prepared,
                     Err(err) => {
-                        let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(err.to_string())))
+                            .await;
                         return;
                     }
                 };
@@ -1415,7 +1478,9 @@ impl Provider for OpenAiCodexProvider {
                     let _ = tx.send(Ok(StreamEvent::Final)).await;
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
                 }
             }
         });
@@ -1427,10 +1492,22 @@ impl Provider for OpenAiCodexProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenAiCodexModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenAiCodex,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{EnvGuard, env_lock};
 
     enum MockCodexReply {
         Sse(&'static str),
@@ -1441,7 +1518,7 @@ mod tests {
     async fn mock_codex_provider(
         replies: Vec<MockCodexReply>,
     ) -> (
-        OpenAiCodexProvider,
+        OpenAiCodexModelProvider,
         std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
@@ -1495,13 +1572,13 @@ mod tests {
         });
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             provider_api_url: Some(format!("http://{addr}")),
             zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
             secrets_encrypt: false,
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
-        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
         (provider, captured, server_handle, temp_dir)
     }
@@ -1556,30 +1633,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_responses_url_prefers_explicit_endpoint_env() {
-        let _lock = env_lock();
-        let _endpoint_guard = EnvGuard::set(
-            CODEX_RESPONSES_URL_ENV,
-            Some("https://env.example.com/v1/responses"),
-        );
-        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, Some("https://base.example.com/v1"));
-
-        let options = ProviderRuntimeOptions::default();
-        assert_eq!(
-            resolve_responses_url(&options).unwrap(),
-            "https://env.example.com/v1/responses"
-        );
-    }
-
-    #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
-        let _lock = env_lock();
-        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
-        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
-
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://proxy.example.com/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
 
         assert_eq!(
@@ -1601,12 +1658,12 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
-            ..ProviderRuntimeOptions::default()
+            ..ModelProviderRuntimeOptions::default()
         };
 
-        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
         assert!(provider.custom_endpoint);
         assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
     }
@@ -1741,30 +1798,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_instructions_uses_default_when_missing() {
-        assert_eq!(
-            resolve_instructions(None),
-            DEFAULT_CODEX_INSTRUCTIONS.to_string()
-        );
-    }
-
-    #[test]
-    fn resolve_instructions_uses_default_when_blank() {
-        assert_eq!(
-            resolve_instructions(Some("   ")),
-            DEFAULT_CODEX_INSTRUCTIONS.to_string()
-        );
-    }
-
-    #[test]
-    fn resolve_instructions_uses_system_prompt_when_present() {
-        assert_eq!(
-            resolve_instructions(Some("Be strict")),
-            "Be strict".to_string()
-        );
-    }
-
-    #[test]
     fn clamp_reasoning_effort_adjusts_known_models() {
         assert_eq!(
             clamp_reasoning_effort("gpt-5-codex", "xhigh"),
@@ -1806,8 +1839,7 @@ mod tests {
 
     #[test]
     fn resolve_reasoning_effort_prefers_configured_override() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
+        // V0.8.0 grammar: configured value wins; no env-var fallback.
         assert_eq!(
             resolve_reasoning_effort("gpt-5-codex", Some("high")),
             "high".to_string()
@@ -1815,12 +1847,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reasoning_effort_uses_legacy_env_when_unconfigured() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("minimal"));
+    fn resolve_reasoning_effort_defaults_when_unconfigured() {
         assert_eq!(
             resolve_reasoning_effort("gpt-5-codex", None),
-            "low".to_string()
+            "high".to_string()
         );
     }
 
@@ -1932,20 +1962,6 @@ data: [DONE]
         assert_eq!(items[0]["encrypted_content"], "enc_reasoning");
         assert_eq!(items[1]["type"], "function_call");
         assert_eq!(items[1]["call_id"], "call_1");
-    }
-
-    #[test]
-    fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
-        let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
-        let bytes = payload.as_bytes();
-        let split_at = payload.find('世').unwrap() + 1;
-
-        let decoded = decode_utf8_stream_chunks([&bytes[..split_at], &bytes[split_at..]]).unwrap();
-        assert_eq!(decoded, payload);
-        assert_eq!(
-            parse_sse_turn(&decoded).unwrap().text.as_deref(),
-            Some("Hello 世")
-        );
     }
 
     #[test]
@@ -2180,29 +2196,12 @@ data: [DONE]
 
     #[test]
     fn capabilities_includes_vision() {
-        let options = ProviderRuntimeOptions {
+        let options = ModelProviderRuntimeOptions {
             secrets_encrypt: false,
-            auth_profile_override: None,
-            reasoning_enabled: None,
-            reasoning_effort: None,
-            provider_timeout_secs: None,
-            extra_headers: std::collections::HashMap::new(),
-            api_path: None,
-            provider_max_tokens: None,
-            merge_system_into_user: false,
-            provider_extra: None,
-            native_tools: None,
-            wire_api: None,
-            provider_api_url: None,
-            zeroclaw_dir: None,
-            think: None,
-            chat_template_kwargs: None,
-            ollama_num_ctx: None,
-            ollama_num_predict: None,
-            ollama_temperature_override: None,
+            ..ModelProviderRuntimeOptions::default()
         };
-        let provider =
-            OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
+        let provider = OpenAiCodexModelProvider::new("test", &options, None)
+            .expect("provider should initialize");
         let caps = provider.capabilities();
 
         assert!(caps.native_tool_calling);
@@ -2211,8 +2210,9 @@ data: [DONE]
 
     #[test]
     fn provider_does_not_advertise_streaming_until_live_sse_is_wired() {
-        let provider = OpenAiCodexProvider::new(&ProviderRuntimeOptions::default(), None)
-            .expect("provider should initialize");
+        let provider =
+            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
+                .expect("provider should initialize");
 
         assert!(!provider.supports_streaming());
         assert!(!provider.supports_streaming_tool_events());

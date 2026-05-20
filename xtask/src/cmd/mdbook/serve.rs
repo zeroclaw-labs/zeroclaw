@@ -51,7 +51,7 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     let watch_locale = locale
         .map(str::to_string)
         .or_else(|| entries.first().map(|e| e.code.clone()))
-        .ok_or_else(|| anyhow::anyhow!("locales.toml has no entries"))?;
+        .ok_or_else(|| anyhow::Error::msg("locales.toml has no entries"))?;
 
     match locale {
         Some(code) => {

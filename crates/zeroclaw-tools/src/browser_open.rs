@@ -77,10 +77,16 @@ impl Tool for BrowserOpenTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+        let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "url"})),
+                "browser_open: missing url parameter"
+            );
+            anyhow::Error::msg("Missing 'url' parameter")
+        })?;
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -271,14 +277,27 @@ fn normalize_domain(raw: &str) -> Option<String> {
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
+    let rest = url.strip_prefix("https://").ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url})),
+            "browser_open: non-https URL rejected"
+        );
+        anyhow::Error::msg("Only https:// URLs are allowed")
+    })?;
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url})),
+            "browser_open: invalid URL"
+        );
+        anyhow::Error::msg("Invalid URL")
+    })?;
 
     if authority.is_empty() {
         anyhow::bail!("URL must include a host");

@@ -1,17 +1,36 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
+import { Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { AgentProvider, useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 
-const DRAFT_KEY = 'agent-chat';
+const DRAFT_KEY_PREFIX = 'agent-chat';
 
+/**
+ * Route entry point for `/agent/:alias`. Reads the alias from the URL and
+ * mounts an AgentProvider keyed by it so React tears down and rebuilds the
+ * WebSocket / chat state on alias change. Missing alias → redirect to the
+ * agents list.
+ */
 export default function AgentChat() {
+  const { alias } = useParams<{ alias: string }>();
+  if (!alias) {
+    return <Navigate to="/agents" replace />;
+  }
+  return (
+    <AgentProvider key={alias} agentAlias={alias}>
+      <AgentChatInner agentAlias={alias} />
+    </AgentProvider>
+  );
+}
+
+function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   const {
     messages,
     sendMessage,
@@ -31,7 +50,7 @@ export default function AgentChat() {
     respondToApproval,
   } = useAgent();
 
-  const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
+  const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
   const [input, setInput] = useState(draft);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -193,7 +212,7 @@ export default function AgentChat() {
       <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         <div className="flex items-center gap-2">
           <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>ZeroClaw Agent</span>
+          <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>{agentAlias}</span>
         </div>
 
         <div className="relative" ref={modelDropdownRef}>

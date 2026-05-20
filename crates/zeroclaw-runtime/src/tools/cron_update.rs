@@ -12,11 +12,21 @@ use zeroclaw_config::schema::Config;
 pub struct CronUpdateTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    /// Owning agent — risk profile gate for command updates.
+    agent_alias: String,
 }
 
 impl CronUpdateTool {
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
-        Self { config, security }
+    pub fn new(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            agent_alias: agent_alias.into(),
+        }
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
@@ -30,8 +40,21 @@ impl CronUpdateTool {
             });
         }
 
-        // Rate limiting is applied by the RateLimitedTool wrapper at
-        // registration time (see zeroclaw-runtime::tools::mod).
+        if self.security.is_rate_limited() {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
+            });
+        }
 
         None
     }
@@ -171,11 +194,11 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
@@ -220,7 +243,13 @@ impl Tool for CronUpdateTool {
             return Ok(blocked);
         }
 
-        match cron::update_shell_job_with_approval(&self.config, job_id, patch, approved) {
+        match cron::update_shell_job_with_approval(
+            &self.config,
+            &self.agent_alias,
+            job_id,
+            patch,
+            approved,
+        ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&cron_job_output(&job)?)?,
@@ -242,31 +271,55 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
 
+    const TEST_AGENT: &str = "test-agent";
+
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
         Arc::new(config)
     }
 
+    fn seed_test_agent(config: &mut Config) {
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", TEST_AGENT)
+            .expect("known family");
+        config.agents.entry(TEST_AGENT.to_string()).or_insert(
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.to_string(),
+                runtime_profile: TEST_AGENT.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
     fn test_security(cfg: &Config) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
-        ))
+        Arc::new(
+            SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
+        )
     }
 
     #[tokio::test]
     async fn updates_enabled_flag() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -284,8 +337,8 @@ mod tests {
     async fn output_includes_timezone_confirmation_fields_for_explicit_cron_timezone() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -318,17 +371,20 @@ mod tests {
     async fn blocks_disallowed_command_updates() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -345,15 +401,20 @@ mod tests {
     async fn blocks_mutation_in_read_only_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
-        config.autonomy.level = AutonomyLevel::ReadOnly;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -370,16 +431,26 @@ mod tests {
     async fn medium_risk_shell_update_requires_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let denied = tool
             .execute(json!({
@@ -411,8 +482,8 @@ mod tests {
     async fn rejects_at_timestamp_without_explicit_offset_with_actionable_error() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -441,15 +512,15 @@ mod tests {
     fn patch_schema_covers_all_cronjobpatch_fields_and_schedule_is_oneof() {
         let tmp = TempDir::new().unwrap();
         let cfg = Arc::new(Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         });
-        let security = Arc::new(SecurityPolicy::from_config(
-            &cfg.autonomy,
-            &cfg.workspace_dir,
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &cfg.data_dir,
         ));
-        let tool = CronUpdateTool::new(cfg, security);
+        let tool = CronUpdateTool::new(cfg, security, TEST_AGENT);
         let schema = tool.parameters_schema();
 
         // Top-level: job_id and patch are required
@@ -589,11 +660,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_update_when_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .level = AutonomyLevel::Full;
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .max_actions_per_hour = 0;
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        seed_test_agent(&mut config);
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
+        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
     async fn empty_allowed_tools_patch_stored_as_none() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let job = cron::add_agent_job(
             &cfg,
+            TEST_AGENT,
             None,
             crate::cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
@@ -607,7 +721,7 @@ mod tests {
             Some(vec!["file_read".into()]),
         )
         .unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({
@@ -631,6 +745,7 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let job = cron::add_agent_job(
             &cfg,
+            TEST_AGENT,
             None,
             crate::cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
@@ -644,7 +759,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({

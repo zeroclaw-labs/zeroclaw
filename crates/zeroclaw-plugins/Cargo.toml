@@ -7,6 +7,7 @@ description = "WASM plugin system for ZeroClaw — host, manifests, signatures, 
 publish = false
 
 [dependencies]
+zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
@@ -19,7 +20,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
 toml = "1.0"
-tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.26"

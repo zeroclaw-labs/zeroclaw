@@ -22,33 +22,6 @@ use tokio::net::TcpListener;
 #[allow(unused_imports)]
 pub use crate::auth::oauth_common::{PkceState, generate_pkce_state};
 
-/// Get Gemini OAuth client ID from environment.
-/// Required: set GEMINI_OAUTH_CLIENT_ID environment variable.
-pub fn gemini_oauth_client_id() -> Option<String> {
-    std::env::var("GEMINI_OAUTH_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// Get Gemini OAuth client secret from environment.
-/// Required: set GEMINI_OAUTH_CLIENT_SECRET environment variable.
-pub fn gemini_oauth_client_secret() -> Option<String> {
-    std::env::var("GEMINI_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// Get required OAuth credentials or return error.
-fn get_oauth_credentials() -> Result<(String, String)> {
-    let client_id = gemini_oauth_client_id().ok_or_else(|| {
-        anyhow::anyhow!("GEMINI_OAUTH_CLIENT_ID environment variable is required")
-    })?;
-    let client_secret = gemini_oauth_client_secret().ok_or_else(|| {
-        anyhow::anyhow!("GEMINI_OAUTH_CLIENT_SECRET environment variable is required")
-    })?;
-    Ok((client_id, client_secret))
-}
-
 pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_OAUTH_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
@@ -101,11 +74,10 @@ struct OAuthErrorResponse {
     error_description: Option<String>,
 }
 
-pub fn build_authorize_url(pkce: &PkceState) -> Result<String> {
-    let (client_id, _) = get_oauth_credentials()?;
+pub fn build_authorize_url(client_id: &str, pkce: &PkceState) -> Result<String> {
     let mut params = BTreeMap::new();
     params.insert("response_type", "code");
-    params.insert("client_id", client_id.as_str());
+    params.insert("client_id", client_id);
     params.insert("redirect_uri", GEMINI_OAUTH_REDIRECT_URI);
     params.insert("scope", GEMINI_OAUTH_SCOPES);
     params.insert("code_challenge", pkce.code_challenge.as_str());
@@ -128,16 +100,17 @@ pub fn build_authorize_url(pkce: &PkceState) -> Result<String> {
 
 pub async fn exchange_code_for_tokens(
     client: &Client,
+    client_id: &str,
+    client_secret: &str,
     code: &str,
     pkce: &PkceState,
 ) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", GEMINI_OAUTH_REDIRECT_URI),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
         ("code_verifier", &pkce.code_verifier),
     ];
 
@@ -182,13 +155,17 @@ pub async fn exchange_code_for_tokens(
     })
 }
 
-pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
+pub async fn refresh_access_token(
+    client: &Client,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
     ];
 
     let response = client
@@ -232,12 +209,8 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
     })
 }
 
-pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> {
-    let (client_id, _) = get_oauth_credentials()?;
-    let form = [
-        ("client_id", client_id.as_str()),
-        ("scope", GEMINI_OAUTH_SCOPES),
-    ];
+pub async fn start_device_code_flow(client: &Client, client_id: &str) -> Result<DeviceCodeStart> {
+    let form = [("client_id", client_id), ("scope", GEMINI_OAUTH_SCOPES)];
 
     let response = client
         .post(GOOGLE_OAUTH_DEVICE_CODE_URL)
@@ -281,9 +254,10 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
 
 pub async fn poll_device_code_tokens(
     client: &Client,
+    client_id: &str,
+    client_secret: &str,
     device: &DeviceCodeStart,
 ) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
     let interval = Duration::from_secs(device.interval.max(5));
 
@@ -295,8 +269,8 @@ pub async fn poll_device_code_tokens(
         tokio::time::sleep(interval).await;
 
         let form = [
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("device_code", device.device_code.as_str()),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ];
@@ -400,7 +374,20 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
                     Ok(code)
                 }
-                Ok(Err(e)) => Err(anyhow::anyhow!("Failed to accept connection: {e}")),
+                Ok(Err(e)) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "oauth_provider": "gemini",
+                                "phase": "callback_accept",
+                                "error": format!("{}", e),
+                            })),
+                        "gemini_oauth: failed to accept callback connection"
+                    );
+                    Err(anyhow::Error::msg(format!("Failed to accept connection: {e}")))
+                }
                 Err(_) => {
                     eprintln!("\nCallback timeout. Falling back to manual input.");
                     receive_code_from_stdin(expected_state).await
@@ -424,7 +411,14 @@ async fn receive_code_from_stdin(expected_state: &str) -> Result<String> {
         stdin.lock().read_line(&mut line).ok();
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
-            return Err(anyhow::anyhow!("No input received"));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"oauth_provider": "gemini"})),
+                "gemini_oauth: empty stdin input for OAuth code"
+            );
+            return Err(anyhow::Error::msg("No input received"));
         }
         parse_code_from_redirect(&trimmed, Some(&expected))
     })
@@ -458,8 +452,32 @@ fn parse_callback_request(request: &str) -> Result<(String, String)> {
         }
     }
 
-    let code = code.ok_or_else(|| anyhow::anyhow!("No 'code' parameter in callback"))?;
-    let state = state.ok_or_else(|| anyhow::anyhow!("No 'state' parameter in callback"))?;
+    let code = code.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "oauth_provider": "gemini",
+                    "missing": "code",
+                })),
+            "gemini_oauth: callback missing code parameter"
+        );
+        anyhow::Error::msg("No 'code' parameter in callback")
+    })?;
+    let state = state.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "oauth_provider": "gemini",
+                    "missing": "state",
+                })),
+            "gemini_oauth: callback missing state parameter"
+        );
+        anyhow::Error::msg("No 'state' parameter in callback")
+    })?;
 
     Ok((code, state))
 }
@@ -565,7 +583,8 @@ mod tests {
             EnvVarRestore::set("GEMINI_OAUTH_CLIENT_SECRET", "test-client-secret");
 
         let pkce = generate_pkce_state();
-        let url = build_authorize_url(&pkce).expect("Failed to build authorize URL");
+        let url =
+            build_authorize_url("test-client-id", &pkce).expect("Failed to build authorize URL");
         assert!(url.contains("accounts.google.com"));
         assert!(url.contains("client_id="));
         assert!(url.contains("redirect_uri="));

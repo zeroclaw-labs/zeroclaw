@@ -1,12 +1,12 @@
 //! E2E test for Gemini fallback with OAuth token refresh.
 //!
 //! This test validates that when:
-//! 1. Primary provider (OpenAI Codex) fails
+//! 1. Primary model_provider (OpenAI Codex) fails
 //! 2. Fallback to Gemini is triggered
 //! 3. Gemini OAuth tokens are expired (we manually expire them)
 //!
 //! Then:
-//! - Gemini provider's warmup() automatically refreshes the tokens
+//! - Gemini model_provider's warmup() automatically refreshes the tokens
 //! - The fallback request succeeds
 //!
 //! Requires:
@@ -32,7 +32,7 @@ use std::path::PathBuf;
 /// This test:
 /// 1. Backs up real auth-profiles.json
 /// 2. Modifies it to set Gemini token as expired
-/// 3. Creates a Gemini provider and calls warmup()
+/// 3. Creates a Gemini model_provider and calls warmup()
 /// 4. Verifies token was refreshed
 /// 5. Restores original auth-profiles.json
 #[tokio::test]
@@ -48,7 +48,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
             "⚠️  No auth-profiles.json found at {:?}",
             auth_profiles_path
         );
-        eprintln!("Run: zeroclaw auth login --provider gemini");
+        eprintln!("Run: zeroclaw auth login --model-provider gemini");
         return Ok(());
     }
 
@@ -62,21 +62,21 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
     let profiles = data
         .get_mut("profiles")
         .and_then(|p| p.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("No profiles object in auth-profiles.json"))?;
+        .ok_or_else(|| anyhow::Error::msg("No profiles object in auth-profiles.json"))?;
 
     let gemini_profile_key = profiles
         .keys()
         .find(|k| k.starts_with("gemini:"))
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No Gemini OAuth profile found. Run: zeroclaw auth login --provider gemini"
+            anyhow::Error::msg(
+                "No Gemini OAuth profile found. Run: zeroclaw auth login --model-provider gemini",
             )
         })?
         .clone();
 
     let gemini_profile = profiles
         .get_mut(&gemini_profile_key)
-        .ok_or_else(|| anyhow::anyhow!("Gemini profile not found"))?;
+        .ok_or_else(|| anyhow::Error::msg("Gemini profile not found"))?;
 
     println!("Found Gemini profile: {}", gemini_profile_key);
 
@@ -120,22 +120,22 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
         return Ok(());
     }
 
-    // Write modified auth-profiles.json BEFORE creating provider
+    // Write modified auth-profiles.json BEFORE creating model_provider
     fs::write(&auth_profiles_path, serde_json::to_string_pretty(&data)?)?;
     println!("✓ Wrote modified auth-profiles.json with expired token");
 
     // Small delay to ensure file is flushed
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Create GeminiProvider using the default factory
+    // Create GeminiModelProvider using the default factory
     // This will load auth from ~/.zeroclaw/auth-profiles.json (with expired token)
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    let model_provider = zeroclaw::providers::create_model_provider("gemini", None)?;
 
-    println!("Created Gemini provider with expired token");
+    println!("Created Gemini model_provider with expired token");
 
     // Call warmup() — should detect expired token and refresh it
     println!("Calling warmup() — should refresh expired token...");
-    let warmup_result = provider.warmup().await;
+    let warmup_result = model_provider.warmup().await;
 
     if let Err(e) = warmup_result {
         eprintln!("❌ warmup() failed: {}", e);
@@ -160,7 +160,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
         .and_then(|p| p.as_object())
         .and_then(|p| p.get(&gemini_profile_key))
         .and_then(|p| p.as_object())
-        .ok_or_else(|| anyhow::anyhow!("Failed to read updated profile"))?;
+        .ok_or_else(|| anyhow::Error::msg("Failed to read updated profile"))?;
 
     let new_expires_at = updated_profile.get("expires_at").and_then(|v| v.as_str());
     println!("New expires_at: {:?}", new_expires_at);
@@ -192,7 +192,7 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
 
     // Try making a real request to verify token works
     println!("\nMaking real request to verify token works...");
-    let response = provider
+    let response = model_provider
         .chat_with_system(
             Some("You are a concise assistant. Reply in one short sentence."),
             "Say 'OAuth refresh works'",
@@ -226,14 +226,14 @@ async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires live Gemini OAuth credentials"]
 async fn gemini_warmup_with_valid_credentials() -> Result<()> {
-    // Create provider from default config
-    let provider = zeroclaw::providers::create_provider("gemini", None)?;
+    // Create model_provider from default config
+    let model_provider = zeroclaw::providers::create_model_provider("gemini", None)?;
 
-    println!("Created Gemini provider");
+    println!("Created Gemini model_provider");
     println!("Calling warmup()...");
 
     // This should succeed if credentials are valid
-    provider.warmup().await?;
+    model_provider.warmup().await?;
 
     println!("✓ warmup() succeeded with valid credentials");
 

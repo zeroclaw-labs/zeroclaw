@@ -416,7 +416,16 @@ impl WebAuthnManager {
             .flatten()
             .find(|c| c.credential_id == response.id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Credential not found: {}", response.id))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"credential_id": response.id})),
+                    "webauthn verify refused: credential id not in store"
+                );
+                anyhow::Error::msg(format!("Credential not found: {}", response.id))
+            })?;
 
         // 3. Validate client data JSON
         let client_data_bytes = URL_SAFE_NO_PAD
@@ -519,9 +528,15 @@ impl WebAuthnManager {
 
     fn generate_challenge(&self) -> Result<String> {
         let mut buf = [0u8; CHALLENGE_LEN];
-        self.rng
-            .fill(&mut buf)
-            .map_err(|_| anyhow::anyhow!("Failed to generate random challenge"))?;
+        self.rng.fill(&mut buf).map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "webauthn challenge: RNG fill failed"
+            );
+            anyhow::Error::msg("Failed to generate random challenge")
+        })?;
         Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
@@ -681,8 +696,15 @@ fn verify_es256_signature(public_key: &[u8], message: &[u8], sig: &[u8]) -> Resu
     // For our use case the stored key is always the raw uncompressed point.
     let pk = signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, public_key);
 
-    pk.verify(message, sig)
-        .map_err(|_| anyhow::anyhow!("WebAuthn signature verification failed"))
+    pk.verify(message, sig).map_err(|_| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "WebAuthn signature verification failed"
+        );
+        anyhow::Error::msg("WebAuthn signature verification failed")
+    })
 }
 
 /// Encode a raw P-256 uncompressed point as DER SubjectPublicKeyInfo.

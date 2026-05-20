@@ -66,7 +66,16 @@ impl Tool for ReportTemplateTool {
         let template = params
             .get("template")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing template"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "template"})),
+                    "report_template_tool: missing template parameter"
+                );
+                anyhow::Error::msg("missing template")
+            })?;
 
         let language = params
             .get("language")
@@ -76,7 +85,16 @@ impl Tool for ReportTemplateTool {
         let variables = params
             .get("variables")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| anyhow::anyhow!("variables must be object"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "variables"})),
+                    "report_template_tool: variables must be an object"
+                );
+                anyhow::Error::msg("variables must be object")
+            })?;
 
         // Convert JSON object to HashMap<String, String>
         // Non-string values are coerced to strings

@@ -2,6 +2,7 @@
 //!
 //! These are cross-cutting utilities used by multiple channel implementations.
 
+pub mod acp_session_store;
 pub mod debounce;
 pub mod session_backend;
 pub mod session_sqlite;
@@ -36,8 +37,12 @@ pub fn make_session_backend(
         }
         "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?)),
         other => {
-            tracing::warn!(
-                "Unknown session_backend '{other}'; falling back to sqlite. \
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"other": other})),
+                "Unknown session_backend ''; falling back to sqlite. \
                  Valid values: 'sqlite' (default), 'jsonl'."
             );
             Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
@@ -59,13 +64,21 @@ fn open_sqlite_with_jsonl_import(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     match backend.migrate_from_jsonl(workspace_dir) {
         Ok(0) => {}
-        Ok(n) => tracing::info!(
-            "session_backend=sqlite: imported {n} legacy JSONL session(s) from \
+        Ok(n) => ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "session_backend=sqlite: imported {n} legacy JSONL session(s) from \
              {}/sessions; renamed to *.jsonl.migrated.",
-            workspace_dir.display(),
+                workspace_dir.display()
+            )
         ),
-        Err(e) => tracing::warn!(
-            "session_backend=sqlite: JSONL import skipped: {e}. Existing JSONL \
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"e": e.to_string()})),
+            "session_backend=sqlite: JSONL import skipped: . Existing JSONL \
              sessions remain on disk; switch to session_backend = \"jsonl\" if \
              you need them visible immediately."
         ),
@@ -77,7 +90,7 @@ fn open_sqlite_with_jsonl_import(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::provider::ChatMessage;
+    use zeroclaw_api::model_provider::ChatMessage;
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::user(content)

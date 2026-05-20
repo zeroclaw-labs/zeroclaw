@@ -33,8 +33,9 @@ pub fn message_ids(src: &str) -> Result<Vec<String>, Vec<FtlError>> {
 
 pub fn message_ids_from_file(path: &Path) -> anyhow::Result<Vec<String>> {
     let src = std::fs::read_to_string(path)?;
-    message_ids(&src)
-        .map_err(|errors| anyhow::anyhow!("{}: {}", path.display(), format_errors(errors)))
+    message_ids(&src).map_err(|errors| {
+        anyhow::Error::msg(format!("{}: {}", path.display(), format_errors(errors)))
+    })
 }
 
 pub fn format_errors(errors: Vec<FtlError>) -> String {

@@ -243,15 +243,27 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .context("Failed to read callback request")?;
 
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Malformed callback request"))?;
+    let first_line = request.lines().next().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: malformed callback request"
+        );
+        anyhow::Error::msg("Malformed callback request")
+    })?;
 
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Callback request missing path"))?;
+    let path = first_line.split_whitespace().nth(1).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: callback request missing path"
+        );
+        anyhow::Error::msg("Callback request missing path")
+    })?;
 
     let code = parse_code_from_redirect(path, Some(expected_state))?;
 
@@ -376,6 +388,77 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
         token_type: token.token_type,
         scope: token.scope,
     })
+}
+
+/// Import an existing OpenAI Codex auth-profile JSON (the file
+/// `~/.codex/auth.json` produced by the upstream Codex CLI) into
+/// ZeroClaw's auth store. Replaces the `import_openai_codex_auth_profile`
+/// helper formerly in `src/main.rs`.
+pub async fn import_codex_auth_profile(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthTokens {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        id_token: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthFile {
+        tokens: CodexAuthTokens,
+    }
+
+    let raw = std::fs::read_to_string(import_path).with_context(|| {
+        format!(
+            "Failed to read import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let imported: CodexAuthFile = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let expires_at = extract_expiry_from_jwt(&imported.tokens.access_token);
+
+    let token_set = crate::auth::profiles::TokenSet {
+        access_token: imported.tokens.access_token,
+        refresh_token: imported.tokens.refresh_token,
+        id_token: imported.tokens.id_token,
+        expires_at,
+        token_type: Some("Bearer".to_string()),
+        scope: None,
+    };
+
+    let account_id = imported
+        .tokens
+        .account_id
+        .or_else(|| extract_account_id_from_jwt(&token_set.access_token));
+    if account_id.is_none() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Could not extract OpenAI account id from imported access token; \
+             requests may fail until re-authentication."
+        );
+    }
+
+    auth_service
+        .store_openai_tokens(profile, token_set, account_id, true)
+        .await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
