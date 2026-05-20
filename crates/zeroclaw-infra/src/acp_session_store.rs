@@ -378,7 +378,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
 
-        let msg = ConversationMessage::Chat(zeroclaw_api::model_provider::ChatMessage::user("hello"));
+        let msg =
+            ConversationMessage::Chat(zeroclaw_api::model_provider::ChatMessage::user("hello"));
         let result = store.append_turn("does-not-exist", &[msg]);
         assert!(result.is_err());
 
