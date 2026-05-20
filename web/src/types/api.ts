@@ -61,6 +61,11 @@ export interface CronDeliveryConfig {
   best_effort?: boolean;
 }
 
+export type CronSchedule =
+  | { kind: 'cron'; expr: string; tz?: string | null }
+  | { kind: 'at'; at: string }
+  | { kind: 'every'; every_ms: number };
+
 export interface CronJob {
   id: string;
   name: string | null;
