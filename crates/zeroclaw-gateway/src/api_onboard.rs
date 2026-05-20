@@ -1111,9 +1111,7 @@ fn first_alias_preferring_default<'a>(aliases: impl Iterator<Item = &'a String>)
 /// `None`) still appear. `schema_walk_picker` uses `map_key_sections()` which
 /// only covers `HashMap`/`Vec` sections and misses `Option<T>` sub-configs.
 fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
-    let active = cfg
-        .get_prop("tunnel.tunnel-provider")
-        .unwrap_or_default();
+    let active = cfg.get_prop("tunnel.tunnel-provider").unwrap_or_default();
     let mut items = vec![PickerItem {
         key: "none".to_string(),
         label: "none".to_string(),
@@ -1144,7 +1142,6 @@ fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
     }
     items
 }
-
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1865,7 +1862,14 @@ mod tests {
         assert_eq!(items[0].badge.as_deref(), Some("active"));
         // All known providers must be present even when their Option is None.
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in ["tailscale", "cloudflare", "ngrok", "openvpn", "pinggy", "custom"] {
+        for expected in [
+            "tailscale",
+            "cloudflare",
+            "ngrok",
+            "openvpn",
+            "pinggy",
+            "custom",
+        ] {
             assert!(
                 keys.contains(&expected),
                 "tunnel_picker must include `{expected}` for unconfigured configs"
