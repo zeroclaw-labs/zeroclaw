@@ -63,9 +63,11 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
 }
 
 fn missing_cli_string(key: &str) -> String {
-    tracing::warn!(
-        error_key = "i18n.missing_cli_string",
-        key,
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})),
         "missing CLI Fluent string"
     );
     format!("{{{key}}}")
@@ -193,7 +195,12 @@ fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
     let search_paths = [workspace_path];
     for path in search_paths.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            tracing::debug!(path = %path.display(), "loaded locale FTL from disk");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path.display().to_string()})),
+                "loaded locale FTL from disk"
+            );
             return Some(content);
         }
     }
@@ -406,6 +413,106 @@ mod tests {
                         value.contains(expected),
                         "{key} in {} should preserve {expected}",
                         source.1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skills_install_cli_strings_format_from_fluent() {
+        type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let en_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["Installing skill from", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  Resolving", "example-skill", "skills registry"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "3 files scanned"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  Security audit completed successfully"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "Official"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "Community submission",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+        let zh_cn_cases: &[FormatCase<'_>] = &[
+            (
+                "cli-skills-install-start",
+                &[("source", "example-skill")][..],
+                &["正在安装技能来源", "example-skill"],
+            ),
+            (
+                "cli-skills-install-resolving-registry",
+                &[("source", "example-skill")][..],
+                &["  正在从技能注册表解析", "example-skill"],
+            ),
+            (
+                "cli-skills-install-installed-audited",
+                &[("status", "OK"), ("path", "/tmp/example"), ("files", "3")][..],
+                &["  OK", "/tmp/example", "已扫描 3 个文件"],
+            ),
+            (
+                "cli-skills-install-security-audit-completed",
+                &[][..],
+                &["  安全审计已成功完成"],
+            ),
+            (
+                "cli-skills-install-tier-official",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &["example-skill", "1.2.3", "官方"],
+            ),
+            (
+                "cli-skills-install-tier-community",
+                &[("name", "example-skill"), ("version", "1.2.3")][..],
+                &[
+                    "example-skill",
+                    "1.2.3",
+                    "社区提交",
+                    "zeroclaw skills audit example-skill",
+                ],
+            ),
+        ];
+
+        for (source, locale, cases) in [
+            (include_str!("../locales/en/cli.ftl"), "en", en_cases),
+            (
+                include_str!("../locales/zh-CN/cli.ftl"),
+                "zh-CN",
+                zh_cn_cases,
+            ),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
                     );
                 }
             }

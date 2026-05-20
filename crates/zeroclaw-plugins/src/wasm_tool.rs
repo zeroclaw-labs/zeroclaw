@@ -5,7 +5,11 @@ use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(WasmTool, ToolKind::Plugin);
 
 /// A tool backed by a WASM plugin function.
 pub struct WasmTool {
@@ -46,9 +50,13 @@ impl WasmTool {
             Ok(mut plugin) => match runtime::call_tool_metadata(&mut plugin) {
                 Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
                 Err(e) => {
-                    tracing::debug!(
-                        "plugin at {} has no tool_metadata export ({e}), using fallback",
-                        wasm_path.display()
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "plugin at {} has no tool_metadata export ({e}), using fallback",
+                            wasm_path.display()
+                        )
                     );
                     (
                         fallback_name.clone(),
@@ -58,9 +66,14 @@ impl WasmTool {
                 }
             },
             Err(e) => {
-                tracing::warn!(
-                    "failed to load WASM plugin at {} for metadata: {e}",
-                    wasm_path.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "failed to load WASM plugin at {} for metadata: {e}",
+                        wasm_path.display()
+                    )
                 );
                 (
                     fallback_name.clone(),

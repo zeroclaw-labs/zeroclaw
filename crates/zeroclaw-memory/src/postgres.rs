@@ -2,7 +2,7 @@
 //!
 //! Compiled in only when the crate is built with `--features memory-postgres`.
 //! Selected at runtime by setting `[memory].backend = "postgres"` and
-//! supplying `db_url` under `[storage.provider.config]`. Optional pgvector
+//! supplying `db_url` under `[storage.model_provider.config]`. Optional pgvector
 //! support is enabled via `[memory.postgres].vector_enabled`.
 //!
 //! Designed for multi-instance deployments where several agents need to share
@@ -31,12 +31,15 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 /// otherwise the backend falls back to keyword-only recall and logs a
 /// warning at construction.
 pub struct PostgresMemory {
+    alias: String,
     client: Arc<Mutex<Client>>,
     qualified_table: String,
+    qualified_agents: String,
 }
 
 impl PostgresMemory {
     pub fn new(
+        alias: &str,
         db_url: &str,
         schema: &str,
         table: &str,
@@ -50,6 +53,7 @@ impl PostgresMemory {
         let schema_ident = quote_identifier(schema);
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
+        let qualified_agents = format!("{schema_ident}.agents");
 
         let client = Self::initialize_client(
             db_url.to_string(),
@@ -68,18 +72,25 @@ impl PostgresMemory {
                 Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
             };
             if !ext_ok {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "pgvector extension not available; falling back to keyword-only recall"
                 );
             }
             Ok(Self {
+                alias: alias.to_string(),
                 client: client_ref,
                 qualified_table,
+                qualified_agents,
             })
         } else {
             Ok(Self {
+                alias: alias.to_string(),
                 client: Arc::new(Mutex::new(client)),
                 qualified_table,
+                qualified_agents,
             })
         }
     }
@@ -107,13 +118,24 @@ impl PostgresMemory {
                     .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+                zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
+                    &mut client,
+                    &schema_ident,
+                    &qualified_table,
+                )?;
                 Ok(client)
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
-        init_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?
+        init_handle.join().map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "PostgreSQL initializer thread panicked"
+            );
+            anyhow::Error::msg("PostgreSQL initializer thread panicked")
+        })?
     }
 
     fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
@@ -123,13 +145,15 @@ impl PostgresMemory {
 
             CREATE TABLE IF NOT EXISTS {qualified_table} (
                 id TEXT PRIMARY KEY,
-                key TEXT UNIQUE NOT NULL,
+                key TEXT NOT NULL,
                 content TEXT NOT NULL,
                 category TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 session_id TEXT
             );
+            -- Composite (agent_id, key) uniqueness lands in the V3 migration
+            -- once the `agent_id` column is added and backfilled.
 
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
@@ -171,8 +195,10 @@ impl PostgresMemory {
             client.execute(&stmt, &[new, old])?;
         }
 
-        tracing::info!(
-            rewritten = rewrites.len(),
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"rewritten": rewrites.len()})),
             "Normalized session_id values in memories table to sanitized form"
         );
 
@@ -254,6 +280,8 @@ impl PostgresMemory {
                 .unwrap_or_else(|_| "default".into()),
             importance: row.try_get("importance").ok(),
             superseded_by: None,
+            agent_alias: row.try_get("agent_alias").ok(),
+            agent_id: row.try_get("agent_id").ok(),
         })
     }
 }
@@ -278,8 +306,15 @@ where
         })
         .context("failed to spawn PostgreSQL operation thread")?;
 
-    rx.await
-        .map_err(|_| anyhow::anyhow!("PostgreSQL operation thread terminated unexpectedly"))?
+    rx.await.map_err(|_| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "PostgreSQL operation thread terminated unexpectedly"
+        );
+        anyhow::Error::msg("PostgreSQL operation thread terminated unexpectedly")
+    })?
 }
 
 fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
@@ -322,35 +357,14 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let category = Self::category_to_str(&category);
-        let sid = session_id.map(str::to_string);
-
-        run_on_os_thread(move || -> Result<()> {
-            let now = Utc::now();
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id)
-                VALUES
-                    ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (key) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
-                "
-            );
-
-            let id = Uuid::new_v4().to_string();
-            client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
-            Ok(())
-        })
-        .await
+        // Trait-level `store` has no agent context. Route through
+        // `store_with_agent` so the row is attributed to the default
+        // agent (the NOT NULL FK on `agent_id` rejects unattributed
+        // inserts; un-attributed callers like the heartbeat memory
+        // path land under the synthesized `default` agent rather than
+        // surfacing a constraint violation).
+        self.store_with_agent(key, content, category, session_id, None, None, None)
+            .await
     }
 
     async fn recall(
@@ -363,6 +377,7 @@ impl Memory for PostgresMemory {
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
         let sid = session_id.map(str::to_string);
         let since_owned = since.map(str::to_string);
@@ -384,22 +399,23 @@ impl Memory for PostgresMemory {
 
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id,
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
                        (
-                         CASE WHEN to_tsvector('simple', key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', key), plainto_tsquery('simple', $1)) * 2.0
+                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
                            ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', $1))
+                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
                            ELSE 0.0 END
                        ) AS score
-                FROM {qualified_table}
-                WHERE ($2::TEXT IS NULL OR session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', key || ' ' || content) @@ plainto_tsquery('simple', $1))
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
                   {time_filter}
-                ORDER BY score DESC, updated_at DESC
+                ORDER BY score DESC, m.updated_at DESC
                 LIMIT $3
-                "
+                ",
             );
 
             #[allow(clippy::cast_possible_wrap)]
@@ -421,20 +437,47 @@ impl Memory for PostgresMemory {
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
 
         run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
-                FROM {qualified_table}
-                WHERE key = $1
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE m.key = $1
                 LIMIT 1
                 "
             );
 
             let row = client.query_opt(&stmt, &[&key])?;
+            row.as_ref().map(Self::row_to_entry).transpose()
+        })
+        .await
+    }
+
+    async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let key = key.to_string();
+        let agent_id = agent_id.to_string();
+
+        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE m.key = $1 AND m.agent_id = $2
+                LIMIT 1
+                "
+            );
+
+            let row = client.query_opt(&stmt, &[&key, &agent_id])?;
             row.as_ref().map(Self::row_to_entry).transpose()
         })
         .await
@@ -447,6 +490,7 @@ impl Memory for PostgresMemory {
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
         let category = category.map(Self::category_to_str);
         let sid = session_id.map(str::to_string);
 
@@ -454,11 +498,12 @@ impl Memory for PostgresMemory {
             let mut client = client.lock();
             let stmt = format!(
                 "
-                SELECT id, key, content, category, created_at, session_id
-                FROM {qualified_table}
-                WHERE ($1::TEXT IS NULL OR category = $1)
-                  AND ($2::TEXT IS NULL OR session_id = $2)
-                ORDER BY updated_at DESC
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($1::TEXT IS NULL OR m.category = $1)
+                  AND ($2::TEXT IS NULL OR m.session_id = $2)
+                ORDER BY m.updated_at DESC
                 "
             );
 
@@ -486,6 +531,37 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let key = key.to_string();
+        let agent_id = agent_id.to_string();
+
+        run_on_os_thread(move || -> Result<bool> {
+            let mut client = client.lock();
+            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1 AND agent_id = $2");
+            let deleted = client.execute(&stmt, &[&key, &agent_id])?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+
+    async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            let stmt =
+                format!("DELETE FROM {qualified_table} WHERE session_id = $1 AND agent_id = $2");
+            let deleted = client.execute(&stmt, &[&session_id, &agent_id])?;
+            usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+        })
+        .await
+    }
+
     async fn count(&self) -> Result<usize> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -506,6 +582,178 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let category = Self::category_to_str(&category);
+        let sid = session_id.map(str::to_string);
+        let aid = agent_id.map(str::to_string);
+
+        run_on_os_thread(move || -> Result<()> {
+            let now = Utc::now();
+            let mut client = client.lock();
+            // `agent_id = COALESCE($8, default-agent-uuid)` so callers
+            // without an agent context still satisfy the NOT NULL FK
+            // by attributing to the synthesized default agent. The
+            // subquery is indexed (UNIQUE alias) so the lookup is
+            // metadata-cached after the first call.
+            let stmt = format!(
+                "
+                INSERT INTO {qualified_table}
+                    (id, key, content, category, created_at, updated_at, session_id, agent_id)
+                VALUES
+                    ($1, $2, $3, $4, $5, $6, $7,
+                     COALESCE($8, (SELECT id FROM {qualified_agents} WHERE alias = 'default' LIMIT 1)))
+                ON CONFLICT (agent_id, key) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    category = EXCLUDED.category,
+                    updated_at = EXCLUDED.updated_at,
+                    session_id = EXCLUDED.session_id
+                "
+            );
+
+            let id = Uuid::new_v4().to_string();
+            client.execute(
+                &stmt,
+                &[&id, &key, &content, &category, &now, &now, &sid, &aid],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        // Empty allowlist means "no agent filter": fall back to plain
+        // recall. The wrapper always includes the bound agent's UUID,
+        // so a non-empty allowlist is the live-runtime case.
+        if allowed_agent_ids.is_empty() {
+            return self.recall(query, limit, session_id, since, until).await;
+        }
+
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let q = normalize_recent_recall_query(query).trim().to_string();
+        let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
+        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            // The agent_id filter lives in the WHERE clause so the
+            // backend never returns a foreign-agent row to the caller;
+            // post-fetch attribution lookups in earlier impls were the
+            // privacy escape Audacity flagged. The NOT NULL FK on
+            // `memories.agent_id` means there are no legacy
+            // unattributed rows to special-case.
+            let time_filter: String = match (since_ref, until_ref) {
+                (Some(_), Some(_)) => {
+                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
+                }
+                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
+                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
+                (None, None) => String::new(),
+            };
+
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                       (
+                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                           ELSE 0.0 END +
+                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                           ELSE 0.0 END
+                       ) AS score
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  AND m.agent_id = ANY($4)
+                  {time_filter}
+                ORDER BY score DESC, m.updated_at DESC
+                LIMIT $3
+                ",
+            );
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => {
+                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
+                }
+                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
+                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+            };
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
+        let client = self.client.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = alias.to_string();
+        run_on_os_thread(move || -> Result<String> {
+            let mut client = client.lock();
+            let candidate = Uuid::new_v4().to_string();
+            client.execute(
+                &format!(
+                    "INSERT INTO {qualified_agents} (id, alias, created_at)
+                     VALUES ($1, $2, NOW())
+                     ON CONFLICT (alias) DO NOTHING"
+                ),
+                &[&candidate, &alias],
+            )?;
+            let row: String = client
+                .query_one(
+                    &format!("SELECT id FROM {qualified_agents} WHERE alias = $1 LIMIT 1"),
+                    &[&alias],
+                )?
+                .get(0);
+            Ok(row)
+        })
+        .await
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for PostgresMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Postgres)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -547,6 +795,7 @@ mod tests {
     async fn new_does_not_panic_inside_tokio_runtime() {
         let outcome = std::panic::catch_unwind(|| {
             PostgresMemory::new(
+                "test",
                 "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
                 "public",
                 "memories",

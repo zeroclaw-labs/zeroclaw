@@ -161,7 +161,7 @@ pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<S
     }
 
     let content = std::fs::read_to_string(&test_file)
-        .with_context(|| format!("failed to read {}", test_file.display()))?;
+        .with_context(|| format!("failed to read {}", test_file.display().to_string()))?;
 
     let cases: Vec<TestCase> = content.lines().filter_map(parse_test_line).collect();
 
@@ -192,7 +192,7 @@ pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<Ski
         }
 
         let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("failed to read directory {}", dir.display()))?;
+            .with_context(|| format!("failed to read directory {}", dir.display().to_string()))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -209,7 +209,11 @@ pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<Ski
                 .unwrap_or_default();
 
             if verbose {
-                println!("  Testing skill: {} ({})", skill_name, path.display());
+                println!(
+                    "  Testing skill: {} ({})",
+                    skill_name,
+                    path.display().to_string()
+                );
             }
 
             let r = test_skill(&path, &skill_name, verbose)?;

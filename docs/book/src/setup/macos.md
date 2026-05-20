@@ -145,7 +145,7 @@ rm -rf ~/Library/Logs/ZeroClaw
 
 ## Gotchas
 
-- **Homebrew config path mismatch.** The wizard warns if it detects Homebrew — the `brew services` daemon reads `$HOMEBREW_PREFIX/var/zeroclaw/config.toml`, not `~/.zeroclaw/config.toml`. If your service is reading stale config, check which one the daemon sees.
+- **Homebrew config path mismatch.** The `brew services` daemon reads `$HOMEBREW_PREFIX/var/zeroclaw/config.toml`, not `~/.zeroclaw/config.toml`. If your service is reading stale config, check which one the daemon sees and set `ZEROCLAW_WORKSPACE` accordingly.
 - **First launch of the browser tool** downloads Chromium (~150 MB) via Playwright.
 - **Apple Silicon** and **Intel** builds are both released. The bootstrap script auto-detects. Homebrew auto-selects.
 

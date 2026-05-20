@@ -247,7 +247,7 @@ export interface ListResponse {
 }
 
 export interface PatchOp {
-  op: 'add' | 'replace' | 'remove' | 'test';
+  op: 'add' | 'replace' | 'remove' | 'test' | 'comment';
   path: string;
   value?: unknown;
   comment?: string;
@@ -319,6 +319,10 @@ export function initSection(section?: string): Promise<{ initialized: string[] }
 
 export function getDrift(): Promise<{ drifted: DriftEntry[] }> {
   return apiFetch<{ drifted: DriftEntry[] }>('/api/config/drift');
+}
+
+export function getReloadStatus(): Promise<{ pending_reload: boolean }> {
+  return apiFetch<{ pending_reload: boolean }>('/api/config/reload-status');
 }
 
 export function getOpenApiSchema(): Promise<unknown> {
@@ -449,6 +453,93 @@ export async function putPersonalityFile(
     throw new Error(`API ${response.status}: ${text || response.statusText}`);
   }
   return (await response.json()) as PersonalityPutResult;
+}
+
+// ── Skills (api_skills.rs) ───────────────────────────────────────────
+
+export interface SkillFrontmatter {
+  name: string;
+  description: string;
+  license?: string | null;
+  author?: string | null;
+  version?: string | null;
+  category?: string | null;
+}
+
+export interface SkillBundleEntry {
+  alias: string;
+  directory: string;
+  include: string[];
+  exclude: string[];
+}
+
+export interface SkillEntry {
+  bundle: string;
+  name: string;
+  directory: string;
+  frontmatter: SkillFrontmatter;
+}
+
+export interface SkillDocument {
+  bundle: string;
+  name: string;
+  frontmatter: SkillFrontmatter;
+  body: string;
+}
+
+export interface SkillCreateRequest {
+  name: string;
+  frontmatter: SkillFrontmatter;
+  body?: string;
+  no_scaffold?: boolean;
+}
+
+export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
+  return apiFetch('/api/skills/bundles');
+}
+
+export function listSkillsInBundle(alias: string): Promise<{ skills: SkillEntry[] }> {
+  return apiFetch(`/api/skills/bundles/${encodeURIComponent(alias)}/skills`);
+}
+
+export function readSkill(bundle: string, name: string): Promise<SkillDocument> {
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
+  );
+}
+
+export function writeSkill(
+  bundle: string,
+  name: string,
+  body: { frontmatter: SkillFrontmatter; body: string },
+): Promise<void> {
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function createSkill(
+  bundle: string,
+  body: SkillCreateRequest,
+): Promise<{ bundle: string; name: string; directory: string }> {
+  return apiFetch(`/api/skills/bundles/${encodeURIComponent(bundle)}/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteSkill(bundle: string, name: string, purge = false): Promise<void> {
+  const q = purge ? '?purge=true' : '';
+  return apiFetch(
+    `/api/skills/bundles/${encodeURIComponent(bundle)}/skills/${encodeURIComponent(name)}${q}`,
+    { method: 'DELETE' },
+  );
 }
 
 // ── Config schema descriptions ───────────────────────────────────────
@@ -656,6 +747,114 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+// ── Shared workspace browse ────────────────────────────────────────
+// Hard-scoped to `<install>/shared/`. The gateway adapter at
+// `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment
+// checks and walking to `zeroclaw_runtime::browse::list_directory`,
+// so the path is interpreted relative to `shared/` here too.
+
+export interface BrowseEntry {
+  name: string;
+  /** `"dir"` or `"file"`. */
+  kind: 'dir' | 'file';
+  /** Bytes; absent for directories. */
+  size?: number;
+  /** True for top-level entries the runtime owns (e.g. `sessions/`,
+   *  `IDENTITY.md`). Server-side mutations on these are rejected; the
+   *  dashboard hides delete/rename affordances when this is set. */
+  protected?: boolean;
+}
+
+export interface BrowseResponse {
+  /** Echoed cleaned path relative to `<install>/shared/`. */
+  path: string;
+  entries: BrowseEntry[];
+}
+
+export function browseShared(path = ''): Promise<BrowseResponse> {
+  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+  return apiFetch<BrowseResponse>(`/api/browse${q}`);
+}
+
+/** Create a new directory under `<install>/shared/`. Idempotent on success. */
+export function mkdirShared(path: string): Promise<{ created: string }> {
+  return apiFetch<{ created: string }>(`/api/browse/mkdir`, {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
+/** Recursively remove a directory under `<install>/shared/`. Backend refuses
+ *  protected top-level entries (skills, skill-bundles, knowledge). */
+export function rmdirShared(path: string): Promise<{ removed: string }> {
+  return apiFetch<{ removed: string }>(`/api/browse/rmdir`, {
+    method: 'DELETE',
+    body: JSON.stringify({ path }),
+  });
+}
+
+// ── Agent workspace explorer ────────────────────────────────────────────
+//
+// All four endpoints scope to `<install>/agents/{alias}/workspace/`. The
+// runtime enforces containment + protected-file refusal; the dashboard is
+// a viewer/editor on top.
+
+export interface AgentWorkspaceFileRead {
+  path: string;
+  size: number;
+  is_text: boolean;
+  /** UTF-8 text when `is_text` is true, base64 otherwise. */
+  content: string;
+  encoding: 'utf8' | 'base64';
+}
+
+export function listAgentWorkspace(alias: string, path = ''): Promise<BrowseResponse> {
+  const q = path ? `?path=${encodeURIComponent(path)}` : '';
+  return apiFetch<BrowseResponse>(
+    `/api/agents/${encodeURIComponent(alias)}/workspace/list${q}`,
+  );
+}
+
+export function readAgentWorkspaceFile(
+  alias: string,
+  path: string,
+): Promise<AgentWorkspaceFileRead> {
+  return apiFetch<AgentWorkspaceFileRead>(
+    `/api/agents/${encodeURIComponent(alias)}/workspace/read?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function deleteAgentWorkspacePath(
+  alias: string,
+  path: string,
+): Promise<{ removed: string }> {
+  return apiFetch<{ removed: string }>(
+    `/api/agents/${encodeURIComponent(alias)}/workspace/path`,
+    { method: 'DELETE', body: JSON.stringify({ path }) },
+  );
+}
+
+export function moveAgentWorkspacePath(
+  alias: string,
+  from: string,
+  to: string,
+): Promise<{ from: string; to: string }> {
+  return apiFetch<{ from: string; to: string }>(
+    `/api/agents/${encodeURIComponent(alias)}/workspace/move`,
+    { method: 'POST', body: JSON.stringify({ from, to }) },
+  );
+}
+
+export function createAgentWorkspaceDirectory(
+  alias: string,
+  path: string,
+): Promise<{ created: string }> {
+  return apiFetch<{ created: string }>(
+    `/api/agents/${encodeURIComponent(alias)}/workspace/mkdir`,
+    { method: 'POST', body: JSON.stringify({ path }) },
+  );
+}
+
 /**
  * Create a new entry under a map-keyed or list-shaped section. For Map
  * kinds the `key` is the new HashMap key; for List kinds it's the new
@@ -686,8 +885,10 @@ export function getCatalog(): Promise<CatalogResponse> {
 }
 
 export interface ModelsResponse {
-  provider: string;
+  model_provider: string;
   models: string[];
+  /** True when the provider family is local according to the gateway catalog. */
+  local: boolean;
   /** false when the upstream catalog fetch failed; form should fall back to free-text. */
   live: boolean;
 }
@@ -697,17 +898,6 @@ export function getCatalogModels(provider: string): Promise<ModelsResponse> {
     `/api/onboard/catalog/models?provider=${encodeURIComponent(provider)}`,
   );
 }
-
-// ── Type parity with the generated OpenAPI client ──────────────────
-//
-// `api-generated.ts` is produced by `cargo web gen-api` (see
-// `xtask/src/bin/web.rs`). The xtask renders the gateway's OpenAPI 3.1
-// spec in-process from `zeroclaw_gateway::openapi::build_spec()` and
-// pipes it through `openapi-typescript`. Neither the spec nor the
-// generated TS is committed — both are regenerated on every
-// `cargo web build` / `cargo web check`. tsc fails here if the
-// hand-maintained shapes below stop matching.
-export type { paths as ApiPaths, components as ApiComponents } from './api-generated';
 
 // ── Onboard sections + picker (mirrors the TUI flow) ────────────────
 
@@ -722,8 +912,24 @@ export interface SectionInfo {
   has_picker: boolean;
   /** True when the user has marked the section completed in onboard_state. */
   completed: boolean;
+  /** True when the section has enough usable config for first-run setup. */
+  ready: boolean;
   /** Display group for the sidebar (`Onboarding`, `Agent`, `Tools`, ...). */
   group: string;
+  /** True when this section is part of the `/onboard` wizard (driven by
+   *  the canonical const in `zeroclaw_config::onboarding`). */
+  is_onboarding: boolean;
+  /** Editor shape (`direct_form` / `one_tier_alias_map` / `typed_family_map`
+   *  / `backend_picker`). Server-emitted from `WizardSection::shape()` so
+   *  the dashboard explorer and the onboard wizard render the same UI for
+   *  the same section without hardcoded section keys on either side.
+   *  `null` / `undefined` for sections that aren't part of the canonical wizard. */
+  shape?:
+    | 'direct_form'
+    | 'one_tier_alias_map'
+    | 'typed_family_map'
+    | 'backend_picker'
+    | null;
 }
 
 export interface SectionsResponse {
@@ -735,17 +941,36 @@ export function getSections(): Promise<SectionsResponse> {
 }
 
 export interface OnboardStatusResponse {
-  /** True when the user is on a fresh install (no completed sections AND
-   * no provider configured). The Dashboard uses this to redirect first
-   * visits to `/onboard`. */
+  /** True when no enabled agent can reply yet. */
   needs_onboarding: boolean;
-  /** Stable machine-readable reason: `fresh_install`, `has_provider`, or
-   * `has_completed_sections`. */
+  /** Stable machine-readable reason: `fresh_install`, `incomplete_agent`, or
+   * `has_dispatchable_agent`. */
   reason: string;
+  /** True once the operator has entered any setup state. */
+  has_partial_state: boolean;
+  /** Human-readable readiness failures for the finish gate. */
+  missing: string[];
 }
 
 export function getOnboardStatus(): Promise<OnboardStatusResponse> {
   return apiFetch<OnboardStatusResponse>('/api/onboard/status');
+}
+
+export interface AgentOptionsResponse {
+  channels: string[];
+  channel_types: string[];
+  model_providers: string[];
+  risk_profiles: string[];
+  runtime_profiles: string[];
+  skill_bundles: string[];
+  knowledge_bundles: string[];
+  mcp_bundles: string[];
+  agents: string[];
+  memory_namespaces?: string[];
+}
+
+export function getAgentOptions(): Promise<AgentOptionsResponse> {
+  return apiFetch<AgentOptionsResponse>('/api/onboard/agent-options');
 }
 
 export interface PickerItem {
@@ -773,11 +998,55 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(section: string, key: string): Promise<SelectItemResponse> {
+export function selectSectionItem(
+  section: string,
+  key: string,
+  alias?: string,
+): Promise<SelectItemResponse> {
+  const body = alias ? JSON.stringify({ alias }) : undefined;
   return apiFetch<SelectItemResponse>(
     `/api/onboard/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body,
+    },
   );
+}
+
+// ── Map-keyed alias CRUD ─────────────────────────────────────────────
+
+export interface MapKeysResponse {
+  path: string;
+  keys: string[];
+}
+
+export function getMapKeys(path: string): Promise<MapKeysResponse> {
+  return apiFetch<MapKeysResponse>(
+    `/api/config/map-keys?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export interface MapKeyMutResponse {
+  path: string;
+  key: string;
+  renamed?: boolean;
+  created?: boolean;
+}
+
+export function deleteMapKey(path: string, key: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>(
+    `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function renameMapKey(path: string, from: string, to: string): Promise<MapKeyMutResponse> {
+  return apiFetch<MapKeyMutResponse>('/api/config/rename-map-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, from, to }),
+  });
 }
 
 // ── Daemon admin (localhost-only on the gateway) ─────────────────────
@@ -821,9 +1090,18 @@ export function getCronJobs(): Promise<CronJob[]> {
   });
 }
 
+export interface CronDelivery {
+  mode: 'none' | 'announce';
+  channel?: string;
+  to?: string;
+  best_effort?: boolean;
+}
+
 export function addCronJob(body: {
+  agent: string;
   name?: string;
   schedule: string;
+  tz?: string;
   command?: string;
   job_type?: string;
   prompt?: string;
@@ -831,6 +1109,7 @@ export function addCronJob(body: {
   session_target?: string;
   allowed_tools?: string[];
   enabled?: boolean;
+  delivery?: CronDelivery;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>('/api/cron', {
     method: 'POST',
@@ -863,7 +1142,7 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 
 export function patchCronJob(
   id: string,
-  patch: { name?: string; schedule?: string; command?: string; prompt?: string },
+  patch: { name?: string; schedule?: string; tz?: string; clear_tz?: boolean; command?: string; prompt?: string },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
     `/api/cron/${encodeURIComponent(id)}`,
@@ -938,10 +1217,12 @@ export function runDoctor(): Promise<DiagResult[]> {
 export function getMemory(
   query?: string,
   category?: string,
+  agent?: string,
 ): Promise<MemoryEntry[]> {
   const params = new URLSearchParams();
   if (query) params.set('query', query);
   if (category) params.set('category', category);
+  if (agent) params.set('agent', agent);
   const qs = params.toString();
   return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
     (data) => {
@@ -955,15 +1236,17 @@ export function storeMemory(
   key: string,
   content: string,
   category?: string,
+  agent?: string,
 ): Promise<void> {
   return apiFetch<unknown>('/api/memory', {
     method: 'POST',
-    body: JSON.stringify({ key, content, category }),
+    body: JSON.stringify({ key, content, category, agent }),
   }).then(() => undefined);
 }
 
-export function deleteMemory(key: string): Promise<void> {
-  return apiFetch<void>(`/api/memory/${encodeURIComponent(key)}`, {
+export function deleteMemory(key: string, agent?: string): Promise<void> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : '';
+  return apiFetch<void>(`/api/memory/${encodeURIComponent(key)}${qs}`, {
     method: 'DELETE',
   });
 }
@@ -972,8 +1255,22 @@ export function deleteMemory(key: string): Promise<void> {
 // Cost
 // ---------------------------------------------------------------------------
 
-export function getCost(): Promise<CostSummary> {
-  return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
+export function getCost(from?: Date, to?: Date): Promise<CostSummary> {
+  const params = new URLSearchParams();
+  if (from) params.set('from', from.toISOString());
+  if (to) params.set('to', to.toISOString());
+  const qs = params.toString();
+  const url = qs ? `/api/cost?${qs}` : '/api/cost';
+  return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
+    unwrapField(data, 'cost'),
+  );
+}
+
+/** Cost summary filtered to a single agent alias. Backed by the same
+ * `/api/cost` endpoint as {@link getCost} via `?agent=<alias>`. */
+export function getCostForAgent(alias: string): Promise<CostSummary> {
+  const url = `/api/cost?agent=${encodeURIComponent(alias)}`;
+  return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
     unwrapField(data, 'cost'),
   );
 }
@@ -1000,6 +1297,14 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
   );
 }
 
+/** Delete a persisted session by its full DB key. */
+export function deleteSession(sessionKey: string): Promise<{ deleted: boolean }> {
+  return apiFetch<{ deleted: boolean }>(
+    `/api/sessions/${encodeURIComponent(sessionKey)}`,
+    { method: 'DELETE' },
+  );
+}
+
 /**
  * Cancel an in-flight agent turn for a session. Idempotent — returns
  * `{ status: "no_active_response" }` when the session is idle.
@@ -1021,6 +1326,73 @@ export function getChannels(): Promise<ChannelDetail[]> {
     return Array.isArray(result) ? result : [];
   });
 }
+
+// ---------------------------------------------------------------------------
+// Logs (persisted JSONL via zeroclaw-log)
+// ---------------------------------------------------------------------------
+
+/** Mirrors `zeroclaw_log::event::LogEvent` (Rust is the source of truth). */
+export interface LogEvent {
+  id: string;
+  '@timestamp': string;
+  severity_number: number;
+  severity_text: string;
+  event: { category: string; action: string; outcome?: string };
+  service?: { name: string; version: string };
+  trace_id?: string | null;
+  span_id?: string | null;
+  zeroclaw: Record<string, string> & { duration_ms?: number };
+  message?: string;
+  attributes?: Record<string, unknown>;
+  schema_version?: number;
+}
+
+export interface LogsResponse {
+  events: LogEvent[];
+  /** `[timestamp, id]` to feed back as `until_ts` + `until_id` for older. */
+  next_cursor: [string, string] | null;
+  at_end: boolean;
+  daemon_started_at: string;
+  /** Canonical attribution-field names the daemon currently emits. Sourced
+   *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so
+   *  the UI never enumerates schema fields itself. */
+  attribution_keys: string[];
+}
+
+/** Non-attribution top-level filters. Per-attribution exact matches live
+ *  in `field_eq` — any `zeroclaw.*` key the daemon emits is valid there. */
+export interface LogsQueryParams {
+  since_ts?: string;
+  until_ts?: string;
+  until_id?: string;
+  action?: string;
+  category?: string;
+  outcome?: string;
+  severity_min?: number;
+  trace_id?: string;
+  q?: string;
+  hide_internal?: boolean;
+  limit?: number;
+  field_eq?: Record<string, string>;
+}
+
+export function getLogs(params: LogsQueryParams = {}): Promise<LogsResponse> {
+  const usp = new URLSearchParams();
+  const { field_eq, ...rest } = params;
+  for (const [key, value] of Object.entries(rest)) {
+    if (value === undefined || value === null || value === '') continue;
+    usp.set(key, String(value));
+  }
+  if (field_eq) {
+    for (const [key, value] of Object.entries(field_eq)) {
+      if (value === undefined || value === null || value === '') continue;
+      usp.set(key, value);
+    }
+  }
+  const qs = usp.toString();
+  return apiFetch<LogsResponse>(`/api/logs${qs ? `?${qs}` : ''}`);
+}
+
 
 // ---------------------------------------------------------------------------
 // CLI Tools

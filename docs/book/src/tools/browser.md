@@ -39,7 +39,7 @@ See the [Config reference](../reference/config.md) for all browser fields and de
 ### 3. Test
 
 ```bash
-echo "Open https://example.com and tell me what it says" | zeroclaw agent
+echo "Open https://example.com and tell me what it says" | zeroclaw agent -a assistant
 ```
 
 ## VNC Setup (GUI Access)
@@ -148,13 +148,13 @@ agent-browser close
 
 ```bash
 # Content extraction
-echo "Open https://example.com and summarize it" | zeroclaw agent
+echo "Open https://example.com and summarize it" | zeroclaw agent -a assistant
 
 # Navigation
-echo "Go to https://github.com/trending and list the top 3 repos" | zeroclaw agent
+echo "Go to https://github.com/trending and list the top 3 repos" | zeroclaw agent -a assistant
 
 # Form interaction
-echo "Go to Wikipedia, search for 'Rust programming language', and summarize" | zeroclaw agent
+echo "Go to Wikipedia, search for 'Rust programming language', and summarize" | zeroclaw agent -a assistant
 ```
 
 ## Troubleshooting

@@ -43,8 +43,8 @@ MQTT payload is forwarded into SOP event payload (`event.payload`), then shown i
 
 ### 3.1 Endpoints
 
-- **`POST /sop/{*rest}`**: SOP-only endpoint. Returns `404` if no SOP matches. No LLM fallback.
-- **`POST /webhook`**: chat endpoint. It attempts SOP dispatch first; if no match, falls back to normal LLM flow.
+- **`POST /sop/{*rest}`**: SOP-only endpoint. Returns `404` if no SOP matches.
+- **`POST /webhook`**: chat endpoint. SOP dispatch runs first; on no match, the request enters the normal LLM flow.
 
 Path matching is exact against configured webhook trigger path.
 

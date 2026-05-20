@@ -1,4 +1,4 @@
-//! Read/write endpoints for the per-workspace personality markdown files
+//! Read/write endpoints for per-agent personality markdown files
 //! (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`,
 //! `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md`).
 //!
@@ -9,12 +9,13 @@
 //! Sandbox: filenames are matched against the static `EDITABLE_PERSONALITY_FILES`
 //! allowlist re-exported from the runtime crate. The on-disk path is
 //! built from a `&'static str` taken from that allowlist plus the
-//! current `workspace_dir`, so user-supplied path components cannot
-//! escape the workspace.
+//! agent's workspace dir resolved via `Config::agent_workspace_dir`,
+//! so user-supplied path components cannot escape the workspace.
 //!
-//! The `agent` query parameter is reserved for #5890 (multi-agent
-//! workspaces). It is accepted on every endpoint and ignored today;
-//! when #5890 lands it will validate an alias and append a subdir.
+//! The `agent` query parameter is required and selects which agent's
+//! workspace the endpoint operates against. Each agent has its own
+//! `<install>/agents/<alias>/workspace/` per the v0.8.0 multi-agent
+//! layout.
 
 use axum::{
     Json,
@@ -35,7 +36,8 @@ use super::api::require_auth;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentQuery {
-    /// Reserved for #5890. Accepted today, has no effect.
+    /// Agent alias selecting which `agents/<alias>/workspace/` the
+    /// endpoint operates against. Required for read/write/index.
     #[serde(default)]
     pub agent: Option<String>,
 }
@@ -58,7 +60,9 @@ pub struct TemplateQuery {
     /// a memory-disabled workspace.
     #[serde(default)]
     pub include_memory: Option<bool>,
-    /// Reserved for #5890.
+    /// Agent alias for which the template is being rendered. When
+    /// provided and present in `[agents]`, the agent's display name is
+    /// folded into the template context as the default for `agent_name`.
     #[serde(default)]
     pub agent: Option<String>,
 }
@@ -143,10 +147,36 @@ fn validate_filename(
         })
 }
 
-fn personality_path(workspace_dir: &Path, _agent: Option<&str>, filename: &'static str) -> PathBuf {
-    // `_agent` is reserved for #5890. Today every personality file
-    // lives at the workspace root.
+fn personality_path(workspace_dir: &Path, filename: &'static str) -> PathBuf {
     workspace_dir.join(filename)
+}
+
+/// Resolve the per-agent workspace directory for personality I/O. Returns
+/// an error response when `agent` is missing or unknown so callers can
+/// short-circuit before touching disk.
+fn resolve_agent_workspace(
+    state: &AppState,
+    agent: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let Some(alias) = agent.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing required `agent` query parameter",
+            })),
+        ));
+    };
+    let cfg = state.config.read();
+    if !cfg.agents.contains_key(alias) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown agent alias",
+                "agent": alias,
+            })),
+        ));
+    }
+    Ok(cfg.agent_workspace_dir(alias))
 }
 
 fn mtime_ms_of(meta: &std::fs::Metadata) -> Option<i64> {
@@ -170,19 +200,20 @@ fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
 
 // ── Handlers ────────────────────────────────────────────────────────
 
-/// GET /api/personality — index of all allowlist files in the active workspace.
+/// GET /api/personality?agent=<alias> — index of all allowlist files in the
+/// named agent's workspace.
 pub async fn handle_index(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(_q): Query<AgentQuery>,
+    Query(q): Query<AgentQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
 
     let files: Vec<PersonalityIndexEntry> = EDITABLE_PERSONALITY_FILES
@@ -230,11 +261,11 @@ pub async fn handle_get(
         Err(e) => return e.into_response(),
     };
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
+    let path = personality_path(&workspace_dir, allowed);
 
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
@@ -297,11 +328,11 @@ pub async fn handle_put(
             .into_response();
     }
 
-    let workspace_dir = {
-        let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+    let workspace_dir = match resolve_agent_workspace(&state, q.agent.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
     };
-    let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
+    let path = personality_path(&workspace_dir, allowed);
 
     // Disk-drift guard: if the editor told us what mtime it saw, reject
     // the write when disk has moved since.
@@ -374,14 +405,23 @@ pub async fn handle_templates(
         return e.into_response();
     }
 
-    let memory_default_enabled = {
-        let cfg = state.config.lock();
-        cfg.memory.backend.as_str() != "none"
+    let (memory_default_enabled, agent_display_default) = {
+        let cfg = state.config.read();
+        let mem = cfg.memory.backend.as_str() != "none";
+        let display = q
+            .agent
+            .as_deref()
+            .map(str::to_string)
+            .filter(|alias| cfg.agents.contains_key(alias));
+        (mem, display)
     };
 
     let defaults = TemplateContext::default();
     let ctx = TemplateContext {
-        agent: q.agent_name.unwrap_or(defaults.agent),
+        agent: q
+            .agent_name
+            .or(agent_display_default)
+            .unwrap_or(defaults.agent),
         user: q.user_name.unwrap_or(defaults.user),
         timezone: q.timezone.unwrap_or(defaults.timezone),
         communication_style: q
@@ -428,15 +468,8 @@ mod tests {
 
     #[test]
     fn personality_path_joins_workspace_root() {
-        let p = personality_path(Path::new("/tmp/ws"), None, "SOUL.md");
+        let p = personality_path(Path::new("/tmp/ws"), "SOUL.md");
         assert_eq!(p, Path::new("/tmp/ws/SOUL.md"));
-    }
-
-    #[test]
-    fn personality_path_ignores_agent_for_now() {
-        let with_agent = personality_path(Path::new("/tmp/ws"), Some("nova"), "SOUL.md");
-        let without = personality_path(Path::new("/tmp/ws"), None, "SOUL.md");
-        assert_eq!(with_agent, without);
     }
 
     #[test]
