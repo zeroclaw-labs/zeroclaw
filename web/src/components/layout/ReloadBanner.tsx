@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { getDrift, getReloadStatus, type DriftEntry } from '@/lib/api';
 import ReloadDaemonButton from '@/components/onboard/ReloadDaemonButton';
@@ -25,6 +26,7 @@ interface BannerState {
 export default function ReloadBanner() {
   const [state, setState] = useState<BannerState | null>(null);
   const [pollKey, setPollKey] = useState(0);
+  const location = useLocation();
 
   useEffect(() => {
     let cancelled = false;
@@ -57,6 +59,29 @@ export default function ReloadBanner() {
 
   const { pendingReload, drifted } = state;
   const driftedCount = drifted.length;
+  const isOnboarding = location.pathname.startsWith('/onboard');
+  if (isOnboarding && pendingReload && driftedCount === 0) {
+    return (
+      <div
+        className="px-4 py-3 border-b flex items-start gap-3"
+        style={{
+          background: 'rgba(14, 165, 233, 0.06)',
+          borderColor: 'rgba(14, 165, 233, 0.2)',
+        }}
+      >
+        <AlertTriangle
+          className="h-4 w-4 flex-shrink-0 mt-0.5"
+          style={{ color: 'var(--pc-accent)' }}
+        />
+        <p
+          className="text-sm font-medium"
+          style={{ color: 'var(--pc-text-primary)' }}
+        >
+          Changes saved. Continue onboarding.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div

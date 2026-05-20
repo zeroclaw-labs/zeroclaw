@@ -678,6 +678,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_code': 'Pairing Code',
     'auth.pair_button': 'Pair',
     'auth.logout': 'Logout',
+    'auth.logout_confirm': 'Log out of ZeroClaw?',
     'auth.pairing_success': 'Pairing successful!',
     'auth.pairing_failed': 'Pairing failed. Please try again.',
     'auth.enter_code': 'Enter your pairing code to connect to the agent.',

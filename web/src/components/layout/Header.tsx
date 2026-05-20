@@ -38,6 +38,12 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   const titleKey = routeTitles[location.pathname];
   const pageTitle = titleKey ? t(titleKey) : '';
 
+  const handleLogout = () => {
+    if (window.confirm(t('auth.logout_confirm'))) {
+      logout();
+    }
+  };
+
   // Close dropdown when clicking outside
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -175,7 +181,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
           {/* Logout */}
           <button
             type="button"
-            onClick={logout}
+            onClick={handleLogout}
             className="h-9 px-3 rounded-xl text-xs transition-all flex items-center gap-1.5"
             style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
             onMouseEnter={(e) => {

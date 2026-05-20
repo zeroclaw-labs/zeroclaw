@@ -164,6 +164,79 @@ function fieldShortLabel(entry: ListResponseEntry): string {
   return entry.path.split('.').pop()!.replace(/[-_]/g, ' ');
 }
 
+function setupFieldPriority(entry: ListResponseEntry): number {
+  const leaf = entry.path.split('.').pop() ?? '';
+  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
+    const order = ['model', 'api-key', 'requires-openai-auth', 'uri'];
+    const idx = order.indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (/^agents\.[^.]+\./.test(entry.path)) {
+    const order = ['enabled', 'model-provider', 'risk-profile', 'runtime-profile', 'channels'];
+    const idx = order.indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (entry.path === 'memory.backend') return 0;
+  if (/^risk-profiles\.[^.]+\./.test(entry.path)) {
+    const idx = ['approval-mode', 'allowed-commands', 'sandbox-mode'].indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  if (/^runtime-profiles\.[^.]+\./.test(entry.path)) {
+    const idx = ['agentic', 'max-iterations', 'timeout-secs', 'max-cost-usd'].indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
+  return 100;
+}
+
+function setupRequirement(entry: ListResponseEntry): { label: string; tone: 'required' | 'choice' | 'optional' } | null {
+  const leaf = entry.path.split('.').pop() ?? '';
+  if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
+    const localProvider = isLocalModelProviderPath(entry.path);
+    if (leaf === 'model') return { label: 'Required', tone: 'required' };
+    if (leaf === 'api-key') {
+      return localProvider
+        ? { label: 'Optional for remote auth', tone: 'optional' }
+        : { label: 'Required for API-key auth', tone: 'required' };
+    }
+    if (leaf === 'requires-openai-auth') return { label: 'Auth option', tone: 'choice' };
+    if (leaf === 'uri') return { label: 'Endpoint option', tone: 'choice' };
+    return { label: 'Optional', tone: 'optional' };
+  }
+  const topLevelAgentField = entry.path.match(/^agents\.[^.]+\.([^.]+)$/)?.[1] ?? null;
+  if (topLevelAgentField) {
+    if (['enabled', 'model-provider', 'risk-profile', 'runtime-profile'].includes(topLevelAgentField)) {
+      return { label: 'Required', tone: 'required' };
+    }
+    return { label: 'Optional', tone: 'optional' };
+  }
+  if (/^risk-profiles\.[^.]+\./.test(entry.path) || /^runtime-profiles\.[^.]+\./.test(entry.path)) {
+    return { label: 'Advanced', tone: 'optional' };
+  }
+  if (entry.path === 'memory.backend') return { label: 'Recommended', tone: 'choice' };
+  return null;
+}
+
+function isLocalModelProviderPath(path: string): boolean {
+  const provider = (path.match(/^providers\.models\.([^.]+)\./)?.[1] ?? '').replace(/-/g, '_');
+  return new Set([
+    'ollama',
+    'lmstudio',
+    'llamacpp',
+    'sglang',
+    'vllm',
+    'osaurus',
+    'atomic_chat',
+    'gemini_cli',
+    'opencode',
+    'kilocli',
+    'synthetic',
+  ]).has(provider);
+}
+
+function modelFallbackExample(path: string): string {
+  return isLocalModelProviderPath(path) ? 'llama3.2' : 'claude-sonnet-4-5-20251101';
+}
+
 function defaultInputValue(entry: ListResponseEntry): string {
   const v = entry.value;
   if (entry.kind === 'string-array' || entry.kind === 'object-array') {
@@ -559,14 +632,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
   const sortedEntries = useMemo(() => {
     // Stable order: `enabled` first (drives whether anything below it
-    // matters), then secrets (most-needed), then alphabetical by short
-    // label. Curating `enabled` is safe — it's a load-bearing standard
-    // field name across every section that has on/off semantics.
+    // matters), then first-run required fields, then secrets, then
+    // alphabetical by short label. Curating these standard leaves keeps
+    // onboarding from burying "model" or agent refs below advanced knobs.
     const isEnabledLeaf = (e: ListResponseEntry) => e.path.endsWith('.enabled') || e.path === 'enabled';
     return [...entries].sort((a, b) => {
       const ea = isEnabledLeaf(a);
       const eb = isEnabledLeaf(b);
       if (ea !== eb) return ea ? -1 : 1;
+      const pa = setupFieldPriority(a);
+      const pb = setupFieldPriority(b);
+      if (pa !== pb) return pa - pb;
       if (a.is_secret !== b.is_secret) return a.is_secret ? -1 : 1;
       return fieldShortLabel(a).localeCompare(fieldShortLabel(b));
     });
@@ -867,6 +943,7 @@ interface FieldRowProps {
 
 function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift, tombstoned, onUndoTombstone }: FieldRowProps) {
   const renderer = rendererFor(entry);
+  const requirement = setupRequirement(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
   // Per-alias model field — `providers.models.<type>.<alias>.model`.
@@ -999,6 +1076,34 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             title={entry.type_hint}
           >
             {entry.path}
+            {requirement && (
+              <span
+                className="ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide font-sans"
+                style={{
+                  color:
+                    requirement.tone === 'required'
+                      ? '#fca5a5'
+                      : requirement.tone === 'choice'
+                        ? '#67e8f9'
+                        : 'var(--pc-text-muted)',
+                  background:
+                    requirement.tone === 'required'
+                      ? 'rgba(239, 68, 68, 0.12)'
+                      : requirement.tone === 'choice'
+                        ? 'rgba(34, 211, 238, 0.10)'
+                        : 'var(--pc-bg-surface-subtle)',
+                  border: '1px solid',
+                  borderColor:
+                    requirement.tone === 'required'
+                      ? 'rgba(239, 68, 68, 0.24)'
+                      : requirement.tone === 'choice'
+                        ? 'rgba(34, 211, 238, 0.20)'
+                        : 'var(--pc-border)',
+                }}
+              >
+                {requirement.label}
+              </span>
+            )}
             {entry.is_secret && (
               <span
                 className="ml-2 text-xs font-sans"
@@ -1083,7 +1188,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             >
               Could not fetch model catalog for this provider. Type the
               identifier from your provider's docs (e.g.{' '}
-              <code>claude-sonnet-4-5-20251101</code>).
+              <code>{modelFallbackExample(entry.path)}</code>).
             </p>
           </>
         ) : isProviderModelField && providerModels === null ? (
@@ -1825,4 +1930,3 @@ function formatDriftValue(value: unknown): string {
     return String(value);
   }
 }
-

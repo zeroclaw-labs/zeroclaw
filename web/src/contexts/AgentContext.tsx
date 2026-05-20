@@ -58,6 +58,34 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
+const LOCAL_PROVIDER_NAMES: Record<string, string> = {
+  atomic_chat: 'Atomic Chat',
+  gemini_cli: 'Gemini CLI',
+  kilocli: 'KiloCLI',
+  lmstudio: 'LM Studio',
+  llamacpp: 'llama.cpp server',
+  ollama: 'Ollama',
+  opencode: 'OpenCode',
+  osaurus: 'Osaurus',
+  sglang: 'SGLang',
+  synthetic: 'Synthetic',
+  vllm: 'vLLM',
+};
+
+function friendlyAgentError(message?: string): string {
+  const raw = message?.trim() || t('agent.unknown_error');
+  const localConnectFailure = raw.match(
+    /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
+  );
+  if (localConnectFailure) {
+    const provider = localConnectFailure[1] ?? '';
+    const model = localConnectFailure[2] ?? 'the selected model';
+    const url = localConnectFailure[3] ?? 'the configured endpoint';
+    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
+  }
+  return raw;
+}
 
 export interface AgentProviderProps {
   /** Configured agent alias this provider is bound to. The WebSocket
@@ -319,18 +347,19 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'error':
+        const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
           {
             id: generateUUID(),
             role: 'agent',
-            content: `${t('agent.error_prefix')} ${msg.message ?? t('agent.unknown_error')}`,
+            content: `${t('agent.error_prefix')} ${friendlyMessage}`,
             timestamp: new Date(),
           },
         ]);
         if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${msg.message}. ${t('agent.check_provider_settings')}.`);
+          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
         } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
