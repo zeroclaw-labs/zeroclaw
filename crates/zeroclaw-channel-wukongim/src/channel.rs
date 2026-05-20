@@ -849,6 +849,18 @@ impl Channel for WuKongIMChannel {
             grouped.entry(key).or_default().push(msg);
         }
 
+        for ((channel_id, channel_type), messages) in grouped {
+            tracing::info!(
+                "WuKongIM: processing offline batch for channel={}:{} count={}",
+                channel_id,
+                channel_type,
+                messages.len()
+            );
+            if let Err(e) = self.process_offline_batch(messages, &tx).await {
+                tracing::warn!("WuKongIM: offline batch processing failed: {}", e);
+            }
+        }
+
         // 4. Start Live Listening.
         //    INVARIANT: this loop must NOT await any operation that ultimately
         //    waits on `pending_responses` — those oneshots are resolved here
