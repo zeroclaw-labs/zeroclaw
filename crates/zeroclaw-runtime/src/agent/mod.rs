@@ -38,6 +38,21 @@ pub(crate) fn set_runtime_approved_arg(
     }
 }
 
+/// Borrow-only Attributable holding an agent alias.
+/// Used by entry points (loop_::run, process_message, cron dispatch)
+/// that don't construct a full `Agent` but still need to open an
+/// `attribution_span!` carrying the agent's role + alias.
+pub struct AgentAttribution<'a>(pub &'a str);
+
+impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Agent
+    }
+    fn alias(&self) -> &str {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

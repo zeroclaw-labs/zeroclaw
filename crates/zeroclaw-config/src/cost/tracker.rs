@@ -1,7 +1,9 @@
-use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
+use super::types::{
+    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+};
 use crate::schema::CostConfig;
-use anyhow::{Context, Result, anyhow};
-use chrono::{Datelike, NaiveDate, Utc};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +25,10 @@ impl CostTracker {
         let storage_path = resolve_storage_path(workspace_dir)?;
 
         let storage = CostStorage::new(&storage_path).with_context(|| {
-            format!("Failed to open cost storage at {}", storage_path.display())
+            format!(
+                "Failed to open cost storage at {}",
+                storage_path.display().to_string()
+            )
         })?;
 
         Ok(Self {
@@ -54,9 +59,14 @@ impl CostTracker {
         }
 
         if !estimated_cost_usd.is_finite() || estimated_cost_usd < 0.0 {
-            return Err(anyhow!(
-                "Estimated cost must be a finite, non-negative value"
-            ));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"estimated_cost_usd": estimated_cost_usd})),
+                "cost budget check rejected: estimated cost is not finite or is negative"
+            );
+            anyhow::bail!("Estimated cost must be a finite, non-negative value");
         }
 
         let mut storage = self.lock_storage();
@@ -106,19 +116,40 @@ impl CostTracker {
         Ok(BudgetCheck::Allowed)
     }
 
-    /// Record a usage event.
+    /// Record a usage event without per-agent attribution.
     pub fn record_usage(&self, usage: TokenUsage) -> Result<()> {
+        self.record_usage_with_agent(usage, None)
+    }
+
+    /// Record a usage event attributed to a specific agent alias. When
+    /// `[cost].track_per_agent` is false the alias is dropped before
+    /// persistence.
+    pub fn record_usage_with_agent(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+    ) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
 
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
-            return Err(anyhow!(
-                "Token usage cost must be a finite, non-negative value"
-            ));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"cost_usd": usage.cost_usd})),
+                "token usage record rejected: cost is not finite or is negative"
+            );
+            anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
 
-        let record = CostRecord::new(&self.session_id, usage);
+        let effective_alias = if self.config.track_per_agent {
+            agent_alias.map(str::to_string)
+        } else {
+            None
+        };
+        let record = CostRecord::with_agent(&self.session_id, effective_alias, usage);
 
         // Persist first for durability guarantees.
         {
@@ -133,32 +164,122 @@ impl CostTracker {
         Ok(())
     }
 
-    /// Get the current cost summary.
+    /// Get the current cost summary. When `[cost].track_per_agent` is
+    /// enabled, the response includes a `by_agent` rollup over today's
+    /// records.
     pub fn get_summary(&self) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost) = {
+        self.get_summary_filtered(None)
+    }
+
+    /// Filter persisted records by `[from, to)` (either side `None` is
+    /// unbounded) and roll up by_model / by_agent / window totals.
+    /// Bounds come from the caller (the dashboard computes them in the
+    /// operator's local timezone); the tracker doesn't decide what
+    /// "today" means.
+    pub fn get_summary_in_bounds(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<CostSummary> {
+        let (daily_cost, monthly_cost, records) = {
             let mut storage = self.lock_storage();
-            storage.get_aggregated_costs()?
+            let (d, m) = storage.get_aggregated_costs()?;
+            let recs = storage.records_in_bounds(from, to)?;
+            (d, m, recs)
         };
-
-        let session_costs = self.lock_session_costs();
-        let session_cost: f64 = session_costs
-            .iter()
-            .map(|record| record.usage.cost_usd)
-            .sum();
-        let total_tokens: u64 = session_costs
-            .iter()
-            .map(|record| record.usage.total_tokens)
-            .sum();
-        let request_count = session_costs.len();
-        let by_model = build_session_model_stats(&session_costs);
-
+        let total_cost: f64 = records.iter().map(|r| r.usage.cost_usd).sum();
+        let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
+        let request_count = records.len();
+        let by_model = build_model_stats(records.iter());
+        let by_agent = if self.config.track_per_agent {
+            build_agent_stats(&records)
+        } else {
+            HashMap::new()
+        };
         Ok(CostSummary {
-            session_cost_usd: session_cost,
+            session_cost_usd: total_cost,
             daily_cost_usd: daily_cost,
             monthly_cost_usd: monthly_cost,
             total_tokens,
             request_count,
             by_model,
+            by_agent,
+        })
+    }
+
+    /// Get the current cost summary scoped to a single agent alias. The
+    /// session/day/month figures and `by_model` are filtered to records
+    /// attributed to that alias; `by_agent` is left empty since the
+    /// caller already chose the dimension.
+    pub fn get_summary_for_agent(&self, agent_alias: &str) -> Result<CostSummary> {
+        self.get_summary_filtered(Some(agent_alias))
+    }
+
+    fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
+        let (daily_cost, monthly_cost, daily_records) = {
+            let mut storage = self.lock_storage();
+            let (d, m) = storage.get_aggregated_costs()?;
+            // Always pull daily_records: per-model and per-agent rollups
+            // both want today's slice. The optional-skip optimisation tied
+            // to `track_per_agent` made the by-model rollup session-scoped,
+            // which surprised operators after a daemon restart and clashes
+            // with the daily totals in the same response.
+            (d, m, storage.daily_records()?)
+        };
+
+        let session_costs = self.lock_session_costs();
+        let matches_agent = |record: &CostRecord| match agent_filter {
+            Some(alias) => record.agent_alias.as_deref() == Some(alias),
+            None => true,
+        };
+
+        // Session view is kept on `CostSummary` for backward-compat with
+        // callers that still want it (CLI `cost` command, etc.), but the
+        // dashboard reads the daily-scoped rollups below.
+        let scoped: Vec<&CostRecord> = session_costs.iter().filter(|r| matches_agent(r)).collect();
+        let session_cost: f64 = scoped.iter().map(|record| record.usage.cost_usd).sum();
+        let total_tokens: u64 = scoped.iter().map(|record| record.usage.total_tokens).sum();
+        let request_count = scoped.len();
+
+        // Daily-scoped per-model rollup. Filter by agent when scoped.
+        let model_records: Vec<&CostRecord> =
+            daily_records.iter().filter(|r| matches_agent(r)).collect();
+        let by_model = build_model_stats(model_records.iter().copied());
+
+        let (daily_total, monthly_total, by_agent) = if let Some(alias) = agent_filter {
+            // Per-agent view: re-aggregate day/month from persisted records.
+            let mut daily_total = 0.0;
+            let mut monthly_total = 0.0;
+            let today = Utc::now().date_naive();
+            let now = Utc::now();
+            for record in &daily_records {
+                if record.agent_alias.as_deref() != Some(alias) {
+                    continue;
+                }
+                let ts = record.usage.timestamp.naive_utc();
+                if ts.date() == today {
+                    daily_total += record.usage.cost_usd;
+                }
+                if ts.year() == now.year() && ts.month() == now.month() {
+                    monthly_total += record.usage.cost_usd;
+                }
+            }
+            (daily_total, monthly_total, HashMap::new())
+        } else if self.config.track_per_agent {
+            let by_agent = build_agent_stats(&daily_records);
+            (daily_cost, monthly_cost, by_agent)
+        } else {
+            (daily_cost, monthly_cost, HashMap::new())
+        };
+
+        Ok(CostSummary {
+            session_cost_usd: session_cost,
+            daily_cost_usd: daily_total,
+            monthly_cost_usd: monthly_total,
+            total_tokens,
+            request_count,
+            by_model,
+            by_agent,
         })
     }
 
@@ -195,7 +316,16 @@ impl CostTracker {
                 match Self::new(config, workspace_dir) {
                     Ok(ct) => Some(Arc::new(ct)),
                     Err(e) => {
-                        tracing::warn!("Failed to initialize global cost tracker: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to initialize global cost tracker"
+                        );
                         None
                     }
                 }
@@ -210,20 +340,29 @@ fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
 
     if !storage_path.exists() && legacy_path.exists() {
         if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create directory {}",
+                    parent.display().to_string()
+                )
+            })?;
         }
 
         if let Err(error) = fs::rename(&legacy_path, &storage_path) {
-            tracing::warn!(
-                "Failed to move legacy cost storage from {} to {}: {error}; falling back to copy",
-                legacy_path.display(),
-                storage_path.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Failed to move legacy cost storage from {} to {}: {error}; falling back to copy",
+                    legacy_path.display().to_string(),
+                    storage_path.display().to_string()
+                )
             );
             fs::copy(&legacy_path, &storage_path).with_context(|| {
                 format!(
                     "Failed to copy legacy cost storage from {} to {}",
-                    legacy_path.display(),
+                    legacy_path.display().to_string(),
                     storage_path.display()
                 )
             })?;
@@ -233,25 +372,64 @@ fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
     Ok(storage_path)
 }
 
-fn build_session_model_stats(session_costs: &[CostRecord]) -> HashMap<String, ModelStats> {
+fn build_model_stats<'a, I>(records: I) -> HashMap<String, ModelStats>
+where
+    I: IntoIterator<Item = &'a CostRecord>,
+{
     let mut by_model: HashMap<String, ModelStats> = HashMap::new();
 
-    for record in session_costs {
+    for record in records {
         let entry = by_model
             .entry(record.usage.model.clone())
             .or_insert_with(|| ModelStats {
                 model: record.usage.model.clone(),
                 cost_usd: 0.0,
                 total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
                 request_count: 0,
             });
 
         entry.cost_usd += record.usage.cost_usd;
         entry.total_tokens += record.usage.total_tokens;
+        entry.input_tokens += record.usage.input_tokens;
+        entry.output_tokens += record.usage.output_tokens;
+        entry.cached_input_tokens += record.usage.cached_input_tokens;
         entry.request_count += 1;
     }
 
     by_model
+}
+
+fn build_agent_stats(records: &[CostRecord]) -> HashMap<String, AgentCostStats> {
+    let mut by_agent: HashMap<String, AgentCostStats> = HashMap::new();
+
+    for record in records {
+        let Some(alias) = record.agent_alias.as_deref() else {
+            continue;
+        };
+        let entry = by_agent
+            .entry(alias.to_string())
+            .or_insert_with(|| AgentCostStats {
+                agent_alias: alias.to_string(),
+                cost_usd: 0.0,
+                total_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                request_count: 0,
+            });
+
+        entry.cost_usd += record.usage.cost_usd;
+        entry.total_tokens += record.usage.total_tokens;
+        entry.input_tokens += record.usage.input_tokens;
+        entry.output_tokens += record.usage.output_tokens;
+        entry.cached_input_tokens += record.usage.cached_input_tokens;
+        entry.request_count += 1;
+    }
+
+    by_agent
 }
 
 /// Persistent storage for cost records.
@@ -268,8 +446,12 @@ impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create directory {}",
+                    parent.display().to_string()
+                )
+            })?;
         }
 
         let now = Utc::now();
@@ -299,8 +481,12 @@ impl CostStorage {
             return Ok(());
         }
 
-        let file = File::open(&self.path)
-            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+        let file = File::open(&self.path).with_context(|| {
+            format!(
+                "Failed to read cost storage from {}",
+                self.path.display().to_string()
+            )
+        })?;
         let reader = BufReader::new(file);
 
         for (line_number, line) in reader.lines().enumerate() {
@@ -320,10 +506,15 @@ impl CostStorage {
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
                 Err(error) => {
-                    tracing::warn!(
-                        "Skipping malformed cost record at {}:{}: {error}",
-                        self.path.display(),
-                        line_number + 1
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Skipping malformed cost record at {}:{}: {error}",
+                            self.path.display().to_string(),
+                            line_number + 1
+                        )
                     );
                 }
             }
@@ -376,12 +567,25 @@ impl CostStorage {
             .create(true)
             .append(true)
             .open(&self.path)
-            .with_context(|| format!("Failed to open cost storage at {}", self.path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to open cost storage at {}",
+                    self.path.display().to_string()
+                )
+            })?;
 
-        writeln!(file, "{}", serde_json::to_string(&record)?)
-            .with_context(|| format!("Failed to write cost record to {}", self.path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
+        writeln!(file, "{}", serde_json::to_string(&record)?).with_context(|| {
+            format!(
+                "Failed to write cost record to {}",
+                self.path.display().to_string()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        })?;
 
         self.ensure_period_cache_current()?;
 
@@ -400,6 +604,42 @@ impl CostStorage {
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
         self.ensure_period_cache_current()?;
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
+    }
+
+    /// Snapshot every record whose timestamp falls within the current
+    /// calendar month. Used to build per-agent rollups without folding a
+    /// new aggregate table into the JSONL file.
+    fn daily_records(&mut self) -> Result<Vec<CostRecord>> {
+        self.ensure_period_cache_current()?;
+        let year = self.cached_year;
+        let month = self.cached_month;
+        let mut out = Vec::new();
+        self.for_each_record(|record| {
+            let ts = record.usage.timestamp.naive_utc();
+            if ts.year() == year && ts.month() == month {
+                out.push(record);
+            }
+        })?;
+        Ok(out)
+    }
+
+    fn records_in_bounds(
+        &mut self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<Vec<CostRecord>> {
+        let mut out = Vec::new();
+        self.for_each_record(|record| {
+            let ts = record.usage.timestamp;
+            if from.is_some_and(|f| ts < f) {
+                return;
+            }
+            if to.is_some_and(|t| ts >= t) {
+                return;
+            }
+            out.push(record);
+        })?;
+        Ok(out)
     }
 
     /// Get cost for a specific date.
@@ -467,7 +707,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
 
-        let usage = TokenUsage::new("test/model", 1000, 500, 1.0, 2.0);
+        let usage = TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0);
         tracker.record_usage(usage).unwrap();
 
         let summary = tracker.get_summary().unwrap();
@@ -488,7 +728,7 @@ mod tests {
         let tracker = CostTracker::new(config, tmp.path()).unwrap();
 
         // Record a usage that exceeds the limit
-        let usage = TokenUsage::new("test/model", 10000, 5000, 1.0, 2.0); // ~0.02 USD
+        let usage = TokenUsage::new("test/model", 10000, 5000, 0, 1.0, 2.0, 0.0); // ~0.02 USD
         tracker.record_usage(usage).unwrap();
 
         let check = tracker.check_budget(0.01).unwrap();
@@ -496,34 +736,52 @@ mod tests {
     }
 
     #[test]
-    fn summary_by_model_is_session_scoped() {
+    fn summary_by_model_is_daily_scoped() {
+        // by_model rollup pulls from today's persisted records so the
+        // dashboard's per-model breakdown survives daemon restarts (matches
+        // by_agent's behaviour). A record from another session that
+        // happened today still shows up; only ones outside the day fall
+        // off — exercised by the storage layer's get_aggregated_costs.
         let tmp = TempDir::new().unwrap();
         let storage_path = resolve_storage_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let old_record = CostRecord::new(
-            "old-session",
-            TokenUsage::new("legacy/model", 500, 500, 1.0, 1.0),
+        let prior_today = CostRecord::new(
+            "prior-session",
+            TokenUsage::new("prior/model", 500, 500, 0, 1.0, 1.0, 0.0),
         );
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(storage_path)
             .unwrap();
-        writeln!(file, "{}", serde_json::to_string(&old_record).unwrap()).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&prior_today).unwrap()).unwrap();
         file.sync_all().unwrap();
 
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         tracker
-            .record_usage(TokenUsage::new("session/model", 1000, 1000, 1.0, 1.0))
+            .record_usage(TokenUsage::new(
+                "session/model",
+                1000,
+                1000,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
             .unwrap();
 
         let summary = tracker.get_summary().unwrap();
-        assert_eq!(summary.by_model.len(), 1);
+        assert_eq!(
+            summary.by_model.len(),
+            2,
+            "by_model must include every model that recorded today, \
+             regardless of which session wrote the record"
+        );
         assert!(summary.by_model.contains_key("session/model"));
-        assert!(!summary.by_model.contains_key("legacy/model"));
+        assert!(summary.by_model.contains_key("prior/model"));
     }
 
     #[test]
@@ -534,7 +792,7 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
 
-        let valid_usage = TokenUsage::new("test/model", 1000, 0, 1.0, 1.0);
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
         let valid_record = CostRecord::new("session-a", valid_usage.clone());
 
         let mut file = OpenOptions::new()
@@ -550,6 +808,76 @@ mod tests {
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         let today_cost = tracker.get_daily_cost(Utc::now().date_naive()).unwrap();
         assert!((today_cost - valid_usage.cost_usd).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn per_agent_aggregation_buckets_by_alias() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000, 1_000, 0, 1.0, 1.0, 0.0),
+                Some("scout"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 2_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("scout"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 500, 500, 0, 1.0, 1.0, 0.0),
+                Some("scribe"),
+            )
+            .unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.by_agent.len(), 2);
+        let scout = summary.by_agent.get("scout").unwrap();
+        assert_eq!(scout.request_count, 2);
+        assert_eq!(scout.total_tokens, 4_000);
+        let scribe = summary.by_agent.get("scribe").unwrap();
+        assert_eq!(scribe.request_count, 1);
+        assert_eq!(scribe.total_tokens, 1_000);
+
+        let scoped = tracker.get_summary_for_agent("scout").unwrap();
+        assert_eq!(scoped.request_count, 2);
+        assert!(
+            scoped.by_agent.is_empty(),
+            "per-agent view doesn't re-bucket"
+        );
+        assert!(
+            (scoped.daily_cost_usd - scout.cost_usd).abs() < 1e-9,
+            "daily filtered to alias must match by_agent bucket"
+        );
+    }
+
+    #[test]
+    fn track_per_agent_disabled_strips_alias() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: true,
+            track_per_agent: false,
+            ..Default::default()
+        };
+        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000, 1_000, 0, 1.0, 1.0, 0.0),
+                Some("scout"),
+            )
+            .unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert!(
+            summary.by_agent.is_empty(),
+            "track_per_agent=false must not surface per-agent rollups"
+        );
     }
 
     #[test]

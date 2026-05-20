@@ -196,9 +196,9 @@ impl Channel for TelegramChannel {
 
 ---
 
-## Provider (`crates/zeroclaw-api/src/provider.rs`)
+## Model provider (`crates/zeroclaw-api/src/model_provider.rs`)
 
-Providers are LLM backend adapters. Each provider connects ZeroClaw to a different model API.
+Model providers are LLM backend adapters. Each implementation connects ZeroClaw to a different model API.
 
 **Required method**: `chat_with_system(system_prompt: Option<&str>, message: &str, model: &str, temperature: Option<f64>) -> Result<String>`.
 Everything else has default implementations:
@@ -209,18 +209,18 @@ streaming methods return empty/error streams by default.
 Register your provider in `crates/zeroclaw-providers/src/lib.rs`.
 
 ```rust
-// In your crate: use zeroclaw::providers::traits::Provider;
+// In your crate: use zeroclaw_api::model_provider::ModelProvider;
 
 use anyhow::Result;
 use async_trait::async_trait;
 
 /// Ollama local provider.
-pub struct OllamaProvider {
+pub struct OllamaModelProvider {
     base_url: String,
     client: reqwest::Client,
 }
 
-impl OllamaProvider {
+impl OllamaModelProvider {
     pub fn new(base_url: Option<&str>) -> Self {
         Self {
             base_url: base_url.unwrap_or("http://localhost:11434").to_string(),
@@ -230,7 +230,7 @@ impl OllamaProvider {
 }
 
 #[async_trait]
-impl Provider for OllamaProvider {
+impl ModelProvider for OllamaModelProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

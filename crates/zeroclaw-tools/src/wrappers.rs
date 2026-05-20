@@ -24,6 +24,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -65,6 +66,15 @@ pub struct RateLimitedTool<T: Tool> {
 impl<T: Tool> RateLimitedTool<T> {
     pub fn new(inner: T, security: Arc<SecurityPolicy>) -> Self {
         Self { inner, security }
+    }
+}
+
+impl<T: Tool> Attributable for RateLimitedTool<T> {
+    fn role(&self) -> Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
     }
 }
 
@@ -161,6 +171,15 @@ impl<T: Tool> PathGuardedTool<T> {
     }
 }
 
+impl<T: Tool> Attributable for PathGuardedTool<T> {
+    fn role(&self) -> Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+}
+
 #[async_trait]
 impl<T: Tool> Tool for PathGuardedTool<T> {
     fn name(&self) -> &str {
@@ -212,6 +231,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    zeroclaw_api::mock_tool_attribution!(CountingTool);
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -393,6 +414,16 @@ mod tests {
         // record_action() must NOT fire, so the budget stays at full and
         // a subsequent successful call still goes through.
         struct AlwaysFails;
+        impl ::zeroclaw_api::attribution::Attributable for AlwaysFails {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for AlwaysFails {
             fn name(&self) -> &str {

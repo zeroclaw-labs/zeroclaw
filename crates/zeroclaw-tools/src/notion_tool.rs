@@ -34,9 +34,16 @@ impl NotionTool {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "Authorization",
-            format!("Bearer {}", self.api_key)
-                .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid Notion API key header value: {e}"))?,
+            format!("Bearer {}", self.api_key).parse().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "notion_tool: invalid API key header value"
+                );
+                anyhow::Error::msg(format!("Invalid Notion API key header value: {e}"))
+            })?,
         );
         headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
         headers.insert("Content-Type", "application/json".parse().unwrap());
