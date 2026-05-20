@@ -180,7 +180,10 @@ fi
 SERVICE_DEST="/etc/systemd/system/zeroclaw.service"
 echo ""
 echo "==> Installing systemd service (requires sudo on the Pi)"
-${SCP_CMD} ${SCP_OPTS} "scripts/zeroclaw.service" "${RPI_USER}@${RPI_HOST}:/tmp/zeroclaw.service"
+# Substitute @@RPI_USER@@ placeholder with the actual deploy user.
+sed "s|@@RPI_USER@@|${RPI_USER}|g" scripts/zeroclaw.service > /tmp/zeroclaw.service.rendered
+${SCP_CMD} ${SCP_OPTS} /tmp/zeroclaw.service.rendered "${RPI_USER}@${RPI_HOST}:/tmp/zeroclaw.service"
+rm -f /tmp/zeroclaw.service.rendered
 # shellcheck disable=SC2029
 ${SSH_CMD} ${SSH_OPTS} "${RPI_USER}@${RPI_HOST}" \
   "sudo mv /tmp/zeroclaw.service ${SERVICE_DEST} && \
