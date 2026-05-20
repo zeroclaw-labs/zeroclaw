@@ -4503,7 +4503,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_empty_falls_back_to_reasoning() {
+    fn reasoning_content_empty_still_wins_over_reasoning_alias() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"","reasoning":"Fallback reasoning"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;

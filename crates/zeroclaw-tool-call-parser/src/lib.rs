@@ -2141,7 +2141,8 @@ mod tests {
         // assistant messages carrying `tool_calls: []`. Empty input must
         // not produce a serialised assistant message with an empty array.
         // See #6298.
-        let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
+        let result =
+            build_native_assistant_history_from_parsed_calls("answer text", &[], None, None);
         assert!(
             result.is_none(),
             "expected None for empty tool_calls slice, got {result:?}"
@@ -2158,6 +2159,7 @@ mod tests {
             "answer text",
             &[],
             Some("deep thought"),
+            None,
         );
         assert!(result.is_none());
     }
@@ -2172,7 +2174,7 @@ mod tests {
             arguments: serde_json::json!({"command": "pwd"}),
             tool_call_id: Some("call_1".into()),
         }];
-        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None, None);
         let s = result.expect("Some(_) for non-empty tool_calls");
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));

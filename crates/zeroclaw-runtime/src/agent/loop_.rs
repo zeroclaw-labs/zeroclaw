@@ -5400,6 +5400,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
+                reasoning_field: None,
             })
         }
     }
