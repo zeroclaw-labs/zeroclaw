@@ -2371,7 +2371,7 @@ mod tests {
     // ── Bulk deletion tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn sqlite_purge_namespace_deletes_only_rows_in_target_namespace() {
+    async fn sqlite_purge_namespace_deletes_only_all_matching_entries() {
         let (_tmp, mem) = temp_sqlite();
 
         mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)

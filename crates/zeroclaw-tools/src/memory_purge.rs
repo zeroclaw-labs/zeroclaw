@@ -25,7 +25,7 @@ impl Tool for MemoryPurgeTool {
     }
 
     fn description(&self) -> &str {
-        "Remove all memories in a namespace (category) or session. Use to bulk-delete conversation context or category-scoped data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
+        "Remove all memories in a namespace or session. Use to bulk-delete per-tenant or per-conversation data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,7 +34,7 @@ impl Tool for MemoryPurgeTool {
             "properties": {
                 "namespace": {
                     "type": "string",
-                    "description": "The namespace (category) to purge. Deletes all memories in this category."
+                    "description": "The namespace to purge. Deletes all memories whose namespace field equals this value."
                 },
                 "session_id": {
                     "type": "string",
@@ -119,7 +119,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
-    use zeroclaw_memory::{MemoryCategory, SqliteMemory};
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -141,45 +141,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_namespace_removes_all_memories() {
+    async fn purge_namespace_removes_only_all_matching_memories() {
         let (_tmp, mem) = test_mem();
-        mem.store_with_metadata(
-            "a1",
-            "data1",
-            MemoryCategory::Core,
-            None,
-            Some("test_ns"),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store_with_metadata(
-            "a2",
-            "data2",
-            MemoryCategory::Core,
-            None,
-            Some("test_ns"),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store_with_metadata(
-            "b1",
-            "data3",
-            MemoryCategory::Core,
-            None,
-            Some("other_ns"),
-            None,
-        )
-        .await
-        .unwrap();
 
+        mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)
+            .await
+            .unwrap();
+        mem.store_with_metadata("b", "data", MemoryCategory::Core, None, Some("ns2"), None)
+            .await
+            .unwrap();
+
+        let in_ns1 =
+            |entries: &[MemoryEntry]| entries.iter().filter(|e| e.namespace == "ns1").count();
+
+        let before = mem.list(None, None).await.unwrap();
         let tool = MemoryPurgeTool::new(mem.clone(), test_security());
-        let result = tool.execute(json!({"namespace": "test_ns"})).await.unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("2 memories"));
+        let result = tool.execute(json!({"namespace": "ns1"})).await.unwrap();
+        let after = mem.list(None, None).await.unwrap();
 
-        assert_eq!(mem.count().await.unwrap(), 1);
+        assert!(result.success);
+        assert_eq!(in_ns1(&after), 0);
+        assert_eq!(after.len() - in_ns1(&after), before.len() - in_ns1(&before));
     }
 
     #[tokio::test]
@@ -250,15 +232,22 @@ mod tests {
     #[tokio::test]
     async fn purge_blocked_in_readonly_mode() {
         let (_tmp, mem) = test_mem();
-        mem.store("a", "data", MemoryCategory::Custom("test".into()), None)
-            .await
-            .unwrap();
+        mem.store_with_metadata(
+            "a",
+            "data",
+            MemoryCategory::Core,
+            None,
+            Some("test-ns"),
+            None,
+        )
+        .await
+        .unwrap();
         let readonly = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
         let tool = MemoryPurgeTool::new(mem.clone(), readonly);
-        let result = tool.execute(json!({"namespace": "test"})).await.unwrap();
+        let result = tool.execute(json!({"namespace": "test-ns"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
@@ -273,15 +262,22 @@ mod tests {
     #[tokio::test]
     async fn purge_blocked_when_rate_limited() {
         let (_tmp, mem) = test_mem();
-        mem.store("a", "data", MemoryCategory::Custom("test".into()), None)
-            .await
-            .unwrap();
+        mem.store_with_metadata(
+            "a",
+            "data",
+            MemoryCategory::Core,
+            None,
+            Some("test-ns"),
+            None,
+        )
+        .await
+        .unwrap();
         let limited = Arc::new(SecurityPolicy {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
         let tool = MemoryPurgeTool::new(mem.clone(), limited);
-        let result = tool.execute(json!({"namespace": "test"})).await.unwrap();
+        let result = tool.execute(json!({"namespace": "test-ns"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
