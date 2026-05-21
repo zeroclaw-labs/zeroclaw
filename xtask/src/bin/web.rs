@@ -11,7 +11,7 @@
 //!   dev      — gen-api + `npm run dev` (vite dev server).
 //!   check    — gen-api + `npx tsc -b` (typecheck without bundling).
 //!
-//! See #6175.
+//!
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::warn;
 
 use crate::sop::types::{SopRunAction, SopStepResult, SopStepStatus};
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
@@ -68,20 +67,41 @@ impl Tool for SopAdvanceTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let run_id = args
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
+        let run_id = args.get("run_id").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "run_id"})),
+                "tool argument validation failed"
+            );
 
-        let status_str = args
-            .get("status")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'status' parameter"))?;
+            anyhow::Error::msg("Missing 'run_id' parameter")
+        })?;
 
-        let output = args
-            .get("output")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'output' parameter"))?;
+        let status_str = args.get("status").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "status"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'status' parameter")
+        })?;
+
+        let output = args.get("output").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "output"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'output' parameter")
+        })?;
 
         let step_status = match status_str {
             "completed" => SopStepStatus::Completed,
@@ -100,15 +120,31 @@ impl Tool for SopAdvanceTool {
 
         // Lock engine, advance step, snapshot data for audit, then drop lock
         let (action, step_result_ok, finished_run) = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+            let mut engine = self.engine.lock().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP engine lock poisoned"
+                );
+
+                anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+            })?;
 
             let current_step = engine
                 .get_run(run_id)
                 .map(|r| r.current_step)
-                .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"run_id": run_id})),
+                        "sop_advance tool: run not found"
+                    );
+                    anyhow::Error::msg(format!("Run not found: {run_id}"))
+                })?;
 
             let now = now_iso8601();
             let step_result = SopStepResult {
@@ -140,12 +176,24 @@ impl Tool for SopAdvanceTool {
             if let Some(ref sr) = step_result_ok
                 && let Err(e) = audit.log_step_result(run_id, sr).await
             {
-                warn!("SOP audit log_step_result failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP audit log_step_result failed"
+                );
             }
             if let Some(ref run) = finished_run
                 && let Err(e) = audit.log_run_complete(run).await
             {
-                warn!("SOP audit log_run_complete failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP audit log_run_complete failed"
+                );
             }
         }
 

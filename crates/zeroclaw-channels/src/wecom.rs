@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// WeCom (WeChat Enterprise) Bot Webhook channel.
@@ -7,15 +8,24 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 /// through a configurable callback URL that WeCom posts to.
 pub struct WeComChannel {
     webhook_key: String,
-    #[allow(dead_code)] // used by is_user_allowed which is WIP
-    allowed_users: Vec<String>,
+    /// The alias key under `[channels.wecom.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl WeComChannel {
-    pub fn new(webhook_key: String, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        webhook_key: String,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             webhook_key,
-            allowed_users,
+            alias: alias.into(),
+            peer_resolver,
         }
     }
 
@@ -30,9 +40,27 @@ impl WeComChannel {
         )
     }
 
-    #[cfg(test)]
-    fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    /// Check whether `user_id` is on the allowlist for this WeCom channel.
+    ///
+    /// WeCom Bot Webhook is send-only, so this gate is exercised only by
+    /// callback flows the gateway routes back through this channel handle.
+    /// The `alias` is included in the trace span so multi-WeCom deployments
+    /// can distinguish which channel made the decision.
+    pub fn is_user_allowed(&self, user_id: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        let allowed =
+            crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive);
+        ::zeroclaw_log::record!(TRACE, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "wecom", "alias": self.alias, "user_id": user_id, "allowed": allowed})), "wecom allowlist decision");
+        allowed
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for WeComChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::WeCom)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -83,7 +111,11 @@ impl Channel for WeComChannel {
         // handled via the gateway webhook subsystem.
         //
         // This listener keeps the channel alive and waits for the sender to close.
-        tracing::info!("WeCom: channel ready (send-only via Bot Webhook)");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "channel ready (send-only via Bot Webhook)"
+        );
         tx.closed().await;
         Ok(())
     }
@@ -115,13 +147,13 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = WeComChannel::new("test-key".into(), vec![]);
+        let ch = WeComChannel::new("test-key".into(), "wecom_test_alias", Arc::new(Vec::new));
         assert_eq!(ch.name(), "wecom");
     }
 
     #[test]
     fn test_webhook_url() {
-        let ch = WeComChannel::new("abc-123".into(), vec![]);
+        let ch = WeComChannel::new("abc-123".into(), "wecom_test_alias", Arc::new(Vec::new));
         assert_eq!(
             ch.webhook_url(),
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123"
@@ -130,40 +162,78 @@ mod tests {
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = WeComChannel::new("key".into(), vec!["*".into()]);
+        let ch = WeComChannel::new(
+            "key".into(),
+            "wecom_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
-        let ch = WeComChannel::new("key".into(), vec!["user123".into()]);
+        let ch = WeComChannel::new(
+            "key".into(),
+            "wecom_test_alias",
+            Arc::new(|| vec!["user123".into()]),
+        );
         assert!(ch.is_user_allowed("user123"));
         assert!(!ch.is_user_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = WeComChannel::new("key".into(), vec![]);
+        let ch = WeComChannel::new("key".into(), "wecom_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
-    fn test_config_serde() {
-        let toml_str = r#"
+    fn v2_allowed_users_fold_into_peer_groups() {
+        // V2 `[channels.wecom].allowed_users` migrates into a synthesized
+        // `[peer_groups.wecom_default]` block in V3. The wildcard sentinel is
+        // filtered out during synthesis so only concrete usernames survive as
+        // external peers.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.wecom]
+enabled = true
 webhook_key = "key-abc-123"
 allowed_users = ["user1", "*"]
 "#;
-        let config: zeroclaw_config::schema::WeComConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.webhook_key, "key-abc-123");
-        assert_eq!(config.allowed_users, vec!["user1", "*"]);
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 wecom config migrates to V3");
+        let wecom = cfg
+            .channels
+            .wecom
+            .get("default")
+            .expect("V2 wecom folds under alias `default`");
+        assert_eq!(wecom.webhook_key, "key-abc-123");
+
+        let group = cfg
+            .peer_groups
+            .get("wecom_default")
+            .expect("wecom allow-list synthesizes [peer_groups.wecom_default]");
+        assert_eq!(group.channel, "wecom");
+        let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
+        assert_eq!(peers, vec!["user1"]);
     }
 
     #[test]
-    fn test_config_serde_defaults() {
-        let toml_str = r#"
+    fn v2_no_allowed_users_synthesizes_no_peer_group() {
+        // V2 wecom without `allowed_users` must not synthesize a peer group.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.wecom]
+enabled = true
 webhook_key = "key"
 "#;
-        let config: zeroclaw_config::schema::WeComConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.allowed_users.is_empty());
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 wecom config without allowed_users migrates");
+        assert!(
+            !cfg.peer_groups.contains_key("wecom_default"),
+            "no peer group synthesized when allowed_users is absent"
+        );
     }
 }

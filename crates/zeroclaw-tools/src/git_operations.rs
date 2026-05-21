@@ -79,9 +79,19 @@ impl GitOperationsTool {
                 } else {
                     self.workspace_dir.join(p)
                 };
-                let resolved = candidate
-                    .canonicalize()
-                    .map_err(|e| anyhow::anyhow!("Cannot resolve path '{}': {}", p, e))?;
+                let resolved = candidate.canonicalize().map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "path": p,
+                                "error": format!("{}", e),
+                            })),
+                        "git_operations: cannot resolve path"
+                    );
+                    anyhow::Error::msg(format!("Cannot resolve path '{}': {}", p, e))
+                })?;
                 let workspace_canonical = self
                     .workspace_dir
                     .canonicalize()
@@ -117,14 +127,41 @@ impl GitOperationsTool {
 
     fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
         let candidate = self.candidate_path(raw_path)?;
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Worktree path must have a parent directory"))?;
-        let file_name = candidate
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("Worktree path must include a final path component"))?;
+        let parent = candidate.parent().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree path has no parent"
+            );
+            anyhow::Error::msg("Worktree path must have a parent directory")
+        })?;
+        let file_name = candidate.file_name().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree path has no file name"
+            );
+            anyhow::Error::msg("Worktree path must include a final path component")
+        })?;
         let resolved_parent = parent.canonicalize().map_err(|e| {
-            anyhow::anyhow!("Cannot resolve worktree parent '{}': {e}", parent.display())
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "parent": parent.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "git_operations: cannot resolve worktree parent"
+            );
+            anyhow::Error::msg(format!(
+                "Cannot resolve worktree parent '{}': {e}",
+                parent.display()
+            ))
         })?;
         let resolved_target = resolved_parent.join(file_name);
 
@@ -140,9 +177,19 @@ impl GitOperationsTool {
 
     fn ensure_worktree_remove_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
         let candidate = self.candidate_path(raw_path)?;
-        let resolved = candidate
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("Cannot resolve worktree path '{}': {e}", raw_path))?;
+        let resolved = candidate.canonicalize().map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "raw_path": raw_path,
+                        "error": format!("{}", e),
+                    })),
+                "git_operations: cannot resolve worktree path"
+            );
+            anyhow::Error::msg(format!("Cannot resolve worktree path '{}': {e}", raw_path))
+        })?;
 
         if !self.security.is_resolved_path_allowed(&resolved) {
             anyhow::bail!(
@@ -410,7 +457,16 @@ impl GitOperationsTool {
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "message"})),
+                    "git_operations: missing message parameter"
+                );
+                anyhow::Error::msg("Missing 'message' parameter")
+            })?;
 
         // Sanitize commit message
         let sanitized = message
@@ -450,10 +506,16 @@ impl GitOperationsTool {
         args: serde_json::Value,
         working_dir: &std::path::Path,
     ) -> anyhow::Result<ToolResult> {
-        let paths = args
-            .get("paths")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'paths' parameter"))?;
+        let paths = args.get("paths").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "paths"})),
+                "git_operations: missing paths parameter"
+            );
+            anyhow::Error::msg("Missing 'paths' parameter")
+        })?;
 
         // Validate paths against injection patterns
         self.sanitize_git_args(paths)?;
@@ -481,10 +543,16 @@ impl GitOperationsTool {
         args: serde_json::Value,
         working_dir: &std::path::Path,
     ) -> anyhow::Result<ToolResult> {
-        let branch = args
-            .get("branch")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'branch' parameter"))?;
+        let branch = args.get("branch").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "branch"})),
+                "git_operations: missing branch parameter"
+            );
+            anyhow::Error::msg("Missing 'branch' parameter")
+        })?;
 
         // Sanitize branch name
         let sanitized = self.sanitize_git_args(branch)?;
@@ -537,8 +605,16 @@ impl GitOperationsTool {
             "list" => self.run_git_command(&["stash", "list"], working_dir).await,
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let index = i32::try_from(index_raw)
-                    .map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
+                let index = i32::try_from(index_raw).map_err(|_| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"index": index_raw})),
+                        "git_operations: stash index too large"
+                    );
+                    anyhow::Error::msg(format!("stash index too large: {index_raw}"))
+                })?;
                 self.run_git_command(
                     &["stash", "drop", &format!("stash@{{{index}}}")],
                     working_dir,
@@ -647,7 +723,13 @@ impl GitOperationsTool {
                 self.sanitize_git_args(worktree_path)?;
                 let worktree_path = self.ensure_worktree_add_target_allowed(worktree_path)?;
                 let worktree_path = worktree_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("Worktree path must be valid UTF-8 for git execution")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "git_operations: worktree path not valid UTF-8"
+                    );
+                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
 
                 let branch = args
@@ -676,7 +758,13 @@ impl GitOperationsTool {
                 self.sanitize_git_args(worktree_path)?;
                 let worktree_path = self.ensure_worktree_remove_target_allowed(worktree_path)?;
                 let worktree_path = worktree_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("Worktree path must be valid UTF-8 for git execution")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "git_operations: worktree path not valid UTF-8"
+                    );
+                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
 
                 self.run_git_command(&["worktree", "remove", worktree_path], working_dir)

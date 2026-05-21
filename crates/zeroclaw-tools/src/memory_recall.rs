@@ -145,7 +145,7 @@ mod tests {
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 
@@ -190,6 +190,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 }])
             } else {
                 Ok(Vec::new())
@@ -212,12 +214,51 @@ mod tests {
             Ok(false)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
 
         async fn health_check(&self) -> bool {
             true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for QueryEchoMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "QueryEchoMemory"
         }
     }
 

@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -117,9 +117,19 @@ impl McpServer {
             )
         })??;
 
-        let result = list_resp
-            .result
-            .ok_or_else(|| anyhow!("tools/list returned no result from `{}`", config.name))?;
+        let result = list_resp.result.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"mcp_server": &config.name})),
+                "mcp_client: tools/list returned no result"
+            );
+            anyhow::Error::msg(format!(
+                "tools/list returned no result from `{}`",
+                config.name
+            ))
+        })?;
         let tool_list: McpToolsListResult = serde_json::from_value(result)
             .with_context(|| format!("failed to parse tools/list from `{}`", config.name))?;
 
@@ -135,10 +145,13 @@ impl McpServer {
             tools: tool_list.tools,
         };
 
-        tracing::info!(
-            "MCP server `{}` connected — {} tool(s) available",
-            inner.config.name,
-            tool_count
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "MCP server `{}` connected — {} tool(s) available",
+                inner.config.name, tool_count
+            )
         );
 
         Ok(Self {
@@ -184,11 +197,21 @@ impl McpServer {
         )
         .await
         .map_err(|_| {
-            anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "tool": tool_name,
+                        "timeout_secs": tool_timeout,
+                    })),
+                "mcp_client: tool call timed out"
+            );
+            anyhow::Error::msg(format!(
                 "MCP server `{}` timed out after {}s during tool call `{tool_name}`",
-                inner.config.name,
-                tool_timeout
-            )
+                inner.config.name, tool_timeout
+            ))
         })?
         .with_context(|| {
             format!(
@@ -234,7 +257,12 @@ impl McpRegistry {
                 }
                 // Non-fatal — log and continue with remaining servers
                 Err(e) => {
-                    tracing::error!("Failed to connect to MCP server `{}`: {:#}", config.name, e);
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
+                    );
                 }
             }
         }
@@ -267,10 +295,16 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String> {
-        let (server_idx, original_name) = self
-            .tool_index
-            .get(prefixed_name)
-            .ok_or_else(|| anyhow!("unknown MCP tool `{prefixed_name}`"))?;
+        let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": prefixed_name})),
+                "mcp_client: unknown MCP tool"
+            );
+            anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
+        })?;
         let result = self.servers[*server_idx]
             .call_tool(original_name, arguments)
             .await?;

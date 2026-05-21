@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{LineDmPolicy, LineGroupPolicy};
+use zeroclaw_config::schema::{Config, LineDmPolicy, LineGroupPolicy};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -31,7 +31,7 @@ const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// DM (1:1) access is controlled by `dm_policy`:
 /// - `open`      — respond to everyone
 /// - `pairing`   — require a one-time `/bind <code>` handshake (default)
-/// - `allowlist` — respond only to user IDs in `allowed_users`
+/// - `allowlist` — respond only to user IDs in the channel's peer group
 ///
 /// Group/room access is controlled by `group_policy`:
 /// - `open`     — respond to every message
@@ -46,8 +46,19 @@ pub struct LineChannel {
     dm_policy: LineDmPolicy,
     /// Group/room access policy.
     group_policy: LineGroupPolicy,
-    /// Allowlist — used when `dm_policy = Allowlist`.
-    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// The alias key under `[channels.line.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle. `None` in tests and one-shot
+    /// builds (pairing then doesn't survive — and without persistence
+    /// the resolver never sees the paired user, matching telegram's
+    /// no-persistence semantics). `Some` in the long-running daemon,
+    /// wired via `.with_persistence(config)`. RwLock so concurrent
+    /// peer reads from sibling channels don't serialize.
+    persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard — `Some` when `dm_policy = Pairing`.
     pairing: Option<Arc<PairingGuard>>,
     /// TCP port the embedded webhook server listens on.
@@ -83,7 +94,13 @@ struct LineState {
     bot_user_id: String,
     dm_policy: LineDmPolicy,
     group_policy: LineGroupPolicy,
-    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// Alias under `[channels.line.<alias>]` — scopes peer-group writes.
+    alias: String,
+    /// Resolves the configured peer allowlist at message-time. Reads
+    /// canonical state, no cache.
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle for the `/bind` flow.
+    persist: Option<Arc<parking_lot::RwLock<Config>>>,
     pairing: Option<Arc<PairingGuard>>,
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     /// HTTP client and credentials for downloading audio content.
@@ -113,7 +130,7 @@ async fn download_audio_content(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        anyhow::bail!("LINE: audio download failed ({status}) for message {message_id}");
+        anyhow::bail!("audio download failed ({status}) for message {message_id}");
     }
 
     let mut bytes = Vec::new();
@@ -122,7 +139,7 @@ async fn download_audio_content(
         bytes.extend_from_slice(&chunk);
         if bytes.len() as u64 > MAX_LINE_AUDIO_BYTES {
             anyhow::bail!(
-                "LINE: audio exceeds {} byte limit for message {message_id}",
+                "audio exceeds {} byte limit for message {message_id}",
                 MAX_LINE_AUDIO_BYTES
             );
         }
@@ -135,6 +152,66 @@ fn build_webhook_router(state: Arc<LineState>) -> axum::Router {
     Router::new()
         .route("/line/webhook", post(handle_webhook))
         .with_state(state)
+}
+
+/// Check whether `user_id` is in the LINE peer allowlist resolved from
+/// canonical config state at call-time. LINE user IDs are case-sensitive.
+fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
+    let peers = (state.peer_resolver)();
+    crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+}
+
+/// Persist a newly-paired LINE userId into `peer_groups.line_<alias>.external_peers`
+/// via the shared Config handle. Mirrors telegram/wechat's `persist_allowed_identity`.
+/// No-op-with-warn when `state.persist` is unset (test fixtures).
+async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+    use zeroclaw_config::providers::ChannelRef;
+
+    let Some(config) = &state.persist else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"user_id": user_id})),
+            "paired userId not persisted (no persistence handle wired)"
+        );
+        return Ok(());
+    };
+    let normalized = user_id.trim().to_string();
+    if normalized.is_empty() {
+        anyhow::bail!("Cannot persist empty LINE userId");
+    }
+    let group_name = format!("line_{}", state.alias);
+    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
+    let snapshot = {
+        let mut cfg = config.write();
+        if !cfg.channels.line.contains_key(&state.alias) {
+            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
+        }
+        let group = cfg
+            .peer_groups
+            .entry(group_name)
+            .or_insert_with(|| PeerGroupConfig {
+                channel: channel_ref.to_string(),
+                ..PeerGroupConfig::default()
+            });
+        if group
+            .external_peers
+            .iter()
+            .any(|p| p.as_str() == normalized)
+        {
+            return Ok(());
+        }
+        group.external_peers.push(PeerUsername::new(normalized));
+        cfg.clone()
+    };
+    snapshot
+        .save()
+        .await
+        .context("Failed to persist LINE paired userId to config.toml")?;
+    Ok(())
 }
 
 async fn handle_webhook(
@@ -165,7 +242,12 @@ async fn handle_webhook(
     };
 
     if !sig_valid {
-        tracing::warn!("LINE: rejected request with invalid signature");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "rejected request with invalid signature"
+        );
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -173,7 +255,13 @@ async fn handle_webhook(
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("LINE: invalid JSON payload: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "invalid JSON payload"
+            );
             return StatusCode::BAD_REQUEST;
         }
     };
@@ -217,7 +305,11 @@ async fn handle_webhook(
             }
             "audio" => {
                 let Some(ref manager) = state.transcription_manager else {
-                    tracing::debug!("LINE: audio message ignored (transcription not configured)");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "audio message ignored (transcription not configured)"
+                    );
                     continue;
                 };
                 let audio = match download_audio_content(
@@ -230,18 +322,48 @@ async fn handle_webhook(
                 {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::warn!("LINE: audio download failed for {msg_id}: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "msg_id": msg_id})
+                            ),
+                            "audio download failed for"
+                        );
                         continue;
                     }
                 };
                 let transcript = match manager.transcribe(&audio, "audio.m4a").await {
                     Ok(t) if !t.trim().is_empty() => t,
                     Ok(_) => {
-                        tracing::debug!("LINE: empty transcript for {msg_id}");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"msg_id": msg_id})),
+                            "empty transcript for"
+                        );
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("LINE: transcription failed for {msg_id}: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "msg_id": msg_id})
+                            ),
+                            "transcription failed for"
+                        );
                         continue;
                     }
                 };
@@ -271,9 +393,16 @@ async fn handle_webhook(
                 LineGroupPolicy::Mention => {
                     let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
                     if mention_span.is_none() {
-                        tracing::debug!(
-                            "LINE: skipping group message without bot mention (userId: {})",
-                            state.bot_user_id
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "skipping group message without bot mention (userId: {})",
+                                state.bot_user_id
+                            )
                         );
                         continue;
                     }
@@ -286,70 +415,73 @@ async fn handle_webhook(
             match state.dm_policy {
                 LineDmPolicy::Open => {}
                 LineDmPolicy::Allowlist => {
-                    let allowed = state
-                        .allowed_users
-                        .read()
-                        .iter()
-                        .any(|u| u == "*" || u == user_id);
-                    if !allowed {
-                        tracing::warn!(
-                            "LINE: ignoring DM from unauthorized user: {user_id}. \
-                            Add to channels.line.allowed_users or use dm_policy = pairing."
+                    if !is_line_user_allowed(&*state, user_id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"user_id": user_id})),
+                            "ignoring DM from unauthorized user: . Add to the channel peer group or use dm_policy = pairing."
                         );
                         continue;
                     }
                 }
                 LineDmPolicy::Pairing => {
-                    let already_allowed = state
-                        .allowed_users
-                        .read()
-                        .iter()
-                        .any(|u| u == "*" || u == user_id);
-
-                    if !already_allowed {
+                    if !is_line_user_allowed(&*state, user_id) {
                         // Try pairing bind
                         if let Some(code) = LineChannel::extract_bind_code(text) {
                             if let Some(ref guard) = state.pairing {
                                 match guard.try_pair(code, user_id).await {
                                     Ok(Some(_)) => {
-                                        state.allowed_users.write().push(user_id.to_string());
-                                        tracing::info!("LINE: paired userId={user_id}");
-                                        // Send confirmation via Push API (no reply token yet)
-                                        // We forward a synthetic message to let the agent greet
+                                        if let Err(e) =
+                                            persist_line_paired_identity(&*state, user_id).await
+                                        {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "paired userId= but persist failed");
+                                        } else {
+                                            ::zeroclaw_log::record!(
+                                                INFO,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Note
+                                                )
+                                                .with_attrs(
+                                                    ::serde_json::json!({"user_id": user_id})
+                                                ),
+                                                "paired userId="
+                                            );
+                                        }
                                     }
                                     Ok(None) => {
-                                        tracing::warn!(
-                                            "LINE: invalid bind code from userId={user_id}"
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                            .with_attrs(::serde_json::json!({"user_id": user_id})),
+                                            "invalid bind code from userId="
                                         );
                                     }
                                     Err(wait_ms) => {
-                                        tracing::warn!(
-                                            "LINE: bind rate-limited for userId={user_id}, retry after {wait_ms}ms"
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "wait_ms": wait_ms})), "bind rate-limited for userId=, retry after ms");
                                     }
                                 }
                             }
                             continue; // bind commands are not forwarded to agent
                         }
 
-                        tracing::warn!(
-                            "LINE: ignoring message from unpaired user: {user_id}. \
-                            Send `{LINE_BIND_COMMAND} <code>` to pair."
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "LINE_BIND_COMMAND": LINE_BIND_COMMAND})), "ignoring message from unpaired user: . Send ` <code>` to pair.");
                         continue;
                     }
                 }
             }
         }
 
-        // 5. Mention gate for group messages using `mention` policy
-        let mention_span = if is_group && state.group_policy == LineGroupPolicy::Mention {
-            LineChannel::find_bot_mention(msg_obj, &state.bot_user_id)
-        } else {
-            None
-        };
-
-        // 6. Resolve recipient (groupId/roomId for group context)
+        // 5. Resolve recipient (groupId/roomId for group context)
         let recipient = match source_type {
             "group" => source
                 .get("groupId")
@@ -364,17 +496,7 @@ async fn handle_webhook(
             _ => user_id.to_string(),
         };
 
-        // 7. Strip the @mention span from group messages using char index/length.
-        let content = if let Some((idx, len)) = mention_span {
-            let stripped = LineChannel::strip_mention_range(text, idx, len);
-            if stripped.is_empty() {
-                continue;
-            }
-            stripped
-        } else {
-            text.trim().to_string()
-        };
-
+        let content = text.trim().to_string();
         if content.is_empty() {
             continue;
         }
@@ -403,6 +525,7 @@ async fn handle_webhook(
             reply_target: recipient,
             content,
             channel: "line".to_string(),
+            channel_alias: Some(state.alias.clone()),
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
@@ -410,7 +533,12 @@ async fn handle_webhook(
         };
 
         if state.tx.send(channel_msg).await.is_err() {
-            tracing::warn!("LINE: receiver dropped, shutting down webhook server");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "receiver dropped, shutting down webhook server"
+            );
             return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
@@ -423,17 +551,13 @@ async fn handle_webhook(
 // ---------------------------------------------------------------------------
 
 impl LineChannel {
-    /// Create a new `LineChannel`.
-    ///
-    /// `channel_access_token` and `channel_secret` fall back to the
-    /// `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET` environment
-    /// variables respectively when the config value is empty.
     pub fn new(
         channel_access_token: String,
         channel_secret: String,
         dm_policy: LineDmPolicy,
         group_policy: LineGroupPolicy,
-        allowed_users: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         webhook_port: u16,
     ) -> Self {
         let token = if channel_access_token.is_empty() {
@@ -447,7 +571,8 @@ impl LineChannel {
             channel_secret
         };
 
-        let pairing = if dm_policy == LineDmPolicy::Pairing && allowed_users.is_empty() {
+        let configured_peers = peer_resolver();
+        let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 println!("  🔐 LINE pairing required. One-time bind code: {code}");
@@ -463,7 +588,9 @@ impl LineChannel {
             channel_secret: secret,
             dm_policy,
             group_policy,
-            allowed_users: Arc::new(RwLock::new(allowed_users)),
+            alias: alias.into(),
+            peer_resolver,
+            persist: None,
             pairing,
             webhook_port,
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
@@ -474,17 +601,31 @@ impl LineChannel {
         }
     }
 
+    /// Wire the shared `Config` handle so `persist_line_paired_identity`
+    /// can write a newly-paired userId into `peer_groups.line_<alias>.external_peers`
+    /// and save. Long-running daemon sets this from the orchestrator; tests
+    /// and one-shot callers leave it unset (pairing then doesn't survive).
+    pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
+        self.persist = Some(config);
+        self
+    }
+
     /// Construct a `LineChannel` directly from a [`zeroclaw_config::schema::LineConfig`].
     ///
     /// Mirrors [`LarkChannel::from_config`] — keeps construction logic inside the
     /// channel crate rather than duplicating it across orchestrator call sites.
-    pub fn from_config(config: &zeroclaw_config::schema::LineConfig) -> Self {
+    pub fn from_config(
+        config: &zeroclaw_config::schema::LineConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self::new(
             config.channel_access_token.clone(),
             config.channel_secret.clone(),
             config.dm_policy.clone(),
             config.group_policy.clone(),
-            config.allowed_users.clone(),
+            alias,
+            peer_resolver,
             config.webhook_port,
         )
         .with_proxy_url(config.proxy_url.clone())
@@ -512,11 +653,34 @@ impl LineChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Channel doesn't carry an agent identity itself; the
+                // configured local_whisper / openai / groq / etc.
+                // provider auto-acts as the agent_transcription_provider
+                // here so inbound audio routes to whichever single
+                // provider the operator configured under
+                // [transcription.<provider>].
+                let m = if config.local_whisper.is_some() {
+                    m.with_agent_transcription_provider("local_whisper")
+                } else if config.openai.is_some() {
+                    m.with_agent_transcription_provider("openai")
+                } else if config.deepgram.is_some() {
+                    m.with_agent_transcription_provider("deepgram")
+                } else if config.assemblyai.is_some() {
+                    m.with_agent_transcription_provider("assemblyai")
+                } else if config.google.is_some() {
+                    m.with_agent_transcription_provider("google")
+                } else {
+                    m.with_agent_transcription_provider("groq")
+                };
                 self.transcription_manager = Some(Arc::new(m));
             }
             Err(e) => {
-                tracing::warn!(
-                    "LINE: transcription manager init failed, audio transcription disabled: {e}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, audio transcription disabled"
                 );
             }
         }
@@ -571,7 +735,7 @@ impl LineChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LINE: failed to fetch bot info ({status}): {err}");
+            anyhow::bail!("failed to fetch bot info ({status}): {err}");
         }
 
         resp.json::<BotInfo>().await.map_err(Into::into)
@@ -632,32 +796,6 @@ impl LineChannel {
             }
         }
         None
-    }
-
-    /// Remove a mention span from `text` using character-unit `index`/`length`
-    /// from LINE's mention data.
-    ///
-    /// After removal, any run of whitespace characters at the join point is
-    /// collapsed to a single space so that "hey @Bot help" → "hey help".
-    fn strip_mention_range(text: &str, char_index: usize, char_length: usize) -> String {
-        let chars: Vec<char> = text.chars().collect();
-        let total = chars.len();
-
-        let before: String = chars[..char_index.min(total)].iter().collect();
-        let end = (char_index + char_length).min(total);
-        let after: String = chars[end..].iter().collect();
-
-        // Trim trailing whitespace from `before` and leading from `after`,
-        // then rejoin with a single space only when both sides are non-empty.
-        let before_trimmed = before.trim_end();
-        let after_trimmed = after.trim_start();
-
-        match (before_trimmed.is_empty(), after_trimmed.is_empty()) {
-            (true, true) => String::new(),
-            (true, false) => after_trimmed.to_string(),
-            (false, true) => before_trimmed.to_string(),
-            (false, false) => format!("{before_trimmed} {after_trimmed}"),
-        }
     }
 
     /// Split long text into chunks ≤ `LINE_MAX_MESSAGE_LEN` characters.
@@ -721,7 +859,7 @@ impl LineChannel {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("LINE Reply API failed ({status}): {err}");
+                anyhow::bail!("Reply API failed ({status}): {err}");
             }
         }
         Ok(())
@@ -751,7 +889,7 @@ impl LineChannel {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("LINE Push API failed ({status}): {err}");
+                anyhow::bail!("Push API failed ({status}): {err}");
             }
         }
         Ok(())
@@ -774,7 +912,9 @@ impl LineChannel {
             bot_user_id,
             dm_policy: self.dm_policy.clone(),
             group_policy: self.group_policy.clone(),
-            allowed_users: Arc::clone(&self.allowed_users),
+            alias: self.alias.clone(),
+            peer_resolver: Arc::clone(&self.peer_resolver),
+            persist: self.persist.clone(),
             pairing: self.pairing.clone(),
             pending_tokens: Arc::clone(&self.pending_tokens),
             client: self.client.clone(),
@@ -784,9 +924,28 @@ impl LineChannel {
         });
 
         let app = build_webhook_router(state);
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow::anyhow!("LINE webhook server error: {e}"))
+        axum::serve(listener, app).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "webhook_server",
+                        "error": format!("{}", e),
+                    })),
+                "line: webhook server error"
+            );
+            anyhow::Error::msg(format!("webhook server error: {e}"))
+        })
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LineChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Line)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -808,8 +967,12 @@ impl Channel for LineChannel {
             match self.send_reply(&token, &message.content).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    tracing::warn!(
-                        "LINE: Reply API failed (token may be expired), falling back to Push: {e}"
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                        "Reply API failed (token may be expired), falling back to Push"
                     );
                 }
             }
@@ -826,16 +989,23 @@ impl Channel for LineChannel {
     /// via `message.mention.mentionees`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_info = self.fetch_bot_info().await?;
-        tracing::info!(
-            "LINE: connected as '{}' (userId: {})",
-            bot_info.display_name,
-            bot_info.user_id
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "connected as '{}' (userId: {})",
+                bot_info.display_name, bot_info.user_id
+            )
         );
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.webhook_port));
-        tracing::info!(
-            "LINE: webhook server listening on http://0.0.0.0:{}/line/webhook",
-            self.webhook_port
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "webhook server listening on http://0.0.0.0:{}/line/webhook",
+                self.webhook_port
+            )
         );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -866,13 +1036,22 @@ mod tests {
 
     // ---- Helpers -----------------------------------------------------------
 
+    fn empty_resolver() -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(Vec::new)
+    }
+
+    fn resolver_from(peers: Vec<String>) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(move || peers.clone())
+    }
+
     fn make_channel() -> LineChannel {
         LineChannel::new(
             "test_access_token".into(),
             "test_secret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
     }
@@ -1006,13 +1185,14 @@ mod tests {
     }
 
     #[test]
-    fn pairing_mode_creates_guard_when_no_allowed_users() {
+    fn pairing_mode_creates_guard_when_no_configured_peers() {
         let ch = LineChannel::new(
             "tok".into(),
             "sec".into(),
             LineDmPolicy::Pairing,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         );
         assert!(ch.pairing_code_active());
@@ -1025,7 +1205,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Pairing,
             LineGroupPolicy::Mention,
-            vec!["Uallowed".into()],
+            "line_test_alias",
+            resolver_from(vec!["Uallowed".into()]),
             8444,
         );
         assert!(!ch.pairing_code_active());
@@ -1046,7 +1227,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         );
         assert_eq!(ch.channel_access_token, "env-token");
@@ -1063,7 +1245,8 @@ mod tests {
             "".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         );
         assert_eq!(ch.channel_secret, "env-secret");
@@ -1118,27 +1301,6 @@ mod tests {
     fn find_bot_mention_missing_field() {
         let msg = serde_json::json!({"type": "text", "text": "hello"});
         assert_eq!(LineChannel::find_bot_mention(&msg, "Ubot123"), None);
-    }
-
-    #[test]
-    fn strip_mention_range_prefix() {
-        let result = LineChannel::strip_mention_range("@Bot hello", 0, 4);
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn strip_mention_range_mid() {
-        let result = LineChannel::strip_mention_range("hey @Bot help", 4, 4);
-        assert_eq!(result, "hey help");
-    }
-
-    #[test]
-    fn strip_mention_range_unicode() {
-        // "สวัสดี @Bot ช่วยด้วย"
-        // สวัสดี = 6 chars, space = 1 → @Bot starts at char index 7, length 4
-        let text = "สวัสดี @Bot ช่วยด้วย";
-        let result = LineChannel::strip_mention_range(text, 7, 4);
-        assert_eq!(result, "สวัสดี ช่วยด้วย");
     }
 
     #[test]
@@ -1225,7 +1387,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
         .with_api_base_url(&server.uri());
@@ -1250,7 +1413,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
         .with_api_base_url(&server.uri());
@@ -1276,7 +1440,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
         .with_api_base_url(&server.uri());
@@ -1310,7 +1475,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
         .with_api_base_url(&server.uri());
@@ -1351,7 +1517,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             8444,
         )
         .with_api_base_url(&server.uri());
@@ -1376,7 +1543,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1392,7 +1560,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1418,7 +1587,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let tokens = Arc::clone(&ch.pending_tokens);
@@ -1446,7 +1616,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Allowlist,
             LineGroupPolicy::Open,
-            vec!["Uallowed".to_string()],
+            "line_test_alias",
+            resolver_from(vec!["Uallowed".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1468,7 +1639,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Allowlist,
             LineGroupPolicy::Open,
-            vec!["Uallowed".to_string()],
+            "line_test_alias",
+            resolver_from(vec!["Uallowed".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1492,7 +1664,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Pairing,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1512,7 +1685,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Pairing,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1532,14 +1706,15 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_dm_pairing_allows_pre_seeded_user() {
-        // If dm_policy=Pairing but a user is already in allowed_users,
-        // they should be forwarded without needing to /bind again.
+        // If dm_policy=Pairing but a user is already in the channel peer
+        // group, they should be forwarded without needing to /bind again.
         let ch = LineChannel::new(
             "tok".into(),
             "mysecret".into(),
             LineDmPolicy::Pairing,
             LineGroupPolicy::Open,
-            vec!["Utrusted".to_string()],
+            "line_test_alias",
+            resolver_from(vec!["Utrusted".to_string()]),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1561,7 +1736,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Disabled,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1588,7 +1764,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1616,7 +1793,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
@@ -1644,7 +1822,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Mention,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
@@ -1657,8 +1836,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Mention span stripped: "@Bot " removed, leaving "help me"
-        assert_eq!(msg.content, "help me");
+        // Mention preserved verbatim — bot-mention stripping was dropped
+        // from inbound message bodies so the agent sees what the operator
+        // typed (including the @-mention).
+        assert_eq!(msg.content, "@Bot help me");
         assert_eq!(msg.reply_target, "Ggrp");
         abort.abort();
     }
@@ -1670,7 +1851,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1696,7 +1878,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1723,7 +1906,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1742,7 +1926,8 @@ mod tests {
             "sec".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         )
         .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
@@ -1759,7 +1944,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
@@ -1813,7 +1999,6 @@ mod tests {
 
         let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             api_key: None,
             api_url: String::new(),
             model: "whisper-1".to_string(),
@@ -1838,7 +2023,8 @@ mod tests {
             "mysecret".into(),
             LineDmPolicy::Open,
             LineGroupPolicy::Open,
-            vec![],
+            "line_test_alias",
+            empty_resolver(),
             0,
         )
         .with_api_base_url(&api_server.uri())

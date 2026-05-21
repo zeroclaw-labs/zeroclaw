@@ -35,11 +35,11 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
@@ -69,16 +69,41 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
 
+    const TEST_AGENT: &str = "test-agent";
+
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
         Arc::new(config)
+    }
+
+    fn seed_test_agent(config: &mut Config) {
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", TEST_AGENT)
+            .expect("known family");
+        config.agents.entry(TEST_AGENT.to_string()).or_insert(
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.to_string(),
+                runtime_profile: TEST_AGENT.to_string(),
+                ..Default::default()
+            },
+        );
     }
 
     #[tokio::test]
@@ -98,6 +123,7 @@ mod tests {
         let cfg = test_config(&tmp).await;
         cron::add_shell_job(
             &cfg,
+            TEST_AGENT,
             None,
             cron::Schedule::Cron {
                 expr: "0 9 * * 1-5".into(),
@@ -128,7 +154,7 @@ mod tests {
     async fn errors_when_cron_disabled() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = (*test_config(&tmp).await).clone();
-        cfg.cron.enabled = false;
+        cfg.scheduler.enabled = false;
         let tool = CronListTool::new(Arc::new(cfg));
 
         let result = tool.execute(json!({})).await.unwrap();

@@ -8,6 +8,7 @@
 //! `send_document_by_url()` immediately via `?`, causing the entire reply
 //! (including already-sent text) to fail with no fallback.
 
+use std::sync::Arc;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zeroclaw::channels::telegram::TelegramChannel;
@@ -15,8 +16,15 @@ use zeroclaw::channels::{Channel, SendMessage};
 
 /// Helper: create a TelegramChannel pointing at a mock server.
 fn test_channel(mock_url: &str) -> TelegramChannel {
-    TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false)
-        .with_api_base(mock_url.to_string())
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(|| vec!["*".into()]);
+    let mention_only = false;
+    TelegramChannel::new(
+        "TEST_TOKEN".into(),
+        "telegram_test_alias",
+        peer_resolver,
+        mention_only,
+    )
+    .with_api_base(mock_url.to_string())
 }
 
 /// Helper: mount a mock that accepts sendMessage requests (the fallback path).

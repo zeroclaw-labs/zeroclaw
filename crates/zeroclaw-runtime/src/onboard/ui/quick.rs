@@ -73,11 +73,21 @@ impl OnboardUi for QuickUi {
         }))
     }
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
+    async fn string(
+        &mut self,
+        prompt: &str,
+        current: Option<&str>,
+        placeholder: Option<&str>,
+    ) -> Result<Answer<String>> {
         if let Some(answer) = self.lookup(prompt) {
             return Ok(Answer::Value(answer));
         }
         if let Some(value) = current {
+            return Ok(Answer::Value(value.to_string()));
+        }
+        // Quick mode is non-interactive — accept a schema/runtime
+        // default the same way the TUI's Enter-on-empty path does.
+        if let Some(value) = placeholder {
             return Ok(Answer::Value(value.to_string()));
         }
         bail!("quick mode: no answer or default provided for prompt {prompt:?}");

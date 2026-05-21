@@ -1,39 +1,39 @@
 //! System-level tests — full agent orchestration with real components.
 //!
 //! These tests wire ALL internal components together:
-//! MockProvider → Agent → Tools → Memory → Agent response
+//! MockModelProvider → Agent → Tools → Memory → Agent response
 //!
 //! Unlike integration tests, system tests use real memory backends (SQLite)
 //! and verify end-to-end data flow across component boundaries.
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
-use crate::support::{CountingTool, EchoTool, MockProvider, RecordingTool};
+use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingTool};
 use zeroclaw::providers::ToolCall;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Full-stack system tests
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Simplest system test: inject message → MockProvider returns text → verify response.
+/// Simplest system test: inject message → MockModelProvider returns text → verify response.
 #[tokio::test]
 async fn system_simple_text_response() {
-    let provider = Box::new(MockProvider::new(vec![text_response(
+    let model_provider = Box::new(MockModelProvider::new(vec![text_response(
         "System test response",
     )]));
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let response = agent.turn("hello system").await.unwrap();
     assert_eq!(response, "System test response");
 }
 
-/// Full tool execution flow: message → provider requests tool → tool executes →
-/// result fed back to provider → final response.
+/// Full tool execution flow: message → model_provider requests tool → tool executes →
+/// result fed back to model_provider → final response.
 #[tokio::test]
 async fn system_tool_execution_flow() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -45,7 +45,7 @@ async fn system_tool_execution_flow() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let response = agent.turn("run echo").await.unwrap();
     assert!(
@@ -57,7 +57,7 @@ async fn system_tool_execution_flow() {
 /// Multi-turn conversation with real SQLite memory — verify history accumulation.
 #[tokio::test]
 async fn system_multi_turn_conversation() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         text_response("First system response"),
         text_response("Second system response"),
         text_response("Third system response"),
@@ -65,7 +65,7 @@ async fn system_multi_turn_conversation() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(EchoTool)], temp_dir.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], temp_dir.path());
 
     let r1 = agent.turn("turn 1").await.unwrap();
     assert_eq!(r1, "First system response");
@@ -87,7 +87,7 @@ async fn system_multi_turn_conversation() {
 async fn system_tool_arguments_passed_correctly() {
     let (recording_tool, calls) = RecordingTool::new("recorder");
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "recorder".into(),
@@ -98,8 +98,11 @@ async fn system_tool_arguments_passed_correctly() {
     ]));
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(recording_tool)], temp_dir.path());
+    let mut agent = build_agent_with_sqlite_memory(
+        model_provider,
+        vec![Box::new(recording_tool)],
+        temp_dir.path(),
+    );
 
     let response = agent.turn("record something").await.unwrap();
     assert!(!response.is_empty());
@@ -122,7 +125,7 @@ async fn system_tool_arguments_passed_correctly() {
 async fn system_parallel_tool_execution() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -142,7 +145,7 @@ async fn system_parallel_tool_execution() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut agent = build_agent_with_sqlite_memory(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool), Box::new(counting_tool)],
         temp_dir.path(),
     );

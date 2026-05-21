@@ -1,4 +1,4 @@
-//! Provider subsystem — re-exported from `zeroclaw-providers`.
+//! ModelProvider subsystem — re-exported from `zeroclaw-providers`.
 
 pub use zeroclaw_providers::*;
 

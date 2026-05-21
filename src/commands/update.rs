@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use tracing::{info, warn};
 
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
@@ -73,7 +72,11 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
 /// If `target_version` is `Some`, fetch that specific version instead of latest.
 pub async fn run(target_version: Option<&str>) -> Result<()> {
     // Phase 1: Preflight
-    info!("Phase 1/6: Preflight checks...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 1/6: Preflight checks..."
+    );
     let update_info = check(target_version).await?;
 
     if !update_info.is_newer {
@@ -94,27 +97,49 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         std::env::current_exe().context("cannot determine current executable path")?;
 
     // Phase 2: Download
-    info!("Phase 2/6: Downloading...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 2/6: Downloading..."
+    );
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
     download_binary(&download_url, &download_path).await?;
 
     // Phase 3: Backup
-    info!("Phase 3/6: Creating backup...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 3/6: Creating backup..."
+    );
     let backup_path = current_exe.with_extension("bak");
     tokio::fs::copy(&current_exe, &backup_path)
         .await
         .context("failed to backup current binary")?;
 
     // Phase 4: Validate
-    info!("Phase 4/6: Validating download...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 4/6: Validating download..."
+    );
     validate_binary(&download_path).await?;
 
     // Phase 5: Swap
-    info!("Phase 5/6: Swapping binary...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 5/6: Swapping binary..."
+    );
     if let Err(e) = swap_binary(&download_path, &current_exe).await {
         // Rollback
-        warn!("Swap failed, rolling back: {e}");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Swap failed, rolling back"
+        );
         if let Err(rollback_err) = rollback_binary(&backup_path, &current_exe).await {
             eprintln!("CRITICAL: Rollback also failed: {rollback_err}");
             eprintln!(
@@ -127,7 +152,11 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     }
 
     // Phase 6: Smoke test
-    info!("Phase 6/6: Smoke test...");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Phase 6/6: Smoke test..."
+    );
     match smoke_test(&current_exe).await {
         Ok(()) => {
             // Cleanup backup on success
@@ -136,7 +165,13 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            warn!("Smoke test failed, rolling back: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Smoke test failed, rolling back"
+            );
             rollback_binary(&backup_path, &current_exe)
                 .await
                 .context("rollback after smoke test failure")?;
