@@ -132,6 +132,8 @@ impl<'a> App<'a> {
                 None => continue,
             };
 
+            self.status_msg = None;
+
             match &self.screen {
                 Screen::SectionList => {
                     if self.handle_section_list(key).await? {
@@ -488,12 +490,15 @@ impl<'a> App<'a> {
             KeyCode::Char('d') => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
                     let prop = field.path.clone();
+                    let saved_cursor = self.field_cursor;
                     if let Screen::FieldList { prefix, .. } = &self.screen {
                         let prefix = prefix.clone();
                         match self.rpc.config_delete(&prop).await {
                             Ok(()) => {
                                 self.status_msg = Some(format!("Reset {prop}"));
                                 self.load_fields(&prefix).await?;
+                                self.field_cursor =
+                                    saved_cursor.min(self.fields.len().saturating_sub(1));
                             }
                             Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
                         }
