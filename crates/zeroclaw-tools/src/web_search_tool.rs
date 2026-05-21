@@ -1366,8 +1366,8 @@ mod tests {
         let tool = WebSearchTool::new_with_config(
             "tavily".to_string(),
             None,
-            None,
             Some("tvly-boot-key".to_string()),
+            None,
             None,
             5,
             15,
@@ -1460,8 +1460,8 @@ mod tests {
         let tool = WebSearchTool::new_with_config(
             "tavily".to_string(),
             None,
-            None,
             Some("tvly-test-key".to_string()),
+            None,
             None,
             5,
             15,
