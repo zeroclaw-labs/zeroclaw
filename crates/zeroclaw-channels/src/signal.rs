@@ -1033,6 +1033,9 @@ mod tests {
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
         assert_eq!(msg.content, "Hello from privacy user");
+        assert_eq!(msg.id, "sig_1700000000000");
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1110,6 +1113,9 @@ mod tests {
         assert_eq!(msg.content, "Hello!");
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
+        assert_eq!(msg.id, "sig_1700000000000");
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
     }
 
     #[test]
@@ -1217,6 +1223,45 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn process_envelope_group_happy_path() {
+        let dm_only = false;
+        let ignore_attachments = false;
+        let ignore_stories = false;
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            vec!["group_xyz".to_string()],
+            dm_only,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1111111111".into()]),
+            ignore_attachments,
+            ignore_stories,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("group hello".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group_xyz".to_string()),
+                }),
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        assert_eq!(msg.sender, "+1111111111");
+        assert_eq!(msg.reply_target, "group:group_xyz");
+        assert_eq!(msg.content, "group hello");
+        assert_eq!(msg.channel, "signal");
+        assert_eq!(msg.id, "sig_1700000000000");
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
     }
 
     #[test]
