@@ -42,15 +42,11 @@ pub struct SlackChannel {
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
     /// Threads (`thread_ts`) for which we have already prepended a
-    /// `[Thread context]` backfill block, mapped to the `Instant` at
-    /// which the entry was last refreshed. Entries older than
-    /// `SLACK_THREAD_BACKFILL_SEEN_TTL_SECS` are treated as expired so
-    /// that a follow-up mention can re-render context after a downstream
-    /// failure (provider 5xx, exhausted credits, etc.). The polling
-    /// loop refreshes timestamps for actively-tracked threads each
-    /// cycle, so long-lived conversations do not re-backfill.
-    /// Reset on process restart. Bounded by `SLACK_THREAD_BACKFILL_SEEN_MAX`.
-    seen_threads: Mutex<HashMap<String, Instant>>,
+    /// `[Thread context]` backfill block. In-memory only — after a
+    /// process restart the set is empty and each active thread sees one
+    /// re-backfill on the next inbound message, which is the accepted
+    /// tradeoff (matches `matrix.rs::context`).
+    seen_threads: Mutex<HashSet<String>>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
     /// Per-channel proxy URL override.
@@ -104,15 +100,6 @@ const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
 const SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE: usize = 3;
 const SLACK_PERMALINK_THREAD_MAX_REPLIES: usize = 20;
 const SLACK_PERMALINK_TEXT_MAX_CHARS: usize = 8_000;
-/// Soft cap on entries in `SlackChannel::seen_threads`. When this is
-/// exceeded the set is cleared, so any active thread sees one re-backfill
-/// next time a message arrives in it. Per-process only (lost on restart).
-const SLACK_THREAD_BACKFILL_SEEN_MAX: usize = 1024;
-/// How long a `seen_threads` entry stays valid before it is treated as
-/// expired. Covers transient failure modes (provider 5xx, brief credits
-/// outage) so the next mention in the same thread re-pulls context.
-/// Refreshed on every polling-loop cycle for actively-tracked threads.
-const SLACK_THREAD_BACKFILL_SEEN_TTL_SECS: u64 = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SlackPermalinkRef {
@@ -210,7 +197,7 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
-            seen_threads: Mutex::new(HashMap::new()),
+            seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
             proxy_url: None,
             transcription: None,
@@ -947,8 +934,7 @@ impl SlackChannel {
     /// First-encounter thread-context gate. Returns a rendered
     /// `[Thread context]` block when this is the first message we forward
     /// for the given thread; returns `None` for top-level messages, thread
-    /// parents, threads we have already backfilled within the TTL window,
-    /// or fetch failures.
+    /// parents, threads we have already backfilled, or fetch failures.
     ///
     /// Marks the thread as seen on success, leaves `seen_threads` untouched
     /// on fetch failure so the next message in the same thread can retry.
@@ -968,16 +954,12 @@ impl SlackChannel {
         block
     }
 
-    /// Pure pre-check for thread-context backfill. Returns `Some(thread_ts)`
-    /// when backfill should run, `None` otherwise.
-    ///
-    /// Returns `None` when:
-    /// - the message has no `thread_ts`
-    /// - `thread_ts` equals `ts` (the message *is* the thread parent)
-    /// - the channel has already backfilled this thread within the TTL window
+    /// Returns `Some(thread_ts)` when this message should trigger backfill:
+    /// it has a `thread_ts`, is not the thread parent (`thread_ts != ts`),
+    /// and has not been backfilled before in this process.
     fn precheck_thread_backfill(
         message: &serde_json::Value,
-        seen_threads: &Mutex<HashMap<String, Instant>>,
+        seen_threads: &Mutex<HashSet<String>>,
     ) -> Option<String> {
         let ts = message
             .get("ts")
@@ -987,42 +969,28 @@ impl SlackChannel {
         if thread_ts.is_empty() || thread_ts == ts {
             return None;
         }
-        let seen = seen_threads.lock().ok()?;
-        if let Some(recorded_at) = seen.get(thread_ts)
-            && recorded_at.elapsed() < Duration::from_secs(SLACK_THREAD_BACKFILL_SEEN_TTL_SECS)
-        {
+        if seen_threads.lock().ok()?.contains(thread_ts) {
             return None;
         }
         Some(thread_ts.to_string())
     }
 
-    /// Mark `thread_ts` as backfilled at the current `Instant`. When the
-    /// seen-set reaches its soft cap, it is cleared first; that is
-    /// acceptable because the worst consequence is one re-backfill per
-    /// active thread.
-    fn record_thread_seen(seen_threads: &Mutex<HashMap<String, Instant>>, thread_ts: &str) {
+    fn record_thread_seen(seen_threads: &Mutex<HashSet<String>>, thread_ts: &str) {
         if let Ok(mut seen) = seen_threads.lock() {
-            if seen.len() >= SLACK_THREAD_BACKFILL_SEEN_MAX && !seen.contains_key(thread_ts) {
-                seen.clear();
-            }
-            seen.insert(thread_ts.to_string(), Instant::now());
+            seen.insert(thread_ts.to_string());
         }
     }
 
-    /// Refresh an existing `seen_threads` entry's timestamp. Does NOT insert
-    /// new entries — first-reply backfill is handled lazily by
-    /// `maybe_render_thread_backfill`. Used by the polling-discovery path so
-    /// long-running threads that were already backfilled stay refreshed and
-    /// do not expire mid-conversation.
-    fn refresh_seen_thread_if_known(
-        seen_threads: &Mutex<HashMap<String, Instant>>,
-        thread_ts: &str,
-    ) {
-        if let Ok(mut seen) = seen_threads.lock()
-            && let Some(recorded_at) = seen.get_mut(thread_ts)
-        {
-            *recorded_at = Instant::now();
+    /// Remove `<@bot_user_id>` mentions from a rendered backfill line so
+    /// historical thread content does not re-trigger "did the user @ me?"
+    /// heuristics when the agent reads it as context.
+    fn strip_bot_mentions(text: &str, bot_user_id: &str) -> String {
+        if bot_user_id.is_empty() {
+            return text.trim().to_string();
         }
+        text.replace(&format!("<@{bot_user_id}>"), " ")
+            .trim()
+            .to_string()
     }
 
     /// Pure composer for the `[Thread context]` block. Takes the
@@ -4547,15 +4515,10 @@ impl Channel for SlackChannel {
                 };
 
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
-                    // Register thread parents discovered in channel history.
-                    // "Discovered for polling" is intentionally kept separate
-                    // from "already had thread-context backfilled into an
-                    // agent payload": the first forwarded reply on a newly
-                    // discovered thread should still get the `[Thread
-                    // context]` block, which happens lazily in
-                    // `maybe_render_thread_backfill`. We only refresh
-                    // already-seen entries here so long-running active
-                    // conversations do not expire mid-flight and re-backfill.
+                    // Register thread parents discovered in channel history for
+                    // reply polling. `seen_threads` is independent and is
+                    // populated lazily by `maybe_render_thread_backfill` on
+                    // the first forwarded reply per thread.
                     for (thread_ts, latest_reply) in Self::extract_active_threads(messages) {
                         let entry = active_threads.entry(thread_ts.clone()).or_insert_with(|| {
                             (channel_id.clone(), thread_ts.clone(), Instant::now())
@@ -4564,8 +4527,6 @@ impl Channel for SlackChannel {
                             entry.1 = latest_reply;
                         }
                         entry.2 = Instant::now();
-
-                        Self::refresh_seen_thread_if_known(&self.seen_threads, &thread_ts);
                     }
 
                     // Messages come newest-first, reverse to process oldest first
@@ -6189,87 +6150,26 @@ mod tests {
 
     // --- Thread-context backfill tests ---
 
-    /// Spec 3.1: First message in an unseen thread → precheck returns the
-    /// thread_ts so backfill should run.
+    /// Top-level message (no thread_ts) and thread-parent (`thread_ts == ts`)
+    /// must not trigger backfill, regardless of `seen_threads` state.
     #[test]
-    fn thread_backfill_precheck_returns_thread_ts_for_unseen_thread() {
-        let seen = Mutex::new(HashMap::new());
-        let message = serde_json::json!({
-            "ts": "1700000010.000100",
-            "thread_ts": "1700000000.000001",
-            "text": "hi bot",
-            "user": "U_USER",
-        });
-        let result = SlackChannel::precheck_thread_backfill(&message, &seen);
-        assert_eq!(result.as_deref(), Some("1700000000.000001"));
-        // Precheck must not mutate seen_threads — the gate records only after
-        // a successful render.
-        assert!(seen.lock().unwrap().is_empty());
-    }
+    fn thread_backfill_precheck_skips_non_replies() {
+        let seen = Mutex::new(HashSet::new());
 
-    /// Spec 3.2: Subsequent message in the same thread → precheck returns
-    /// None because the thread is already in `seen_threads`.
-    #[test]
-    fn thread_backfill_precheck_returns_none_for_already_seen_thread() {
-        let seen = Mutex::new(HashMap::new());
-        seen.lock()
-            .unwrap()
-            .insert("1700000000.000001".to_string(), Instant::now());
-        let message = serde_json::json!({
-            "ts": "1700000020.000200",
-            "thread_ts": "1700000000.000001",
-            "text": "another reply",
-            "user": "U_USER",
-        });
-        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
-    }
-
-    /// Spec 3.2b (TTL): An entry older than
-    /// `SLACK_THREAD_BACKFILL_SEEN_TTL_SECS` is treated as expired so a
-    /// follow-up mention re-pulls thread context after a downstream
-    /// failure (provider 5xx, exhausted credits, etc.).
-    #[test]
-    fn thread_backfill_precheck_treats_expired_entries_as_unseen() {
-        let seen = Mutex::new(HashMap::new());
-        let stale = Instant::now()
-            .checked_sub(Duration::from_secs(SLACK_THREAD_BACKFILL_SEEN_TTL_SECS + 1))
-            .expect("instant arithmetic must not underflow on a fresh process");
-        seen.lock()
-            .unwrap()
-            .insert("1700000000.000001".to_string(), stale);
-        let message = serde_json::json!({
-            "ts": "1700000020.000200",
-            "thread_ts": "1700000000.000001",
-            "text": "follow-up mention after the previous one failed",
-            "user": "U_USER",
-        });
-        let result = SlackChannel::precheck_thread_backfill(&message, &seen);
-        assert_eq!(result.as_deref(), Some("1700000000.000001"));
-    }
-
-    /// Spec 3.3: Top-level message (no thread_ts) → no backfill.
-    #[test]
-    fn thread_backfill_precheck_returns_none_for_top_level_message() {
-        let seen = Mutex::new(HashMap::new());
-        let message = serde_json::json!({
+        let top_level = serde_json::json!({
             "ts": "1700000010.000100",
             "text": "hi bot",
             "user": "U_USER",
         });
-        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
-    }
+        assert!(SlackChannel::precheck_thread_backfill(&top_level, &seen).is_none());
 
-    /// Spec 3.4: Thread parent message (`thread_ts == ts`) → no backfill.
-    #[test]
-    fn thread_backfill_precheck_returns_none_for_thread_parent() {
-        let seen = Mutex::new(HashMap::new());
-        let message = serde_json::json!({
+        let parent = serde_json::json!({
             "ts": "1700000000.000001",
             "thread_ts": "1700000000.000001",
             "text": "thread starts here",
             "user": "U_USER",
         });
-        assert!(SlackChannel::precheck_thread_backfill(&message, &seen).is_none());
+        assert!(SlackChannel::precheck_thread_backfill(&parent, &seen).is_none());
     }
 
     /// Spec 3.5: Mixed allow / non-allow senders → 3 rendered + gap marker
@@ -6343,127 +6243,18 @@ mod tests {
         assert!(stripped.contains("can you help?"));
     }
 
-    /// Polling-loop discovery must NOT eagerly mark threads as seen — the
-    /// first forwarded reply on a freshly discovered thread is exactly the
-    /// payload that needs the `[Thread context]` block, and is recorded
-    /// lazily by `maybe_render_thread_backfill` after a successful render.
-    #[test]
-    fn thread_backfill_polling_discovery_does_not_eagerly_mark_threads_seen() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["C1".into()], vec![]);
-        let messages = vec![serde_json::json!({
-            "ts": "1700000000.000001",
-            "thread_ts": "1700000000.000001",
-            "reply_count": 2,
-            "latest_reply": "1700000020.000200",
-            "user": "U_USER",
-            "text": "thread parent",
-        })];
-        let mut active_threads: HashMap<String, (String, String, Instant)> = HashMap::new();
-
-        // Mirror the corrected polling-loop registration block from `listen()`.
-        for (thread_ts, latest_reply) in SlackChannel::extract_active_threads(&messages) {
-            let entry = active_threads
-                .entry(thread_ts.clone())
-                .or_insert_with(|| ("C1".to_string(), thread_ts.clone(), Instant::now()));
-            if latest_reply > entry.1 {
-                entry.1 = latest_reply;
-            }
-            entry.2 = Instant::now();
-            SlackChannel::refresh_seen_thread_if_known(&ch.seen_threads, &thread_ts);
-        }
-
-        assert!(
-            ch.seen_threads.lock().unwrap().is_empty(),
-            "polling discovery must leave seen_threads untouched so the first reply backfills",
-        );
-
-        // The precheck a forwarded reply runs must report the thread as
-        // unseen, even after discovery has registered it for reply polling.
-        let reply = serde_json::json!({
-            "ts": "1700000020.000200",
-            "thread_ts": "1700000000.000001",
-            "user": "U_USER",
-            "text": "first reply",
-        });
-        assert_eq!(
-            SlackChannel::precheck_thread_backfill(&reply, &ch.seen_threads).as_deref(),
-            Some("1700000000.000001"),
-        );
-    }
-
-    /// Polling-loop discovery must refresh `seen_threads` entries that
-    /// already exist, so long-running threads that have been backfilled
-    /// stay alive across the 10-minute TTL while replies keep arriving.
-    #[test]
-    fn thread_backfill_polling_discovery_refreshes_known_seen_threads() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["C1".into()], vec![]);
-        SlackChannel::record_thread_seen(&ch.seen_threads, "1700000000.000001");
-        let before = *ch
-            .seen_threads
-            .lock()
-            .unwrap()
-            .get("1700000000.000001")
-            .expect("seed entry present");
-
-        // Force the monotonic clock to advance so the refresh is observable.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-
-        let messages = vec![serde_json::json!({
-            "ts": "1700000000.000001",
-            "thread_ts": "1700000000.000001",
-            "reply_count": 1,
-            "latest_reply": "1700000020.000200",
-            "user": "U_USER",
-            "text": "thread parent",
-        })];
-        for (thread_ts, _) in SlackChannel::extract_active_threads(&messages) {
-            SlackChannel::refresh_seen_thread_if_known(&ch.seen_threads, &thread_ts);
-        }
-
-        let after = *ch
-            .seen_threads
-            .lock()
-            .unwrap()
-            .get("1700000000.000001")
-            .expect("refresh must not delete the entry");
-        assert!(
-            after > before,
-            "long-running thread should have its seen_threads timestamp refreshed",
-        );
-
-        // And refreshing must not insert unrelated entries.
-        assert_eq!(ch.seen_threads.lock().unwrap().len(), 1);
-    }
-
-    /// `refresh_seen_thread_if_known` is a strict refresh: never inserts.
-    #[test]
-    fn thread_backfill_refresh_seen_thread_does_not_insert() {
-        let seen: Mutex<HashMap<String, Instant>> = Mutex::new(HashMap::new());
-        SlackChannel::refresh_seen_thread_if_known(&seen, "T_UNKNOWN");
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "refresh must not seed new entries",
-        );
-    }
-
-    /// Regression for the polling-loop sequence: discovery does not mark
-    /// the thread; the first forwarded reply's precheck returns the
-    /// thread_ts (so render runs); after the lazy record, the next reply's
-    /// precheck returns None (so the block is not repeated).
+    /// Core contract: first reply in an unseen thread triggers backfill;
+    /// after a successful render the thread is recorded; subsequent replies
+    /// skip backfill.
     #[test]
     fn thread_backfill_first_reply_backfills_then_subsequent_replies_do_not() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["C1".into()], vec![]);
-        let history = vec![serde_json::json!({
-            "ts": "T_PARENT",
-            "thread_ts": "T_PARENT",
-            "reply_count": 1,
-            "latest_reply": "T_REPLY1",
-            "user": "U_USER",
-            "text": "parent",
-        })];
-        for (thread_ts, _) in SlackChannel::extract_active_threads(&history) {
-            SlackChannel::refresh_seen_thread_if_known(&ch.seen_threads, &thread_ts);
-        }
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec!["C1".into()],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        );
 
         let reply1 = serde_json::json!({
             "ts": "T_REPLY1",
@@ -6471,9 +6262,8 @@ mod tests {
             "user": "U_USER",
             "text": "first reply",
         });
-        let first = SlackChannel::precheck_thread_backfill(&reply1, &ch.seen_threads);
         assert_eq!(
-            first.as_deref(),
+            SlackChannel::precheck_thread_backfill(&reply1, &ch.seen_threads).as_deref(),
             Some("T_PARENT"),
             "first forwarded reply must trigger backfill",
         );
@@ -6488,10 +6278,9 @@ mod tests {
             "user": "U_USER",
             "text": "second reply",
         });
-        let second = SlackChannel::precheck_thread_backfill(&reply2, &ch.seen_threads);
         assert!(
-            second.is_none(),
-            "second reply must not re-backfill within TTL",
+            SlackChannel::precheck_thread_backfill(&reply2, &ch.seen_threads).is_none(),
+            "second reply must not re-backfill",
         );
     }
 
@@ -6533,43 +6322,25 @@ mod tests {
         );
     }
 
-    /// Spec 3.10: Fetch failure → triggering message forwarded without
+    /// Fetch failure → triggering message forwarded without
     /// `[Thread context]` block, and the thread is NOT inserted into
-    /// `seen_threads` so the next message can retry. This test mirrors
-    /// the contract of `maybe_render_thread_backfill`: record only on
-    /// `Some(_)`.
+    /// `seen_threads` so the next message can retry.
     #[test]
     fn thread_backfill_fetch_failure_does_not_record_thread_as_seen() {
-        let seen = Mutex::new(HashMap::new());
+        let seen = Mutex::new(HashSet::new());
+
         // Simulate: precheck returned Some, render returned None.
         let block: Option<String> = None;
         if block.is_some() {
-            SlackChannel::record_thread_seen(&seen, "1700000000.000001");
+            SlackChannel::record_thread_seen(&seen, "T_PARENT");
         }
         assert!(seen.lock().unwrap().is_empty());
 
         // Sanity: the same flow with a successful render does record.
         let block: Option<String> = Some("[Thread context]\n- alice: hi".to_string());
         if block.is_some() {
-            SlackChannel::record_thread_seen(&seen, "1700000000.000001");
+            SlackChannel::record_thread_seen(&seen, "T_PARENT");
         }
-        assert!(seen.lock().unwrap().contains_key("1700000000.000001"));
-    }
-
-    /// Soft-cap eviction: when the seen-set reaches its cap, recording a
-    /// new thread clears the set first, so the new entry is the only one
-    /// remaining. Documents the trade-off chosen for `record_thread_seen`.
-    #[test]
-    fn thread_backfill_soft_cap_clears_when_full() {
-        let seen = Mutex::new(HashMap::new());
-        for i in 0..SLACK_THREAD_BACKFILL_SEEN_MAX {
-            SlackChannel::record_thread_seen(&seen, &format!("T{i}"));
-        }
-        assert_eq!(seen.lock().unwrap().len(), SLACK_THREAD_BACKFILL_SEEN_MAX);
-
-        SlackChannel::record_thread_seen(&seen, "T_NEW");
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert!(seen.contains_key("T_NEW"));
+        assert!(seen.lock().unwrap().contains("T_PARENT"));
     }
 }
