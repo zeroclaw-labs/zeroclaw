@@ -84,9 +84,11 @@ struct App<'a> {
     section_cursor: usize,
     // Type list (TypedFamilyMap families)
     types: Vec<ConfigTemplateEntry>,
+    type_alias_counts: Vec<usize>,
     type_cursor: usize,
     // Alias list
     aliases: Vec<String>,
+    alias_enabled: Vec<Option<bool>>,
     alias_cursor: usize,
     // Field list
     fields: Vec<ConfigFieldEntry>,
@@ -108,8 +110,10 @@ impl<'a> App<'a> {
             templates: Vec::new(),
             section_cursor: 0,
             types: Vec::new(),
+            type_alias_counts: Vec::new(),
             type_cursor: 0,
             aliases: Vec::new(),
+            alias_enabled: Vec::new(),
             alias_cursor: 0,
             fields: Vec::new(),
             field_cursor: 0,
@@ -160,8 +164,38 @@ impl<'a> App<'a> {
             .collect()
     }
 
+    async fn load_type_alias_counts(&mut self) -> Result<()> {
+        self.type_alias_counts.clear();
+        for tmpl in &self.types {
+            let count = self
+                .rpc
+                .config_map_keys(&tmpl.path)
+                .await
+                .map(|k| k.len())
+                .unwrap_or(0);
+            self.type_alias_counts.push(count);
+        }
+        Ok(())
+    }
+
     async fn load_aliases(&mut self, map_path: &str) -> Result<()> {
         self.aliases = self.rpc.config_map_keys(map_path).await?;
+        self.alias_enabled.clear();
+        for alias in &self.aliases {
+            let enabled_path = format!("{}.{}.enabled", map_path, alias);
+            let fields = self
+                .rpc
+                .config_list(Some(&enabled_path))
+                .await
+                .unwrap_or_default();
+            let status = fields.first().and_then(|f| {
+                f.value
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "true")
+            });
+            self.alias_enabled.push(status);
+        }
         self.alias_cursor = 0;
         Ok(())
     }
@@ -193,6 +227,7 @@ impl<'a> App<'a> {
                         Some(SectionShape::TypedFamilyMap) => {
                             self.types = self.types_for_section(&section_key);
                             self.type_cursor = 0;
+                            self.load_type_alias_counts().await?;
                             self.screen = Screen::TypeList { section_idx: idx };
                         }
                         Some(SectionShape::OneTierAliasMap) => {
@@ -751,12 +786,15 @@ impl<'a> App<'a> {
         let items: Vec<ListItem> = self
             .types
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(i, t)| {
                 let name = t.path.rsplit('.').next().unwrap_or(&t.path);
-                ListItem::new(Line::from(Span::styled(
-                    name.to_string(),
-                    theme::body_style(),
-                )))
+                let count = self.type_alias_counts.get(i).copied().unwrap_or(0);
+                let mut spans = vec![Span::styled(name.to_string(), theme::body_style())];
+                if count > 0 {
+                    spans.push(Span::styled(format!("  ({count})"), theme::accent_style()));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
@@ -803,7 +841,16 @@ impl<'a> App<'a> {
         let mut items: Vec<ListItem> = self
             .aliases
             .iter()
-            .map(|a| ListItem::new(Line::from(Span::styled(a.clone(), theme::body_style()))))
+            .enumerate()
+            .map(|(i, a)| {
+                let mut spans = vec![Span::styled(a.clone(), theme::body_style())];
+                match self.alias_enabled.get(i).copied().flatten() {
+                    Some(true) => spans.push(Span::styled("  ✓", theme::accent_style())),
+                    Some(false) => spans.push(Span::styled("  disabled", theme::dim_style())),
+                    None => {}
+                }
+                ListItem::new(Line::from(spans))
+            })
             .collect();
         items.push(ListItem::new(Line::from(Span::styled(
             "[+ Add]",
