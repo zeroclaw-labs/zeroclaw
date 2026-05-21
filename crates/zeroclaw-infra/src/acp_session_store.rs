@@ -314,6 +314,7 @@ mod tests {
                     extra_content: None,
                 }],
                 reasoning_content: None,
+                reasoning_field: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "tc-1".into(),
