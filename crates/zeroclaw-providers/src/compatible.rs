@@ -4870,7 +4870,7 @@ mod tests {
 
     #[test]
     fn parse_native_response_captures_reasoning() {
-        let provider = make_provider("test", "https://example.com", None);
+        let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
             content: Some("answer".to_string()),
             reasoning_content: Some("thinking step".to_string()),
@@ -4898,7 +4898,7 @@ mod tests {
 
     #[test]
     fn parse_native_response_omits_empty_reasoning_content() {
-        let provider = make_provider("test", "https://example.com", None);
+        let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
             content: Some("answer".to_string()),
             reasoning_content: Some(String::new()),
@@ -4967,7 +4967,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let provider = make_provider("test", "https://example.com", None);
+        let provider = make_model_provider("test", "https://example.com", None);
         let native = provider.convert_messages_for_native(&messages, true);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");

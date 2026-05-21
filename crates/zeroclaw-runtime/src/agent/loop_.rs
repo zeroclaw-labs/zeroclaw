@@ -7211,105 +7211,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
-        let provider = ScriptedProvider {
-            responses: Arc::new(Mutex::new(VecDeque::from(vec![
-                ChatResponse {
-                    text: Some("Task started. Waiting 30 seconds before checking status.".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "call_wait".into(),
-                        name: "count_tool".into(),
-                        arguments: r#"{"value":"A"}"#.into(),
-                        extra_content: None,
-                    }],
-                    usage: None,
-                    reasoning_content: None,
-                    reasoning_field: None,
-                },
-                ChatResponse {
-                    text: Some("Final answer".into()),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    reasoning_content: None,
-                    reasoning_field: None,
-                },
-            ]))),
-            capabilities: ProviderCapabilities {
-                native_tool_calling: true,
-                ..ProviderCapabilities::default()
-            },
-        };
-
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("run tool calls"),
-        ];
-        let observer = NoopObserver;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-        )
-        .await
-        .expect("native tool-call text should be relayed through on_delta");
-
-        let mut deltas: Vec<DraftEvent> = Vec::new();
-        while let Some(delta) = rx.recv().await {
-            deltas.push(delta);
-        }
-
-        assert!(
-            deltas.iter().any(
-                |delta| matches!(delta, StreamDelta::Text(t) if t == "Task started. Waiting 30 seconds before checking status.\n")
-            ),
-            "native assistant text should be relayed to on_delta"
-        );
-        assert!(
-            deltas
-                .iter()
-                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("💬 Got 1 tool call(s)"))),
-            "tool-call progress line should still be relayed"
-        );
-        assert!(
-            result.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {result}"
-        );
-        assert_eq!(invocations.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn run_tool_call_loop_preserves_unknown_function_call_json_with_tools() {
         let business_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
@@ -8452,12 +8353,14 @@ This is an example, not an invocation."#;
                     }],
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
                 ChatResponse {
                     text: Some("Final answer".into()),
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
+                    reasoning_field: None,
                 },
             ]))),
             capabilities: ProviderCapabilities {
@@ -10726,7 +10629,7 @@ Let me check the result."#;
         struct ReasoningFieldProvider;
 
         #[async_trait]
-        impl Provider for ReasoningFieldProvider {
+        impl ModelProvider for ReasoningFieldProvider {
             async fn chat_with_system(
                 &self,
                 _system_prompt: Option<&str>,
@@ -10770,6 +10673,19 @@ Let me check the result."#;
                 ]))
             }
         }
+        impl ::zeroclaw_api::attribution::Attributable for ReasoningFieldProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "ReasoningFieldProvider"
+            }
+        }
 
         let provider = ReasoningFieldProvider;
         let messages = vec![ChatMessage::user("hi")];
@@ -10779,7 +10695,7 @@ Let me check the result."#;
             &messages,
             None,
             "vllm-model",
-            0.2,
+            Some(0.2),
             None,
             None,
         )
