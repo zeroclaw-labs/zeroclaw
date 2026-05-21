@@ -757,9 +757,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 }
 
                 // Inside a heredoc body: don't split on newlines.
-                if let Some(ref delim) = heredoc_delimiter.clone() {
+                if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
-                        if heredoc_line_buf.trim() == delim.as_str() {
+                        if heredoc_line_buf.trim() == delim {
                             // Terminator line reached — end of heredoc body.
                             heredoc_delimiter = None;
                             heredoc_line_buf.clear();
@@ -3609,6 +3609,8 @@ mod tests {
         assert!(p.is_command_allowed("cat <<EOF\nhello\nEOF\necho done"));
         // Heredoc followed by a disallowed command must be blocked
         assert!(!p.is_command_allowed("cat <<EOF\nhello\nEOF\nrm -rf /"));
+        // Unterminated heredoc — entire input stays as one segment (safe: cat is allowed).
+        assert!(p.is_command_allowed("cat <<EOF\nhello world"));
     }
 
     #[test]
