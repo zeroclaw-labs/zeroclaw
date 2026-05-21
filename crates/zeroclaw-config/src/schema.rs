@@ -17865,6 +17865,7 @@ bot_token = "xoxb-tok"
             send_method: None,
             auth_header: None,
             secret: None,
+            excluded_tools: vec![],
             max_retries: Some(5),
             retry_base_delay_ms: Some(250),
             retry_max_delay_ms: Some(10_000),

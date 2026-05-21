@@ -185,7 +185,9 @@ impl WebhookChannel {
         }
 
         // Other 4xx → do not retry.
-        AttemptOutcome::Fatal(anyhow::anyhow!("Webhook send failed ({status}): {body}"))
+        AttemptOutcome::Fatal(anyhow::Error::msg(format!(
+            "Webhook send failed ({status}): {body}"
+        )))
     }
 }
 
@@ -279,11 +281,15 @@ impl Channel for WebhookChannel {
                         );
                     }
                     let capped = delay.min(Duration::from_millis(self.retry_max_delay_ms));
-                    tracing::warn!(
-                        "Webhook send: server requested retry after {}ms (attempt {}/{}), waiting...",
-                        capped.as_millis(),
-                        attempt + 1,
-                        total_attempts
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Webhook send: server requested retry after {}ms (attempt {}/{}), waiting...",
+                            capped.as_millis(),
+                            attempt + 1,
+                            total_attempts
+                        )
                     );
                     tokio::time::sleep(capped).await;
                 }
@@ -294,12 +300,16 @@ impl Channel for WebhookChannel {
                         );
                     }
                     let delay = self.compute_backoff(attempt);
-                    tracing::warn!(
-                        "Webhook send failed (attempt {}/{}): {}; retrying in {}ms",
-                        attempt + 1,
-                        total_attempts,
-                        err_msg,
-                        delay.as_millis()
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Webhook send failed (attempt {}/{}): {}; retrying in {}ms",
+                            attempt + 1,
+                            total_attempts,
+                            err_msg,
+                            delay.as_millis()
+                        )
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -500,6 +510,7 @@ mod tests {
     fn make_channel_to(url: &str) -> WebhookChannel {
         // Fast retries to keep tests snappy.
         WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some(url.into()),
@@ -514,8 +525,18 @@ mod tests {
 
     #[test]
     fn default_path() {
-        let ch =
-            WebhookChannel::new("test-hook".into(), 8080, None, None, None, None, None, None, None, None);
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(ch.listen_path, "/webhook");
     }
 
@@ -570,6 +591,7 @@ mod tests {
     #[test]
     fn retry_overrides_applied() {
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some("https://example.com".into()),
@@ -588,6 +610,7 @@ mod tests {
     #[test]
     fn backoff_capped_by_max_delay() {
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some("https://example.com".into()),
@@ -611,6 +634,7 @@ mod tests {
         // historically push the result above the cap. With strict capping the
         // returned delay must stay `<= retry_max_delay_ms` on every draw.
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some("https://example.com".into()),
@@ -843,6 +867,7 @@ mod tests {
         // Use a channel whose retry_max_delay_ms is high enough to let us actually
         // wait the full Retry-After (cap at 2s so we honor the 1s instruction).
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some(format!("{}/cb", mock.uri())),
@@ -886,6 +911,7 @@ mod tests {
             .await;
 
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some(format!("{}/cb", mock.uri())),
@@ -921,6 +947,7 @@ mod tests {
             .await;
 
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some(format!("{}/cb", mock.uri())),
