@@ -36,19 +36,22 @@ pub mod method {
 // ── Socket path resolution ───────────────────────────────────────
 
 /// Resolve the daemon socket path.
-/// `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock`.
-pub fn resolve_socket_path() -> Result<PathBuf> {
+/// CLI flag > `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock`.
+pub fn resolve_socket_path(config_dir: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         let p = p.trim();
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
         }
     }
-    Ok(resolve_config_dir()?.join("data").join("daemon.sock"))
+    Ok(config_dir.join("data").join("daemon.sock"))
 }
 
-/// Resolve config dir: `$ZEROCLAW_CONFIG_DIR` > `~/.zeroclaw`.
-pub fn resolve_config_dir() -> Result<PathBuf> {
+/// Resolve config dir: CLI flag > `$ZEROCLAW_CONFIG_DIR` > `~/.zeroclaw`.
+pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = cli_override {
+        return Ok(dir.to_path_buf());
+    }
     if let Ok(d) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let d = d.trim();
         if !d.is_empty() {

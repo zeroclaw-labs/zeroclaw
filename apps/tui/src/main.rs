@@ -1,9 +1,27 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use clap::Parser;
 
 mod client;
 mod config_manager;
 mod theme;
 mod widgets;
+
+const DAEMON_CONNECT_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Parser)]
+#[command(
+    name = "zeroclaw-tui",
+    about = "Interactive TUI config manager for ZeroClaw"
+)]
+struct Cli {
+    /// Path to the ZeroClaw config directory
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,33 +35,32 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let socket = client::resolve_socket_path()?;
+    let cli = Cli::parse();
+    let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+    let socket = client::resolve_socket_path(&config_dir)?;
 
-    // Try connecting to an existing daemon first.
     let rpc = match client::RpcClient::connect(&socket).await {
         Ok(c) => c,
         Err(_) => {
-            // No daemon running — spawn one in ephemeral mode.
-            spawn_ephemeral_daemon(&socket).await?;
-            client::RpcClient::connect(&socket).await?
+            spawn_ephemeral_daemon(&config_dir)?;
+            await_daemon_ready(&socket).await?
         }
     };
 
     config_manager::run(&rpc).await
 }
 
-async fn spawn_ephemeral_daemon(socket: &std::path::Path) -> anyhow::Result<()> {
+fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))
-        .unwrap_or_else(|| std::path::PathBuf::from("zeroclaw"));
+        .unwrap_or_else(|| PathBuf::from("zeroclaw"));
 
-    let mut cmd = tokio::process::Command::new(&exe);
-    cmd.arg("daemon").arg("--ephemeral");
-
-    if let Ok(dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
-        cmd.arg("--config-dir").arg(dir);
-    }
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon")
+        .arg("--ephemeral")
+        .arg("--config-dir")
+        .arg(config_dir);
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -52,16 +69,22 @@ async fn spawn_ephemeral_daemon(socket: &std::path::Path) -> anyhow::Result<()> 
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
 
-    // Wait for socket to appear.
-    for _ in 0..100 {
-        if socket.exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    Ok(())
+}
 
-    anyhow::bail!(
-        "daemon did not start (socket never appeared at {})",
-        socket.display()
-    )
+async fn await_daemon_ready(socket: &std::path::Path) -> anyhow::Result<client::RpcClient> {
+    let deadline = tokio::time::Instant::now() + DAEMON_CONNECT_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "daemon did not become ready within {}s (socket: {})",
+                DAEMON_CONNECT_TIMEOUT.as_secs(),
+                socket.display(),
+            );
+        }
+        match client::RpcClient::connect(socket).await {
+            Ok(c) => return Ok(c),
+            Err(_) => tokio::time::sleep(DAEMON_CONNECT_INTERVAL).await,
+        }
+    }
 }

@@ -14,6 +14,7 @@ path = "src/main.rs"
 zeroclaw-api = { workspace = true }
 zeroclaw-config = { workspace = true, default-features = true }
 anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 async-trait = "0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = { version = "0.30", default-features = true }

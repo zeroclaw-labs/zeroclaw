@@ -13661,6 +13661,7 @@ version = "0.8.0-beta-1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "clap",
  "crossterm",
  "libc",
  "ratatui",
