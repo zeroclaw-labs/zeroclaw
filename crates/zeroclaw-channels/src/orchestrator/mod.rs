@@ -16073,9 +16073,15 @@ Done."#;
             "user_abc123",
             None,
         );
-        assert!(prompt.contains("sender=user_abc123"));
-        assert!(prompt.contains("channel=mattermost"));
-        assert!(prompt.contains("reply_target=channel123:root456"));
+        // Pin the comma-separated triple in the format string at lines
+        // ~752-754 so a refactor that splits, reorders, or rewords the
+        // context block fails loudly rather than silently.
+        assert!(
+            prompt.contains(
+                "channel=mattermost, reply_target=channel123:root456, sender=user_abc123"
+            ),
+            "prompt missing the joint channel-context triple: {prompt}"
+        );
     }
 
     #[test]
@@ -16095,6 +16101,20 @@ Done."#;
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_for_message_propagates_channel_fields() {
+        // The wrapper unpacks ChannelMessage into build_channel_system_prompt
+        // args. Pin that the channel-context triple in the rendered prompt
+        // reflects the message's channel/reply_target/sender so a later
+        // refactor adding more fields can't silently drop existing ones.
+        let msg = channel_message("discord", None);
+        let prompt = build_channel_system_prompt_for_message("Base.", &msg, None);
+        assert!(
+            prompt.contains("channel=discord, reply_target=r1, sender=u1"),
+            "wrapper did not propagate channel/reply_target/sender from ChannelMessage: {prompt}"
+        );
     }
 
     #[test]
