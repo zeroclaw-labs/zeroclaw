@@ -167,13 +167,11 @@ enum NodeMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum GatewayMessage {
-    #[allow(dead_code)] // Serialized gateway protocol message
+    #[allow(dead_code)] // Wire-format ack; only the test constructs it today.
     Registered {
         node_id: String,
         capabilities_count: usize,
     },
-    #[allow(dead_code)] // Serialized gateway protocol message
-    Error { message: String },
     Invoke {
         call_id: String,
         capability: String,
@@ -235,7 +233,7 @@ pub async fn handle_ws_nodes(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     // Auth: check node auth token if configured
-    let nodes_config = state.config.lock().nodes.clone();
+    let nodes_config = state.config.read().nodes.clone();
     if let Some(ref expected_token) = nodes_config.auth_token {
         let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         if token != expected_token {
@@ -333,7 +331,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
             } => {
                 // Validate node_id
                 if node_id.is_empty() || node_id.len() > 128 {
-                    tracing::warn!("Node registration rejected: invalid node_id length");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Node registration rejected: invalid node_id length"
+                    );
                     continue;
                 }
 
@@ -345,7 +348,14 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                 };
 
                 if registry.register(info) {
-                    tracing::info!("Node registered: {node_id} with {caps_count} capabilities");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(
+                                ::serde_json::json!({"node_id": node_id, "caps_count": caps_count})
+                            ),
+                        "Node registered: with capabilities"
+                    );
                     registered_node_id = Some(node_id.clone());
 
                     // Send ack — we can't use `sender` here since it's moved
@@ -355,8 +365,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                     // a registered message. For simplicity, we just log and the
                     // ack is implicit in the protocol.
                 } else {
-                    tracing::warn!(
-                        "Node registration rejected: registry at capacity for {node_id}"
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"node_id": node_id})),
+                        "Node registration rejected: registry at capacity for"
                     );
                 }
             }
@@ -380,7 +394,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
     // Cleanup: unregister node on disconnect
     if let Some(node_id) = registered_node_id {
         registry.unregister(&node_id);
-        tracing::info!("Node disconnected and unregistered: {node_id}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"node_id": node_id})),
+            "Node disconnected and unregistered"
+        );
     }
 
     send_task.abort();

@@ -7,7 +7,7 @@ description = "Tool call parsing for LLM responses — handles JSON, XML, GLM, M
 publish = false
 
 [dependencies]
+zeroclaw-log.workspace = true
 regex = "1.10"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-tracing = { version = "0.1", default-features = false }

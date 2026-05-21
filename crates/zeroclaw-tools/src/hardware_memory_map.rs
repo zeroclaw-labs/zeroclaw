@@ -148,8 +148,19 @@ fn probe_rs_memory_map(chip: &str) -> anyhow::Result<String> {
     use probe_rs::config::MemoryRegion;
     use probe_rs::{Session, SessionConfig};
 
-    let session = Session::auto_attach(chip, SessionConfig::default())
-        .map_err(|e| anyhow::anyhow!("probe-rs attach failed: {}", e))?;
+    let session = Session::auto_attach(chip, SessionConfig::default()).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "error": format!("{}", e),
+                })),
+            "hardware_memory_map: probe-rs attach failed"
+        );
+        anyhow::Error::msg(format!("probe-rs attach failed: {}", e))
+    })?;
 
     let target = session.target();
     let mut out = String::new();

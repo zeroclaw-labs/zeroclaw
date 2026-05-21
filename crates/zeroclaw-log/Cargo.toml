@@ -1,0 +1,34 @@
+[package]
+name = "zeroclaw-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified log emission surface: structured event schema, JSONL persistence, broadcast hook, and the record! macro every other crate emits through."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+parking_lot = "0.12"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+strum = "0.27"
+strum_macros = "0.27"
+tokio = { version = "1.50", default-features = false, features = ["sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt", "ansi", "env-filter"] }
+uuid = { version = "1.18", default-features = false, features = ["v4", "std"] }
+
+[dev-dependencies]
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+# zeroclaw-log IS the log pipeline. The `record!` macro it exports is
+# the workspace-wide deny gate for `tracing::info!`/`warn!`/etc. — see
+# workspace clippy.toml. This crate's own implementation has to call
+# the underlying `tracing::*` macros directly to bootstrap the
+# pipeline, so the ban is lifted here and only here.
+[lints.clippy]
+disallowed_macros = "allow"

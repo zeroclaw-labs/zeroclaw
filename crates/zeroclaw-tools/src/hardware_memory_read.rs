@@ -149,13 +149,37 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
     use probe_rs::Session;
     use probe_rs::SessionConfig;
 
-    let mut session = Session::auto_attach(chip, SessionConfig::default())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut session = Session::auto_attach(chip, SessionConfig::default()).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "error": format!("{}", e),
+                })),
+            "hardware_memory_read: probe-rs auto_attach failed"
+        );
+        anyhow::Error::msg(format!("{}", e))
+    })?;
 
     let mut core = session.core(0)?;
     let mut buf = vec![0u8; length];
-    core.read_8(address, &mut buf)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    core.read_8(address, &mut buf).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "address": address,
+                    "length": length,
+                    "error": format!("{}", e),
+                })),
+            "hardware_memory_read: probe-rs read_8 failed"
+        );
+        anyhow::Error::msg(format!("{}", e))
+    })?;
 
     // Format as hex dump: address | bytes (16 per line)
     let mut out = format!("Memory read from 0x{:08X} ({} bytes):\n\n", address, length);

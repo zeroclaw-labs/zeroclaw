@@ -60,6 +60,8 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
         }
     }
 

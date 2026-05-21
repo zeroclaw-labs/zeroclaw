@@ -16,7 +16,13 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(DeviceReadCodeTool, ToolKind::Plugin);
+tool_attribution!(DeviceWriteCodeTool, ToolKind::Plugin);
+tool_attribution!(DeviceExecTool, ToolKind::Plugin);
 
 /// Default timeout for `mpremote` operations (seconds).
 const MPREMOTE_TIMEOUT_SECS: u64 = 30;
@@ -189,7 +195,7 @@ impl Tool for DeviceReadCodeTool {
             other => return Ok(unsupported_runtime(&other, "device_read_code")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, "reading main.py from device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime)})), "reading main.py from device");
 
         match run_mpremote(
             &["connect", &port, "cat", ":main.py"],
@@ -309,7 +315,7 @@ impl Tool for DeviceWriteCodeTool {
             other => return Ok(unsupported_runtime(&other, "device_write_code")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "writing main.py to device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime), "code_len": code.len()})), "writing main.py to device");
 
         // Write code to an atomic, owner-only temp file via tempfile crate.
         let named_tmp = match tokio::task::spawn_blocking(|| {
@@ -357,12 +363,23 @@ impl Tool for DeviceWriteCodeTool {
 
         // Explicit cleanup — log if removal fails rather than silently ignoring.
         if let Err(e) = named_tmp.close() {
-            tracing::warn!(path = %tmp_str, err = %e, "failed to clean up temp file");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": tmp_str, "err": e.to_string()})),
+                "failed to clean up temp file"
+            );
         }
 
         match result {
             Ok((_stdout, _stderr)) => {
-                tracing::info!(alias = %alias, "main.py deployed and device reset");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"alias": alias})),
+                    "main.py deployed and device reset"
+                );
 
                 // Wait for the serial port to reappear after reset.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -482,7 +499,7 @@ impl Tool for DeviceExecTool {
             other => return Ok(unsupported_runtime(&other, "device_exec")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "executing snippet on device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime), "code_len": code.len()})), "executing snippet on device");
 
         // Write snippet to an atomic, owner-only temp file via tempfile crate.
         let named_tmp = match tokio::task::spawn_blocking(|| {
@@ -527,7 +544,13 @@ impl Tool for DeviceExecTool {
 
         // Explicit cleanup — log if removal fails rather than silently ignoring.
         if let Err(e) = named_tmp.close() {
-            tracing::warn!(path = %tmp_str, err = %e, "failed to clean up temp file");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": tmp_str, "err": e.to_string()})),
+                "failed to clean up temp file"
+            );
         }
 
         match result {

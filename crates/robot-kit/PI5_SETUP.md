@@ -357,26 +357,34 @@ nohup python3 ~/sensor_loop.py &
 ### Start ZeroClaw Agent
 
 ```bash
-# Configure ZeroClaw to use robot tools
+# Configure ZeroClaw to use robot tools. The four-section V3 shape
+# (provider entry, agent, risk profile, optional memory) is documented at
+# https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/providers/configuration.md#minimal-working-example
 cat > ~/.zeroclaw/config.toml << 'EOF'
-api_key = ""  # Not needed for local Ollama
-default_provider = "ollama"
-default_model = "llama3.2:3b"
+schema_version = 3
 
-[memory]
-backend = "sqlite"
-embedding_provider = "noop"  # No cloud embeddings
+[providers.models.ollama.local]    # type = ollama; alias = local (you choose)
+model = "llama3.2:3b"
+# (no api_key — Ollama runs locally)
 
-[autonomy]
+[agents.assistant]                  # alias = assistant (you choose)
+model_provider = "ollama.local"
+risk_profile = "assistant"
+
+[risk_profiles.assistant]
 level = "supervised"
 workspace_only = true
+
+[memory]
+backend = "sqlite.local"            # <backend>.<alias>; no [storage.sqlite.local] needed for defaults
+embedding_provider = "none"         # keyword-only retrieval; no cloud embedding calls
 EOF
 
 # Copy robot personality
 cp ~/zeroclaw/crates/robot-kit/SOUL.md ~/.zeroclaw/workspace/
 
 # Start agent
-./target/release/zeroclaw agent
+./target/release/zeroclaw agent -a assistant
 ```
 
 ### Full Robot Startup Script

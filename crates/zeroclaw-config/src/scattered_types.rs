@@ -396,6 +396,10 @@ fn default_max_attachment_bytes() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     pub imap_host: String,
@@ -418,12 +422,15 @@ pub struct EmailConfig {
     /// capability (RFC 2177). Ignored when IDLE is available.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
     #[serde(default = "default_subject")]
     pub default_subject: String,
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -450,9 +457,9 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             poll_interval_secs: default_poll_interval_secs(),
-            allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -465,6 +472,10 @@ fn default_label_filter() -> Vec<String> {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.gmail"]
 pub struct GmailPushConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     pub topic: String,
@@ -474,11 +485,14 @@ pub struct GmailPushConfig {
     #[secret]
     pub oauth_token: String,
     #[serde(default)]
-    pub allowed_senders: Vec<String>,
-    #[serde(default)]
     pub webhook_url: String,
     #[serde(default)]
     pub webhook_secret: String,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for GmailPushConfig {
@@ -497,9 +511,9 @@ impl Default for GmailPushConfig {
             topic: String::new(),
             label_filter: default_label_filter(),
             oauth_token: String::new(),
-            allowed_senders: Vec::new(),
             webhook_url: String::new(),
             webhook_secret: String::new(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -508,6 +522,10 @@ impl Default for GmailPushConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     #[secret]
@@ -519,6 +537,11 @@ pub struct ClawdTalkConfig {
     #[serde(default)]
     #[secret]
     pub webhook_secret: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for ClawdTalkConfig {
@@ -530,7 +553,7 @@ impl ChannelConfig for ClawdTalkConfig {
     }
 }
 
-/// Which telephony provider to use.
+/// Which telephony model_provider to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -566,10 +589,14 @@ fn default_max_call_duration() -> u64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub provider: VoiceProvider,
+    pub model_provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
     pub from_number: String,
@@ -585,13 +612,18 @@ pub struct VoiceCallConfig {
     pub max_call_duration_secs: u64,
     #[serde(default)]
     pub webhook_base_url: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: VoiceProvider::default(),
+            model_provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),
             from_number: String::new(),
@@ -601,6 +633,7 @@ impl Default for VoiceCallConfig {
             tts_voice: None,
             max_call_duration_secs: default_max_call_duration(),
             webhook_base_url: None,
+            excluded_tools: Vec::new(),
         }
     }
 }

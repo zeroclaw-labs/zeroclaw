@@ -130,10 +130,8 @@ RUN size=$(stat -c%s /app/zeroclaw) && \
 # The web dashboard bundle is installed in the runtime stage at
 # /usr/share/zeroclawlabs/web/dist (outside the documented /zeroclaw-data
 # mount point) so a bind mount on /zeroclaw-data cannot shadow it (#6400).
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'workspace_dir = "/zeroclaw-data/workspace"' \
-        'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
         'api_key = ""' \
         'default_provider = "openrouter"' \
         'default_model = "anthropic/claude-sonnet-4-20250514"' \
@@ -145,7 +143,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'allow_public_bind = true' \
         'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
         '' \
-        '[autonomy]' \
+        '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
@@ -171,7 +169,7 @@ COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden

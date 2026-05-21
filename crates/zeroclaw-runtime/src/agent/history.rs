@@ -187,7 +187,7 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
-/// and downstream providers receive a `null` `call_id` (#5425).
+/// and downstream model_providers receive a `null` `call_id`.
 pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     if max_chars == 0 || msg_content.len() <= max_chars {
         return msg_content.to_string();
@@ -226,7 +226,7 @@ pub fn fast_trim_tool_results(
 
 /// Emergency: drop oldest non-system, non-recent messages from history.
 /// Tool groups (assistant + consecutive tool messages) are dropped
-/// atomically to preserve tool_use/tool_result pairing. See #4810.
+/// atomically to preserve tool_use/tool_result pairing.
 /// Returns number of messages dropped.
 pub fn emergency_history_trim(
     history: &mut Vec<zeroclaw_providers::ChatMessage>,
@@ -255,7 +255,7 @@ pub fn emergency_history_trim(
             dropped += 1;
         }
     }
-    dropped += remove_orphaned_tool_messages(history);
+    dropped += remove_orphaned_tool_messages(history).removed;
     dropped
 }
 
@@ -376,7 +376,7 @@ pub fn load_interactive_session_history(
     // dropped the assistant tool_use block but left its tool_result).
     // Without this the next API call fails with 400 "unexpected tool_use_id
     // found in tool_result blocks" and the session stays bricked until the
-    // file is deleted. See #5813.
+    // file is deleted.
     remove_orphaned_tool_messages(&mut state.history);
 
     Ok(state.history)
@@ -402,11 +402,14 @@ mod tests {
         let image = dir.path().join("generated.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
 
-        let input = format!("Image generated successfully.\nFile: {}", image.display());
+        let input = format!(
+            "Image generated successfully.\nFile: {}",
+            image.display().to_string()
+        );
         let output = canonicalize_tool_result_media_markers(&input);
 
         assert!(output.contains("[IMAGE:"));
-        assert!(output.contains(&format!("[IMAGE:{}]", image.display())));
+        assert!(output.contains(&format!("[IMAGE:{}]", image.display().to_string())));
     }
 
     #[test]
