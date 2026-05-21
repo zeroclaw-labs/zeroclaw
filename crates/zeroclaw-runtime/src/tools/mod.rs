@@ -651,6 +651,7 @@ pub fn all_tools_with_runtime(
             root_config.web_search.search_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
+            root_config.web_search.jina_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
