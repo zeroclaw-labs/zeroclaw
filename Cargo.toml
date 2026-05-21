@@ -1,33 +1,41 @@
 [workspace]
-members = [".", "crates/quantclaw-api", "crates/quantclaw-infra", "crates/quantclaw-config", "crates/quantclaw-providers", "crates/quantclaw-memory", "crates/quantclaw-channels", "crates/quantclaw-tools", "crates/quantclaw-runtime", "crates/quantclaw-tui", "crates/quantclaw-plugins", "crates/quantclaw-gateway", "crates/quantclaw-hardware", "crates/quantclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/quantclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
+exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.6.9"
+version = "0.8.0-beta-1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/quant-speed/quantclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-quantclaw-api = { path = "crates/quantclaw-api", version = "0.6.9" }
-quantclaw-infra = { path = "crates/quantclaw-infra", version = "0.6.9" }
-quantclaw-config = { path = "crates/quantclaw-config", version = "0.6.9", default-features = false }
-quantclaw-providers = { path = "crates/quantclaw-providers", version = "0.6.9" }
-quantclaw-memory = { path = "crates/quantclaw-memory", version = "0.6.9" }
-quantclaw-channels = { path = "crates/quantclaw-channels", version = "0.6.9", default-features = false }
-quantclaw-tools = { path = "crates/quantclaw-tools", version = "0.6.9" }
-quantclaw-runtime = { path = "crates/quantclaw-runtime", version = "0.6.9", default-features = false }
-quantclaw-tui = { path = "crates/quantclaw-tui", version = "0.6.9" }
-quantclaw-plugins = { path = "crates/quantclaw-plugins", version = "0.6.9" }
-quantclaw-gateway = { path = "crates/quantclaw-gateway", version = "0.6.9" }
-quantclaw-hardware = { path = "crates/quantclaw-hardware", version = "0.6.9" }
-quantclaw-tool-call-parser = { path = "crates/quantclaw-tool-call-parser", version = "0.6.9" }
-quantclaw-macros = { path = "crates/quantclaw-macros", version = "0.6.9" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-1" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-1" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-1" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-1" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-1" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-1" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.8.0-beta-1" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-1" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-1" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-1" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-1" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-1" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
-name = "quantspeed"
+name = "zeroclawlabs"
+# Publishing blocked during microkernel workspace transition — see #5811.
+# All 14 workspace sub-crates are publish = false and therefore unresolvable
+# on crates.io. Flip or remove this once the multi-crate publish topology is
+# designed per RFC #5579.
+publish = false
+default-run = "zeroclaw"
 version.workspace = true
 edition.workspace = true
 authors = ["theonlyhennygod"]
@@ -46,12 +54,17 @@ include = [
   "/LICENSE*",
   "/README.md",
   "/web/dist/**/*",
-  "/tool_descriptions/**/*",
+  "/locales/**/*",
 ]
 
 [[bin]]
 name = "quantclaw"
 path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw-acp-bridge"
+path = "src/bin/zeroclaw-acp-bridge.rs"
+required-features = ["acp-bridge"]
 
 [lib]
 name = "quantclaw"
@@ -59,23 +72,25 @@ path = "src/lib.rs"
 
 [dependencies]
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
-quantclaw-api.workspace = true
-quantclaw-infra.workspace = true
-quantclaw-config.workspace = true
-quantclaw-providers.workspace = true
-quantclaw-memory.workspace = true
-quantclaw-channels = { workspace = true, optional = true }
-quantclaw-tools = { workspace = true, optional = true }
-quantclaw-runtime = { workspace = true, optional = true }
-quantclaw-tui = { workspace = true, optional = true }
-quantclaw-plugins = { workspace = true, optional = true }
-quantclaw-gateway = { workspace = true, optional = true }
-quantclaw-hardware = { workspace = true, optional = true }
-quantclaw-tool-call-parser.workspace = true
-quantclaw-macros.workspace = true
+zeroclaw-api.workspace = true
+zeroclaw-infra.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-memory.workspace = true
+zeroclaw-channels = { workspace = true, optional = true }
+zeroclaw-tools = { workspace = true, optional = true }
+zeroclaw-runtime = { workspace = true, optional = true }
+zeroclaw-tui = { workspace = true, optional = true }
+zeroclaw-plugins = { workspace = true, optional = true }
+zeroclaw-gateway = { workspace = true, optional = true }
+zeroclaw-hardware = { workspace = true, optional = true }
+zeroclaw-tool-call-parser.workspace = true
+zeroclaw-macros.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+clap-markdown = "0.1"
 
 # Async runtime - feature-optimized for size
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
@@ -92,14 +107,13 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
+toml_edit = "0.25"  # already a transitive dep via toml — zero added compile/binary cost
 shellexpand = "3.1"
 
 # JSON Schema generation for config export
 schemars = "1.2"
 
 # Logging - minimal
-tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
@@ -111,7 +125,7 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-rumqttc = "0.24"
+rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -197,7 +211,7 @@ tokio-native-tls = { version = "0.3", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "native-tls"], optional = true }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 
@@ -226,12 +240,16 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "acp-bridge",
+    "gateway",
+    "tui-onboarding",
     "observability-prometheus",
     "schema-export",
 ]
 
-# The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
+# The full agent runtime — agent loop, channels, tools, all subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
+# Gateway and TUI onboarding are opt-in separately (included in `default`).
 agent-runtime = [
     "dep:quantclaw-runtime", "dep:quantclaw-channels", "dep:quantclaw-tools",
     "dep:rusqlite",
@@ -240,9 +258,6 @@ agent-runtime = [
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:native-tls", "dep:tokio-native-tls",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
-    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
-    "dep:mime_guess",
-    "gateway", "tui-onboarding",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
@@ -255,54 +270,64 @@ agent-runtime = [
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
-gateway = ["dep:quantclaw-gateway"]
-tui-onboarding = ["dep:quantclaw-tui"]
-schema-export = ["quantclaw-config/schema-export"]
+gateway = [
+    "dep:zeroclaw-gateway",
+    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
+    "dep:mime_guess",
+]
+tui-onboarding = ["dep:zeroclaw-tui"]
+schema-export = ["zeroclaw-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
 
-# Channels — each forwards directly to quantclaw-channels (1 hop)
-channel-email = ["quantclaw-channels/channel-email"]
-channel-telegram = ["quantclaw-channels/channel-telegram"]
-channel-lark = ["quantclaw-channels/channel-lark"]
-channel-nostr = ["quantclaw-channels/channel-nostr", "quantclaw-runtime/channel-nostr", "dep:nostr-sdk"]
-channel-matrix = ["quantclaw-channels/channel-matrix"]
-channel-discord = ["quantclaw-channels/channel-discord"]
-channel-slack = ["quantclaw-channels/channel-slack"]
-channel-signal = ["quantclaw-channels/channel-signal"]
-channel-mattermost = ["quantclaw-channels/channel-mattermost"]
-channel-irc = ["quantclaw-channels/channel-irc"]
-channel-imessage = ["quantclaw-channels/channel-imessage"]
-channel-dingtalk = ["quantclaw-channels/channel-dingtalk"]
-channel-qq = ["quantclaw-channels/channel-qq"]
-channel-bluesky = ["quantclaw-channels/channel-bluesky"]
-channel-twitter = ["quantclaw-channels/channel-twitter"]
-channel-reddit = ["quantclaw-channels/channel-reddit"]
-channel-notion = ["quantclaw-channels/channel-notion"]
-channel-linq = ["quantclaw-channels/channel-linq"]
-channel-wati = ["quantclaw-channels/channel-wati"]
-channel-nextcloud = ["quantclaw-channels/channel-nextcloud"]
-channel-mochat = ["quantclaw-channels/channel-mochat"]
-channel-wecom = ["quantclaw-channels/channel-wecom"]
-channel-clawdtalk = ["quantclaw-channels/channel-clawdtalk"]
-channel-webhook = ["quantclaw-channels/channel-webhook"]
-channel-acp-server = ["quantclaw-channels/channel-acp-server"]
-channel-whatsapp-cloud = ["quantclaw-channels/channel-whatsapp-cloud"]
-channel-voice-call = ["quantclaw-channels/channel-voice-call"]
-channel-feishu = ["channel-lark"]
-whatsapp-web = ["quantclaw-channels/whatsapp-web"]
-voice-wake = ["quantclaw-channels/voice-wake"]
+# Channels — each forwards directly to zeroclaw-channels (1 hop)
+channel-email = ["zeroclaw-channels/channel-email"]
+channel-telegram = ["zeroclaw-channels/channel-telegram"]
+channel-lark = ["zeroclaw-channels/channel-lark"]
+channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
+channel-matrix = ["zeroclaw-channels/channel-matrix"]
+channel-discord = ["zeroclaw-channels/channel-discord"]
+channel-slack = ["zeroclaw-channels/channel-slack"]
+channel-signal = ["zeroclaw-channels/channel-signal"]
+channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
+channel-irc = ["zeroclaw-channels/channel-irc"]
+channel-imessage = ["zeroclaw-channels/channel-imessage"]
+channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
+channel-qq = ["zeroclaw-channels/channel-qq"]
+channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
+channel-twitter = ["zeroclaw-channels/channel-twitter"]
+channel-reddit = ["zeroclaw-channels/channel-reddit"]
+channel-notion = ["zeroclaw-channels/channel-notion"]
+channel-linq = ["zeroclaw-channels/channel-linq"]
+channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
+channel-mochat = ["zeroclaw-channels/channel-mochat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat"]
+channel-wecom = ["zeroclaw-channels/channel-wecom"]
+channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
+channel-webhook = ["zeroclaw-channels/channel-webhook"]
+channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
+channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
+channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+voice-wake = ["zeroclaw-channels/voice-wake"]
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate
-observability-prometheus = ["quantclaw-runtime/observability-prometheus"]
-observability-otel = ["quantclaw-runtime/observability-otel"]
-hardware = ["dep:quantclaw-hardware", "quantclaw-hardware/hardware"]
-peripheral-rpi = ["dep:quantclaw-hardware", "quantclaw-hardware/peripheral-rpi"]
-sandbox-landlock = ["quantclaw-runtime/sandbox-landlock"]
-sandbox-bubblewrap = ["quantclaw-runtime/sandbox-bubblewrap"]
-browser-native = ["quantclaw-tools/browser-native"]
-plugins-wasm = ["dep:quantclaw-plugins", "quantclaw-runtime/plugins-wasm"]
-probe = ["dep:quantclaw-hardware", "quantclaw-hardware/probe"]
-rag-pdf = ["quantclaw-tools/rag-pdf"]
-webauthn = ["quantclaw-runtime/webauthn"]
+observability-prometheus = [
+    "zeroclaw-runtime/observability-prometheus",
+    "zeroclaw-gateway/observability-prometheus",
+]
+observability-otel = ["zeroclaw-runtime/observability-otel"]
+hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
+peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
+sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
+sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
+browser-native = ["zeroclaw-tools/browser-native"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
+probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
+rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
+webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
+embedded-web = ["zeroclaw-gateway/embedded-web"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]
@@ -317,7 +342,7 @@ ci-all = [
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "plugins-wasm", "probe", "rag-pdf",
-    "webauthn",
+    "webauthn", "memory-postgres",
 ]
 
 [profile.dev]
@@ -372,6 +397,14 @@ path = "tests/test_system.rs"
 [[test]]
 name = "live"
 path = "tests/test_live.rs"
+
+# Architecture invariant gates. Fail-on-detect for patterns that
+# violate the workspace's ABSOLUTE RULE (AGENTS.md §1) — duplicate
+# state across the codebase. Run with `cargo test --test architecture`
+# during development; the workspace `cargo test` already includes it.
+[[test]]
+name = "architecture"
+path = "tests/test_architecture.rs"
 
 [[bench]]
 name = "agent_benchmarks"

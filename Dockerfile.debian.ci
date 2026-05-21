@@ -19,16 +19,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the pre-built binary for this platform (amd64 or arm64)
 COPY bin/${TARGETARCH}/quantclaw /usr/local/bin/quantclaw
 
+# Copy the web dashboard bundled alongside the binary in the release tarball.
+# Installed at /usr/share/zeroclawlabs/web/dist (outside the documented
+# /zeroclaw-data mount) so a bind mount on /zeroclaw-data cannot shadow it
+# (#6400). The dashboard was decoupled from the binary in #5665 and is now
+# served from disk at `gateway.web_dist_dir`.
+COPY bin/${TARGETARCH}/web/dist /usr/share/zeroclawlabs/web/dist
+
 # Runtime directory structure and default config
 COPY --chown=65534:65534 quantclaw-data/ /quantclaw-data/
 
 ENV LANG=C.UTF-8
-ENV QUANTCLAW_WORKSPACE=/quantclaw-data/workspace
-ENV HOME=/quantclaw-data
-ENV QUANTCLAW_GATEWAY_PORT=42617
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_GATEWAY_PORT=42617
 
 WORKDIR /quantclaw-data
 USER 65534:65534
 EXPOSE 42617
-ENTRYPOINT ["quantclaw"]
-CMD ["gateway"]
+ENTRYPOINT ["zeroclaw"]
+CMD ["daemon"]

@@ -23,22 +23,22 @@ services:
     restart: unless-stopped
     
     environment:
-      # Required: Your LLM provider API key
-      - API_KEY=${API_KEY:-}
-      # Or use the prefixed version:
-      # - QUANTCLAW_API_KEY=${QUANTCLAW_API_KEY:-}
-      
-      # Optional: LLM provider (default: openrouter)
-      # Options: openrouter, openai, anthropic, ollama
-      - PROVIDER=${PROVIDER:-openrouter}
-      
+      # V0.8.0: single env-var override surface — the schema-mirror grammar
+      # `ZEROCLAW_<dotted_path_with_double_underscores>=<value>`. Each `__`
+      # is a path separator. Legacy `API_KEY`, `ANTHROPIC_API_KEY`,
+      # `OPENAI_API_KEY`, `PROVIDER`, `ZEROCLAW_MODEL` (etc.) fallbacks were
+      # eradicated.
+      #
+      # Pick a typed-family alias and set its api_key + model:
+      - ZEROCLAW_providers__models__openrouter__default__api_key=${OPENROUTER_API_KEY:-}
+      # - ZEROCLAW_providers__models__openrouter__default__model=anthropic/claude-sonnet-4-20250514
+      # - ZEROCLAW_providers__models__anthropic__default__api_key=${ANTHROPIC_API_KEY:-}
+      # - ZEROCLAW_providers__models__openai__default__api_key=${OPENAI_API_KEY:-}
+
       # Allow public bind inside Docker (required for container networking)
-      - QUANTCLAW_ALLOW_PUBLIC_BIND=true
+      - ZEROCLAW_gateway__allow_public_bind=true
       # Default gateway port inside container
-      - QUANTCLAW_GATEWAY_PORT=${QUANTCLAW_GATEWAY_PORT:-42617}
-      
-      # Optional: Model override
-      # - QUANTCLAW_MODEL=anthropic/claude-sonnet-4-20250514
+      - ZEROCLAW_gateway__port=${ZEROCLAW_GATEWAY_PORT:-42617}
       
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)

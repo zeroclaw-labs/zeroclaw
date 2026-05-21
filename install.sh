@@ -124,34 +124,161 @@ shell_export_syntax() {
   esac
 }
 
+# ── Platform / target triple detection ───────────────────────────
+
+detect_target_triple() {
+  local os arch
+  os=$(uname -s)
+  arch=$(uname -m)
+
+  case "$os" in
+    Darwin) echo "aarch64-apple-darwin" ;;   # presume M-series
+    Linux)
+      case "$arch" in
+        x86_64)          echo "x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64)   echo "aarch64-unknown-linux-gnu" ;;
+        armv7l)          echo "armv7-unknown-linux-gnueabihf" ;;
+        armv6l|arm*)     echo "arm-unknown-linux-gnueabihf" ;;
+        *)               echo "" ;;
+      esac ;;
+    *) echo "" ;;
+  esac
+}
+
+# ── Pre-built binary install ──────────────────────────────────────
+
+install_prebuilt() {
+  local triple version asset_name asset_url sha256_url tmp_dir web_data_dir
+  triple=$(detect_target_triple)
+
+  if [ -z "$triple" ]; then
+    warn "No pre-built binary for this platform — falling back to source build"
+    return 1
+  fi
+
+  # Resolve latest release version via GitHub API
+  version=$(curl -fsSL "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest" \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+
+  if [ -z "$version" ]; then
+    warn "Could not resolve latest release — falling back to source build"
+    return 1
+  fi
+
+  asset_name="zeroclaw-${triple}.tar.gz"
+  asset_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/${asset_name}"
+  sha256_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/SHA256SUMS"
+
+  echo
+  printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
+  info "Platform: $triple"
+  info "Source:   $asset_url"
+  echo
+
+  # Resolve platform-correct web data directory to match gateway auto-detect
+  case "$(uname -s)" in
+    Darwin)
+      web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
+      ;;
+    MINGW*|CYGWIN*|MSYS*)
+      web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
+      ;;
+    *)
+      web_data_dir="${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
+      ;;
+  esac
+
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would download $asset_url"
+    info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install web dashboard to $web_data_dir"
+    return 0
+  fi
+
+  tmp_dir=$(mktemp -d)
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" \
+    || { warn "Download failed — falling back to source build"; rm -rf "$tmp_dir"; return 1; }
+
+  # Verify checksum — all failure modes fall back to source rather than install unverified
+  if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
+    warn "Could not fetch SHA256SUMS — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
+  fi
+
+  expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
+  if [ -z "$expected" ]; then
+    warn "Asset not found in SHA256SUMS — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
+  else
+    warn "No checksum tool available (sha256sum/shasum) — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
+  fi
+
+  if [ "$actual" != "$expected" ]; then
+    die "Checksum mismatch — download may be corrupt. Expected: $expected  Got: $actual"
+  fi
+  info "Checksum verified"
+
+  tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
+  mkdir -p "$CARGO_HOME/bin"
+  install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+
+  # Install web dashboard assets bundled in the release tarball
+  if [ -d "$tmp_dir/web/dist" ]; then
+    mkdir -p "$web_data_dir"
+    cp -r "$tmp_dir/web/dist/." "$web_data_dir/"
+    info "Web dashboard installed to $web_data_dir"
+  fi
+
+  rm -rf "$tmp_dir"
+  trap - EXIT
+  return 0
+}
+
 # ── Usage ─────────────────────────────────────────────────────────
 
 usage() {
   cat <<EOF
-$(bold "QuantClaw installer") — build and install from source
+$(bold "ZeroClaw installer")
 
 Usage: $0 [options]
 
 Options:
-  --minimal            Build kernel only (config + providers + memory, ~6.6MB)
-  --features X,Y       Select specific features (comma-separated)
+  --prebuilt           Download and install a pre-built binary (default when asked)
+  --source             Build from source (skips the pre-built prompt)
+  --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
+                       'full' (default features). Source builds only.
+  --minimal            Alias for --preset minimal
+  --features X,Y       Select specific features — source only (comma-separated)
+  --with-gateway       Force the gateway feature on (overrides preset/feature default)
+  --without-gateway    Force the gateway feature off (overrides preset/feature default)
   --list-features      Print all available features and exit
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
-  --skip-onboard       Skip the setup wizard after install
-  --uninstall          Remove QuantClaw binary and optionally config/data
+  --skip-onboard       Skip the post-install onboarding prompt
+  --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
   -V, --version        Show version from Cargo.toml
 
 Examples:
-  $0                                          # full install (interactive)
-  $0 --minimal                                # smallest possible binary
-  $0 --features agent-runtime,channel-discord  # custom feature set
-  $0 --skip-onboard                           # build only, configure later
-  $0 --prefix /tmp/zc-test --skip-onboard     # isolated test install
-  $0 --dry-run --minimal                      # preview without building
-  $0 --uninstall                              # remove QuantClaw
+  $0                                           # interactive: asks prebuilt or source
+  $0 --prebuilt                                # download pre-built binary (fast)
+  $0 --source                                  # always build from source
+  $0 --source --minimal                        # smallest possible binary
+  $0 --source --features agent-runtime,channel-discord  # custom feature set
+  $0 --skip-onboard                            # install only, configure later
+  $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
+  $0 --dry-run --prebuilt                      # preview without installing
+  $0 --uninstall                               # remove ZeroClaw
 
 Environment:
   QUANTCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.quantclaw/src)
@@ -181,7 +308,7 @@ do_uninstall() {
   if [ -d "$config_dir" ]; then
     if [ -t 0 ]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
-      read confirm
+      read -r confirm
       case "$confirm" in
         [Yy]*) rm -rf "$config_dir"; info "Removed $config_dir" ;;
         *)     info "Config preserved at $config_dir" ;;
@@ -207,6 +334,150 @@ do_uninstall() {
   exit 0
 }
 
+# ── Onboarding-needed status check ───────────────────────────────
+#
+# Detect whether the operator already has a completed onboarding so the
+# 3-way "how would you like to onboard?" prompt can skip silently on a
+# re-install. We treat onboarding as complete when a config file exists at
+# the expected path AND it contains at least one `[providers.models.*]` or
+# `[providers.fallback]` line — i.e. some provider is configured. Empty or
+# default config files still trigger the prompt.
+onboarding_needed() {
+  cfg="$PREFIX/.zeroclaw/config.toml"
+  [ -f "$cfg" ] || return 0   # no config → onboard
+  # Already-configured signal: any of these patterns means a provider was set.
+  if grep -qE '^\[providers\.models\.|^fallback *=|^default_provider *=' "$cfg" 2>/dev/null; then
+    return 1   # configured → skip
+  fi
+  return 0     # config exists but empty → onboard
+}
+
+# ── Interactive feature picker ───────────────────────────────────
+#
+# POSIX-sh number-toggle picker over the OPTIONAL feature set (channel-*,
+# observability-*, hardware/peripheral/sandbox/browser flavours). Default
+# features are always on; this only surfaces the opt-in extras. The output
+# is a comma-separated list of selected features written to stdout.
+#
+# Invoked from the interactive flow when the operator runs install.sh in a
+# TTY without `--minimal`, `--preset`, or `--features`. Skipped in
+# non-interactive runs (curl | bash) and in CI.
+interactive_feature_picker() {
+  toml="$1"
+  parse_cargo_toml "$toml"
+
+  picker_features=""
+  for feat in $ALL_FEATURES; do
+    case "$feat" in
+      default|ci-all|fantoccini|landlock|metrics) continue ;;
+      channel-*|observability-*|hardware|peripheral-*|sandbox-*|browser-*|probe|rag-pdf|webauthn)
+        picker_features="${picker_features:+$picker_features }$feat" ;;
+    esac
+  done
+
+  selected=""
+  # Prompt-side output goes to stderr so the picker's stdout — captured
+  # by the caller's `PICKED=$(interactive_feature_picker …)` — only
+  # carries the final selection. Without this redirect every prompt
+  # silently disappears into the variable and the user sees a frozen
+  # terminal.
+  echo >&2
+  printf "  %s\n" "$(bold "Optional features (off by default):")" >&2
+  printf "  %s\n" "Type the numbers to toggle, blank line to confirm." >&2
+  printf "  %s\n" "Default features (agent runtime, gateway, …) are always on." >&2
+  echo >&2
+
+  while :; do
+    i=1
+    for feat in $picker_features; do
+      mark=" "
+      case " $selected " in *" $feat "*) mark="✓" ;; esac
+      printf "    [%2d] %s %s\n" "$i" "$mark" "$feat" >&2
+      i=$((i + 1))
+    done
+    echo >&2
+    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")" >&2
+    read -r choices
+    [ -z "$choices" ] && break
+    for n in $choices; do
+      case "$n" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      idx=1
+      for feat in $picker_features; do
+        if [ "$idx" -eq "$n" ]; then
+          case " $selected " in
+            *" $feat "*) selected=$(printf '%s' "$selected" | tr ' ' '\n' | grep -vx "$feat" | paste -sd' ' -) ;;
+            *)            selected="${selected:+$selected }$feat" ;;
+          esac
+          break
+        fi
+        idx=$((idx + 1))
+      done
+    done
+  done
+
+  printf '%s' "$selected" | tr ' ' ','
+}
+
+# ── Web dashboard build for source installs ──────────────────────
+#
+# When a source build includes the `gateway` feature, the dashboard
+# (`web/dist`) needs to be built so the gateway can serve it. If Node.js
+# is on PATH we run `cargo web build` from the source root so the
+# generated API client is refreshed before TypeScript compiles. Without
+# Node.js we warn — the gateway still starts but the dashboard route
+# returns 404 until `web/dist` is populated.
+build_web_dashboard() {
+  src_dir="$1"
+  if [ ! -d "$src_dir/web" ]; then
+    warn "Source has no web/ directory; skipping dashboard build."
+    return 0
+  fi
+  if [ -f "$src_dir/web/dist/index.html" ]; then
+    info "Web dashboard already built at $src_dir/web/dist"
+    return 0
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    warn "npm not found — skipping dashboard build. The gateway will run"
+    warn "  in API-only mode until you build the dashboard:"
+    warn "  cd $src_dir && cargo web build"
+    return 0
+  fi
+  info "Building web dashboard (cargo web build)..."
+  (cd "$src_dir" && cargo web build) || {
+    warn "Dashboard build failed — gateway will run in API-only mode."
+    return 0
+  }
+  info "Web dashboard built at $src_dir/web/dist"
+}
+
+# ── Low-memory build heuristic ────────────────────────────────────
+#
+# [profile.release] in Cargo.toml uses fat LTO + codegen-units = 1.
+# With heavy crates in the graph (matrix-sdk-crypto, ruma, vodozemac)
+# a single rustc process can peak past 7 GB RSS during the cross-crate
+# type pass, OOM-ing 8 GB ARM devices. Thin LTO trades a small
+# binary-size hit for a much lower build-time RAM peak. Apply it as
+# a default on Linux hosts with under ~12 GiB MemTotal, but only when
+# the user has not already pinned CARGO_PROFILE_RELEASE_LTO.
+apply_low_mem_lto_default() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  [ -r /proc/meminfo ] || return 0
+  [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ] && return 0
+
+  mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+  case "$mem_kb" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  # 12 GiB in KiB = 12 * 1024 * 1024
+  if [ "$mem_kb" -lt 12582912 ]; then
+    mem_gib=$((mem_kb / 1048576))
+    export CARGO_PROFILE_RELEASE_LTO=thin
+    info "Low-memory device detected (${mem_gib} GiB RAM): using thin LTO to keep build RAM bounded. Set CARGO_PROFILE_RELEASE_LTO=fat to override."
+  fi
+}
+
 # ── Parse arguments ───────────────────────────────────────────────
 
 MINIMAL=false
@@ -216,6 +487,9 @@ LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
+INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
+PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-features
+WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 
 # Support legacy env var
 if [ -n "${QUANTCLAW_CARGO_FEATURES:-}" ]; then
@@ -225,11 +499,23 @@ fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --minimal)        MINIMAL=true ;;
+    --preset)
+      if [ $# -lt 2 ]; then
+        die "Missing value for --preset. Expected: --preset minimal|full"
+      fi
+      shift
+      case "$1" in
+        minimal) PRESET="minimal"; MINIMAL=true ;;
+        full)    PRESET="full" ;;
+        *)       die "Unknown preset '$1'. Expected: minimal or full" ;;
+      esac ;;
     --features)
       if [ $# -lt 2 ]; then
         die "Missing value for --features. Expected: --features X,Y"
       fi
       shift; USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$1" ;;
+    --with-gateway)    WITH_GATEWAY="true" ;;
+    --without-gateway) WITH_GATEWAY="false" ;;
     --list-features)  LIST_FEATURES=true ;;
     --prefix)
       if [ $# -lt 2 ]; then
@@ -238,6 +524,8 @@ while [ $# -gt 0 ]; do
       shift; PREFIX=$(echo "$1" | sed 's|/*$||') ;;
     --dry-run)        DRY_RUN=true ;;
     --skip-onboard)   SKIP_ONBOARD=true ;;
+    --prebuilt)       INSTALL_MODE="prebuilt" ;;
+    --source)         INSTALL_MODE="source" ;;
     --uninstall)      UNINSTALL=true ;;
     -h|--help)        usage; exit 0 ;;
     -V|--version)
@@ -277,7 +565,67 @@ if [ "$LIST_FEATURES" = true ]; then
   exit 0
 fi
 
+# ── Decide: pre-built or source ───────────────────────────────────
+
+# --minimal, --features, --without-gateway, or --preset full imply source.
+# Prebuilt binaries always ship with default features, so any flag that
+# changes the feature set must force a source build.
+if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] \
+   || [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
+  INSTALL_MODE="source"
+fi
+
+if [ "$INSTALL_MODE" = "" ]; then
+  triple=$(detect_target_triple)
+  if [ -n "$triple" ]; then
+    if [ -t 0 ]; then
+      echo
+      printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
+      printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
+      printf "  [s] Build from source — custom features, latest code\n"
+      printf "\n  Choice [P/s]: "
+      read -r install_choice
+      case "$install_choice" in
+        [Ss]*) INSTALL_MODE="source" ;;
+        *)     INSTALL_MODE="prebuilt" ;;
+      esac
+    else
+      # Non-interactive (curl | bash): default to pre-built silently
+      INSTALL_MODE="prebuilt"
+    fi
+  else
+    INSTALL_MODE="source"
+  fi
+fi
+
+if [ "$INSTALL_MODE" = "prebuilt" ]; then
+  if install_prebuilt; then
+    PREBUILT_OK=true
+  else
+    warn "Pre-built install failed — continuing with source build"
+    INSTALL_MODE="source"
+    PREBUILT_OK=false
+  fi
+fi
+
+[ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
+  BIN="$CARGO_HOME/bin/zeroclaw"
+  if [ -f "$BIN" ]; then
+    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+    SIZE=$(du -h "$BIN" | awk '{print $1}')
+    echo
+    info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
+  fi
+}
+
 # ── Locate source ─────────────────────────────────────────────────
+
+[ "${PREBUILT_OK:-false}" = true ] && {
+  # Jump past the source build to PATH + onboard
+  SOURCE_SKIPPED=true
+}
+
+if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
 echo
 printf "%s\n" "$(bold "QuantClaw — source install")"
@@ -354,11 +702,49 @@ See all available features:
 esac
 
 # ── Build feature flags ──────────────────────────────────────────
+#
+# Cargo cannot remove individual entries from `default`, so toggling
+# `gateway` off requires `--no-default-features` plus an explicit list
+# of the rest. Derive that list from $DEFAULT_FEATURES (parsed from
+# Cargo.toml above) so it stays in sync automatically.
 
 CARGO_FLAGS=""
 
 if [ "$MINIMAL" = true ]; then
   CARGO_FLAGS="--no-default-features"
+fi
+
+# `--without-gateway` overrides the default-features set: switch to
+# --no-default-features and re-add everything in `default` except gateway.
+if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
+  CARGO_FLAGS="--no-default-features"
+  defaults_no_gateway=$(printf '%s' "$DEFAULT_FEATURES" | tr ',' '\n' | grep -vx gateway | paste -sd, -)
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$defaults_no_gateway"
+fi
+
+# `--with-gateway` is a no-op when default features are on (gateway is
+# already there), and additive when --no-default-features is in play.
+if [ "$WITH_GATEWAY" = "true" ]; then
+  case "$CARGO_FLAGS" in
+    *--no-default-features*) USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}gateway" ;;
+  esac
+fi
+
+# Interactive feature picker — only when the operator did not pin
+# features via the CLI and is running under a TTY. Skipped on
+# `--minimal`, `--preset`, `--features`, `--with-gateway` /
+# `--without-gateway`, and any non-interactive run (curl | bash).
+if [ -t 0 ] \
+    && [ "$MINIMAL" != true ] \
+    && [ -z "$USER_FEATURES" ] \
+    && [ -z "$PRESET" ] \
+    && [ -z "$WITH_GATEWAY" ] \
+    && [ "$DRY_RUN" != true ]; then
+  PICKED=$(interactive_feature_picker "Cargo.toml")
+  if [ -n "$PICKED" ]; then
+    USER_FEATURES="$PICKED"
+    info "Picked features: $USER_FEATURES"
+  fi
 fi
 
 if [ -n "$USER_FEATURES" ]; then
@@ -393,13 +779,20 @@ if [ -n "$PATH_BIN" ]; then
   if [ "$MINIMAL" = true ] && [ "$DRY_RUN" != true ]; then
     if [ -t 0 ]; then
       printf "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] "
-      read confirm
+      read -r confirm
       case "$confirm" in
         [Nn]*) echo "Aborted."; exit 0 ;;
       esac
     fi
   fi
+  if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
+    info "--preset full: building from source with the full default feature set."
+  fi
 fi
+
+# ── Build profile RAM heuristic (Linux low-mem hosts) ─────────────
+
+apply_low_mem_lto_default
 
 # ── Dry run ───────────────────────────────────────────────────────
 
@@ -412,6 +805,9 @@ if [ "$DRY_RUN" = true ]; then
   info "Config:   $PREFIX/.quantclaw/"
   info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
   echo
+  if [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ]; then
+    info "env:      CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO"
+  fi
   if [ -n "$CARGO_FLAGS" ]; then
     info "cargo install --path . --locked --force $CARGO_FLAGS"
   else
@@ -441,6 +837,23 @@ echo
 # shellcheck disable=SC2086
 cargo install --path . --locked --force $CARGO_FLAGS
 
+# ── Web dashboard (gateway feature only) ──────────────────────────
+# When the install includes the `gateway` feature, build `web/dist` so
+# the dashboard route serves something. Skips silently when the build
+# excluded gateway (`--without-gateway`, `--minimal` without explicit
+# gateway in --features, etc).
+WANT_GATEWAY=true
+case "$CARGO_FLAGS" in
+  *--no-default-features*)
+    case ",$USER_FEATURES," in
+      *,gateway,*) ;;
+      *) WANT_GATEWAY=false ;;
+    esac ;;
+esac
+if [ "$WANT_GATEWAY" = true ]; then
+  build_web_dashboard "$INSTALL_DIR"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────
 
 BIN="$CARGO_HOME/bin/quantclaw"
@@ -461,6 +874,10 @@ if [ -f "$BIN" ]; then
 else
   warn "Binary not found at expected path: $BIN"
 fi
+
+fi  # end source build block
+
+BIN="$CARGO_HOME/bin/zeroclaw"
 
 # ── PATH guidance ─────────────────────────────────────────────────
 
@@ -490,14 +907,45 @@ fi
 
 # ── Onboard ───────────────────────────────────────────────────────
 
-if [ "$SKIP_ONBOARD" = false ] && [ -f "$BIN" ]; then
-  if [ -t 0 ]; then
+if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
+  # Skip the prompt entirely when the operator already has a configured
+  # ZeroClaw — re-installs should not re-prompt.
+  if ! onboarding_needed; then
+    info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping onboard prompt."
+    info "Run 'zeroclaw onboard' to reconfigure."
+  elif [ -t 0 ]; then
+    # 3-way onboarding choice. Bare Enter accepts the [1] CLI default;
+    # option [2] foregrounds the daemon so the operator can finish in the
+    # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
+    # Non-TTY runs fall through to the silent skip in the else branch.
     echo
-    printf "%s\n" "$(bold "Running setup wizard...")"
-    echo
-    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'quantclaw onboard' manually"
+    printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete onboarding?")"
+    printf "  [1] CLI/TUI  (zeroclaw onboard)\n"
+    printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
+    printf "  [3] Skip for now\n"
+    printf "  Choice [1-3, default 1]: "
+    read -r onboard_choice
+    case "${onboard_choice:-1}" in
+      1|"")
+        echo
+        "$BIN" onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
+        ;;
+      2)
+        echo
+        info "Starting gateway daemon for browser-based onboarding..."
+        info "Open the dashboard in your browser; pair with the code shown in logs."
+        info "Stop the daemon with Ctrl+C when done; then run 'zeroclaw service install' for always-on."
+        "$BIN" daemon || warn "Daemon exited with an error — run 'zeroclaw daemon' manually"
+        ;;
+      3)
+        info "Skipped onboarding. Run 'zeroclaw onboard' (CLI) or 'zeroclaw daemon' (browser) when ready."
+        ;;
+      *)
+        warn "Unknown choice '$onboard_choice' — skipping. Run 'zeroclaw onboard' to configure."
+        ;;
+    esac
   else
-    info "Non-interactive — skipping onboard wizard. Run 'quantclaw onboard' to configure."
+    info "Non-interactive — skipping onboard prompt. Run 'zeroclaw onboard' to configure."
   fi
 fi
 
