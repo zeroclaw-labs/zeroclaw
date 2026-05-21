@@ -520,6 +520,14 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    pub fn set_temperature(&mut self, temperature: f64) {
+        self.temperature = temperature;
+    }
+
+    pub fn set_model_name(&mut self, model_name: String) {
+        self.model_name = model_name;
+    }
+
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
     ///
     /// Ensures a system prompt is prepended if history is empty, then appends all

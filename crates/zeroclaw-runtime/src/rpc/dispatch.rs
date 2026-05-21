@@ -17,6 +17,38 @@ use zeroclaw_infra::session_backend::SessionBackend;
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
 
+// ── Method registry ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Initialize,
+    SessionNew,
+    SessionClose,
+    SessionPrompt,
+    SessionConfigure,
+    SessionCancel,
+    Status,
+}
+
+impl Method {
+    const ALL: &[(Method, &str)] = &[
+        (Method::Initialize, "initialize"),
+        (Method::SessionNew, "session/new"),
+        (Method::SessionClose, "session/close"),
+        (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionConfigure, "session/configure"),
+        (Method::SessionCancel, "session/cancel"),
+        (Method::Status, "status"),
+    ];
+
+    fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(_, wire)| *wire == s)
+            .map(|(m, _)| *m)
+    }
+}
+
 type RpcResult = Result<Value, JsonRpcError>;
 
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
@@ -84,7 +116,22 @@ impl RpcDispatcher {
         let id = req.id.clone().unwrap_or(Value::Null);
         let is_notification = req.id.is_none();
 
-        if !self.authenticated && req.method != "initialize" {
+        let method = match Method::from_wire(&req.method) {
+            Some(m) => m,
+            None => {
+                if !is_notification {
+                    self.send_error(
+                        id,
+                        METHOD_NOT_FOUND,
+                        &format!("Unknown method: {}", req.method),
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+        if !self.authenticated && method != Method::Initialize {
             if !is_notification {
                 self.send_error(id, AUTH_REQUIRED, "First call must be 'initialize'")
                     .await;
@@ -92,17 +139,14 @@ impl RpcDispatcher {
             return;
         }
 
-        let result = match req.method.as_str() {
-            "initialize" => self.handle_initialize(&req.params).await,
-            "session/new" => self.handle_session_new(&req.params).await,
-            "session/close" => self.handle_session_close(&req.params).await,
-            "session/prompt" => self.handle_session_prompt(&req.params).await,
-            "session/cancel" => self.handle_session_cancel(&req.params),
-            "status" => self.handle_status().await,
-            _ => Err(rpc_err(
-                METHOD_NOT_FOUND,
-                format!("Unknown method: {}", req.method),
-            )),
+        let result = match method {
+            Method::Initialize => self.handle_initialize(&req.params).await,
+            Method::SessionNew => self.handle_session_new(&req.params).await,
+            Method::SessionClose => self.handle_session_close(&req.params).await,
+            Method::SessionPrompt => self.handle_session_prompt(&req.params).await,
+            Method::SessionConfigure => self.handle_session_configure(&req.params).await,
+            Method::SessionCancel => self.handle_session_cancel(&req.params),
+            Method::Status => self.handle_status().await,
         };
 
         if is_notification {
@@ -265,6 +309,24 @@ impl RpcDispatcher {
             })),
             Err(e) => Err(rpc_err(INTERNAL_ERROR, e.to_string())),
         }
+    }
+
+    async fn handle_session_configure(&self, params: &Value) -> RpcResult {
+        let sid = require_str(params, "sessionId")?;
+        let patch: super::session::SessionOverrides =
+            serde_json::from_value(params.get("overrides").cloned().unwrap_or_default())
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid overrides: {e}")))?;
+
+        let merged = self
+            .sessions
+            .set_overrides(sid, patch)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        Ok(json!({
+            "sessionId": sid,
+            "overrides": merged,
+        }))
     }
 
     fn handle_session_cancel(&self, params: &Value) -> RpcResult {

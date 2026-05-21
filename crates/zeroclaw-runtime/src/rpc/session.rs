@@ -1,11 +1,26 @@
 //! RPC session state.
 
 use crate::agent::agent::Agent;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_infra::session_queue::SessionActorQueue;
+
+/// Per-session runtime overrides. All fields are optional — `None` means
+/// "use config default". Overrides are session-scoped, do not persist,
+/// and evaporate when the session ends.
+///
+/// `reasoning_effort` is deferred — it requires `ModelProvider` trait
+/// changes to support mutation after construction.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
@@ -13,6 +28,7 @@ pub struct RpcSession {
     pub last_active: Instant,
     pub agent_alias: String,
     pub workspace_dir: String,
+    pub overrides: SessionOverrides,
 }
 
 impl RpcSession {
@@ -23,6 +39,7 @@ impl RpcSession {
             last_active: Instant::now(),
             agent_alias: alias.to_string(),
             workspace_dir: workspace.to_string(),
+            overrides: SessionOverrides::default(),
         }
     }
 }
@@ -61,6 +78,43 @@ impl SessionStore {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
         }
+    }
+
+    /// Apply overrides to the session and immediately mutate the agent.
+    /// Returns the merged overrides for confirmation.
+    pub async fn set_overrides(
+        &self,
+        id: &str,
+        patch: SessionOverrides,
+    ) -> Option<SessionOverrides> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(id)?;
+        if let Some(ref m) = patch.model {
+            session.overrides.model = Some(m.clone());
+        }
+        if let Some(t) = patch.temperature {
+            session.overrides.temperature = Some(t);
+        }
+        // Apply to agent immediately.
+        let overrides = session.overrides.clone();
+        let agent = session.agent.clone();
+        drop(sessions);
+        let mut guard = agent.lock().await;
+        if let Some(ref m) = overrides.model {
+            guard.set_model_name(m.clone());
+        }
+        if let Some(t) = overrides.temperature {
+            guard.set_temperature(t);
+        }
+        Some(overrides)
+    }
+
+    pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|s| s.overrides.clone())
     }
 
     pub async fn seed_history(&self, id: &str, msgs: &[zeroclaw_api::model_provider::ChatMessage]) {
