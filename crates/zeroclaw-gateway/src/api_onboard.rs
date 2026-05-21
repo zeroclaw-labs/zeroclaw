@@ -17,14 +17,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 use zeroclaw_runtime::rpc::types::{
-    CatalogModelProvider, CatalogModelsResult, CatalogResponse, OnboardSectionEntry,
-    OnboardSectionsResult, OnboardStatusResult, PickerItem, PickerResponse, SelectItemResponse,
+    CatalogModelProvider, CatalogModelsResult, CatalogResponse, ConfigSectionEntry,
+    ConfigSectionsResult, ConfigStatusResult, PickerItem, PickerResponse, SelectItemResponse,
 };
 
 use super::AppState;
 use super::api::require_auth;
 
-/// `GET /api/onboard/catalog` — list every model provider the CLI wizard knows
+/// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
 pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -54,7 +54,7 @@ pub struct ModelsQuery {
     pub model_provider: String,
 }
 
-/// `GET /api/onboard/catalog/models?model_provider=<name>` — fetch the model list
+/// `GET /api/config/catalog/models?model_provider=<name>` — fetch the model list
 /// for one model_provider. Same code path the CLI wizard uses
 /// (`zeroclaw_providers::create_model_provider(...).list_models()`), which goes
 /// through the models.dev cached catalog for OpenAI / Anthropic / Gemini,
@@ -125,7 +125,7 @@ fn error_response(err: ConfigApiError) -> Response {
 /// not a completion signal: chat dispatch still bounces with a setup error in
 /// that state.
 #[must_use]
-pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResult {
+pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> ConfigStatusResult {
     let missing = onboard_missing_requirements(cfg);
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
@@ -140,7 +140,7 @@ pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardSt
     } else {
         "fresh_install"
     };
-    OnboardStatusResult {
+    ConfigStatusResult {
         needs_onboarding: !ready,
         reason: reason.to_string(),
         has_partial_state,
@@ -228,7 +228,7 @@ fn onboard_agent_missing_requirements(
     missing
 }
 
-/// `GET /api/onboard/status` — boolean signal for the dashboard's
+/// `GET /api/config/status` — boolean signal for the dashboard's
 /// fresh-install redirect. The daemon writes a default `config.toml` on
 /// first init, so file existence isn't a useful "is the user new?" check.
 /// Onboarding is complete iff at least one agent has its
@@ -310,7 +310,7 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
     }
 }
 
-/// `GET /api/onboard/agent-options` — every alias-reference list the
+/// `GET /api/config/agent-options` — every alias-reference list the
 /// agent form needs, derived from the live config. Mirrors the lists the
 /// TUI computes locally for its alias pickers.
 pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -321,7 +321,7 @@ pub async fn handle_agent_options(State(state): State<AppState>, headers: Header
     axum::Json(build_agent_options(&cfg)).into_response()
 }
 
-/// `GET /api/onboard/sections` — list every top-level config section.
+/// `GET /api/config/sections` — list every top-level config section.
 ///
 /// Schema-driven: walks `Config::prop_fields()` and collects unique first
 /// segments, then asks `Config::map_key_sections()` for which ones have
@@ -428,7 +428,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         }
     });
 
-    let sections: Vec<OnboardSectionEntry> = ordered
+    let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
             // Picker eligibility = anything `handle_section_picker`
@@ -446,7 +446,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 ),
                 None => section_has_picker_for_key(&key),
             };
-            OnboardSectionEntry {
+            ConfigSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
                 label: humanize_section(&key),
@@ -460,7 +460,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         })
         .collect();
 
-    axum::Json(OnboardSectionsResult { sections }).into_response()
+    axum::Json(ConfigSectionsResult { sections }).into_response()
 }
 
 fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_marker: bool) -> bool {
@@ -573,7 +573,7 @@ pub struct SectionPath {
     pub section: String,
 }
 
-/// `GET /api/onboard/sections/<section>` — picker items for that section.
+/// `GET /api/config/sections/<section>` — picker items for that section.
 ///
 /// Per-section dispatch:
 /// * `providers` → `zeroclaw_providers::list_model_providers()` (CLI's catalog).
@@ -1022,7 +1022,7 @@ pub struct SectionItemPath {
     pub key: String,
 }
 
-/// `POST /api/onboard/sections/<section>/items/<key>` — instantiate the
+/// `POST /api/config/sections/<section>/items/<key>` — instantiate the
 /// selected item in the live config (idempotent) and return the dotted
 /// prefix the frontend should fetch fields under.
 ///

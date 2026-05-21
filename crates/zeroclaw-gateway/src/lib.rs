@@ -1303,23 +1303,23 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
+        .route("/api/config/catalog", get(api_onboard::handle_catalog))
         .route(
-            "/api/onboard/catalog/models",
+            "/api/config/catalog/models",
             get(api_onboard::handle_catalog_models),
         )
-        .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route("/api/config/status", get(api_onboard::handle_onboard_status))
         .route(
-            "/api/onboard/agent-options",
+            "/api/config/agent-options",
             get(api_onboard::handle_agent_options),
         )
-        .route("/api/onboard/sections", get(api_onboard::handle_sections))
+        .route("/api/config/sections", get(api_onboard::handle_sections))
         .route(
-            "/api/onboard/sections/{section}",
+            "/api/config/sections/{section}",
             get(api_onboard::handle_section_picker),
         )
         .route(
-            "/api/onboard/sections/{section}/items/{key}",
+            "/api/config/sections/{section}/items/{key}",
             post(api_onboard::handle_section_select),
         )
         .route("/api/personality", get(api_personality::handle_index))

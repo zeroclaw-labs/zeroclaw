@@ -105,13 +105,11 @@ pub enum Method {
     PersonalityPut,
     PersonalityTemplates,
 
-    // Onboard
-    OnboardSections,
-    OnboardStatus,
-    OnboardCatalog,
-    OnboardCatalogModels,
-    OnboardSectionPicker,
-    OnboardSectionSelect,
+    // Config introspection (sections, catalog, status)
+    ConfigSections,
+    ConfigStatus,
+    ConfigCatalog,
+    ConfigCatalogModels,
 
     // Logs / Events
     LogsSubscribe,
@@ -176,13 +174,11 @@ impl Method {
         (Method::PersonalityGet, "personality/get"),
         (Method::PersonalityPut, "personality/put"),
         (Method::PersonalityTemplates, "personality/templates"),
-        // Onboard
-        (Method::OnboardSections, "onboard/sections"),
-        (Method::OnboardStatus, "onboard/status"),
-        (Method::OnboardCatalog, "onboard/catalog"),
-        (Method::OnboardCatalogModels, "onboard/catalog-models"),
-        (Method::OnboardSectionPicker, "onboard/section-picker"),
-        (Method::OnboardSectionSelect, "onboard/section-select"),
+        // Config introspection
+        (Method::ConfigSections, "config/sections"),
+        (Method::ConfigStatus, "config/status"),
+        (Method::ConfigCatalog, "config/catalog"),
+        (Method::ConfigCatalogModels, "config/catalog-models"),
         // Logs
         (Method::LogsSubscribe, "logs/subscribe"),
     ];
@@ -362,13 +358,11 @@ impl RpcDispatcher {
             Method::PersonalityPut => self.handle_personality_put(&req.params),
             Method::PersonalityTemplates => self.handle_personality_templates(&req.params),
 
-            // Onboard
-            Method::OnboardSections => self.handle_onboard_sections(),
-            Method::OnboardStatus => self.handle_onboard_status(),
-            Method::OnboardCatalog => self.handle_onboard_catalog(),
-            Method::OnboardCatalogModels => self.handle_onboard_catalog_models(&req.params).await,
-            Method::OnboardSectionPicker => self.handle_onboard_section_picker(&req.params),
-            Method::OnboardSectionSelect => self.handle_onboard_section_select(&req.params).await,
+            // Config introspection
+            Method::ConfigSections => self.handle_config_sections(),
+            Method::ConfigStatus => self.handle_config_status(),
+            Method::ConfigCatalog => self.handle_config_catalog(),
+            Method::ConfigCatalogModels => self.handle_config_catalog_models(&req.params).await,
 
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
@@ -1348,12 +1342,12 @@ impl RpcDispatcher {
         })
     }
 
-    // ── Onboard handlers ─────────────────────────────────────────
+    // ── Config introspection handlers ───────────────────────────
 
-    fn handle_onboard_sections(&self) -> RpcResult {
+    fn handle_config_sections(&self) -> RpcResult {
         use zeroclaw_config::sections::{ONBOARDING_SECTIONS, SectionShape};
         let config = self.ctx.config.read().clone();
-        let sections: Vec<OnboardSectionEntry> = ONBOARDING_SECTIONS
+        let sections: Vec<ConfigSectionEntry> = ONBOARDING_SECTIONS
             .iter()
             .map(|&section| {
                 let completed = crate::onboard::section_has_signal(&config, section);
@@ -1361,7 +1355,7 @@ impl RpcDispatcher {
                     section.shape(),
                     SectionShape::TypedFamilyMap | SectionShape::OneTierAliasMap
                 );
-                OnboardSectionEntry {
+                ConfigSectionEntry {
                     key: section.as_str().to_string(),
                     label: section.as_str().replace(['-', '_'], " "),
                     help: section.help().to_string(),
@@ -1374,10 +1368,10 @@ impl RpcDispatcher {
                 }
             })
             .collect();
-        to_result(OnboardSectionsResult { sections })
+        to_result(ConfigSectionsResult { sections })
     }
 
-    fn handle_onboard_status(&self) -> RpcResult {
+    fn handle_config_status(&self) -> RpcResult {
         use zeroclaw_config::sections::ONBOARDING_SECTIONS;
         let config = self.ctx.config.read().clone();
         let missing: Vec<String> = ONBOARDING_SECTIONS
@@ -1391,15 +1385,15 @@ impl RpcDispatcher {
         } else {
             "all sections complete".to_string()
         };
-        to_result(OnboardStatusResult {
+        to_result(ConfigStatusResult {
             needs_onboarding,
             reason,
-            has_partial_state: false, // TODO: detect partial state
+            has_partial_state: false,
             missing,
         })
     }
 
-    fn handle_onboard_catalog(&self) -> RpcResult {
+    fn handle_config_catalog(&self) -> RpcResult {
         let providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
             .into_iter()
             .map(|p| CatalogModelProvider {
@@ -1413,7 +1407,7 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_onboard_catalog_models(&self, params: &Value) -> RpcResult {
+    async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
         let req: CatalogModelsParams = parse_params(params)?;
         let family = &req.model_provider;
         let local = matches!(
@@ -1429,14 +1423,6 @@ impl RpcDispatcher {
             local,
             live: true,
         })
-    }
-
-    fn handle_onboard_section_picker(&self, _params: &Value) -> RpcResult {
-        not_yet_implemented(Method::OnboardSectionPicker)
-    }
-
-    async fn handle_onboard_section_select(&self, _params: &Value) -> RpcResult {
-        not_yet_implemented(Method::OnboardSectionSelect)
     }
 
     // ── Logs handler ─────────────────────────────────────────────

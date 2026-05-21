@@ -1,6 +1,6 @@
 // Picker view used by /onboard and /config to mirror the TUI's
 //   ZeroClaw Onboard › Providers › [filter:_____] › <pickable list>
-// flow. Items come from /api/onboard/sections/<section> (gateway derives
+// flow. Items come from /api/config/sections/<section> (gateway derives
 // them from list_providers / selectable_memory_backends / schema-walk).
 //
 // Fuzzy filter is inline (web/src/lib/fuzzy.ts), no npm dep.
@@ -10,14 +10,10 @@
 // buttons are owned by the parent (Onboard / Config) so the picker stays
 // a pure list view — no duplicate buttons.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Check } from 'lucide-react';
-import { fuzzyFilter } from '../../lib/fuzzy';
-import {
-  ApiError,
-  getSectionPicker,
-  type PickerItem,
-} from '../../lib/api';
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Check } from "lucide-react";
+import { fuzzyFilter } from "../../lib/fuzzy";
+import { ApiError, getSectionPicker, type PickerItem } from "../../lib/api";
 
 interface SectionPickerProps {
   /** Section key, e.g. 'providers'. */
@@ -43,7 +39,7 @@ export default function SectionPicker({
   const [items, setItems] = useState<PickerItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState('');
+  const [filter, setFilter] = useState("");
   const [highlightIdx, setHighlightIdx] = useState(0);
   const filterRef = useRef<HTMLInputElement>(null);
 
@@ -51,7 +47,7 @@ export default function SectionPicker({
     let cancelled = false;
     setLoading(true);
     setError(null);
-    setFilter('');
+    setFilter("");
     setHighlightIdx(0);
     getSectionPicker(sectionKey)
       .then((resp) => {
@@ -63,7 +59,9 @@ export default function SectionPicker({
         if (e instanceof ApiError) {
           setError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
-          setError(`Couldn't load picker for ${sectionKey}: ${e instanceof Error ? e.message : String(e)}`);
+          setError(
+            `Couldn't load picker for ${sectionKey}: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
       })
       .finally(() => !cancelled && setLoading(false));
@@ -84,16 +82,16 @@ export default function SectionPicker({
   );
 
   const handleKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'ArrowDown') {
+    if (e.key === "ArrowDown") {
       e.preventDefault();
       setHighlightIdx((idx) => Math.min(idx + 1, filtered.length - 1));
-    } else if (e.key === 'ArrowUp') {
+    } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setHighlightIdx((idx) => Math.max(idx - 1, 0));
-    } else if (e.key === 'Enter' && filtered[highlightIdx]) {
+    } else if (e.key === "Enter" && filtered[highlightIdx]) {
       e.preventDefault();
       onPick(filtered[highlightIdx]);
-    } else if (e.key === 'Escape' && onSkip) {
+    } else if (e.key === "Escape" && onSkip) {
       e.preventDefault();
       onSkip();
     }
@@ -104,7 +102,10 @@ export default function SectionPicker({
       <div className="flex items-center justify-center py-12">
         <div
           className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+          style={{
+            borderColor: "var(--pc-border)",
+            borderTopColor: "var(--pc-accent)",
+          }}
         />
       </div>
     );
@@ -113,10 +114,7 @@ export default function SectionPicker({
   return (
     <div className="flex flex-col gap-4">
       {help && (
-        <p
-          className="text-sm"
-          style={{ color: 'var(--pc-text-secondary)' }}
-        >
+        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
           {help}
         </p>
       )}
@@ -125,9 +123,9 @@ export default function SectionPicker({
         <div
           className="rounded-xl border p-3 text-sm animate-fade-in"
           style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
+            background: "rgba(239, 68, 68, 0.08)",
+            borderColor: "rgba(239, 68, 68, 0.2)",
+            color: "#f87171",
           }}
         >
           {error}
@@ -151,12 +149,12 @@ export default function SectionPicker({
 
       <div
         className="surface-panel divide-y overflow-y-auto"
-        style={{ borderColor: 'var(--pc-border)', maxHeight: '60vh' }}
+        style={{ borderColor: "var(--pc-border)", maxHeight: "60vh" }}
       >
         {filtered.length === 0 ? (
           <div
             className="px-4 py-6 text-sm text-center"
-            style={{ color: 'var(--pc-text-muted)' }}
+            style={{ color: "var(--pc-text-muted)" }}
           >
             No matches. Try a different filter.
           </div>
@@ -170,19 +168,19 @@ export default function SectionPicker({
               className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors"
               style={{
                 background:
-                  idx === highlightIdx ? 'var(--pc-hover)' : 'transparent',
+                  idx === highlightIdx ? "var(--pc-hover)" : "transparent",
               }}
             >
               <div className="flex-1 min-w-0">
                 <div
                   className="text-sm font-medium"
-                  style={{ color: 'var(--pc-text-primary)' }}
+                  style={{ color: "var(--pc-text-primary)" }}
                 >
                   {item.label}
                   {item.label !== item.key && (
                     <code
                       className="ml-2 text-xs"
-                      style={{ color: 'var(--pc-text-faint)' }}
+                      style={{ color: "var(--pc-text-faint)" }}
                     >
                       {item.key}
                     </code>
@@ -191,7 +189,7 @@ export default function SectionPicker({
                 {item.description && (
                   <div
                     className="text-xs mt-0.5"
-                    style={{ color: 'var(--pc-text-muted)' }}
+                    style={{ color: "var(--pc-text-muted)" }}
                   >
                     {item.description}
                   </div>
@@ -202,20 +200,18 @@ export default function SectionPicker({
                   className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
                   style={{
                     background: badgeIsGood(item.badge)
-                      ? 'rgba(0, 230, 138, 0.12)'
-                      : item.badge === 'needs setup'
-                        ? 'rgba(245, 180, 0, 0.12)'
-                        : 'var(--pc-bg-elevated)',
+                      ? "rgba(0, 230, 138, 0.12)"
+                      : item.badge === "needs setup"
+                        ? "rgba(245, 180, 0, 0.12)"
+                        : "var(--pc-bg-elevated)",
                     color: badgeIsGood(item.badge)
-                      ? 'var(--color-status-success)'
-                      : item.badge === 'needs setup'
-                        ? 'var(--color-status-warning, #f5b400)'
-                        : 'var(--pc-text-secondary)',
+                      ? "var(--color-status-success)"
+                      : item.badge === "needs setup"
+                        ? "var(--color-status-warning, #f5b400)"
+                        : "var(--pc-text-secondary)",
                   }}
                 >
-                  {badgeIsGood(item.badge) && (
-                    <Check className="h-3 w-3" />
-                  )}
+                  {badgeIsGood(item.badge) && <Check className="h-3 w-3" />}
                   {item.badge}
                 </span>
               )}
@@ -241,5 +237,5 @@ export default function SectionPicker({
 }
 
 function badgeIsGood(badge: string | undefined): boolean {
-  return badge === 'configured' || badge === 'active' || badge === 'set';
+  return badge === "configured" || badge === "active" || badge === "set";
 }

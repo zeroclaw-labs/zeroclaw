@@ -17,7 +17,7 @@ use ratatui::{
 use zeroclaw_config::sections::SectionShape;
 use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
-use crate::client::{ConfigTemplateEntry, OnboardSectionEntry, RpcClient};
+use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::theme;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -88,7 +88,7 @@ enum FilterAction {
 struct App<'a> {
     rpc: &'a RpcClient,
     screen: Screen,
-    sections: Vec<OnboardSectionEntry>,
+    sections: Vec<ConfigSectionEntry>,
     templates: Vec<ConfigTemplateEntry>,
     section_cursor: usize,
     // Type list (TypedFamilyMap families)
@@ -139,7 +139,7 @@ impl<'a> App<'a> {
     }
 
     async fn run(&mut self, term: &mut Term) -> Result<()> {
-        self.sections = self.rpc.onboard_sections().await?;
+        self.sections = self.rpc.config_sections().await?;
         self.templates = self.rpc.config_templates().await?;
 
         loop {

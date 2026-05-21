@@ -30,8 +30,8 @@ pub mod method {
     pub const CONFIG_MAP_KEY_RENAME: &str = "config/map-key-rename";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
     pub const CONFIG_VALIDATE: &str = "config/validate";
-    pub const ONBOARD_SECTIONS: &str = "onboard/sections";
-    pub const ONBOARD_STATUS: &str = "onboard/status";
+    pub const CONFIG_SECTIONS: &str = "config/sections";
+    pub const CONFIG_STATUS: &str = "config/status";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -174,9 +174,9 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn onboard_sections(&self) -> Result<Vec<OnboardSectionEntry>> {
-        let result: OnboardSectionsResult = self
-            .call(method::ONBOARD_SECTIONS, serde_json::json!({}))
+    pub async fn config_sections(&self) -> Result<Vec<ConfigSectionEntry>> {
+        let result: ConfigSectionsResult = self
+            .call(method::CONFIG_SECTIONS, serde_json::json!({}))
             .await?;
         Ok(result.sections)
     }
@@ -247,13 +247,13 @@ pub struct ConfigMapKeysResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct OnboardSectionsResult {
-    pub sections: Vec<OnboardSectionEntry>,
+pub struct ConfigSectionsResult {
+    pub sections: Vec<ConfigSectionEntry>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct OnboardSectionEntry {
+pub struct ConfigSectionEntry {
     pub key: String,
     pub label: String,
     pub help: String,

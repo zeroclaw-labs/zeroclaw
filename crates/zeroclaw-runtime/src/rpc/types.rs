@@ -807,7 +807,7 @@ rpc_type! {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// ── Onboard ──────────────────────────────────────────────────────────
+// ── Config introspection (sections, catalog, status) ─────────────────
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
@@ -845,8 +845,8 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// Consolidates gateway `SectionInfo`.
-    pub struct OnboardSectionEntry {
+    /// A config section entry for the dashboard sidebar / TUI section list.
+    pub struct ConfigSectionEntry {
         pub key: String,
         pub label: String,
         pub help: String,
@@ -870,15 +870,15 @@ rpc_type! {
 }
 
 rpc_type! {
-    /// Consolidates gateway `SectionsResponse`.
-    pub struct OnboardSectionsResult {
-        pub sections: Vec<OnboardSectionEntry>,
+    /// Response for `config/sections`.
+    pub struct ConfigSectionsResult {
+        pub sections: Vec<ConfigSectionEntry>,
     }
 }
 
 rpc_type! {
-    /// Consolidates gateway `OnboardStatusResponse`.
-    pub struct OnboardStatusResult {
+    /// Config readiness status for the dashboard/TUI.
+    pub struct ConfigStatusResult {
         pub needs_onboarding: bool,
         pub reason: String,
         pub has_partial_state: bool,
