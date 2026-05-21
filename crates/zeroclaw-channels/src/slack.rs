@@ -945,13 +945,68 @@ impl SlackChannel {
         bot_user_id: &str,
     ) -> Option<String> {
         let thread_ts = Self::precheck_thread_backfill(message, &self.seen_threads)?;
+        let trigger_ts = message
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let block = self
-            .render_thread_backfill_block(channel_id, &thread_ts, bot_user_id)
+            .render_thread_backfill_block(channel_id, &thread_ts, trigger_ts, bot_user_id)
             .await;
         if block.is_some() {
             Self::record_thread_seen(&self.seen_threads, &thread_ts);
         }
         block
+    }
+
+    /// Pure filter for `render_thread_backfill_block`. Drops, in order:
+    ///
+    /// - the triggering message itself (already forwarded as the message
+    ///   body — including it here would duplicate it for the agent),
+    /// - unsupported message subtypes (`channel_join`, `channel_leave`,
+    ///   bot status messages, etc. — same gate the main polling loop uses),
+    /// - messages from users not on the channel's allow-list (the count
+    ///   is returned separately so the renderer can surface a gap marker).
+    ///
+    /// Messages with no `user` field (webhooks) and the bot's own past
+    /// replies pass through — the bot's prior turns are useful self-context,
+    /// and webhook content is already trusted at ingest.
+    fn filter_backfill_messages<'a>(
+        messages: &'a [serde_json::Value],
+        trigger_ts: &str,
+        bot_user_id: &str,
+        is_user_allowed: impl Fn(&str) -> bool,
+    ) -> (Vec<&'a serde_json::Value>, usize) {
+        let mut dropped_by_allow_list = 0usize;
+        let allowed = messages
+            .iter()
+            .filter(|message| {
+                let ts = message
+                    .get("ts")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !trigger_ts.is_empty() && ts == trigger_ts {
+                    return false;
+                }
+                let subtype = message.get("subtype").and_then(|v| v.as_str());
+                if !Self::is_supported_message_subtype(subtype) {
+                    return false;
+                }
+                let user = message
+                    .get("user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if user.is_empty() || user == bot_user_id {
+                    return true;
+                }
+                if is_user_allowed(user) {
+                    true
+                } else {
+                    dropped_by_allow_list += 1;
+                    false
+                }
+            })
+            .collect();
+        (allowed, dropped_by_allow_list)
     }
 
     /// Returns `Some(thread_ts)` when this message should trigger backfill:
@@ -1335,8 +1390,20 @@ impl SlackChannel {
     /// replies of `thread_ts`, suitable for prepending to the agent payload
     /// on the bot's first encounter with a thread.
     ///
+    /// `trigger_ts` is the `ts` of the message currently being forwarded;
+    /// it is filtered out of the backfill so the agent does not see the
+    /// triggering message duplicated (once in the context block, once as
+    /// the message body).
+    ///
     /// Behaviour:
-    /// - Fail-open: if the underlying Slack fetch fails, returns `None`.
+    /// - Fail-open: if the underlying Slack fetch fails, returns `None`
+    ///   (logged at WARN so operators can correlate "agent has no context
+    ///   for this thread" with the Slack API failure).
+    /// - Triggering-message filter: the message at `trigger_ts` is dropped
+    ///   so it does not appear twice in the agent payload.
+    /// - Subtype filter: same gate as the main polling loop —
+    ///   `channel_join`, `channel_leave`, bot status messages etc. are
+    ///   skipped so they don't add system noise to the context block.
     /// - Allow-list filtering: messages from users not on the channel's
     ///   allow-list are dropped; the count is surfaced as a visible gap
     ///   marker so the agent knows context is missing for policy reasons.
@@ -1356,36 +1423,30 @@ impl SlackChannel {
         &self,
         channel_id: &str,
         thread_ts: &str,
+        trigger_ts: &str,
         bot_user_id: &str,
     ) -> Option<String> {
-        let messages = self
+        let Some(messages) = self
             .fetch_thread_messages_with_retry(channel_id, thread_ts)
-            .await?;
+            .await
+        else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "channel_id": channel_id,
+                        "thread_ts": thread_ts,
+                    })),
+                "Slack: thread-context backfill skipped — conversations.replies fetch returned None"
+            );
+            return None;
+        };
 
-        let mut dropped_by_allow_list = 0usize;
-        let allowed: Vec<&serde_json::Value> = messages
-            .iter()
-            .filter(|message| {
-                let user = message
-                    .get("user")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                // Pass through:
-                //   - messages with no `user` field (bot/webhook) — let the
-                //     renderer decide how to label them
-                //   - the bot's own past replies — useful self-context
-                //   - allow-listed users
-                if user.is_empty() || user == bot_user_id {
-                    return true;
-                }
-                if self.is_user_allowed(user) {
-                    true
-                } else {
-                    dropped_by_allow_list += 1;
-                    false
-                }
-            })
-            .collect();
+        let (allowed, dropped_by_allow_list) =
+            Self::filter_backfill_messages(&messages, trigger_ts, bot_user_id, |user| {
+                self.is_user_allowed(user)
+            });
 
         let total_allowed = allowed.len();
         let reply_cap_omitted = total_allowed.saturating_sub(SLACK_PERMALINK_THREAD_MAX_REPLIES);
@@ -1397,11 +1458,26 @@ impl SlackChannel {
             }
         }
 
-        Self::compose_thread_backfill_block(
+        let block = Self::compose_thread_backfill_block(
             rendered_message_lines,
             dropped_by_allow_list,
             reply_cap_omitted,
-        )
+        );
+        if block.is_some() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "channel_id": channel_id,
+                        "thread_ts": thread_ts,
+                        "rendered": total_allowed.saturating_sub(reply_cap_omitted),
+                        "dropped_by_allow_list": dropped_by_allow_list,
+                        "reply_cap_omitted": reply_cap_omitted,
+                    })),
+                "Slack: thread-context backfill prepended"
+            );
+        }
+        block
     }
 
     async fn render_permalink_thread_messages(
@@ -6170,6 +6246,55 @@ mod tests {
             "user": "U_USER",
         });
         assert!(SlackChannel::precheck_thread_backfill(&parent, &seen).is_none());
+    }
+
+    /// `filter_backfill_messages` must drop the triggering message
+    /// (otherwise the agent sees it twice — once in `[Thread context]`,
+    /// once as the message body), drop unsupported subtypes such as
+    /// `channel_join`, and count non-allow-listed messages without
+    /// passing them through.
+    #[test]
+    fn thread_backfill_filter_drops_trigger_subtype_and_non_allow_listed() {
+        let messages = vec![
+            // Parent message from allow-listed user — keep.
+            serde_json::json!({"ts": "T_PARENT", "user": "U_USER", "text": "parent"}),
+            // Earlier reply from allow-listed user — keep.
+            serde_json::json!({"ts": "T_R1", "thread_ts": "T_PARENT", "user": "U_USER", "text": "first"}),
+            // System message (`channel_join`) — must be dropped by subtype.
+            serde_json::json!({
+                "ts": "T_R2",
+                "thread_ts": "T_PARENT",
+                "subtype": "channel_join",
+                "user": "U_USER",
+                "text": "joined",
+            }),
+            // Reply from non-allow-listed user — must be counted as a drop.
+            serde_json::json!({"ts": "T_R3", "thread_ts": "T_PARENT", "user": "U_BAD", "text": "filtered"}),
+            // Bot's own past reply — must pass through (useful self-context).
+            serde_json::json!({"ts": "T_R4", "thread_ts": "T_PARENT", "user": "U_BOT", "text": "bot turn"}),
+            // The triggering reply itself — must be dropped to avoid
+            // duplication in the agent payload.
+            serde_json::json!({"ts": "T_TRIGGER", "thread_ts": "T_PARENT", "user": "U_USER", "text": "hi bot"}),
+        ];
+
+        let (allowed, dropped) =
+            SlackChannel::filter_backfill_messages(&messages, "T_TRIGGER", "U_BOT", |user| {
+                user == "U_USER"
+            });
+
+        let kept_ts: Vec<&str> = allowed
+            .iter()
+            .map(|m| m.get("ts").and_then(|v| v.as_str()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kept_ts,
+            vec!["T_PARENT", "T_R1", "T_R4"],
+            "trigger, subtype, and non-allow-listed messages must be dropped",
+        );
+        assert_eq!(
+            dropped, 1,
+            "only non-allow-listed messages count toward the gap marker",
+        );
     }
 
     /// Spec 3.5: Mixed allow / non-allow senders → 3 rendered + gap marker
