@@ -69,6 +69,7 @@ pub async fn run_full(config: &crate::config::Config) -> Result<Vec<CheckResult>
     results.push(check_memory_roundtrip(config).await);
 
     // 11. WebSocket handshake
+    #[cfg(feature = "gateway")]
     results.push(check_websocket_handshake(config).await);
 
     Ok(results)
@@ -334,6 +335,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
     }
 }
 
+#[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);

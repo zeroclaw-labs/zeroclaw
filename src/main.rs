@@ -1663,36 +1663,42 @@ async fn main() -> Result<()> {
             max_sessions,
             session_timeout,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig {
-                max_sessions: config.acp.max_sessions,
-                session_timeout_secs: config.acp.session_timeout_secs,
-            };
-            if let Some(max) = max_sessions {
-                acp_config.max_sessions = max;
+            #[cfg(feature = "channel-acp-server")]
+            {
+                let mut acp_config = channels::acp_server::AcpServerConfig {
+                    max_sessions: config.acp.max_sessions,
+                    session_timeout_secs: config.acp.session_timeout_secs,
+                };
+                if let Some(max) = max_sessions {
+                    acp_config.max_sessions = max;
+                }
+                if let Some(timeout) = session_timeout {
+                    acp_config.session_timeout_secs = timeout;
+                }
+                let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+                    .map(std::sync::Arc::new)
+                    .inspect_err(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "Failed to open ACP session store"
+                        );
+                    })
+                    .ok();
+                let server = if let Some(store) = store {
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(config, acp_config, store))
+                } else {
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
+                };
+                server.run().await
             }
-            if let Some(timeout) = session_timeout {
-                acp_config.session_timeout_secs = timeout;
+            #[cfg(not(feature = "channel-acp-server"))]
+            {
+                let _ = (max_sessions, session_timeout);
+                anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
-            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
-                .map(std::sync::Arc::new)
-                .inspect_err(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "Failed to open ACP session store"
-                    );
-                })
-                .ok();
-            let server = if let Some(store) = store {
-                std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                    config, acp_config, store,
-                ))
-            } else {
-                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-            };
-            server.run().await
         }
 
         Commands::Gateway { gateway_command } => {
@@ -1972,6 +1978,7 @@ async fn main() -> Result<()> {
                             .await
                         })
                     })),
+                    #[cfg(feature = "channel-mqtt")]
                     mqtt_start: Some(Box::new({
                         use std::sync::{Arc, Mutex};
                         use zeroclaw_config::schema::SopConfig;
@@ -2000,6 +2007,8 @@ async fn main() -> Result<()> {
                             })
                         }
                     })),
+                    #[cfg(not(feature = "channel-mqtt"))]
+                    mqtt_start: None,
                 };
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),

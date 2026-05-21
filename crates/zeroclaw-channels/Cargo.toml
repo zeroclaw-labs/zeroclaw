@@ -18,7 +18,7 @@ zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
-rumqttc = "0.25"
+rumqttc = { version = "0.25", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 async-trait = "0.1"
@@ -107,6 +107,7 @@ channel-bluesky = []
 channel-twitter = []
 channel-reddit = []
 channel-notion = []
+channel-mqtt = ["dep:rumqttc"]
 channel-linq = []
 channel-wati = []
 channel-nextcloud = []

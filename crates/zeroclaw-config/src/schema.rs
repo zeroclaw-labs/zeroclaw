@@ -9973,78 +9973,97 @@ impl ChannelsConfig {
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
+            #[cfg(feature = "channel-telegram")]
             (
                 Box::new(ConfigWrapper::new(self.telegram.get("default"))),
                 !self.telegram.is_empty(),
             ),
+            #[cfg(feature = "channel-discord")]
             (
                 Box::new(ConfigWrapper::new(self.discord.get("default"))),
                 !self.discord.is_empty(),
             ),
+            #[cfg(feature = "channel-slack")]
             (
                 Box::new(ConfigWrapper::new(self.slack.get("default"))),
                 !self.slack.is_empty(),
             ),
+            #[cfg(feature = "channel-mattermost")]
             (
                 Box::new(ConfigWrapper::new(self.mattermost.get("default"))),
                 !self.mattermost.is_empty(),
             ),
+            #[cfg(feature = "channel-imessage")]
             (
                 Box::new(ConfigWrapper::new(self.imessage.get("default"))),
                 !self.imessage.is_empty(),
             ),
+            #[cfg(feature = "channel-matrix")]
             (
                 Box::new(ConfigWrapper::new(self.matrix.get("default"))),
                 !self.matrix.is_empty(),
             ),
+            #[cfg(feature = "channel-signal")]
             (
                 Box::new(ConfigWrapper::new(self.signal.get("default"))),
                 !self.signal.is_empty(),
             ),
+            #[cfg(feature = "channel-whatsapp-cloud")]
             (
                 Box::new(ConfigWrapper::new(self.whatsapp.get("default"))),
                 !self.whatsapp.is_empty(),
             ),
+            #[cfg(feature = "channel-linq")]
             (
                 Box::new(ConfigWrapper::new(self.linq.get("default"))),
                 !self.linq.is_empty(),
             ),
+            #[cfg(feature = "channel-wati")]
             (
                 Box::new(ConfigWrapper::new(self.wati.get("default"))),
                 !self.wati.is_empty(),
             ),
+            #[cfg(feature = "channel-nextcloud")]
             (
                 Box::new(ConfigWrapper::new(self.nextcloud_talk.get("default"))),
                 !self.nextcloud_talk.is_empty(),
             ),
+            #[cfg(feature = "channel-email")]
             (
                 Box::new(ConfigWrapper::new(self.email.get("default"))),
                 !self.email.is_empty(),
             ),
+            #[cfg(feature = "channel-email")]
             (
                 Box::new(ConfigWrapper::new(self.gmail_push.get("default"))),
                 !self.gmail_push.is_empty(),
             ),
+            #[cfg(feature = "channel-irc")]
             (
                 Box::new(ConfigWrapper::new(self.irc.get("default"))),
                 !self.irc.is_empty()
             ),
+            #[cfg(feature = "channel-lark")]
             (
                 Box::new(ConfigWrapper::new(self.lark.get("default"))),
                 !self.lark.is_empty(),
             ),
+            #[cfg(feature = "channel-dingtalk")]
             (
                 Box::new(ConfigWrapper::new(self.dingtalk.get("default"))),
                 !self.dingtalk.is_empty(),
             ),
+            #[cfg(feature = "channel-wecom")]
             (
                 Box::new(ConfigWrapper::new(self.wecom.get("default"))),
                 !self.wecom.is_empty(),
             ),
+            #[cfg(feature = "channel-wechat")]
             (
                 Box::new(ConfigWrapper::new(self.wechat.get("default"))),
                 !self.wechat.is_empty(),
             ),
+            #[cfg(feature = "channel-qq")]
             (
                 Box::new(ConfigWrapper::new(self.qq.get("default"))),
                 !self.qq.is_empty()
@@ -10054,14 +10073,17 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.nostr.get("default"))),
                 !self.nostr.is_empty(),
             ),
+            #[cfg(feature = "channel-clawdtalk")]
             (
                 Box::new(ConfigWrapper::new(self.clawdtalk.get("default"))),
                 !self.clawdtalk.is_empty(),
             ),
+            #[cfg(feature = "channel-reddit")]
             (
                 Box::new(ConfigWrapper::new(self.reddit.get("default"))),
                 !self.reddit.is_empty(),
             ),
+            #[cfg(feature = "channel-bluesky")]
             (
                 Box::new(ConfigWrapper::new(self.bluesky.get("default"))),
                 !self.bluesky.is_empty(),
@@ -10071,6 +10093,7 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.voice_wake.get("default"))),
                 !self.voice_wake.is_empty(),
             ),
+            #[cfg(feature = "channel-mqtt")]
             (
                 Box::new(ConfigWrapper::new(self.mqtt.get("default"))),
                 !self.mqtt.is_empty(),
@@ -10079,11 +10102,16 @@ impl ChannelsConfig {
     }
 
     pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
-        let mut ret = self.channels_except_webhook();
-        ret.push((
-            Box::new(ConfigWrapper::new(self.webhook.get("default"))),
-            !self.webhook.is_empty(),
-        ));
+        let ret = self.channels_except_webhook();
+        #[cfg(feature = "channel-webhook")]
+        let ret = {
+            let mut r = ret;
+            r.push((
+                Box::new(ConfigWrapper::new(self.webhook.get("default"))),
+                !self.webhook.is_empty(),
+            ));
+            r
+        };
         ret
     }
 }
