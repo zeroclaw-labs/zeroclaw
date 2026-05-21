@@ -7,7 +7,7 @@ description = "TUI onboarding wizard for ZeroClaw."
 publish = false
 
 [dependencies]
-zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 # Proc-macro crate, already compiled for api/channels/runtime/config via
 # workspace feature unification — expands at compile time, no runtime
