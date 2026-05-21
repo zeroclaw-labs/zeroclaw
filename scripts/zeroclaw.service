@@ -14,8 +14,6 @@ Restart=on-failure
 RestartSec=5
 EnvironmentFile=/home/pi/zeroclaw/.env
 Environment=RUST_LOG=info
-Environment=ZEROCLAW_gateway__allow_public_bind=true
-Environment=ZEROCLAW_gateway__port=8080
 
 # Expand ~ in config path
 Environment=HOME=/home/pi
