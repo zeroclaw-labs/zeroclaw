@@ -88,10 +88,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, ReplyIntentPolicy};
 use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, ChatMessage, Provider, ReasoningEffort};
 use zeroclaw_runtime::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
@@ -375,7 +375,7 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<zeroclaw_config::schema::ModelRouteConfig>>,
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
-    precheck_reply_intent: bool,
+    reply_intent_policy: ReplyIntentPolicy,
     show_tool_calls: bool,
     session_store: Option<Arc<zeroclaw_infra::session_store::SessionStore>>,
     /// Non-interactive approval manager for channel-driven runs.
@@ -2128,7 +2128,13 @@ async fn classify_channel_reply_intent(
     }
 
     let response = provider
-        .chat_fast(Some(system_prompt), &convo, model, temperature)
+        .chat_with_effort(
+            Some(system_prompt),
+            &convo,
+            model,
+            Some(temperature),
+            ReasoningEffort::Low,
+        )
         .await?;
     Ok(parse_reply_intent(&response))
 }
@@ -2906,12 +2912,12 @@ async fn process_channel_message(
         }
     }
 
-    // ── Reply-intent precheck ────────────────────────────────────────
+    // ── Reply-intent policy dispatch ─────────────────────────────────
     // Runs a small classifier LLM call that decides whether this bot should
     // reply. Useful for multi-bot group chats; pure overhead in single-bot
-    // DMs. Disable via `[channels] precheck_reply_intent = false`.
-    let reply_intent = if ctx.precheck_reply_intent {
-        classify_channel_reply_intent(
+    // DMs. Skip via `[channels] reply_intent_policy = "always_reply"`.
+    let reply_intent = match ctx.reply_intent_policy {
+        ReplyIntentPolicy::Precheck => classify_channel_reply_intent(
             active_provider.as_ref(),
             history[0].content.as_str(),
             &history,
@@ -2919,9 +2925,8 @@ async fn process_channel_message(
             runtime_defaults.temperature,
         )
         .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
-    } else {
-        AssistantChannelOutcome::Reply(String::new())
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new())),
+        ReplyIntentPolicy::AlwaysReply => AssistantChannelOutcome::Reply(String::new()),
     };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
@@ -5689,9 +5694,10 @@ pub async fn start_channels(
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
 
-    if !config.channels.precheck_reply_intent {
+    if config.channels.reply_intent_policy != ReplyIntentPolicy::Precheck {
         tracing::info!(
-            "Reply-intent precheck disabled via [channels] precheck_reply_intent = false"
+            "Reply-intent policy: {:?} (set via [channels] reply_intent_policy)",
+            config.channels.reply_intent_policy
         );
     }
 
@@ -5761,7 +5767,7 @@ pub async fn start_channels(
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
-        precheck_reply_intent: config.channels.precheck_reply_intent,
+        reply_intent_policy: config.channels.reply_intent_policy,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
             match zeroclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
@@ -6356,7 +6362,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6483,7 +6489,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6567,7 +6573,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6668,7 +6674,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7270,7 +7276,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7363,7 +7369,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7470,7 +7476,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7562,7 +7568,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7664,7 +7670,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7787,7 +7793,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7891,7 +7897,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8010,7 +8016,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8114,7 +8120,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8211,7 +8217,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8434,7 +8440,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8549,7 +8555,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8674,7 +8680,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
             },
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -8814,7 +8820,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8923,7 +8929,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9013,7 +9019,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9103,7 +9109,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9899,7 +9905,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10046,7 +10052,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10234,7 +10240,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10353,7 +10359,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10978,7 +10984,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11077,7 +11083,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11208,7 +11214,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11387,7 +11393,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11510,7 +11516,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11625,7 +11631,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11760,7 +11766,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -12077,7 +12083,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(

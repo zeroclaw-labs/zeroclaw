@@ -2,7 +2,7 @@ use crate::ProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::traits::{ChatMessage, Provider, ProviderCapabilities, ReasoningEffort};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -783,12 +783,13 @@ impl Provider for OpenAiCodexProvider {
             .await
     }
 
-    async fn chat_fast(
+    async fn chat_with_effort(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
+        effort: ReasoningEffort,
     ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -800,7 +801,7 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request_with_effort(input, instructions, model, Some("low"))
+        self.send_responses_request_with_effort(input, instructions, model, Some(effort.as_str()))
             .await
     }
 }

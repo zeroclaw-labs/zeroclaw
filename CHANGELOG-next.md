@@ -79,10 +79,13 @@
   `google_workspace` schema (#5975).
 - **Groq**: native tool calling is now disabled where it was misbehaving (#5848).
 - `strip_native_tool_messages` now coalesces adjacent assistant turns (#5829).
-- **OpenAI Codex**: `Provider::chat_fast` override sends classifier and router-style
-  calls with `reasoning.effort = "low"`, dropping ~1s per call versus inheriting the
-  caller's higher effort. Default trait impl delegates to `chat_with_system` so
-  non-Codex providers see no behavior change (#5979).
+- **OpenAI Codex**: `Provider::chat_with_effort` override sends classifier and
+  router-style calls with the requested `ReasoningEffort` (Codex Responses
+  `reasoning.effort`). The reply-intent classifier routes through this method
+  with `ReasoningEffort::Low`, dropping ~1s per call versus inheriting the
+  caller's higher effort. Default trait impl ignores the effort hint and
+  delegates to `chat_with_system`, so non-Codex providers see no behavior
+  change (#5979).
 
 ### Channels
 
@@ -103,10 +106,11 @@
   the channel set, unblocking approval-gated tool flows on every supported chat
   platform.
 - **Feishu**: `mention_only` config wired through (#5848).
-- **Reply-intent precheck opt-out**: new `[channels] precheck_reply_intent` flag (default
-  `true`, preserving today's behavior). Single-bot DM operators can set it to `false`
-  to skip the per-message classifier call; warm Telegram latency drops from ~7s to
-  ~3.3s on a Codex backend (#5979).
+- **Reply-intent policy**: new `[channels] reply_intent_policy` enum (default
+  `"precheck"`, preserving today's behavior). Operators with single-bot DMs or
+  admission-gated channels can set `"always_reply"` to skip the per-message
+  classifier call and route accepted messages straight to the main agent loop;
+  warm Telegram latency drops from ~7s to ~3.3s on a Codex backend (#5979, #5674).
 
 ### Tools & Skills
 

@@ -65,6 +65,35 @@ pub struct TokenUsage {
     pub cached_input_tokens: Option<u64>,
 }
 
+/// Reasoning effort hint for providers that support per-call effort selection
+/// (Codex Responses API, o-series reasoning models, Claude extended thinking).
+///
+/// Providers that do not support per-call effort selection ignore this value
+/// and behave as if `chat_with_system` had been called directly. Callers should
+/// pass the lowest level that still produces an acceptable answer for the task:
+/// `Minimal`/`Low` for classifier/router calls, higher levels for tasks that
+/// benefit from deeper reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// String representation matching the wire-format expected by providers
+    /// that accept an effort field (currently the Codex Responses API).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -395,17 +424,22 @@ pub trait Provider: Send + Sync {
         temperature: Option<f64>,
     ) -> anyhow::Result<String>;
 
-    /// One-shot chat optimized for quick classifier/router-style calls where
-    /// deep reasoning is unnecessary. Providers may lower reasoning effort or
-    /// take a simpler code path. Default delegates to chat_with_system.
-    async fn chat_fast(
+    /// One-shot chat with an explicit reasoning-effort hint.
+    ///
+    /// Providers that expose a per-call effort parameter (Codex Responses API,
+    /// o-series, Claude extended thinking) should override this to honor
+    /// `effort`. The default implementation ignores `effort` and delegates to
+    /// `chat_with_system`, preserving today's behavior for providers without
+    /// per-call effort selection.
+    async fn chat_with_effort(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
+        _effort: ReasoningEffort,
     ) -> anyhow::Result<String> {
-        self.chat_with_system(system_prompt, message, model, Some(temperature))
+        self.chat_with_system(system_prompt, message, model, temperature)
             .await
     }
 

@@ -6748,13 +6748,17 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
-    /// Whether to run the reply-intent classifier LLM call before every
-    /// channel message. The classifier coordinates multi-bot group chats by
-    /// deciding whether this bot should answer a given message. For
-    /// single-bot DM deployments it is pure overhead (always returns REPLY)
-    /// and can be disabled to halve per-message latency. Default: `true`.
-    #[serde(default = "default_true")]
-    pub precheck_reply_intent: bool,
+    /// Policy controlling the reply-intent classifier LLM call. The classifier
+    /// coordinates multi-bot group chats by deciding whether this bot should
+    /// answer a given message; for single-bot DMs (or any setup where channel
+    /// admission already gates the messages the bot should answer) it is pure
+    /// overhead. Default: `"precheck"`.
+    ///
+    /// Values:
+    /// - `"precheck"` -- run the classifier and honor its decision (default).
+    /// - `"always_reply"` -- skip the classifier; treat accepted messages as REPLY.
+    #[serde(default)]
+    pub reply_intent_policy: ReplyIntentPolicy,
     /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
     /// to channel users. When `false`, tool calls are still logged server-side but
     /// not forwarded as individual channel messages. Default: `false`.
@@ -6978,7 +6982,7 @@ impl Default for ChannelsConfig {
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -7001,6 +7005,27 @@ pub enum StreamMode {
     /// Send the response as multiple separate messages at paragraph boundaries.
     #[serde(rename = "multi_message")]
     MultiMessage,
+}
+
+/// Per-message policy for the channel reply-intent classifier.
+///
+/// The classifier coordinates multi-bot group chats by deciding whether this
+/// bot should answer a given accepted message. Operators with deployments that
+/// don't need the coordination (single-bot DMs, or any setup where channel
+/// admission checks already select for messages the bot should answer) can
+/// opt out per #5979 / #5674.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyIntentPolicy {
+    /// Run the classifier LLM call before every accepted message and honor
+    /// its decision. Preserves today's behavior. Default.
+    #[default]
+    Precheck,
+    /// Skip the classifier entirely and treat every accepted channel message
+    /// as a REPLY. Use for single-bot DM deployments or any setup where
+    /// channel admission already gates which messages the bot should answer.
+    AlwaysReply,
 }
 
 fn default_draft_update_interval_ms() -> u64 {
@@ -11776,6 +11801,7 @@ impl_enum_prop_kind!(
     OtpMethod,
     SandboxBackend,
     AutonomyLevel,
+    ReplyIntentPolicy,
 );
 
 impl HasPropKind for serde_json::Value {
@@ -12363,7 +12389,7 @@ auto_save = true
                 mqtt: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
-                precheck_reply_intent: true,
+                reply_intent_policy: ReplyIntentPolicy::Precheck,
                 show_tool_calls: true,
                 session_persistence: true,
                 session_backend: default_session_backend(),
@@ -13538,7 +13564,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -13921,7 +13947,7 @@ bot_token = "xoxb-tok"
             mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
-            precheck_reply_intent: true,
+            reply_intent_policy: ReplyIntentPolicy::Precheck,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
