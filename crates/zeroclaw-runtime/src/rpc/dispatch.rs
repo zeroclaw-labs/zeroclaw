@@ -235,6 +235,19 @@ impl RpcDispatcher {
         }
     }
 
+    /// Flush dirty config paths to disk. Clone the config out of the
+    /// lock (parking_lot guards are !Send), save to disk, then write
+    /// the clone (with cleared dirty set) back.
+    async fn flush_config(&self) -> Result<(), JsonRpcError> {
+        let mut snapshot = self.ctx.config.read().clone();
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        *self.ctx.config.write() = snapshot;
+        Ok(())
+    }
+
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
         while let Some(line) = transport.next_frame().await {
@@ -895,23 +908,26 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
-        let mut config = self.ctx.config.write();
-        // Polymorphic value: strings pass through, everything else coerced.
-        let info = config
-            .prop_fields()
-            .into_iter()
-            .find(|f| f.name == req.prop);
-        let value_str = match &req.value {
-            Value::String(s) => s.clone(),
-            other => zeroclaw_config::typed_value::coerce_for_set_prop(
-                other,
-                info.as_ref().map(|i| i.kind),
-            )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
-        };
-        config
-            .set_prop_persistent(&req.prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+        {
+            let mut config = self.ctx.config.write();
+            // Polymorphic value: strings pass through, everything else coerced.
+            let info = config
+                .prop_fields()
+                .into_iter()
+                .find(|f| f.name == req.prop);
+            let value_str = match &req.value {
+                Value::String(s) => s.clone(),
+                other => zeroclaw_config::typed_value::coerce_for_set_prop(
+                    other,
+                    info.as_ref().map(|i| i.kind),
+                )
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+            };
+            config
+                .set_prop_persistent(&req.prop, &value_str)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+        }
+        self.flush_config().await?;
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
@@ -966,10 +982,13 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
-        let mut config = self.ctx.config.write();
-        config
-            .set_prop_persistent(&req.prop, "")
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        {
+            let mut config = self.ctx.config.write();
+            config
+                .set_prop_persistent(&req.prop, "")
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        }
+        self.flush_config().await?;
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
@@ -993,12 +1012,18 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
-        let mut config = self.ctx.config.write();
-        let created = config
-            .create_map_key(&req.path, &req.key)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        let created = {
+            let mut config = self.ctx.config.write();
+            let created = config
+                .create_map_key(&req.path, &req.key)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            if created {
+                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            }
+            created
+        };
         if created {
-            config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            self.flush_config().await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -1009,12 +1034,18 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
-        let mut config = self.ctx.config.write();
-        let deleted = config
-            .delete_map_key(&req.path, &req.key)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        let deleted = {
+            let mut config = self.ctx.config.write();
+            let deleted = config
+                .delete_map_key(&req.path, &req.key)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            if deleted {
+                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            }
+            deleted
+        };
         if deleted {
-            config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            self.flush_config().await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -1025,13 +1056,19 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_rename(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyRenameParams = parse_params(params)?;
-        let mut config = self.ctx.config.write();
-        let renamed = config
-            .rename_map_key(&req.path, &req.from, &req.to)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        let renamed = {
+            let mut config = self.ctx.config.write();
+            let renamed = config
+                .rename_map_key(&req.path, &req.from, &req.to)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            if renamed {
+                config.mark_dirty(&format!("{}.{}", req.path, req.from));
+                config.mark_dirty(&format!("{}.{}", req.path, req.to));
+            }
+            renamed
+        };
         if renamed {
-            config.mark_dirty(&format!("{}.{}", req.path, req.from));
-            config.mark_dirty(&format!("{}.{}", req.path, req.to));
+            self.flush_config().await?;
         }
         to_result(ConfigMapKeyRenameResult {
             path: req.path,
