@@ -74,7 +74,7 @@ path = "src/lib.rs"
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-config.workspace = true
+zeroclaw-config = { workspace = true, features = ["clap"] }
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
@@ -124,8 +124,6 @@ urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
-
-rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
