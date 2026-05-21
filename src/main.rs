@@ -1675,20 +1675,26 @@ async fn main() -> Result<()> {
                 if let Some(timeout) = session_timeout {
                     acp_config.session_timeout_secs = timeout;
                 }
-                let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
-                    .map(std::sync::Arc::new)
-                    .inspect_err(|e| {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                let store =
+                    zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+                        .map(std::sync::Arc::new)
+                        .inspect_err(|e| {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                                 .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                            "Failed to open ACP session store"
-                        );
-                    })
-                    .ok();
+                                "Failed to open ACP session store"
+                            );
+                        })
+                        .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(config, acp_config, store))
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
+                        config, acp_config, store,
+                    ))
                 } else {
                     std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
                 };
