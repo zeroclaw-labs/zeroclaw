@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=@@RPI_USER@@
-SupplementaryGroups=gpio spidev i2c
+SupplementaryGroups=gpio spi i2c
 WorkingDirectory=/home/@@RPI_USER@@/zeroclaw
 ExecStart=/home/@@RPI_USER@@/zeroclaw/zeroclaw gateway --host 0.0.0.0 --port 8080
 Restart=on-failure
