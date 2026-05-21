@@ -1861,18 +1861,14 @@ mod tests {
         // `none` is the active default for a fresh config.
         assert_eq!(items[0].badge.as_deref(), Some("active"));
         // All known providers must be present even when their Option is None.
+        // Derive from the same schema source tunnel_picker uses so new providers
+        // are caught automatically.
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in [
-            "tailscale",
-            "cloudflare",
-            "ngrok",
-            "openvpn",
-            "pinggy",
-            "custom",
-        ] {
+        for entry in cfg.tunnel.nested_option_entries() {
             assert!(
-                keys.contains(&expected),
-                "tunnel_picker must include `{expected}` for unconfigured configs"
+                keys.contains(&entry.field),
+                "tunnel_picker must include `{}` for unconfigured configs",
+                entry.field
             );
         }
     }
