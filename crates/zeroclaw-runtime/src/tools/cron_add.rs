@@ -324,6 +324,19 @@ impl Tool for CronAddTool {
                     });
                 }
 
+                if self.security.is_command_gated(command) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "This command matches a gated_commands pattern and cannot be \
+                             scheduled. Commands requiring TOTP verification must be run \
+                             interactively via the shell tool."
+                                .to_string(),
+                        ),
+                    });
+                }
+
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
@@ -470,6 +483,13 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    fn test_security_with_gated(cfg: &Config, patterns: Vec<&str>) -> Arc<SecurityPolicy> {
+        Arc::new(
+            SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir)
+                .with_gated_commands(patterns.into_iter().map(String::from).collect()),
+        )
     }
 
     #[tokio::test]
@@ -1008,6 +1028,45 @@ mod tests {
         assert_eq!(jobs[0].delivery.to.as_deref(), Some("user-42"));
         assert_eq!(jobs[0].delivery.thread_id.as_deref(), Some("conv-99"));
         assert!(jobs[0].delivery.best_effort);
+    }
+
+    #[tokio::test]
+    async fn gated_command_cannot_be_scheduled() {
+        // Use a command the default policy allows (echo), gate it, and assert
+        // the cron scheduler rejects it with the gated_commands error — not the
+        // ordinary validate_command_execution rejection.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security_with_gated(&cfg, vec!["echo *"]));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 * * * *" },
+                "job_type": "shell",
+                "command": "echo secret"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.error.unwrap().contains("gated_commands pattern"),
+            "expected gated_commands rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_gated_command_can_be_scheduled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security_with_gated(&cfg, vec!["echo *"]));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "0 * * * *" },
+                "job_type": "shell",
+                "command": "ls -la"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[test]

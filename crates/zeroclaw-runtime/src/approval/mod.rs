@@ -317,7 +317,6 @@ fn looks_like_secret_key(key: &str) -> bool {
         "private-key",
         "privatekey",
         "credential",
-        "otp",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

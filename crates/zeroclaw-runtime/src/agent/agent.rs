@@ -670,7 +670,8 @@ impl Agent {
             let mut policy = SecurityPolicy::from_risk_profile(
                 risk_profile,
                 session_cwd.unwrap_or(&agent_workspace),
-            );
+            )
+            .with_gated_commands(config.security.otp.gated_commands.clone());
             // When a per-session cwd overrides the sandbox root, ensure
             // the per-agent workspace (where skills, identity, and config
             // data live) remains readable. Without this, file_read and

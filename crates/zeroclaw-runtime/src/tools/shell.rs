@@ -195,8 +195,9 @@ impl Tool for ShellTool {
                         success: false,
                         output: String::new(),
                         error: Some(
-                            "Command matches a gated_commands pattern but OTP is not configured. \
-                             Set security.otp.enabled = true to use gated_commands."
+                            "Command matches a gated_commands pattern but the OTP validator is \
+                             unavailable. Verify that security.otp.enabled = true and that the \
+                             OTP secret file is present and readable."
                                 .to_string(),
                         ),
                     });

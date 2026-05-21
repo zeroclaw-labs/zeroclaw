@@ -2478,6 +2478,9 @@ impl SecurityPolicy {
         if self.gated_commands.is_empty() {
             return false;
         }
+        if command.contains("$(") || command.contains('`') || command.contains("<(") {
+            return true;
+        }
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
             let remaining = cmd_part.trim();
@@ -5460,5 +5463,36 @@ mod tests {
         assert!(p.is_command_gated("sudo apt update"));
         assert!(p.is_command_gated("reboot"));
         assert!(!p.is_command_gated("ls"));
+    }
+
+    #[test]
+    fn gated_commands_blocks_dollar_paren_substitution() {
+        let p = gated_policy(vec!["sudo *"]);
+        // `echo $(sudo reboot)` embeds a gated command inside a substitution;
+        // the top-level segment is `echo`, not `sudo`, so the matcher cannot
+        // see it. Treat any command with $() as gated when patterns are set.
+        assert!(p.is_command_gated("echo $(sudo reboot)"));
+        assert!(p.is_command_gated("VAR=$(sudo whoami) echo $VAR"));
+    }
+
+    #[test]
+    fn gated_commands_blocks_backtick_substitution() {
+        let p = gated_policy(vec!["sudo *"]);
+        assert!(p.is_command_gated("echo `sudo reboot`"));
+    }
+
+    #[test]
+    fn gated_commands_blocks_process_substitution() {
+        let p = gated_policy(vec!["sudo *"]);
+        assert!(p.is_command_gated("diff <(sudo cat /etc/shadow) /tmp/out"));
+    }
+
+    #[test]
+    fn gated_commands_empty_allows_substitutions() {
+        // When no gated patterns are configured the substitution guard must
+        // not fire — the existing shell-policy tests rely on this.
+        let p = SecurityPolicy::default();
+        assert!(!p.is_command_gated("echo $(date)"));
+        assert!(!p.is_command_gated("echo `date`"));
     }
 }

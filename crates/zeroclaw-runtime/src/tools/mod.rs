@@ -465,7 +465,6 @@ pub fn all_tools_with_runtime(
         }
     };
 
-
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(shell_tool, security.clone()),
