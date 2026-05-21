@@ -500,25 +500,21 @@ impl<'a> App<'a> {
             }
             KeyCode::Enter => {
                 if self.field_cursor < self.fields.len() {
-                    if self.fields[self.field_cursor].is_secret {
-                        self.status_msg = Some("Secret fields cannot be edited in the TUI".into());
-                    } else {
-                        let idx = self.field_cursor;
-                        self.prepare_edit_at(idx);
-                        if let Screen::FieldList {
-                            section_idx,
-                            prefix,
-                            breadcrumb,
-                            ..
-                        } = &self.screen
-                        {
-                            self.screen = Screen::FieldEdit {
-                                section_idx: *section_idx,
-                                prefix: prefix.clone(),
-                                breadcrumb: breadcrumb.clone(),
-                                field_idx: idx,
-                            };
-                        }
+                    let idx = self.field_cursor;
+                    self.prepare_edit_at(idx);
+                    if let Screen::FieldList {
+                        section_idx,
+                        prefix,
+                        breadcrumb,
+                        ..
+                    } = &self.screen
+                    {
+                        self.screen = Screen::FieldEdit {
+                            section_idx: *section_idx,
+                            prefix: prefix.clone(),
+                            breadcrumb: breadcrumb.clone(),
+                            field_idx: idx,
+                        };
                     }
                 }
             }
@@ -1020,9 +1016,17 @@ impl<'a> App<'a> {
 
             self.draw_footer(frame, r, "↑↓/jk=navigate  Enter=save  Esc=cancel");
         } else {
-            // Text input
-            let kind_hint = format!("Type: {}", field.kind.wire_name());
-            let input_display = format!("{}{}", self.edit_buf, "█");
+            // Text input (masked for secrets)
+            let kind_hint = if field.is_secret {
+                format!("Type: {} (secret — input hidden)", field.kind.wire_name())
+            } else {
+                format!("Type: {}", field.kind.wire_name())
+            };
+            let input_display = if field.is_secret {
+                format!("{}█", "•".repeat(self.edit_buf.len()))
+            } else {
+                format!("{}█", self.edit_buf)
+            };
 
             let input = Paragraph::new(vec![
                 Line::from(Span::styled(&kind_hint, theme::dim_style())),
