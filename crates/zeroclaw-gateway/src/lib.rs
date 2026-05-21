@@ -629,6 +629,7 @@ pub async fn run_gateway(
                 _channel_map_handle,
                 _ask_user_handle_gw,
                 _escalate_handle_gw,
+                _channel_send_handle_gw,
             ) = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,

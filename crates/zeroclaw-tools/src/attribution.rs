@@ -12,6 +12,7 @@ use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool_attribution;
 
 use crate::ask_user::AskUserTool;
+use crate::channel_send::ChannelSendTool;
 use crate::backup_tool::BackupTool;
 use crate::browser::BrowserTool;
 use crate::browser_delegate::BrowserDelegateTool;
@@ -74,6 +75,7 @@ use crate::web_fetch::WebFetchTool;
 use crate::web_search_tool::WebSearchTool;
 
 tool_attribution!(AskUserTool, ToolKind::Wait);
+tool_attribution!(ChannelSendTool, ToolKind::Plugin);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 tool_attribution!(BrowserTool, ToolKind::Plugin);
 tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);

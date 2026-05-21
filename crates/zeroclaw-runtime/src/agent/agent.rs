@@ -26,48 +26,10 @@ pub use zeroclaw_api::agent::TurnEvent;
 
 /// Build the configured channel targets section for system prompt injection.
 /// Returns `Some(string)` if any channels have `default_target` set, `None` otherwise.
-fn build_channel_targets(config: &Config) -> Option<String> {
-    let mut targets = Vec::new();
-    if let Some(ref tg) = config.channels.telegram
-        && let Some(ref target) = tg.default_target
-    {
-        targets.push(("telegram", target.as_str()));
-    }
-    if let Some(ref dc) = config.channels.discord
-        && let Some(ref target) = dc.default_target
-    {
-        targets.push(("discord", target.as_str()));
-    }
-    if let Some(ref sl) = config.channels.slack
-        && let Some(ref target) = sl.default_target
-    {
-        targets.push(("slack", target.as_str()));
-    }
-    if let Some(ref mm) = config.channels.mattermost
-        && let Some(ref target) = mm.default_target
-    {
-        targets.push(("mattermost", target.as_str()));
-    }
-    if let Some(ref mx) = config.channels.matrix
-        && let Some(ref target) = mx.default_target
-    {
-        targets.push(("matrix", target.as_str()));
-    }
-    if let Some(ref irc) = config.channels.irc
-        && let Some(ref target) = irc.default_target
-    {
-        targets.push(("irc", target.as_str()));
-    }
-    if targets.is_empty() {
-        None
-    } else {
-        let mut s = String::from("## Configured Channel Targets\n\n");
-        s.push_str("Use `channel_send` to deliver messages to external channels:\n\n");
-        for (name, target) in &targets {
-            s.push_str(&format!("- {}: `{}`\n", name, target));
-        }
-        Some(s)
-    }
+///
+/// TODO: implement when `default_target` field lands on channel config schema (#6647).
+fn build_channel_targets(_config: &Config) -> Option<String> {
+    None
 }
 
 pub struct Agent {

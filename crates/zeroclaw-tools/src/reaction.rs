@@ -294,16 +294,14 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> ReactionTool {
-        let tool = ReactionTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Arc::new(RwLock::new(HashMap::new())),
-        );
-        let map: HashMap<String, Arc<dyn Channel>> = channels
-            .into_iter()
-            .map(|(name, ch)| (name.to_string(), ch))
-            .collect();
-        tool.populate(map);
-        tool
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut map = handle.write();
+            for (name, ch) in channels {
+                map.insert(name.to_string(), ch);
+            }
+        }
+        ReactionTool::new(Arc::new(SecurityPolicy::default()), handle)
     }
 
     #[test]
@@ -536,11 +534,11 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
+        let handle = Arc::new(RwLock::new(HashMap::new()));
         let tool = ReactionTool::new(
             Arc::new(SecurityPolicy::default()),
-            Arc::new(RwLock::new(HashMap::new())),
+            handle.clone(),
         );
-        let handle = tool.channel_map_handle();
 
         // Initially empty — tool reports not initialized
         let result = tool
@@ -554,7 +552,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
 
-        // Populate via the handle
+        // Populate via the shared handle
         {
             let mut map = handle.write();
             map.insert(

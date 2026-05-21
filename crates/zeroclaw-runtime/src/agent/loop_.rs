@@ -2971,6 +2971,7 @@ pub async fn run(
             _channel_map_handle,
             _ask_user_handle,
             _escalate_handle,
+            _channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -4281,6 +4282,7 @@ pub async fn process_message(
             _channel_map_handle_pm,
             _ask_user_handle_pm,
             _escalate_handle_pm,
+            _channel_send_handle_pm,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,

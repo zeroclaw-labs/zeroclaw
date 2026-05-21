@@ -7394,6 +7394,7 @@ pub async fn start_channels(
             _channel_map_handle,
             ask_user_handle_ch,
             escalate_handle_ch,
+            _channel_send_handle_ch,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
