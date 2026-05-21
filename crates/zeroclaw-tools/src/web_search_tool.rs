@@ -557,9 +557,6 @@ impl WebSearchTool {
     async fn search_jina(&self, query: &str) -> anyhow::Result<String> {
         let api_key = self.resolve_jina_api_key()?;
 
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!("https://s.jina.ai/?q={}", encoded_query);
-
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
             .user_agent("ZeroClaw/1.0 (https://zeroclaw.ai)");
@@ -567,10 +564,15 @@ impl WebSearchTool {
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
         let client = builder.build()?;
 
+        // Jina Search API requires POST with JSON body
+        let body = serde_json::json!({"q": query});
+
         let response = client
-            .get(&search_url)
+            .post("https://s.jina.ai/")
             .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .json(&body)
             .send()
             .await?;
 
@@ -583,8 +585,9 @@ impl WebSearchTool {
     }
 
     fn parse_jina_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        // Jina API returns {"code": 200, "status": 20000, "data": [...]}
         let results = json
-            .get("results")
+            .get("data")
             .and_then(|r| r.as_array())
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -609,15 +612,18 @@ impl WebSearchTool {
                 .and_then(|t| t.as_str())
                 .unwrap_or("No title");
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let description = result
-                .get("description")
-                .and_then(|d| d.as_str())
+            // Jina's content field contains richer markdown-formatted page content;
+            // fall back to description if content is absent
+            let snippet = result
+                .get("content")
+                .and_then(|c| c.as_str())
+                .or_else(|| result.get("description").and_then(|d| d.as_str()))
                 .unwrap_or("");
 
             lines.push(format!("{}. {}", i + 1, title));
             lines.push(format!("   {}", url));
-            if !description.is_empty() {
-                lines.push(format!("   {}", description));
+            if !snippet.is_empty() {
+                lines.push(format!("   {}", snippet));
             }
         }
 
@@ -1678,7 +1684,8 @@ mod tests {
     #[test]
     fn test_parse_jina_results_empty() {
         let tool = WebSearchTool::new("jina".to_string(), None, None, 5, 15);
-        let json = serde_json::json!({"results": []});
+        // Jina API returns {"code": 200, "status": 20000, "data": [...]}
+        let json = serde_json::json!({"data": []});
         let result = tool.parse_jina_results(&json, "test").unwrap();
         assert!(result.contains("No results found"));
     }
@@ -1686,12 +1693,13 @@ mod tests {
     #[test]
     fn test_parse_jina_results_with_data() {
         let tool = WebSearchTool::new("jina".to_string(), None, None, 5, 15);
+        // Jina API returns {"code": 200, "status": 20000, "data": [...]}
         let json = serde_json::json!({
-            "results": [
+            "data": [
                 {
                     "title": "Jina AI",
                     "url": "https://jina.ai/",
-                    "description": "Best-in-class embeddings, rerankers, web reader, deepsearch"
+                    "content": "Best-in-class embeddings, rerankers, web reader, deepsearch"
                 },
                 {
                     "title": "Jina AI on GitHub",
@@ -1704,6 +1712,25 @@ mod tests {
         assert!(result.contains("Jina AI"));
         assert!(result.contains("https://jina.ai/"));
         assert!(result.contains("via Jina AI"));
+        // content field should be read when available
+        assert!(result.contains("Best-in-class embeddings"));
+    }
+
+    #[test]
+    fn test_parse_jina_results_falls_back_to_description() {
+        let tool = WebSearchTool::new("jina".to_string(), None, None, 5, 15);
+        // When content is absent, fall back to description
+        let json = serde_json::json!({
+            "data": [
+                {
+                    "title": "Test",
+                    "url": "https://example.com",
+                    "description": "Fallback description"
+                }
+            ]
+        });
+        let result = tool.parse_jina_results(&json, "test").unwrap();
+        assert!(result.contains("Fallback description"));
     }
 
     #[test]
