@@ -541,6 +541,26 @@ impl<'a> App<'a> {
     // ── Field list ───────────────────────────────────────────────
 
     async fn handle_field_list(&mut self, key: KeyEvent) -> Result<()> {
+        let field_names: Vec<String> = self
+            .fields
+            .iter()
+            .map(|f| f.path.rsplit('.').next().unwrap_or(&f.path).to_string())
+            .collect();
+        let visible = self.filtered_indices(&field_names);
+
+        match self.handle_filter_key(key, visible.len()) {
+            FilterAction::Consumed => return Ok(()),
+            FilterAction::Accept => {
+                if let Some(&orig) = visible.get(self.filter_cursor) {
+                    self.deactivate_filter();
+                    self.field_cursor = orig;
+                    self.enter_field_edit(orig);
+                }
+                return Ok(());
+            }
+            FilterAction::Passthrough => {}
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
@@ -566,7 +586,6 @@ impl<'a> App<'a> {
                             breadcrumb: bc,
                         };
                     }
-                    // len == 1 means DirectForm/BackendPicker → SectionList (already set)
                 }
                 self.status_msg = None;
             }
@@ -580,22 +599,7 @@ impl<'a> App<'a> {
             }
             KeyCode::Enter => {
                 if self.field_cursor < self.fields.len() {
-                    let idx = self.field_cursor;
-                    self.prepare_edit_at(idx);
-                    if let Screen::FieldList {
-                        section_idx,
-                        prefix,
-                        breadcrumb,
-                        ..
-                    } = &self.screen
-                    {
-                        self.screen = Screen::FieldEdit {
-                            section_idx: *section_idx,
-                            prefix: prefix.clone(),
-                            breadcrumb: breadcrumb.clone(),
-                            field_idx: idx,
-                        };
-                    }
+                    self.enter_field_edit(self.field_cursor);
                 }
             }
             KeyCode::Char('d') => {
@@ -619,6 +623,24 @@ impl<'a> App<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    fn enter_field_edit(&mut self, idx: usize) {
+        self.prepare_edit_at(idx);
+        if let Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb,
+            ..
+        } = &self.screen
+        {
+            self.screen = Screen::FieldEdit {
+                section_idx: *section_idx,
+                prefix: prefix.clone(),
+                breadcrumb: breadcrumb.clone(),
+                field_idx: idx,
+            };
+        }
     }
 
     fn prepare_edit_at(&mut self, idx: usize) {
@@ -1132,8 +1154,16 @@ impl<'a> App<'a> {
             .collect();
         render_breadcrumb(frame, r.breadcrumb, &bc);
 
-        // Show description of selected field
-        if let Some(field) = self.fields.get(self.field_cursor) {
+        let field_names: Vec<String> = self
+            .fields
+            .iter()
+            .map(|f| f.path.rsplit('.').next().unwrap_or(&f.path).to_string())
+            .collect();
+        let visible = self.filtered_indices(&field_names);
+
+        if let Some(buf) = &self.filter {
+            render_filter_bar(frame, r.help, buf);
+        } else if let Some(field) = self.fields.get(self.field_cursor) {
             frame.render_widget(
                 Paragraph::new(Span::styled(&field.description, theme::dim_style()))
                     .wrap(Wrap { trim: false }),
@@ -1141,11 +1171,11 @@ impl<'a> App<'a> {
             );
         }
 
-        let items: Vec<ListItem> = self
-            .fields
+        let items: Vec<ListItem> = visible
             .iter()
-            .map(|f| {
-                let short_name = f.path.rsplit('.').next().unwrap_or(&f.path);
+            .map(|&i| {
+                let f = &self.fields[i];
+                let short_name = &field_names[i];
                 let val_display = if f.is_secret {
                     "••••••".to_string()
                 } else {
@@ -1170,9 +1200,18 @@ impl<'a> App<'a> {
             })
             .collect();
 
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible
+                .iter()
+                .position(|&i| i == self.field_cursor)
+                .unwrap_or(0)
+        };
+
         let mut state = ListState::default();
-        if !self.fields.is_empty() {
-            state.select(Some(self.field_cursor));
+        if !items.is_empty() {
+            state.select(Some(cursor.min(items.len().saturating_sub(1))));
         }
 
         frame.render_stateful_widget(
@@ -1184,7 +1223,12 @@ impl<'a> App<'a> {
             &mut state,
         );
 
-        self.draw_footer(frame, r, "↑↓/jk=navigate  Enter=edit  d=reset  Esc=back");
+        let hints = if self.filter.is_some() {
+            "↑↓=navigate  Enter=edit  Esc=clear filter"
+        } else {
+            "↑↓/jk=navigate  Enter=edit  d=reset  /=filter  Esc=back"
+        };
+        self.draw_footer(frame, r, hints);
     }
 
     fn draw_field_edit(
