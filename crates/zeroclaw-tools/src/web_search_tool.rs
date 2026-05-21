@@ -586,19 +586,16 @@ impl WebSearchTool {
 
     fn parse_jina_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         // Jina API returns {"code": 200, "status": 20000, "data": [...]}
-        let results = json
-            .get("data")
-            .and_then(|r| r.as_array())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"search_provider": "jina"})),
-                    "web_search: invalid Jina AI response"
-                );
-                anyhow::Error::msg("Invalid Jina AI API response")
-            })?;
+        let results = json.get("data").and_then(|r| r.as_array()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "jina"})),
+                "web_search: invalid Jina AI response"
+            );
+            anyhow::Error::msg("Invalid Jina AI API response")
+        })?;
 
         if results.is_empty() {
             return Ok(format!("No results found for: {}", query));
