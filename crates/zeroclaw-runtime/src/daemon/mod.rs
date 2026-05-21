@@ -29,9 +29,55 @@ pub enum DaemonExit {
 /// The reload trigger is a tokio watch channel (not an OS signal) so it
 /// works identically on Linux, macOS, and Windows. The Sender is owned by
 /// the daemon (created in `run`) and cloned to the gateway for AppState.
+/// Default grace period (seconds) before ephemeral shutdown after last client disconnects.
+const EPHEMERAL_GRACE_SECS: u64 = 30;
+
 async fn wait_for_exit_signal(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
+    ephemeral: bool,
+    client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<DaemonExit> {
+    use std::sync::atomic::Ordering;
+
+    // Future that resolves when ephemeral shutdown is triggered:
+    // waits for at least one client to connect, then for all clients to
+    // disconnect, then sleeps the grace period. Pending forever if not
+    // ephemeral.
+    let ephemeral_shutdown = async {
+        if !ephemeral {
+            return std::future::pending::<()>().await;
+        }
+        // Wait until at least one client has connected.
+        loop {
+            if client_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // Wait until all clients disconnect.
+        loop {
+            if client_count.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"grace_secs": EPHEMERAL_GRACE_SECS})),
+            "All socket clients disconnected; starting ephemeral grace period"
+        );
+        // Grace period — if a client reconnects, abort.
+        for _ in 0..EPHEMERAL_GRACE_SECS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if client_count.load(Ordering::Relaxed) > 0 {
+                // Client reconnected — restart the whole wait.
+                return Box::pin(wait_for_ephemeral(client_count.clone())).await;
+            }
+        }
+    };
+    tokio::pin!(ephemeral_shutdown);
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -55,9 +101,6 @@ async fn wait_for_exit_signal(
                 }
                 changed = reload_rx.changed() => {
                     if changed.is_err() {
-                        // Sender dropped — treat as shutdown (shouldn't
-                        // happen in normal operation; the gateway holds a
-                        // clone for the lifetime of the daemon).
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "Reload sender dropped; shutting down");
                         return Ok(DaemonExit::Shutdown);
                     }
@@ -65,6 +108,10 @@ async fn wait_for_exit_signal(
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         return Ok(DaemonExit::Reload);
                     }
+                }
+                _ = &mut ephemeral_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
+                    return Ok(DaemonExit::Shutdown);
                 }
             }
         }
@@ -89,7 +136,35 @@ async fn wait_for_exit_signal(
                         return Ok(DaemonExit::Reload);
                     }
                 }
+                _ = &mut ephemeral_shutdown => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Ephemeral daemon: no clients remaining, shutting down");
+                    return Ok(DaemonExit::Shutdown);
+                }
             }
+        }
+    }
+}
+
+/// Recursive helper: wait for clients to connect then all disconnect, with grace period.
+async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    // Wait until all clients disconnect again.
+    loop {
+        if client_count.load(Ordering::Relaxed) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"grace_secs": EPHEMERAL_GRACE_SECS})),
+        "All socket clients disconnected; starting ephemeral grace period"
+    );
+    for _ in 0..EPHEMERAL_GRACE_SECS {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if client_count.load(Ordering::Relaxed) > 0 {
+            return Box::pin(wait_for_ephemeral(client_count)).await;
         }
     }
 }
@@ -127,13 +202,15 @@ pub struct DaemonSubsystems {
                 + Sync,
         >,
     >,
-    /// Start the Unix socket RPC listener. Same signature as `channels_start`.
+    /// Start the Unix socket RPC listener.
+    /// Third argument is the shared client count for `--ephemeral` shutdown.
     #[cfg(unix)]
     pub socket_start: Option<
         Box<
             dyn Fn(
                     Config,
                     tokio_util::sync::CancellationToken,
+                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
@@ -156,6 +233,7 @@ pub async fn run(
     host: String,
     port: u16,
     subsystems: DaemonSubsystems,
+    ephemeral: bool,
 ) -> Result<DaemonExit> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -237,11 +315,13 @@ pub async fn run(
     }
 
     // Unix socket RPC listener (#6837).
+    let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[cfg(unix)]
     if let Some(socket_start) = subsystems.socket_start {
         let socket_cfg = config.clone();
         let socket_start = std::sync::Arc::new(socket_start);
         let socket_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
         handles.push(spawn_component_supervisor(
             "socket",
             initial_backoff,
@@ -250,7 +330,8 @@ pub async fn run(
                 let cfg = socket_cfg.clone();
                 let start = socket_start.clone();
                 let cancel = socket_cancel.clone();
-                async move { start(cfg, cancel).await }
+                let count = count.clone();
+                async move { start(cfg, cancel, count).await }
             },
         ));
     }
@@ -339,7 +420,7 @@ pub async fn run(
     println!("   Ctrl+C or SIGTERM to stop");
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
-    let exit = wait_for_exit_signal(reload_rx).await?;
+    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
     crate::health::mark_component_error(
         "daemon",
         match exit {
@@ -1549,7 +1630,8 @@ mod tests {
         use tokio::time::{Duration, timeout};
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, false, count));
 
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1572,7 +1654,8 @@ mod tests {
         use tokio::time::{Duration, timeout};
 
         let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx));
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, false, count));
         tokio::time::sleep(Duration::from_millis(50)).await;
         reload_tx.send(true).expect("send reload");
 
@@ -1582,5 +1665,81 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Reload);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_does_not_exit_before_client_connects() {
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count));
+
+        // No clients ever connect — should NOT shut down.
+        let result = timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_err(),
+            "ephemeral daemon should not exit before any client connects"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_exits_after_client_disconnects() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count2));
+
+        // Simulate client connect then disconnect.
+        count.store(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        count.store(0, Ordering::Relaxed);
+
+        // Should exit within grace period + buffer.
+        let result = timeout(Duration::from_secs(EPHEMERAL_GRACE_SECS + 5), handle)
+            .await
+            .expect("ephemeral daemon should shut down after last client disconnects")
+            .expect("task should not panic")
+            .expect("signal handler should not error");
+        assert_eq!(result, DaemonExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_grace_period_resets_on_reconnect() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, timeout};
+
+        let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let mut handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count2));
+
+        // Client connects, disconnects.
+        count.store(1, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        count.store(0, Ordering::Relaxed);
+
+        // Wait partway through grace period, then reconnect.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        count.store(1, Ordering::Relaxed);
+
+        // Should NOT shut down while client is connected.
+        let result = timeout(Duration::from_millis(500), &mut handle).await;
+        assert!(
+            result.is_err(),
+            "ephemeral daemon should not exit while client is connected"
+        );
+
+        // Disconnect again — should eventually shut down.
+        count.store(0, Ordering::Relaxed);
+        let result = timeout(Duration::from_secs(EPHEMERAL_GRACE_SECS + 5), handle)
+            .await
+            .expect("ephemeral daemon should shut down after second disconnect")
+            .expect("task should not panic")
+            .expect("signal handler should not error");
+        assert_eq!(result, DaemonExit::Shutdown);
     }
 }

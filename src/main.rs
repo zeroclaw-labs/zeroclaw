@@ -471,6 +471,10 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Self-terminate after all socket clients disconnect (with grace period)
+        #[arg(long)]
+        ephemeral: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -1825,7 +1829,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Daemon { port, host } => {
+        Commands::Daemon {
+            port,
+            host,
+            ephemeral,
+        } => {
             if let Ok(exe) = std::env::current_exe() {
                 let under_home = directories::UserDirs::new()
                     .map(|u| u.home_dir().to_path_buf())
@@ -2001,10 +2009,14 @@ async fn main() -> Result<()> {
                         }
                     })),
                     #[cfg(unix)]
-                    socket_start: Some(Box::new(|config, cancel| {
+                    socket_start: Some(Box::new(|config, cancel, client_count| {
                         Box::pin(async move {
-                            Box::pin(zeroclaw_runtime::rpc::unix::run_unix_socket(config, cancel))
-                                .await
+                            Box::pin(zeroclaw_runtime::rpc::unix::run_unix_socket(
+                                config,
+                                cancel,
+                                client_count,
+                            ))
+                            .await
                         })
                     })),
                 };
@@ -2013,6 +2025,7 @@ async fn main() -> Result<()> {
                     host.clone(),
                     port,
                     subsystems,
+                    ephemeral,
                 ))
                 .await?;
                 match exit {

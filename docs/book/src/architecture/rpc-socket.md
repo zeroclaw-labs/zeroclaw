@@ -70,6 +70,12 @@ The socket does not require a pairing token. Access control is handled by Unix f
 
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_result`, `approval_request`.
 
+## Ephemeral mode
+
+`zeroclaw daemon --ephemeral` tracks connected socket clients and self-terminates when the last one disconnects (after a 30-second grace period). A reconnect during the grace period cancels the shutdown. The daemon will not exit until at least one client has connected.
+
+Daemons started without `--ephemeral` ignore client count and run until explicitly stopped.
+
 ## Security
 
 - Socket directory: `0o700` (owner only)

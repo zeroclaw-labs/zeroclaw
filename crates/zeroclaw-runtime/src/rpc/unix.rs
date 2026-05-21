@@ -94,7 +94,14 @@ fn peer_label_from(stream: &UnixStream) -> String {
 // ── Listener ─────────────────────────────────────────────────────
 
 /// Run the Unix socket RPC listener as a daemon subsystem.
-pub async fn run_unix_socket(config: Config, cancel: CancellationToken) -> Result<()> {
+///
+/// `client_count` is incremented on connect, decremented on disconnect.
+/// The daemon uses it for `--ephemeral` shutdown logic.
+pub async fn run_unix_socket(
+    config: Config,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+) -> Result<()> {
     let path = socket_path(&config);
 
     let session_backend =
@@ -138,7 +145,6 @@ pub async fn run_unix_socket(config: Config, cancel: CancellationToken) -> Resul
 
     let session_queue = Arc::new(SessionActorQueue::new(32, 30, 600));
     let sessions = Arc::new(SessionStore::new(64, session_queue));
-    let client_count = Arc::new(AtomicUsize::new(0));
 
     loop {
         tokio::select! {
@@ -204,6 +210,10 @@ mod tests {
         }
     }
 
+    fn test_client_count() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
     #[tokio::test]
     async fn socket_initialize_handshake() {
         let tmp = tempfile::tempdir().unwrap();
@@ -213,8 +223,9 @@ mod tests {
 
         let server_cancel = cancel.clone();
         let server_config = config.clone();
-        let handle =
-            tokio::spawn(async move { run_unix_socket(server_config, server_cancel).await });
+        let handle = tokio::spawn(async move {
+            run_unix_socket(server_config, server_cancel, test_client_count()).await
+        });
 
         // Wait for socket to appear.
         for _ in 0..50 {
@@ -284,7 +295,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_config = config.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel).await;
+            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
         });
 
         for _ in 0..50 {
@@ -333,7 +344,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_config = config.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel).await;
+            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
         });
 
         for _ in 0..50 {
@@ -369,7 +380,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_config = config.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel).await;
+            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
         });
 
         // Wait for the listener to start (it should remove the stale file and bind).
@@ -387,6 +398,49 @@ mod tests {
             stream.is_ok(),
             "should be able to connect after stale cleanup"
         );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn client_count_tracks_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let sock_path = config.data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let server_cancel = cancel.clone();
+        let server_config = config.clone();
+        let server_count = count.clone();
+        tokio::spawn(async move {
+            let _ = run_unix_socket(server_config, server_cancel, server_count).await;
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+
+        // Connect two clients.
+        let s1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let s2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+
+        // Drop one — count should go to 1.
+        drop(s1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        // Drop the other — count should go to 0.
+        drop(s2);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(count.load(Ordering::Relaxed), 0);
 
         cancel.cancel();
     }
