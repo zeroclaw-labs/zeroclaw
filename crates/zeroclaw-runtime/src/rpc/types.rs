@@ -23,6 +23,7 @@ pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_config::cost::types::CostSummary;
+pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
 // ── Derive helper ────────────────────────────────────────────────────
 
@@ -426,9 +427,11 @@ rpc_type! {
 // Full config read returns `Value` (masked) — inherently untyped.
 
 rpc_type! {
+    /// Value is polymorphic: a JSON string passes through as-is (backward
+    /// compat); any other JSON type is coerced via `coerce_for_set_prop`.
     pub struct ConfigSetParams {
         pub prop: String,
-        pub value: String,
+        pub value: Value,
     }
 }
 
@@ -450,6 +453,121 @@ rpc_type! {
 rpc_type! {
     pub struct ConfigReloadResult {
         pub reloading: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigListParams {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub prefix: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigListResult {
+        pub entries: Vec<ConfigFieldEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigDeleteParams {
+        pub prop: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigDeleteResult {
+        pub prop: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeysParams {
+        pub path: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeysResult {
+        pub path: String,
+        pub keys: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyCreateParams {
+        pub path: String,
+        pub key: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyCreateResult {
+        pub path: String,
+        pub key: String,
+        pub created: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyDeleteParams {
+        pub path: String,
+        pub key: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyDeleteResult {
+        pub path: String,
+        pub key: String,
+        pub deleted: bool,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyRenameParams {
+        pub path: String,
+        pub from: String,
+        pub to: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigMapKeyRenameResult {
+        pub path: String,
+        pub from: String,
+        pub to: String,
+        pub renamed: bool,
+    }
+}
+
+rpc_type! {
+    /// Owned wire representation of a [`zeroclaw_config::traits::MapKeySection`].
+    /// The upstream type uses `&'static str` fields that can't round-trip
+    /// through `Deserialize`, so this owned copy serves as the wire format.
+    pub struct ConfigTemplateEntry {
+        pub path: String,
+        pub kind: zeroclaw_config::traits::MapKeyKind,
+        pub value_type: String,
+        pub description: String,
+    }
+}
+
+impl From<zeroclaw_config::traits::MapKeySection> for ConfigTemplateEntry {
+    fn from(s: zeroclaw_config::traits::MapKeySection) -> Self {
+        Self {
+            path: s.path.to_string(),
+            kind: s.kind,
+            value_type: s.value_type.to_string(),
+            description: s.description.to_string(),
+        }
+    }
+}
+
+rpc_type! {
+    pub struct ConfigTemplatesResult {
+        pub templates: Vec<ConfigTemplateEntry>,
     }
 }
 

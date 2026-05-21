@@ -10,7 +10,8 @@ pub struct SecretFieldInfo {
 }
 
 /// Runtime type classification for config property values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PropKind {
     String,
     Bool,
@@ -180,6 +181,24 @@ pub struct PropFieldInfo {
     pub derived_from_secret: bool,
 }
 
+impl PropKind {
+    /// Stable lowercase-kebab wire name matching the serde serialization.
+    /// Useful when consumers need the tag as a `&'static str` without
+    /// going through serde round-trip.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Bool => "bool",
+            Self::Integer => "integer",
+            Self::Float => "float",
+            Self::Enum => "enum",
+            Self::StringArray => "string_array",
+            Self::ObjectArray => "object_array",
+            Self::Object => "object",
+        }
+    }
+}
+
 impl PropFieldInfo {
     pub fn is_enum(&self) -> bool {
         self.enum_variants.is_some()
@@ -257,12 +276,9 @@ pub fn restore_required_secret(value: &mut String, current: &str) {
 /// `Vec<T>` (List) field whose value type implements `Configurable`. The
 /// dashboard / CLI use this to surface `+ Add` affordances without
 /// hardcoding the section list. Auto-discovered by the `Configurable` derive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "schema-export",
-    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
-)]
-#[cfg_attr(feature = "schema-export", serde(rename_all = "snake_case"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
 pub enum MapKeyKind {
     /// `HashMap<String, T>` — key is user-supplied; new value is default.
     Map,
@@ -271,11 +287,8 @@ pub enum MapKeyKind {
     List,
 }
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    feature = "schema-export",
-    derive(serde::Serialize, schemars::JsonSchema)
-)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeySection {
     /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
     pub path: &'static str,
@@ -286,6 +299,63 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+}
+
+/// Serializable wire representation of a config field for API consumers
+/// (RPC dispatch, gateway, TUI). Single source of truth — replaces the
+/// gateway's local `ListEntry` and the RPC dispatch's ad-hoc JSON.
+///
+/// Built from [`PropFieldInfo`] via [`ConfigFieldEntry::from_prop_field`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigFieldEntry {
+    pub path: String,
+    pub category: String,
+    pub kind: PropKind,
+    pub type_hint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    pub populated: bool,
+    pub is_secret: bool,
+    #[serde(default)]
+    pub is_env_overridden: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_variants: Vec<String>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboard_section: Option<String>,
+}
+
+impl ConfigFieldEntry {
+    /// Convert a [`PropFieldInfo`] (server-side introspection) into its wire
+    /// representation. Secrets are masked (value omitted). The caller supplies
+    /// `is_env_overridden` from `Config::prop_is_env_overridden`.
+    pub fn from_prop_field(info: PropFieldInfo, is_env_overridden: bool) -> Self {
+        let populated = info.display_value != "<unset>";
+        let is_sensitive = info.is_secret || info.derived_from_secret;
+        let value = if is_sensitive {
+            None
+        } else {
+            Some(serde_json::Value::String(info.display_value))
+        };
+        let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
+        let onboard_section =
+            crate::sections::Section::from_key(info.name.split('.').next().unwrap_or(""))
+                .map(|s| s.as_str().to_string());
+
+        Self {
+            path: info.name,
+            category: info.category.to_string(),
+            kind: info.kind,
+            type_hint: info.type_hint.to_string(),
+            value,
+            populated,
+            is_secret: is_sensitive,
+            is_env_overridden,
+            enum_variants,
+            description: info.description.to_string(),
+            onboard_section,
+        }
+    }
 }
 
 /// One row emitted by the `Configurable` derive's `nested_option_entries()`

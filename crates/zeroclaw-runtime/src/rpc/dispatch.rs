@@ -69,6 +69,13 @@ pub enum Method {
     ConfigSet,
     ConfigValidate,
     ConfigReload,
+    ConfigList,
+    ConfigDelete,
+    ConfigMapKeys,
+    ConfigMapKeyCreate,
+    ConfigMapKeyDelete,
+    ConfigMapKeyRename,
+    ConfigTemplates,
 
     // Agents
     AgentsList,
@@ -138,6 +145,13 @@ impl Method {
         (Method::ConfigSet, "config/set"),
         (Method::ConfigValidate, "config/validate"),
         (Method::ConfigReload, "config/reload"),
+        (Method::ConfigList, "config/list"),
+        (Method::ConfigDelete, "config/delete"),
+        (Method::ConfigMapKeys, "config/map-keys"),
+        (Method::ConfigMapKeyCreate, "config/map-key-create"),
+        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
+        (Method::ConfigMapKeyRename, "config/map-key-rename"),
+        (Method::ConfigTemplates, "config/templates"),
         // Agents
         (Method::AgentsList, "agents/list"),
         (Method::AgentsStatus, "agents/status"),
@@ -312,6 +326,13 @@ impl RpcDispatcher {
             Method::ConfigSet => self.handle_config_set(&req.params).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(),
+            Method::ConfigList => self.handle_config_list(&req.params),
+            Method::ConfigDelete => self.handle_config_delete(&req.params).await,
+            Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
+            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
+            Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
+            Method::ConfigTemplates => self.handle_config_templates(),
 
             // Agents
             Method::AgentsList => self.handle_agents_list(),
@@ -873,8 +894,21 @@ impl RpcDispatcher {
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
         let mut config = self.ctx.config.write();
+        // Polymorphic value: strings pass through, everything else coerced.
+        let info = config
+            .prop_fields()
+            .into_iter()
+            .find(|f| f.name == req.prop);
+        let value_str = match &req.value {
+            Value::String(s) => s.clone(),
+            other => zeroclaw_config::typed_value::coerce_for_set_prop(
+                other,
+                info.as_ref().map(|i| i.kind),
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+        };
         config
-            .set_prop_persistent(&req.prop, &req.value)
+            .set_prop_persistent(&req.prop, &value_str)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
         to_result(ConfigSetResult {
             prop: req.prop,
@@ -903,6 +937,115 @@ impl RpcDispatcher {
         } else {
             Err(rpc_err(INTERNAL_ERROR, "Reload not available"))
         }
+    }
+
+    fn handle_config_list(&self, params: &Value) -> RpcResult {
+        use crate::onboard::field_visibility;
+        use zeroclaw_config::traits::ConfigFieldEntry;
+        let req: ConfigListParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let prefix = req.prefix.as_deref();
+        let excluded = field_visibility::excluded_paths(&config, prefix.unwrap_or(""));
+        let entries: Vec<ConfigFieldEntry> = config
+            .prop_fields()
+            .into_iter()
+            .filter(|info| match prefix {
+                Some(p) => info.name.starts_with(p),
+                None => true,
+            })
+            .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
+            .map(|info| {
+                let env = config.prop_is_env_overridden(&info.name);
+                ConfigFieldEntry::from_prop_field(info, env)
+            })
+            .collect();
+        to_result(ConfigListResult { entries })
+    }
+
+    async fn handle_config_delete(&self, params: &Value) -> RpcResult {
+        let req: ConfigDeleteParams = parse_params(params)?;
+        let mut config = self.ctx.config.write();
+        config
+            .set_prop_persistent(&req.prop, "")
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        to_result(ConfigDeleteResult {
+            prop: req.prop,
+            deleted: true,
+        })
+    }
+
+    fn handle_config_map_keys(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeysParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let keys = config.get_map_keys(&req.path).ok_or_else(|| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("No map-keyed section at `{}`", req.path),
+            )
+        })?;
+        to_result(ConfigMapKeysResult {
+            path: req.path,
+            keys,
+        })
+    }
+
+    async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let mut config = self.ctx.config.write();
+        let created = config
+            .create_map_key(&req.path, &req.key)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        if created {
+            config.mark_dirty(&format!("{}.{}", req.path, req.key));
+        }
+        to_result(ConfigMapKeyCreateResult {
+            path: req.path,
+            key: req.key,
+            created,
+        })
+    }
+
+    async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let mut config = self.ctx.config.write();
+        let deleted = config
+            .delete_map_key(&req.path, &req.key)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        if deleted {
+            config.mark_dirty(&format!("{}.{}", req.path, req.key));
+        }
+        to_result(ConfigMapKeyDeleteResult {
+            path: req.path,
+            key: req.key,
+            deleted,
+        })
+    }
+
+    async fn handle_config_map_key_rename(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeyRenameParams = parse_params(params)?;
+        let mut config = self.ctx.config.write();
+        let renamed = config
+            .rename_map_key(&req.path, &req.from, &req.to)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+        if renamed {
+            config.mark_dirty(&format!("{}.{}", req.path, req.from));
+            config.mark_dirty(&format!("{}.{}", req.path, req.to));
+        }
+        to_result(ConfigMapKeyRenameResult {
+            path: req.path,
+            from: req.from,
+            to: req.to,
+            renamed,
+        })
+    }
+
+    fn handle_config_templates(&self) -> RpcResult {
+        use zeroclaw_config::schema::Config;
+        let templates: Vec<ConfigTemplateEntry> = Config::map_key_sections()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        to_result(ConfigTemplatesResult { templates })
     }
 
     // ── Agents handlers ──────────────────────────────────────────
