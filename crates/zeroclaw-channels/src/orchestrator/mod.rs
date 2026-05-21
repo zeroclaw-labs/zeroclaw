@@ -14159,6 +14159,94 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
+        let discord_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let discord_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let healthy_name = format!("test-supervised-sibling-{}", uuid::Uuid::new_v4());
+        let discord_component = format!("channel:{discord_name}");
+        let healthy_component = format!("channel:{healthy_name}");
+
+        let discord_channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: discord_name,
+            calls: Arc::clone(&discord_calls),
+            err: Mutex::new(Some(anyhow::Error::new(
+                crate::discord::DiscordListenerFatalError::new(
+                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                ),
+            ))),
+        });
+        let healthy_channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: healthy_name,
+            calls: Arc::clone(&healthy_calls),
+        });
+
+        let (discord_tx, discord_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (healthy_tx, healthy_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let discord_handle = spawn_supervised_listener(
+            discord_channel,
+            None,
+            discord_tx,
+            1,
+            1,
+            cancel.clone(),
+        );
+        let healthy_handle = spawn_supervised_listener_with_health_interval(
+            healthy_channel,
+            None,
+            healthy_tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let first_last_ok = zeroclaw_runtime::health::snapshot_json()["components"]
+            [&healthy_component]["last_ok"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(!first_last_ok.is_empty(), "healthy sibling should report health");
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let discord = &snapshot["components"][&discord_component];
+        let healthy = &snapshot["components"][&healthy_component];
+        let second_last_ok = healthy["last_ok"].as_str().unwrap_or("").to_string();
+        let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+        let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+
+        assert_eq!(discord_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(discord["status"], "error");
+        assert_eq!(discord["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            discord["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+        assert_eq!(healthy["status"], "ok");
+        assert!(second > first, "healthy sibling should keep refreshing health");
+        assert!(healthy_calls.load(Ordering::SeqCst) >= 1);
+
+        drop(discord_rx);
+        drop(healthy_rx);
+        cancel.cancel();
+        let discord_join = tokio::time::timeout(Duration::from_millis(500), discord_handle).await;
+        let healthy_join = tokio::time::timeout(Duration::from_millis(500), healthy_handle).await;
+        assert!(discord_join.is_ok(), "fatal discord listener should stop on cancel");
+        assert!(healthy_join.is_ok(), "healthy sibling listener should stop on cancel");
+    }
+
     #[test]
     fn maybe_restart_daemon_systemd_args_regression() {
         assert_eq!(
