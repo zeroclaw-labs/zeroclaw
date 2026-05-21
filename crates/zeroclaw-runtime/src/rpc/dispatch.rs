@@ -11,16 +11,24 @@ use super::types::*;
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
-use zeroclaw_api::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RpcOutbound};
+use zeroclaw_api::jsonrpc::{
+    JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    RpcOutbound,
+};
 use zeroclaw_api::model_provider::ChatMessage;
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
+
+mod notification {
+    pub const SESSION_UPDATE: &str = "session/update";
+    pub const LOGS_EVENT: &str = "logs/event";
+}
 
 // ── Method registry ──────────────────────────────────────────────
 //
@@ -1444,11 +1452,7 @@ impl RpcDispatcher {
         // Spawn a forwarding task that lives until the subscriber drops.
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "logs/event",
-                    "params": event,
-                });
+                let notification = JsonRpcNotification::new(notification::LOGS_EVENT, event);
                 if let Ok(json) = serde_json::to_string(&notification)
                     && !rpc.send_raw(json).await
                 {
@@ -1463,7 +1467,7 @@ impl RpcDispatcher {
 
     async fn send_result(&self, id: Value, result: Value) {
         let resp = JsonRpcResponse {
-            jsonrpc: "2.0",
+            jsonrpc: JSONRPC_VERSION,
             result: Some(result),
             error: None,
             id,
@@ -1475,7 +1479,7 @@ impl RpcDispatcher {
 
     async fn send_error(&self, id: Value, code: i32, message: &str) {
         let resp = JsonRpcResponse {
-            jsonrpc: "2.0",
+            jsonrpc: JSONRPC_VERSION,
             result: None,
             error: Some(JsonRpcError {
                 code,
@@ -1538,12 +1542,8 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
     };
 
     let params = serde_json::to_value(update).ok()?;
-    serde_json::to_string(&json!({
-        "jsonrpc": "2.0",
-        "method": "session/update",
-        "params": params,
-    }))
-    .ok()
+    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&n).ok()
 }
 
 #[cfg(test)]
@@ -1587,9 +1587,9 @@ mod tests {
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
-        assert_eq!(v["jsonrpc"], "2.0");
-        assert_eq!(v["method"], "session/update");
-        assert_eq!(v["params"]["sessionId"], "s1");
+        assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["type"], "agent_message_chunk");
         assert_eq!(v["params"]["text"], "hello");
     }
@@ -1615,9 +1615,9 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_call");
-        assert_eq!(v["params"]["toolCallId"], "tc_1");
+        assert_eq!(v["params"]["tool_call_id"], "tc_1");
         assert_eq!(v["params"]["name"], "bash");
-        assert_eq!(v["params"]["rawInput"]["cmd"], "ls");
+        assert_eq!(v["params"]["raw_input"]["cmd"], "ls");
     }
 
     #[test]
@@ -1630,8 +1630,8 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_result");
-        assert_eq!(v["params"]["toolCallId"], "tc_1");
-        assert_eq!(v["params"]["rawOutput"], "file.txt");
+        assert_eq!(v["params"]["tool_call_id"], "tc_1");
+        assert_eq!(v["params"]["raw_output"], "file.txt");
     }
 
     #[test]
@@ -1645,9 +1645,9 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "approval_request");
-        assert_eq!(v["params"]["requestId"], "ar_1");
-        assert_eq!(v["params"]["toolName"], "bash");
-        assert_eq!(v["params"]["timeoutSecs"], 30);
+        assert_eq!(v["params"]["request_id"], "ar_1");
+        assert_eq!(v["params"]["tool_name"], "bash");
+        assert_eq!(v["params"]["timeout_secs"], 30);
     }
 
     #[test]
@@ -1662,7 +1662,7 @@ mod tests {
 
     #[test]
     fn parse_params_valid() {
-        let v = json!({"sessionId": "s1"});
+        let v = json!({"session_id": "s1"});
         let p: SessionIdParams = parse_params(&v).unwrap();
         assert_eq!(p.session_id, "s1");
     }
@@ -1681,7 +1681,7 @@ mod tests {
             server_version: "0.1.0".into(),
         };
         let val = to_result(r).unwrap();
-        assert_eq!(val["protocolVersion"], 1);
-        assert_eq!(val["serverVersion"], "0.1.0");
+        assert_eq!(val["protocol_version"], 1);
+        assert_eq!(val["server_version"], "0.1.0");
     }
 }

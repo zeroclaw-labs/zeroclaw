@@ -188,8 +188,11 @@ pub async fn run_unix_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::dispatch::Method;
     use crate::rpc::session::SessionStore;
+    use crate::rpc::types::{InitializeParams, StatusResult};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use zeroclaw_api::jsonrpc::{JSONRPC_VERSION, JsonRpcRequest};
     use zeroclaw_infra::session_queue::SessionActorQueue;
 
     fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
@@ -207,6 +210,63 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
+    fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
+        let req = JsonRpcRequest::new(
+            method.wire_name(),
+            serde_json::to_value(params).unwrap(),
+            serde_json::Value::Number(id.into()),
+        );
+        let mut s = serde_json::to_string(&req).unwrap();
+        s.push('\n');
+        s
+    }
+
+    /// Read a single NDJSON response and deserialize the `result` field.
+    async fn read_result<T: serde::de::DeserializeOwned>(
+        reader: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> (serde_json::Value, T) {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        let result: T = serde_json::from_value(frame["result"].clone()).unwrap();
+        (frame, result)
+    }
+
+    /// Send initialize handshake and return the authenticated reader/writer.
+    async fn do_initialize(
+        sock_path: &std::path::Path,
+    ) -> (
+        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
+        let stream = tokio::net::UnixStream::connect(sock_path).await.unwrap();
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+
+        let params = InitializeParams {
+            protocol_version: 1,
+        };
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+
+        let (_frame, _result): (_, serde_json::Value) = read_result(&mut reader).await;
+        (reader, writer)
+    }
+
+    /// Poll until the socket file appears.
+    async fn wait_for_socket(path: &std::path::Path) {
+        for _ in 0..50 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("socket never appeared at {}", path.display());
+    }
+
     #[tokio::test]
     async fn socket_initialize_handshake() {
         let tmp = tempfile::tempdir().unwrap();
@@ -220,58 +280,38 @@ mod tests {
             run_unix_socket(server_ctx, server_cancel, test_client_count()).await
         });
 
-        // Wait for socket to appear.
-        for _ in 0..50 {
-            if sock_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(sock_path.exists(), "socket never appeared");
+        wait_for_socket(&sock_path).await;
 
         // Connect and send initialize.
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(reader);
+        let (read_half, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
 
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "params": { "protocolVersion": 1, "token": "" },
-            "id": 1
-        });
+        let init_params = InitializeParams {
+            protocol_version: 1,
+        };
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
             .await
             .unwrap();
 
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let (frame, init_result): (_, crate::rpc::types::InitializeResult) =
+            read_result(&mut reader).await;
 
-        assert_eq!(resp["jsonrpc"], "2.0");
-        assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["protocolVersion"], 1);
-        assert!(resp["result"]["serverVersion"].is_string());
-        assert!(resp["error"].is_null());
+        assert_eq!(frame["jsonrpc"], JSONRPC_VERSION);
+        assert_eq!(frame["id"], 1);
+        assert_eq!(init_result.protocol_version, 1);
+        assert!(!init_result.server_version.is_empty());
 
         // Send status (should work after auth).
-        let req2 = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "status",
-            "params": {},
-            "id": 2
-        });
+        // Status takes no meaningful params — use empty object.
         writer
-            .write_all(format!("{}\n", req2).as_bytes())
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
             .await
             .unwrap();
 
-        let mut line2 = String::new();
-        reader.read_line(&mut line2).await.unwrap();
-        let resp2: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
-        assert_eq!(resp2["id"], 2);
-        assert_eq!(resp2["result"]["activeSessions"], 0);
+        let (_frame2, status): (_, StatusResult) = read_result(&mut reader).await;
+        assert_eq!(status.active_sessions, 0);
 
         cancel.cancel();
         drop(writer);
@@ -291,26 +331,15 @@ mod tests {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
-        for _ in 0..50 {
-            if sock_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for_socket(&sock_path).await;
 
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Send status without initialize first.
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "status",
-            "params": {},
-            "id": 1
-        });
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 1).as_bytes())
             .await
             .unwrap();
 
@@ -340,12 +369,7 @@ mod tests {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
-        for _ in 0..50 {
-            if sock_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for_socket(&sock_path).await;
 
         use std::os::unix::fs::PermissionsExt;
         let meta = std::fs::metadata(&sock_path).unwrap();
@@ -410,12 +434,7 @@ mod tests {
             let _ = run_unix_socket(server_ctx, server_cancel, server_count).await;
         });
 
-        for _ in 0..50 {
-            if sock_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        wait_for_socket(&sock_path).await;
 
         assert_eq!(count.load(Ordering::Relaxed), 0);
 

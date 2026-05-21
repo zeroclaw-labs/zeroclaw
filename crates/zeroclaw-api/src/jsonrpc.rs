@@ -10,15 +10,48 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
+// ── Protocol constants ───────────────────────────────────────────
+
+/// JSON-RPC protocol version string. Used in every frame's `jsonrpc` field.
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// Prefix for server-originated outbound request IDs, disjoint from any
+/// client-issued id space.
+pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
+
+// ── Wire field name constants ────────────────────────────────────
+// Used when parsing raw `Value` frames (e.g. in the client read loop).
+
+pub mod field {
+    pub const JSONRPC: &str = "jsonrpc";
+    pub const METHOD: &str = "method";
+    pub const PARAMS: &str = "params";
+    pub const ID: &str = "id";
+    pub const RESULT: &str = "result";
+    pub const ERROR: &str = "error";
+}
+
 // ── Wire types ───────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
     pub id: Option<Value>,
+}
+
+impl JsonRpcRequest {
+    /// Build a request with an auto-incremented numeric id.
+    pub fn new(method: &str, params: Value, id: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: method.to_string(),
+            params,
+            id: Some(id),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +69,16 @@ pub struct JsonRpcNotification {
     pub jsonrpc: &'static str,
     pub method: &'static str,
     pub params: Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: &'static str, params: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            method,
+            params,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,12 +154,8 @@ impl RpcOutbound {
     }
 
     /// Send a JSON-RPC notification (no `id`, no response expected).
-    pub async fn notify(&self, method: &str, params: Value) {
-        let n = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
+    pub async fn notify(&self, method: &'static str, params: Value) {
+        let n = JsonRpcNotification::new(method, params);
         if let Ok(s) = serde_json::to_string(&n) {
             let _ = self.writer_tx.send(s).await;
         }
@@ -129,7 +168,7 @@ impl RpcOutbound {
         params: Value,
     ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = format!("zc-out-{n}");
+        let id = format!("{OUTBOUND_ID_PREFIX}{n}");
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -139,12 +178,7 @@ impl RpcOutbound {
             pending: &self.pending,
             id: id.clone(),
         };
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": id,
-        });
+        let req = JsonRpcRequest::new(method, params, Value::String(id));
         let body = match serde_json::to_string(&req) {
             Ok(s) => s,
             Err(e) => {

@@ -7,7 +7,7 @@
 //! ## Conventions
 //!
 //! - All structs derive `Debug, Clone, Serialize, Deserialize`.
-//! - All structs use `#[serde(rename_all = "camelCase")]`.
+//! - All structs use `#[serde(rename_all = "snake_case")]`.
 //! - Optional fields use `#[serde(default, skip_serializing_if = "Option::is_none")]`.
 //! - Types that already exist elsewhere (`MemoryEntry`, `CronJob`,
 //!   `CostSummary`, `SkillFrontmatter`) are re-exported, not re-defined.
@@ -33,7 +33,7 @@ macro_rules! rpc_type {
         pub struct $name:ident { $($body:tt)* }
     ) => {
         #[derive(Debug, Clone, Serialize, Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "snake_case")]
         $(#[$meta])*
         pub struct $name { $($body)* }
     };
@@ -42,7 +42,7 @@ macro_rules! rpc_type {
         pub enum $name:ident { $($body:tt)* }
     ) => {
         #[derive(Debug, Clone, Serialize, Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "snake_case")]
         $(#[$meta])*
         pub enum $name { $($body)* }
     };
@@ -732,7 +732,7 @@ rpc_type! {
         pub exists: bool,
         #[serde(default)]
         pub size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "mtime_ms")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mtime_ms: Option<i64>,
     }
 }
@@ -741,7 +741,6 @@ rpc_type! {
     /// Consolidates gateway `PersonalityIndex`.
     pub struct PersonalityListResult {
         pub files: Vec<PersonalityFileEntry>,
-        #[serde(rename = "max_chars")]
         pub max_chars: usize,
     }
 }
@@ -762,7 +761,7 @@ rpc_type! {
         pub exists: bool,
         #[serde(default)]
         pub truncated: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "mtime_ms")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mtime_ms: Option<i64>,
     }
 }
@@ -778,9 +777,8 @@ rpc_type! {
 rpc_type! {
     /// Consolidates gateway `PersonalityPutResponse`.
     pub struct PersonalityPutResult {
-        #[serde(rename = "bytes_written")]
         pub bytes_written: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "mtime_ms")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mtime_ms: Option<i64>,
     }
 }
@@ -816,7 +814,6 @@ rpc_type! {
     /// Consolidates gateway `CatalogModelProvider`.
     pub struct CatalogModelProvider {
         pub name: String,
-        #[serde(rename = "display_name")]
         pub display_name: String,
         pub local: bool,
     }
@@ -825,7 +822,6 @@ rpc_type! {
 rpc_type! {
     /// Consolidates gateway `CatalogResponse`.
     pub struct CatalogResponse {
-        #[serde(rename = "model_providers")]
         pub model_providers: Vec<CatalogModelProvider>,
     }
 }
@@ -841,7 +837,6 @@ rpc_type! {
 rpc_type! {
     /// Consolidates gateway `ModelsResponse`.
     pub struct CatalogModelsResult {
-        #[serde(rename = "model_provider")]
         pub model_provider: String,
         pub models: Vec<String>,
         pub local: bool,
@@ -855,7 +850,6 @@ rpc_type! {
         pub key: String,
         pub label: String,
         pub help: String,
-        #[serde(rename = "has_picker")]
         pub has_picker: bool,
         pub completed: bool,
         /// Whether the section currently has enough usable config for the
@@ -866,7 +860,7 @@ rpc_type! {
         #[serde(default)]
         pub group: String,
         /// `true` when this section is part of the canonical onboarding list.
-        #[serde(default, rename = "is_onboarding")]
+        #[serde(default)]
         pub is_onboarding: bool,
         /// Editor shape (direct form / one-tier alias map / typed-family map /
         /// backend picker).
@@ -885,10 +879,8 @@ rpc_type! {
 rpc_type! {
     /// Consolidates gateway `OnboardStatusResponse`.
     pub struct OnboardStatusResult {
-        #[serde(rename = "needs_onboarding")]
         pub needs_onboarding: bool,
         pub reason: String,
-        #[serde(rename = "has_partial_state")]
         pub has_partial_state: bool,
         pub missing: Vec<String>,
     }
@@ -927,7 +919,6 @@ rpc_type! {
 rpc_type! {
     /// Consolidates gateway `SelectItemResponse`.
     pub struct SelectItemResponse {
-        #[serde(rename = "fields_prefix")]
         pub fields_prefix: String,
         pub created: bool,
     }
@@ -953,43 +944,30 @@ rpc_type! {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdateEvent {
     AgentMessageChunk {
-        #[serde(rename = "sessionId")]
         session_id: String,
         text: String,
     },
     AgentThoughtChunk {
-        #[serde(rename = "sessionId")]
         session_id: String,
         text: String,
     },
     ToolCall {
-        #[serde(rename = "sessionId")]
         session_id: String,
-        #[serde(rename = "toolCallId")]
         tool_call_id: String,
         name: String,
-        #[serde(rename = "rawInput")]
         raw_input: Value,
     },
     ToolResult {
-        #[serde(rename = "sessionId")]
         session_id: String,
-        #[serde(rename = "toolCallId")]
         tool_call_id: String,
         name: String,
-        #[serde(rename = "rawOutput")]
         raw_output: String,
     },
     ApprovalRequest {
-        #[serde(rename = "sessionId")]
         session_id: String,
-        #[serde(rename = "requestId")]
         request_id: String,
-        #[serde(rename = "toolName")]
         tool_name: String,
-        #[serde(rename = "argumentsSummary")]
         arguments_summary: String,
-        #[serde(rename = "timeoutSecs")]
         timeout_secs: u64,
     },
 }
