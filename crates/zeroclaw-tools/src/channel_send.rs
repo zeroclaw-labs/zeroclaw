@@ -88,7 +88,7 @@ impl Tool for ChannelSendTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'channel' parameter"))?
+            .ok_or_else(|| anyhow::Error::msg("Missing 'channel' parameter"))?
             .to_string();
 
         let to = args
@@ -96,7 +96,7 @@ impl Tool for ChannelSendTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'to' parameter"))?
+            .ok_or_else(|| anyhow::Error::msg("Missing 'to' parameter"))?
             .to_string();
 
         let body = args
@@ -104,23 +104,27 @@ impl Tool for ChannelSendTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'body' parameter"))?
+            .ok_or_else(|| anyhow::Error::msg("Missing 'body' parameter"))?
             .to_string();
 
         let channel = {
             let channel_map = self.channel_map.read();
             channel_map.get(&channel_name).cloned().ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow::Error::msg(format!(
                     "Channel '{}' not found. Check the configured channel name.",
                     channel_name
-                )
+                ))
             })?
         };
 
         let message = SendMessage::new(body, &to);
 
         channel.send(&message).await.map_err(|e| {
-            anyhow::anyhow!("Failed to send message through '{}': {}", channel.name(), e)
+            anyhow::Error::msg(format!(
+                "Failed to send message through '{}': {}",
+                channel.name(),
+                e
+            ))
         })?;
 
         Ok(ToolResult {

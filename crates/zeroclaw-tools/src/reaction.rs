@@ -535,10 +535,7 @@ mod tests {
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
         let handle = Arc::new(RwLock::new(HashMap::new()));
-        let tool = ReactionTool::new(
-            Arc::new(SecurityPolicy::default()),
-            handle.clone(),
-        );
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
         let result = tool

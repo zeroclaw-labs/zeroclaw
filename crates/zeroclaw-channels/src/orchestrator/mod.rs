@@ -5761,6 +5761,61 @@ fn find_channel_for_message<'a>(
         .and_then(|(base, _)| channels.get(base))
 }
 
+/// Build `channel_key → Arc<dyn Channel>` map from config.
+///
+/// Constructs channel instances without starting listen loops.
+/// Called by CLI and other callers that need a channel map
+/// for late-bound tool handle population.
+pub fn build_channel_map(
+    config: &Config,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let config_arc = Arc::new(RwLock::new(config.clone()));
+    collect_configured_channels(&config_arc, "", &[])
+        .into_iter()
+        .map(|ch| {
+            let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
+            (key, ch.channel)
+        })
+        .collect()
+}
+
+/// Build configured channels and register them into late-bound tool handles.
+///
+/// Constructs channel instances from config (without starting listen loops)
+/// and inserts each into the provided handles under their composite key
+/// (`<channel>.<alias>` or bare `<channel>` for singletons).
+///
+/// Returns the list of registered channel names for logging.
+pub fn register_channels_for_tools(
+    config: &Config,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &Option<tools::PerToolChannelHandle>,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+    channel_send_handle: &Option<tools::PerToolChannelHandle>,
+) -> Vec<String> {
+    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let configured = collect_configured_channels(&config_arc, "", &[]);
+
+    let handles = [
+        ask_user_handle.as_ref(),
+        reaction_handle.as_ref(),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+        channel_send_handle.as_ref(),
+    ];
+
+    let mut names = Vec::new();
+    for ch in &configured {
+        let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
+        for handle in handles.iter().flatten() {
+            handle.write().insert(key.clone(), Arc::clone(&ch.channel));
+        }
+        names.push(key);
+    }
+    names
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -7394,7 +7449,7 @@ pub async fn start_channels(
             _channel_map_handle,
             ask_user_handle_ch,
             escalate_handle_ch,
-            _channel_send_handle_ch,
+            channel_send_handle_ch,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -7798,6 +7853,12 @@ pub async fn start_channels(
             }
         }
         if let Some(ref handle) = escalate_handle_ch {
+            let mut map = handle.write();
+            for (name, ch) in channels_by_name.as_ref() {
+                map.insert(name.clone(), Arc::clone(ch));
+            }
+        }
+        if let Some(ref handle) = channel_send_handle_ch {
             let mut map = handle.write();
             for (name, ch) in channels_by_name.as_ref() {
                 map.insert(name.clone(), Arc::clone(ch));

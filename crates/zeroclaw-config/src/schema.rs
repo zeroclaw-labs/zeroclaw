@@ -10274,6 +10274,12 @@ pub struct TelegramConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -10358,6 +10364,12 @@ pub struct DiscordConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -10442,6 +10454,12 @@ pub struct SlackConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -10531,6 +10549,12 @@ pub struct MattermostConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -10692,6 +10716,12 @@ pub struct MatrixConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -10746,6 +10776,12 @@ pub struct SignalConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -10887,6 +10923,12 @@ pub struct WhatsAppConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -11236,6 +11278,12 @@ pub struct IrcConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for IrcConfig {
@@ -11315,6 +11363,12 @@ pub struct LarkConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Default recipient for daemon/CLI `channel_send` calls.
+    /// Injected into the agent system prompt so it knows where to deliver
+    /// outbound messages without asking the user for a target ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_target: Option<String>,
 }
 
 impl ChannelConfig for LarkConfig {

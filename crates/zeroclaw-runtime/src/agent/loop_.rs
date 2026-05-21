@@ -29,6 +29,68 @@ static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
+
+/// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
+/// Injected by the binary so `zeroclaw-runtime` doesn't depend on
+/// `zeroclaw-channels`.
+type ChannelMapFn = Box<
+    dyn Fn()
+            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
+/// Channel map factory, injected by the binary.
+static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
+
+/// Register the channel map factory. Called once at startup by the binary.
+pub fn register_channel_map_fn(f: ChannelMapFn) {
+    let _ = CHANNEL_MAP_FN.set(f);
+}
+
+/// Populate all channel-driven tool handles from the registered factory.
+/// Returns the number of channels seeded.
+///
+/// Parameter order matches the return tuple of `all_tools_with_runtime`:
+///   pos3 = `Option<PerToolChannelHandle>` (ask_user)
+///   pos4 = `PerToolChannelHandle` (NOT Option — reaction in loop_.rs named `channel_map_handle`)
+///   pos5 = `Option<PerToolChannelHandle>` (poll in loop_.rs named `reaction_handle`)
+///   pos6 = `Option<PerToolChannelHandle>` (escalate)
+///   pos7 = `Option<PerToolChannelHandle>` (channel_send)
+fn seed_channel_handles(
+    pos3: &Option<tools::PerToolChannelHandle>,
+    pos4: &tools::PerToolChannelHandle,
+    pos5: &Option<tools::PerToolChannelHandle>,
+    pos6: &Option<tools::PerToolChannelHandle>,
+    pos7: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let Some(factory) = CHANNEL_MAP_FN.get() else {
+        return 0;
+    };
+    let map = factory();
+    if map.is_empty() {
+        return 0;
+    }
+
+    let handles = [
+        pos3.as_ref(),
+        Some(pos4),
+        pos5.as_ref(),
+        pos6.as_ref(),
+        pos7.as_ref(),
+    ];
+
+    let mut count = 0;
+    for (name, ch) in &map {
+        for handle in handles.iter().flatten() {
+            handle
+                .write()
+                .insert(name.clone(), std::sync::Arc::clone(ch));
+        }
+        count += 1;
+    }
+    count
+}
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -2967,11 +3029,11 @@ pub async fn run(
         let (
             mut tools_registry,
             delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
-            _channel_send_handle,
+            reaction_handle,
+            channel_map_handle,
+            ask_user_handle,
+            escalate_handle,
+            channel_send_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -2991,6 +3053,23 @@ pub async fn run(
             None,
             is_subagent_caller,
         );
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle,
+            &channel_map_handle,
+            &reaction_handle,
+            &escalate_handle,
+            &channel_send_handle,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                "Registered channels for CLI agent",
+            );
+        }
 
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
@@ -4278,11 +4357,11 @@ pub async fn process_message(
         let (
             mut tools_registry,
             delegate_handle_pm,
-            _reaction_handle_pm,
-            _channel_map_handle_pm,
-            _ask_user_handle_pm,
-            _escalate_handle_pm,
-            _channel_send_handle_pm,
+            reaction_handle_pm,
+            channel_map_handle_pm,
+            ask_user_handle_pm,
+            escalate_handle_pm,
+            channel_send_handle_pm,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -4304,6 +4383,23 @@ pub async fn process_message(
             None,
             false,
         );
+
+        // Populate all channel-driven tool handles from the registered factory.
+        let count = seed_channel_handles(
+            &ask_user_handle_pm,
+            &channel_map_handle_pm,
+            &reaction_handle_pm,
+            &escalate_handle_pm,
+            &channel_send_handle_pm,
+        );
+        if count > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                "Registered channels for process_message agent",
+            );
+        }
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
         } else {

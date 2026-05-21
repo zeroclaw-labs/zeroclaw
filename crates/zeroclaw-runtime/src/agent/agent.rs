@@ -26,10 +26,76 @@ pub use zeroclaw_api::agent::TurnEvent;
 
 /// Build the configured channel targets section for system prompt injection.
 /// Returns `Some(string)` if any channels have `default_target` set, `None` otherwise.
-///
-/// TODO: implement when `default_target` field lands on channel config schema (#6647).
-fn build_channel_targets(_config: &Config) -> Option<String> {
-    None
+fn build_channel_targets(config: &Config) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for (alias, cfg) in &config.channels.telegram {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("telegram.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.discord {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("discord.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.slack {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("slack.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.mattermost {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("mattermost.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.matrix {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("matrix.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.irc {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("irc.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.signal {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("signal.{alias}"), t.clone()));
+        }
+    }
+    for (alias, cfg) in &config.channels.whatsapp {
+        if cfg.enabled
+            && let Some(ref t) = cfg.default_target
+        {
+            entries.push((format!("whatsapp.{alias}"), t.clone()));
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("## Configured Channel Targets\n\n");
+    out.push_str("Use these recipients when sending messages:\n\n");
+    for (channel, target) in &entries {
+        out.push_str(&format!("- {channel}: {target}\n"));
+    }
+    Some(out)
 }
 
 pub struct Agent {
@@ -516,6 +582,25 @@ impl Agent {
     /// into all five tool maps in one shot.
     pub fn channel_handles(&self) -> &AgentChannelHandles {
         &self.channel_handles
+    }
+
+    /// Populate late-bound channel-map handles with configured channels.
+    ///
+    /// Seeds `ask_user`, `reaction`, `poll`, `escalate`, and `channel_send`
+    /// handles from the provided map. Called by CLI and orchestrator paths
+    /// after agent construction but before the agent loop starts.
+    ///
+    /// Returns the list of registered channel names for logging.
+    pub fn populate_channels(
+        &self,
+        channel_map: &std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, ch) in channel_map {
+            self.channel_handles.register_channel(name, Arc::clone(ch));
+            names.push(name.clone());
+        }
+        names
     }
 
     pub fn clear_history(&mut self) {

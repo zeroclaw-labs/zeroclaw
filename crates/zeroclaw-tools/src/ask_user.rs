@@ -569,10 +569,7 @@ mod tests {
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
         let handle = Arc::new(RwLock::new(HashMap::new()));
-        let tool = AskUserTool::new(
-            Arc::new(SecurityPolicy::default()),
-            handle.clone(),
-        );
+        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
