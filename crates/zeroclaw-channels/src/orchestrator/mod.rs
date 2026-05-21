@@ -699,6 +699,7 @@ fn build_channel_system_prompt_for_message(
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+        &msg.id,
         bot_mention.as_deref(),
     )
 }
@@ -708,6 +709,7 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     sender: &str,
+    message_id: &str,
     bot_mention: Option<&str>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
@@ -771,9 +773,11 @@ fn build_channel_system_prompt(
         };
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}. \
+             reply_target={reply_target}, sender={sender}, message_id={message_id}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
+             The message_id field identifies this incoming message; pass it as the \
+             `message_id` argument when calling the `reaction` tool. \
              When scheduling delayed messages or reminders \
              via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user.\n\nCalibration note: agents in this system currently err \
@@ -16071,33 +16075,53 @@ Done."#;
             "mattermost",
             "channel123:root456",
             "user_abc123",
+            "msg-xyz789",
             None,
         );
-        // Pin the comma-separated triple in the format string at lines
-        // ~752-754 so a refactor that splits, reorders, or rewords the
-        // context block fails loudly rather than silently.
+        // Pin the comma-separated tuple in the format string so a refactor
+        // that splits, reorders, or rewords the context block fails loudly
+        // rather than silently.
         assert!(
             prompt.contains(
-                "channel=mattermost, reply_target=channel123:root456, sender=user_abc123"
+                "channel=mattermost, reply_target=channel123:root456, \
+                 sender=user_abc123, message_id=msg-xyz789"
             ),
-            "prompt missing the joint channel-context triple: {prompt}"
+            "prompt missing the joint channel-context tuple: {prompt}"
         );
     }
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt =
-            build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123", None);
+        let prompt = build_channel_system_prompt(
+            "Base prompt.",
+            "mattermost",
+            "",
+            "user_abc123",
+            "msg-xyz789",
+            None,
+        );
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a =
-            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa", None);
-        let prompt_b =
-            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb", None);
+        let prompt_a = build_channel_system_prompt(
+            "Base.",
+            "mattermost",
+            "ch:thread",
+            "user_aaa",
+            "msg-1",
+            None,
+        );
+        let prompt_b = build_channel_system_prompt(
+            "Base.",
+            "mattermost",
+            "ch:thread",
+            "user_bbb",
+            "msg-1",
+            None,
+        );
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
@@ -16106,14 +16130,15 @@ Done."#;
     #[test]
     fn build_channel_system_prompt_for_message_propagates_channel_fields() {
         // The wrapper unpacks ChannelMessage into build_channel_system_prompt
-        // args. Pin that the channel-context triple in the rendered prompt
-        // reflects the message's channel/reply_target/sender so a later
-        // refactor adding more fields can't silently drop existing ones.
+        // args. Pin the rendered prompt against every msg.* field the LLM
+        // is expected to see so a future refactor adding more fields can't
+        // silently drop existing ones.
         let msg = channel_message("discord", None);
         let prompt = build_channel_system_prompt_for_message("Base.", &msg, None);
         assert!(
-            prompt.contains("channel=discord, reply_target=r1, sender=u1"),
-            "wrapper did not propagate channel/reply_target/sender from ChannelMessage: {prompt}"
+            prompt.contains("channel=discord, reply_target=r1, sender=u1, message_id=m1"),
+            "wrapper did not propagate channel/reply_target/sender/message_id \
+             from ChannelMessage: {prompt}"
         );
     }
 
@@ -16128,6 +16153,7 @@ Done."#;
             "webhook",
             "agent-chat:agent-1:thread-7",
             "user:abc",
+            "msg-1",
             None,
         );
         assert!(
@@ -16146,7 +16172,8 @@ Done."#;
 
     #[test]
     fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
-        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890", None);
+        let prompt =
+            build_channel_system_prompt("Base.", "slack", "C12345", "U67890", "msg-1", None);
         assert!(
             prompt.contains("\"to\":\"C12345\""),
             "non-webhook cron hint should keep reply_target as `to`: {prompt}"
