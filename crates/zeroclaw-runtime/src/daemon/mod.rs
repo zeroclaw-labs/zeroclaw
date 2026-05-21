@@ -203,12 +203,13 @@ pub struct DaemonSubsystems {
         >,
     >,
     /// Start the Unix socket RPC listener.
-    /// Third argument is the shared client count for `--ephemeral` shutdown.
+    /// First argument is the shared `RpcContext`; third is the client count
+    /// for `--ephemeral` shutdown.
     #[cfg(unix)]
     pub socket_start: Option<
         Box<
             dyn Fn(
-                    Config,
+                    std::sync::Arc<crate::rpc::context::RpcContext>,
                     tokio_util::sync::CancellationToken,
                     std::sync::Arc<std::sync::atomic::AtomicUsize>,
                 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
@@ -318,7 +319,28 @@ pub async fn run(
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[cfg(unix)]
     if let Some(socket_start) = subsystems.socket_start {
-        let socket_cfg = config.clone();
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::session::SessionStore;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let session_queue = std::sync::Arc::new(SessionActorQueue::new(32, 30, 600));
+        let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue));
+        let session_backend = zeroclaw_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .ok();
+
+        let rpc_ctx = std::sync::Arc::new(RpcContext {
+            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
+            sessions,
+            session_backend,
+            memory: None,       // TODO: wire when memory subsystem is daemon-scoped
+            cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
+            event_tx: Some(event_tx.clone()),
+            reload_tx: Some(reload_tx.clone()),
+        });
+
         let socket_start = std::sync::Arc::new(socket_start);
         let socket_cancel = channels_cancel.clone();
         let count = socket_client_count.clone();
@@ -327,11 +349,11 @@ pub async fn run(
             initial_backoff,
             max_backoff,
             move || {
-                let cfg = socket_cfg.clone();
+                let ctx = rpc_ctx.clone();
                 let start = socket_start.clone();
                 let cancel = socket_cancel.clone();
                 let count = count.clone();
-                async move { start(cfg, cancel, count).await }
+                async move { start(ctx, cancel, count).await }
             },
         ));
     }

@@ -3,8 +3,8 @@
 //! Binds at `<config.data_dir>/daemon.sock` so each `--data-dir` gets its own
 //! socket. `$ZEROCLAW_SOCKET` overrides the path.
 
+use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
-use super::session::SessionStore;
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,7 +16,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::session_queue::SessionActorQueue;
 
 /// Resolve socket path: `$ZEROCLAW_SOCKET` or `<data_dir>/daemon.sock`.
 pub fn socket_path(config: &Config) -> PathBuf {
@@ -98,15 +97,14 @@ fn peer_label_from(stream: &UnixStream) -> String {
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
 pub async fn run_unix_socket(
-    config: Config,
+    ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let path = socket_path(&config);
-
-    let session_backend =
-        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
-            .ok();
+    let path = {
+        let config = ctx.config.read();
+        socket_path(&config)
+    };
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -143,9 +141,6 @@ pub async fn run_unix_socket(
         "RPC unix socket listening"
     );
 
-    let session_queue = Arc::new(SessionActorQueue::new(32, 30, 600));
-    let sessions = Arc::new(SessionStore::new(64, session_queue));
-
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -170,9 +165,7 @@ pub async fn run_unix_socket(
                     }
                 };
 
-                let config = config.clone();
-                let sessions = sessions.clone();
-                let session_backend = session_backend.clone();
+                let ctx = ctx.clone();
                 let count = client_count.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
@@ -180,12 +173,7 @@ pub async fn run_unix_socket(
                 tokio::spawn(async move {
                     let mut transport = UnixSocketTransport::new(stream);
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(
-                        config,
-                        sessions,
-                        session_backend,
-                        writer_tx,
-                    );
+                    let mut dispatcher = RpcDispatcher::new(ctx, writer_tx);
                     dispatcher.run(&mut transport).await;
                     count.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -200,14 +188,19 @@ pub async fn run_unix_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::session::SessionStore;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use zeroclaw_infra::session_queue::SessionActorQueue;
 
-    fn test_config(tmp: &std::path::Path) -> Config {
-        Config {
+    fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
+        let config = Config {
             data_dir: tmp.to_path_buf(),
             config_path: tmp.join("config.toml"),
             ..Config::default()
-        }
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal(config, sessions)
     }
 
     fn test_client_count() -> Arc<AtomicUsize> {
@@ -217,14 +210,14 @@ mod tests {
     #[tokio::test]
     async fn socket_initialize_handshake() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let sock_path = config.data_dir.join("daemon.sock");
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
 
         let server_cancel = cancel.clone();
-        let server_config = config.clone();
+        let server_ctx = ctx.clone();
         let handle = tokio::spawn(async move {
-            run_unix_socket(server_config, server_cancel, test_client_count()).await
+            run_unix_socket(server_ctx, server_cancel, test_client_count()).await
         });
 
         // Wait for socket to appear.
@@ -288,14 +281,14 @@ mod tests {
     #[tokio::test]
     async fn socket_rejects_before_initialize() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let sock_path = config.data_dir.join("daemon.sock");
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
 
         let server_cancel = cancel.clone();
-        let server_config = config.clone();
+        let server_ctx = ctx.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
+            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
         for _ in 0..50 {
@@ -337,14 +330,14 @@ mod tests {
     #[tokio::test]
     async fn socket_permissions() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let sock_path = config.data_dir.join("daemon.sock");
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
 
         let server_cancel = cancel.clone();
-        let server_config = config.clone();
+        let server_ctx = ctx.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
+            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
         for _ in 0..50 {
@@ -368,19 +361,19 @@ mod tests {
     #[tokio::test]
     async fn stale_socket_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let sock_path = config.data_dir.join("daemon.sock");
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
 
         // Pre-create a stale socket file.
-        std::fs::create_dir_all(&config.data_dir).unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
         std::fs::write(&sock_path, b"stale").unwrap();
         assert!(sock_path.exists());
 
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
-        let server_config = config.clone();
+        let server_ctx = ctx.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel, test_client_count()).await;
+            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
         // Wait for the listener to start (it should remove the stale file and bind).
@@ -405,16 +398,16 @@ mod tests {
     #[tokio::test]
     async fn client_count_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let sock_path = config.data_dir.join("daemon.sock");
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
         let cancel = CancellationToken::new();
         let count = Arc::new(AtomicUsize::new(0));
 
         let server_cancel = cancel.clone();
-        let server_config = config.clone();
+        let server_ctx = ctx.clone();
         let server_count = count.clone();
         tokio::spawn(async move {
-            let _ = run_unix_socket(server_config, server_cancel, server_count).await;
+            let _ = run_unix_socket(server_ctx, server_cancel, server_count).await;
         });
 
         for _ in 0..50 {

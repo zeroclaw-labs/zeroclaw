@@ -16,26 +16,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+use zeroclaw_runtime::rpc::types::{
+    CatalogModelProvider, CatalogModelsResult, CatalogResponse, OnboardSectionEntry,
+    OnboardSectionsResult, OnboardStatusResult, PickerItem, PickerResponse, SelectItemResponse,
+};
 
 use super::AppState;
 use super::api::require_auth;
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct CatalogModelProvider {
-    /// Canonical model_provider name as used in `[model_providers.<name>]`.
-    pub name: String,
-    /// Human-readable display name.
-    pub display_name: String,
-    /// Whether the model model_provider is fully local (no API key required).
-    pub local: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct CatalogResponse {
-    pub model_providers: Vec<CatalogModelProvider>,
-}
 
 /// `GET /api/onboard/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -65,20 +52,6 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ModelsResponse {
-    pub model_provider: String,
-    pub models: Vec<String>,
-    /// Whether this provider family is local according to the canonical
-    /// provider catalog.
-    pub local: bool,
-    /// `true` when the catalog was fetched live; `false` if the cache was
-    /// served (or if this model_provider has no remote catalog and the empty list
-    /// is the genuine answer).
-    pub live: bool,
 }
 
 /// `GET /api/onboard/catalog/models?model_provider=<name>` — fetch the model list
@@ -128,7 +101,7 @@ pub async fn handle_catalog_models(
         }
     };
 
-    axum::Json(ModelsResponse {
+    axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
         local,
@@ -145,75 +118,6 @@ fn error_response(err: ConfigApiError) -> Response {
 
 // ── Section + picker (mirrors the TUI flow) ──────────────────────────
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct SectionInfo {
-    /// Stable section key — `model_providers`, `channels`, `memory`,
-    /// `hardware`, `tunnel`. Matches `Section::as_path_prefix` in
-    /// zeroclaw-runtime so CLI / web stay aligned.
-    pub key: String,
-    /// Human-readable section name for headers / breadcrumbs.
-    pub label: String,
-    /// Help text the wizard shows under the section title.
-    pub help: String,
-    /// `true` when this section requires picking an item before the form
-    /// renders (Providers / Channels / Memory / Tunnel). `false` for sections
-    /// that have a single direct form (Hardware).
-    pub has_picker: bool,
-    /// Whether the user has marked the section completed in
-    /// `onboard_state.completed_sections`.
-    pub completed: bool,
-    /// Whether the section currently has enough usable config for the
-    /// first-run path. This is stricter than `completed`: visiting a section
-    /// can mark it completed, but the sidebar checkmark should not imply a
-    /// provider or agent is runnable when required fields are still missing.
-    pub ready: bool,
-    /// Display group for the dashboard sidebar (`Foundation`, `Agent`,
-    /// `Tools`, etc.). Curated server-side until v3 / #5947 lands a schema
-    /// attribute that encodes the grouping declaratively.
-    pub group: String,
-    /// `true` when this section is part of `/onboard`'s canonical
-    /// section list (`zeroclaw_config::sections::ONBOARDING_SECTIONS`).
-    /// Since the wizard/explorer split was retired, every known section
-    /// returns `true`; the field is preserved for API stability so the
-    /// frontend's `.filter((s) => s.is_onboarding)` stays a no-op rather
-    /// than failing to compile.
-    pub is_onboarding: bool,
-    /// Editor shape (direct form / one-tier alias map / typed-family map /
-    /// backend picker). Server-emitted from
-    /// `zeroclaw_config::sections::Section::shape()`; both the
-    /// dashboard explorer and the onboard wizard dispatch their renderer
-    /// off this flag so identical sections render identically.
-    /// `None` for sections that aren't part of the canonical wizard.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shape: Option<zeroclaw_config::sections::SectionShape>,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct SectionsResponse {
-    pub sections: Vec<SectionInfo>,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct OnboardStatusResponse {
-    /// `true` when no agent is dispatchable yet. The dashboard uses this
-    /// signal to redirect first-load visits from `/` to `/onboard`.
-    pub needs_onboarding: bool,
-    /// Short machine-readable reason for the value of `needs_onboarding`,
-    /// for logs / debugging. Stable: `fresh_install` / `incomplete_agent`
-    /// / `has_dispatchable_agent`.
-    pub reason: &'static str,
-    /// `true` when the operator has started entering setup state even if no
-    /// agent can reply yet. The dashboard uses this to say "Continue
-    /// onboarding" instead of pretending the flow is fresh.
-    pub has_partial_state: bool,
-    /// Human-readable readiness failures. When onboarding cannot finish, the
-    /// UI shows these directly so the operator knows exactly what is missing.
-    pub missing: Vec<String>,
-}
-
 /// Pure derivation of the onboard-status response from a config snapshot.
 /// `needs_onboarding` is `false` iff at least one enabled `[agents.<alias>]`
 /// block has a resolved model provider with a selected model plus resolved
@@ -221,7 +125,7 @@ pub struct OnboardStatusResponse {
 /// not a completion signal: chat dispatch still bounces with a setup error in
 /// that state.
 #[must_use]
-pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResponse {
+pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResult {
     let missing = onboard_missing_requirements(cfg);
     let ready = missing.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
@@ -236,9 +140,9 @@ pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardSt
     } else {
         "fresh_install"
     };
-    OnboardStatusResponse {
+    OnboardStatusResult {
         needs_onboarding: !ready,
-        reason,
+        reason: reason.to_string(),
         has_partial_state,
         missing,
     }
@@ -524,7 +428,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         }
     });
 
-    let sections: Vec<SectionInfo> = ordered
+    let sections: Vec<OnboardSectionEntry> = ordered
         .into_iter()
         .map(|key| {
             // Picker eligibility = anything `handle_section_picker`
@@ -542,7 +446,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 ),
                 None => section_has_picker_for_key(&key),
             };
-            SectionInfo {
+            OnboardSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
                 label: humanize_section(&key),
@@ -556,7 +460,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         })
         .collect();
 
-    axum::Json(SectionsResponse { sections }).into_response()
+    axum::Json(OnboardSectionsResult { sections }).into_response()
 }
 
 fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_marker: bool) -> bool {
@@ -667,35 +571,6 @@ fn section_help(key: &str) -> &'static str {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SectionPath {
     pub section: String,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PickerItem {
-    /// Stable identifier — what the frontend POSTs back to select this item.
-    pub key: String,
-    /// Human-readable label for display (catalog display_name, channel name,
-    /// memory backend label, etc.).
-    pub label: String,
-    /// Optional secondary line under the label (e.g. memory backend's
-    /// extended description, "(local)" for local-only model_providers).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Optional badge — `"set"` / `"needs setup"` / `"created"` /
-    /// `"configured"` / `"active"` depending on section semantics. The
-    /// frontend uses this to mark rows distinct without overstating readiness.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub badge: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PickerResponse {
-    pub section: String,
-    pub items: Vec<PickerItem>,
-    /// Help text for the picker (re-served from the section info so the
-    /// frontend doesn't need to round-trip).
-    pub help: String,
 }
 
 /// `GET /api/onboard/sections/<section>` — picker items for that section.
@@ -1138,17 +1013,6 @@ fn schema_walk_picker_with_none(
     }
     items.extend(rest);
     items
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct SelectItemResponse {
-    /// The dotted prefix the frontend should use for `GET /api/config/list?prefix=...`
-    /// to render the form for the selected item. E.g. picking `anthropic`
-    /// under Providers returns `model_providers.anthropic`.
-    pub fields_prefix: String,
-    /// True if this select created a new entry (vs. resolved to an existing one).
-    pub created: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -683,7 +683,7 @@ async fn skip_if_configured(
 /// section has values that can only come from user action (i.e. diverged
 /// from `Config::default()`'s idle state). Exhaustive over [`Section`]
 /// so adding a wizard variant forces a decision here.
-fn section_has_signal(cfg: &Config, section: Section) -> bool {
+pub(crate) fn section_has_signal(cfg: &Config, section: Section) -> bool {
     match section {
         Section::ModelProviders => !cfg.providers.models.is_empty(),
         // `channels.cli: bool` is a default-true scalar that lives directly
