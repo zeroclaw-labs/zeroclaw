@@ -40,10 +40,11 @@ pub(crate) struct Chat<'a> {
     turn_result_tx: mpsc::Sender<anyhow::Result<SessionPromptResult>>,
     turn_result_rx: mpsc::Receiver<anyhow::Result<SessionPromptResult>>,
     phase: ChatPhase,
+    tab_title: &'static str,
 }
 
 impl<'a> Chat<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient) -> Self {
+    pub(crate) fn new(rpc: &'a RpcClient, tab_title: &'static str) -> Self {
         let (turn_result_tx, turn_result_rx) = mpsc::channel(4);
         Self {
             rpc,
@@ -56,6 +57,7 @@ impl<'a> Chat<'a> {
                 list_state: ListState::default(),
                 loading: true,
             },
+            tab_title,
         }
     }
 
@@ -149,13 +151,13 @@ impl<'a> Chat<'a> {
                 list_state,
                 loading,
             } => {
-                draw_agent_picker(frame, area, agents, list_state, *loading);
+                draw_agent_picker(frame, area, agents, list_state, *loading, self.tab_title);
             }
             ChatPhase::Active(state) => {
                 render(frame, state, area);
             }
             ChatPhase::Error(msg) => {
-                draw_error(frame, area, msg);
+                draw_error(frame, area, msg, self.tab_title);
             }
         }
     }
@@ -297,9 +299,10 @@ fn draw_agent_picker(
     agents: &[String],
     list_state: &mut ListState,
     loading: bool,
+    tab_title: &str,
 ) {
     let block = Block::default()
-        .title(Span::styled(" Chat ", theme::title_style()))
+        .title(Span::styled(tab_title.to_string(), theme::title_style()))
         .borders(Borders::ALL)
         .border_style(theme::dim_style());
 
@@ -351,9 +354,9 @@ fn draw_agent_picker(
 
 // ── Error rendering ──────────────────────────────────────────────
 
-fn draw_error(frame: &mut Frame, area: Rect, msg: &str) {
+fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
     let block = Block::default()
-        .title(Span::styled(" Chat ", theme::title_style()))
+        .title(Span::styled(tab_title.to_string(), theme::title_style()))
         .borders(Borders::ALL)
         .border_style(theme::dim_style());
 

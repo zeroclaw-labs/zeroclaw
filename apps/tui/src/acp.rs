@@ -1,60 +1,33 @@
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
-};
+use crossterm::event::KeyEvent;
+use ratatui::layout::Rect;
 
+use crate::chat;
 use crate::client::RpcClient;
-use crate::theme;
 
 pub(crate) struct Acp<'a> {
-    rpc: &'a RpcClient,
+    inner: chat::Chat<'a>,
 }
 
 impl<'a> Acp<'a> {
     pub(crate) fn new(rpc: &'a RpcClient) -> Self {
-        Self { rpc }
+        Self {
+            inner: chat::Chat::new(rpc, " ACP "),
+        }
     }
 
-    pub(crate) fn draw(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let block = Block::default()
-            .title(Span::styled(" ACP ", theme::title_style()))
-            .borders(Borders::ALL)
-            .border_style(theme::dim_style());
-
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .split(inner);
-
-        let hint = Paragraph::new(Line::from(vec![
-            Span::styled("Coming soon ", theme::body_style()),
-            Span::styled("— press ", theme::dim_style()),
-            Span::styled("F1", theme::accent_style()),
-            Span::styled(" to switch to Config", theme::dim_style()),
-        ]))
-        .alignment(Alignment::Center);
-
-        let version = Paragraph::new(Line::from(Span::styled(
-            format!("daemon v{}", self.rpc.server_version),
-            theme::dim_style(),
-        )))
-        .alignment(Alignment::Center);
-
-        frame.render_widget(hint, chunks[1]);
-        frame.render_widget(version, chunks[2]);
+    pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
+        self.inner.init().await
     }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
-        matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.inner.draw(frame, area);
+    }
+
+    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.inner.handle_key(key).await
+    }
+
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.inner.wants_text_input()
     }
 }
