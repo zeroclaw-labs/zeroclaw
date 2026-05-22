@@ -2,7 +2,6 @@
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroclaw_macros::Configurable;
