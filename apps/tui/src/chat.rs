@@ -18,6 +18,10 @@ use crate::diff;
 use crate::theme;
 use zeroclaw_api::jsonrpc::RpcOutbound;
 
+// Height of the approval popup anchored to the bottom of the content area.
+// Used both in render_approval_overlay and to pad diffs so they aren't covered.
+const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
+
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
 enum ChatPhase {
@@ -437,11 +441,17 @@ fn render_tool_entry<'a>(
             let new = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
             let ext = file_ext(input);
             lines.extend(diff::diff_lines(old, new, ext));
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
         }
         "file_write" => {
             let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let ext = file_ext(input);
             lines.extend(diff::write_lines(content, ext));
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
         }
         _ => {
             let summary = serde_json::to_string(input).unwrap_or_default();
@@ -559,10 +569,9 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     };
 
     // Anchor to the bottom of the given area.
-    const HEIGHT: u16 = 7;
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(HEIGHT)])
+        .constraints([Constraint::Min(0), Constraint::Length(APPROVAL_OVERLAY_HEIGHT)])
         .split(area);
     let overlay_area = Layout::default()
         .direction(Direction::Horizontal)
