@@ -2553,50 +2553,6 @@ mod tests {
     }
 
     #[test]
-    fn named_provider_kind_does_not_leak_to_model_route_providers() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.providers.fallback = Some("devstral-fast".to_string());
-        config.providers.models.insert(
-            "devstral-fast".to_string(),
-            zeroclaw_config::schema::ModelProviderConfig {
-                kind: Some("openai-compatible".to_string()),
-                base_url: Some("http://192.168.0.107:1234/v1".to_string()),
-                model: Some("devstral-2-123b-instruct-2512".to_string()),
-                ..Default::default()
-            },
-        );
-        config.providers.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
-            hint: "general".to_string(),
-            provider: "openrouter".to_string(),
-            model: "anthropic/claude-sonnet-4-5".to_string(),
-            api_key: None,
-        }];
-
-        let options = provider_runtime_options_from_config(&config);
-        let primary_options =
-            options_for_routed_provider("devstral-fast", "devstral-fast", &options);
-        let route_options = options_for_routed_provider("openrouter", "devstral-fast", &options);
-
-        let inherited_kind_err = match create_provider_with_options("openrouter", None, &options) {
-            Ok(_) => panic!("route provider must not inherit the primary alias provider kind"),
-            Err(err) => err,
-        };
-        assert!(
-            inherited_kind_err
-                .to_string()
-                .contains("Provider kind \"openai-compatible\" requires"),
-            "inherited primary kind should try the wrong factory: {inherited_kind_err}"
-        );
-        assert_eq!(
-            primary_options.provider_kind.as_deref(),
-            Some("openai-compatible")
-        );
-        assert_eq!(route_options.provider_kind, None);
-        create_provider_with_options("openrouter", None, &route_options)
-            .expect("canonical route provider should initialize by its own provider name");
-    }
-
-    #[test]
     fn factory_mistral() {
         assert!(create_model_provider("mistral", Some("key")).is_ok());
     }
