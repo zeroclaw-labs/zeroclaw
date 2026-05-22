@@ -102,6 +102,23 @@ impl FileUploadTool {
             _ => "application/octet-stream",
         }
     }
+
+    /// Truncate a remote response body to at most `RESPONSE_BODY_LIMIT_BYTES`,
+    /// snapping the cut *down* to the nearest UTF-8 character boundary. The body
+    /// is controlled by the operator-configured receiver and is untrusted input,
+    /// so a multi-byte character straddling the byte limit must not panic the
+    /// slice (`&body[..n]` requires `n` to be a char boundary).
+    fn truncate_response_body(body: &str) -> String {
+        if body.len() <= RESPONSE_BODY_LIMIT_BYTES {
+            return body.to_string();
+        }
+        // A UTF-8 code point is at most 4 bytes, so this steps back at most 3.
+        let mut end = RESPONSE_BODY_LIMIT_BYTES;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... [truncated {} bytes]", &body[..end], body.len() - end)
+    }
 }
 
 #[async_trait]
@@ -261,6 +278,22 @@ impl Tool for FileUploadTool {
             }
         };
 
+        // Re-check against the bytes actually read. The metadata guard above can
+        // be defeated if the file grows between `metadata()` and `read()` (or for
+        // sources whose pre-read size is unreliable), so enforce the cap on the
+        // payload that would actually hit the network before building the body.
+        if bytes.len() as u64 > self.config.max_file_size_bytes {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "File too large after read: {} bytes (limit: {} bytes)",
+                    bytes.len(),
+                    self.config.max_file_size_bytes
+                )),
+            });
+        }
+
         let file_name = resolved_path
             .file_name()
             .and_then(|s| s.to_str())
@@ -313,15 +346,7 @@ impl Tool for FileUploadTool {
 
         let status = response.status();
         let raw_body = response.text().await.unwrap_or_default();
-        let truncated = if raw_body.len() > RESPONSE_BODY_LIMIT_BYTES {
-            format!(
-                "{}... [truncated {} bytes]",
-                &raw_body[..RESPONSE_BODY_LIMIT_BYTES],
-                raw_body.len() - RESPONSE_BODY_LIMIT_BYTES
-            )
-        } else {
-            raw_body
-        };
+        let truncated = Self::truncate_response_body(&raw_body);
 
         if status.is_success() {
             Ok(ToolResult {
@@ -628,6 +653,72 @@ mod tests {
         assert_eq!(
             FileUploadTool::detect_mime(bytes, "mystery.dat"),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn truncate_response_body_passes_short_bodies_through() {
+        assert_eq!(FileUploadTool::truncate_response_body("ok"), "ok");
+        // Multi-byte but under the limit: returned unchanged.
+        let small = "café ☕".to_string();
+        assert_eq!(FileUploadTool::truncate_response_body(&small), small);
+    }
+
+    #[test]
+    fn truncate_response_body_is_utf8_boundary_safe() {
+        // '€' is 3 bytes and 4096 is not a multiple of 3, so the byte limit
+        // lands inside a character — a naive `&body[..LIMIT]` slice would panic.
+        let body = "€".repeat(2000); // 6000 bytes, well over the 4 KiB cap
+        assert!(
+            !body.is_char_boundary(RESPONSE_BODY_LIMIT_BYTES),
+            "test precondition: limit must land mid-character"
+        );
+
+        let out = FileUploadTool::truncate_response_body(&body);
+
+        // No panic, and the cut snaps down to the last whole char that fits:
+        // floor(4096 / 3) = 1365 chars = 4095 bytes retained, 1905 truncated.
+        assert!(out.contains("[truncated 1905 bytes]"), "got: {out}");
+        assert!(out.starts_with("€".repeat(1365).as_str()));
+        assert!(!out.starts_with("€".repeat(1366).as_str()));
+    }
+
+    #[tokio::test]
+    async fn execute_truncates_multibyte_response_without_panicking() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        // Valid UTF-8 response whose 4 KiB cut point falls mid-character. Before
+        // the boundary-safe truncation this panicked the tool path end to end.
+        let big_body = "€".repeat(2000);
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(big_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = FileUploadConfig {
+            url: Some(format!("{}/upload", server.uri())),
+            ..FileUploadConfig::default()
+        };
+        let tool = FileUploadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+        );
+
+        let result = tool
+            .execute(json!({ "file_path": "hello.txt" }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got {result:?}");
+        assert!(
+            result.output.contains("truncated"),
+            "got: {}",
+            result.output
         );
     }
 }
