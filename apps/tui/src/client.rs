@@ -197,7 +197,7 @@ pub fn spawn_notification_router(
 // ── Client ───────────────────────────────────────────────────────
 
 pub struct RpcClient {
-    rpc: Arc<RpcOutbound>,
+    pub(crate) rpc: Arc<RpcOutbound>,
     _read_task: tokio::task::JoinHandle<()>,
     _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
@@ -295,6 +295,20 @@ impl RpcClient {
             .await
             .map_err(|e| anyhow::anyhow!("RPC {method}: {} ({})", e.message, e.code))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
+    }
+
+    /// Call an RPC method using a shared Arc<RpcOutbound> — usable from spawned tasks.
+    pub async fn call_static<T: serde::de::DeserializeOwned + Send + 'static>(
+        rpc: &Arc<RpcOutbound>,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<T> {
+        let result = rpc
+            .request(method, params)
+            .await
+            .map_err(|e| anyhow::anyhow!("RPC {method}: {} ({})", e.message, e.code))?;
+        serde_json::from_value(result)
+            .map_err(|e| anyhow::anyhow!("deserializing {method} result: {e}"))
     }
 
     // ── Notifications ─────────────────────────────────────────────

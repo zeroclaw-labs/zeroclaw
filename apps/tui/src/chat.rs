@@ -311,22 +311,18 @@ async fn chat_loop(
                                     let msg = state.take_input();
                                     if !msg.is_empty() {
                                         state.push_user_message(msg.clone());
-                                        // Drive the prompt call; the future is polled
-                                        // in the same select! loop via turn_result_rx.
                                         let sid = session_id.clone();
-                                        let rpc_ref: *mut RpcClient = rpc;
+                                        let rpc_arc = rpc.rpc.clone();
                                         let tx = turn_result_tx.clone();
-                                        // SAFETY: the loop borrows rpc exclusively and
-                                        // we await inside a single-threaded context
-                                        // so the raw pointer is valid for this call.
-                                        //
-                                        // Actually, we can't send a raw pointer across
-                                        // threads. Use an inline call with a boxed future
-                                        // stored on the stack instead.
-                                        let _ = (sid, rpc_ref, tx); // drop the planned approach
-                                        // Inline: call session_prompt directly and send result.
-                                        let prompt_result = rpc.session_prompt(&session_id, &msg).await;
-                                        let _ = turn_result_tx.send(prompt_result).await;
+                                        tokio::spawn(async move {
+                                            let result = RpcClient::call_static::<SessionPromptResult>(
+                                                &rpc_arc,
+                                                crate::client::method::SESSION_PROMPT,
+                                                serde_json::json!({"session_id": sid, "prompt": msg}),
+                                            )
+                                            .await;
+                                            let _ = tx.send(result).await;
+                                        });
                                     }
                                 }
                             }
@@ -545,6 +541,17 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[tokio::test]
+    async fn apply_update_during_turn_in_flight() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(crate::client::SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "streaming...".to_string(),
+        });
+        assert_eq!(s.current_agent_text(), "streaming...");
     }
 
     #[test]
