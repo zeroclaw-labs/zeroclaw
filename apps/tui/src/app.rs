@@ -4,14 +4,14 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::acp;
 use crate::chat;
-use crate::client::RpcClient;
+use crate::client::{ConnectionState, RpcClient};
 use crate::config_manager;
 use crate::dashboard;
 use crate::logs;
@@ -43,13 +43,14 @@ enum Mode {
 
 // ── Top-level entry point ────────────────────────────────────────
 
-pub async fn run(rpc: &RpcClient) -> Result<()> {
-    let mut term = config_manager::init_terminal()?;
-
+/// Run the TUI event loop. Returns `true` if the daemon disconnected
+/// (caller should attempt reconnection), `false` if the user quit normally.
+pub async fn run(rpc: &RpcClient, mut term: &mut config_manager::Term) -> Result<bool> {
     let mut mode = Mode::Dashboard;
     let mut show_help = false;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
+    let mut disconnect_since: Option<std::time::Instant> = None;
 
     let mut dashboard_pane = dashboard::Dashboard::new(rpc);
     dashboard_pane.init().await?;
@@ -62,10 +63,15 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
 
     loop {
         // Draw
+        let conn_state = rpc.connection_state();
         term.draw(|frame| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .constraints([
+                    Constraint::Length(1), // mode bar
+                    Constraint::Min(0),    // content
+                    Constraint::Length(1), // status bar
+                ])
                 .split(frame.area());
 
             bar_area = chunks[0];
@@ -79,6 +85,8 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
             }
+
+            draw_status_bar(frame, chunks[2], &conn_state);
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
@@ -98,6 +106,16 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
 
         // Poll for input with a timeout so live panes refresh periodically.
         if !event::poll(TICK)? {
+            if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                // Keep the UI alive for a few seconds so the user sees the
+                // disconnect reason, then hand off to the caller to reconnect.
+                // RPC calls are skipped — they'd hang on the dead socket.
+                let since = *disconnect_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(2) {
+                    return Ok(true);
+                }
+                continue;
+            }
             if mode == Mode::Dashboard {
                 dashboard_pane.tick().await;
             }
@@ -160,6 +178,12 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                     }
                 }
 
+                // Skip pane key handlers when disconnected — they may
+                // issue RPC calls that hang on the dead socket.
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue;
+                }
+
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, &mut term).await?,
@@ -190,28 +214,29 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                         continue;
                     }
                 }
-                // Forward to active pane
-                match mode {
-                    Mode::Dashboard => {
-                        dashboard_pane.handle_mouse(mouse, content_area);
+                // Forward to active pane (skip when disconnected).
+                if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    match mode {
+                        Mode::Dashboard => {
+                            dashboard_pane.handle_mouse(mouse, content_area);
+                        }
+                        Mode::Config => {
+                            config_app
+                                .handle_mouse(mouse, content_area, &mut term)
+                                .await?;
+                        }
+                        Mode::Logs => {
+                            logs_pane.handle_mouse(mouse, content_area);
+                        }
+                        _ => {}
                     }
-                    Mode::Config => {
-                        config_app
-                            .handle_mouse(mouse, content_area, &mut term)
-                            .await?;
-                    }
-                    Mode::Logs => {
-                        logs_pane.handle_mouse(mouse, content_area);
-                    }
-                    _ => {}
                 }
             }
             _ => {} // Resize, etc. — just redraw on next iteration
         }
     }
 
-    config_manager::restore_terminal(&mut term)?;
-    Ok(())
+    Ok(false)
 }
 
 // ── Mode bar ─────────────────────────────────────────────────────
@@ -231,6 +256,37 @@ fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Status bar ───────────────────────────────────────────────────
+
+const HEALTHY_GREEN: Color = Color::Rgb(80, 220, 120);
+const DEAD_RED: Color = Color::Rgb(255, 80, 80);
+
+fn draw_status_bar(frame: &mut ratatui::Frame, area: Rect, state: &ConnectionState) {
+    let (dot, label, style) = match state {
+        ConnectionState::Connected => (
+            "\u{25cf}",
+            " Connected".to_string(),
+            Style::default().fg(HEALTHY_GREEN),
+        ),
+        ConnectionState::Disconnected { reason } => (
+            "\u{25cf}",
+            format!(" Disconnected (reason: {reason})"),
+            Style::default().fg(DEAD_RED),
+        ),
+    };
+
+    let text_len = 1 + label.len(); // dot + label
+    let padding = (area.width as usize).saturating_sub(text_len);
+
+    let line = Line::from(vec![
+        Span::raw(" ".repeat(padding)),
+        Span::styled(dot, style),
+        Span::styled(label, style),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 // ── Help modal ───────────────────────────────────────────────────

@@ -50,6 +50,7 @@ async fn run() -> anyhow::Result<()> {
     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let socket = client::resolve_socket_path(&config_dir)?;
 
+    // Initial connection (before the terminal is initialized).
     let mut rpc = match client::RpcClient::connect(&socket).await {
         Ok(c) => c,
         Err(_) => {
@@ -58,10 +59,34 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    if let Some(alias) = cli.agent {
-        chat::run(&mut rpc, &alias).await
-    } else {
-        app::run(&rpc).await
+    let mut term = config_manager::init_terminal()?;
+    let result = run_with_reconnect(&mut rpc, &mut term, &socket).await;
+    config_manager::restore_terminal(&mut term)?;
+    result
+}
+
+async fn run_with_reconnect(
+    rpc: &mut client::RpcClient,
+    term: &mut config_manager::Term,
+    socket: &std::path::Path,
+) -> anyhow::Result<()> {
+    loop {
+        let should_reconnect = app::run(rpc, term).await?;
+        if !should_reconnect {
+            return Ok(());
+        }
+        // Retry connecting to the existing socket. We do NOT spawn a new
+        // daemon here — multiple TUIs reconnecting simultaneously would
+        // each spawn their own, causing a stampede. The daemon is managed
+        // externally (service manager, manual restart, or the initial
+        // startup path in run()).
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Ok(c) = client::RpcClient::connect(socket).await {
+                *rpc = c;
+                break;
+            }
+        }
     }
 }
 

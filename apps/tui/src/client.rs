@@ -4,7 +4,7 @@
 //! plumbing the daemon uses for bidirectional calls.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -192,6 +192,16 @@ pub fn spawn_notification_router(
     })
 }
 
+// ── Connection state ──────────────────────────────────────────────
+
+/// Observable connection state, written by the socket read task.
+/// This is the single source of truth for daemon connectivity.
+#[derive(Clone, Debug)]
+pub enum ConnectionState {
+    Connected,
+    Disconnected { reason: String },
+}
+
 // ── Client ───────────────────────────────────────────────────────
 
 pub struct RpcClient {
@@ -201,6 +211,7 @@ pub struct RpcClient {
     pub server_version: String,
     notifications_bcast: broadcast::Sender<RpcNotification>,
     pub notifications: mpsc::Receiver<SessionUpdate>,
+    connection_state: Arc<Mutex<ConnectionState>>,
 }
 
 impl RpcClient {
@@ -228,6 +239,9 @@ impl RpcClient {
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
 
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_reader = conn_state.clone();
+
         let rpc_for_reader = rpc.clone();
         let read_task = tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
@@ -235,7 +249,18 @@ impl RpcClient {
             loop {
                 buf.clear();
                 match reader.read_line(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
+                            reason: "EOF (daemon closed connection)".to_string(),
+                        };
+                        break;
+                    }
+                    Err(e) => {
+                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
+                            reason: e.to_string(),
+                        };
+                        break;
+                    }
                     Ok(_) => {}
                 }
                 let frame: Value = match serde_json::from_str(buf.trim()) {
@@ -283,6 +308,7 @@ impl RpcClient {
             server_version,
             notifications_bcast: notif_tx,
             notifications: update_rx,
+            connection_state: conn_state,
         })
     }
 
@@ -307,6 +333,13 @@ impl RpcClient {
             .map_err(|e| anyhow::anyhow!("RPC {method}: {} ({})", e.message, e.code))?;
         serde_json::from_value(result)
             .map_err(|e| anyhow::anyhow!("deserializing {method} result: {e}"))
+    }
+
+    // ── Connection state ─────────────────────────────────────────
+
+    /// Current connection state. Cheap mutex read, safe to call on every frame.
+    pub fn connection_state(&self) -> ConnectionState {
+        self.connection_state.lock().unwrap().clone()
     }
 
     // ── Notifications ─────────────────────────────────────────────
@@ -608,6 +641,7 @@ impl RpcClient {
             server_version: "test".to_string(),
             notifications_bcast: notif_tx,
             notifications: rx,
+            connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
         }
     }
 }
