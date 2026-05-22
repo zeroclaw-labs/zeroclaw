@@ -1132,6 +1132,16 @@ fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
+pub(crate) fn moonshot_code_base_url() -> &'static str {
+    <zeroclaw_config::schema::MoonshotEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+        &zeroclaw_config::schema::MoonshotEndpoint::Code,
+    )
+}
+
+fn is_legacy_kimi_code_alias(name: &str) -> bool {
+    matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1160,6 +1170,7 @@ fn create_model_provider_inner(
         }
     }
     let (split_name, split_url) = split_v2_colon_url(raw_name);
+    let legacy_kimi_code = is_legacy_kimi_code_alias(split_name);
     let api_url = api_url.or(split_url);
     let name = canonicalize_v2_model_provider_name(split_name);
 
@@ -1226,6 +1237,17 @@ fn create_model_provider_inner(
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
             });
+
+    if legacy_kimi_code {
+        let base_url = match resolved_url {
+            Some(url) => url,
+            None => moonshot_code_base_url(),
+        };
+        return Ok(factory::apply_compat_options(
+            factory::build_kimi_code_compat(alias, key, base_url),
+            options,
+        ));
+    }
 
     factory::dispatch_family_factory(config, name, alias, key, resolved_url, options)
 }
@@ -2070,7 +2092,65 @@ mod tests {
     }
 
     #[test]
-    fn factory_kimi_code() {}
+    fn factory_kimi_code_supports_vision() {
+        for alias in ["kimi-code", "kimi_coding", "kimi_for_coding"] {
+            let provider = create_model_provider(alias, Some("key"))
+                .expect("legacy kimi-code alias should build");
+            assert!(
+                provider.supports_vision(),
+                "alias `{alias}` should report vision capability"
+            );
+            assert_eq!(
+                moonshot_code_base_url(),
+                "https://api.moonshot.cn/coder/v1",
+                "alias `{alias}` should resolve to the Moonshot code endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_kimi_code_preserves_semantics_with_url_overrides() {
+        let custom_url = "https://proxy.example.test/v1";
+
+        let provider = create_model_provider_with_url("kimi-code", Some("key"), Some(custom_url))
+            .expect("legacy kimi-code alias with custom URL should build");
+        assert!(provider.supports_vision());
+
+        let provider = create_model_provider_with_options(
+            "kimi-code",
+            Some("key"),
+            &ModelProviderRuntimeOptions {
+                provider_api_url: Some(custom_url.to_string()),
+                ..ModelProviderRuntimeOptions::default()
+            },
+        )
+        .expect("legacy kimi-code alias with options URL should build");
+        assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn moonshot_code_endpoint_supports_vision() {
+        use zeroclaw_config::schema::{Config, MoonshotEndpoint, MoonshotModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.moonshot.insert(
+            "code".to_string(),
+            MoonshotModelProviderConfig {
+                endpoint: MoonshotEndpoint::Code,
+                ..MoonshotModelProviderConfig::default()
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "moonshot", "code");
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some(moonshot_code_base_url())
+        );
+
+        let provider =
+            create_model_provider_for_alias(&config, "moonshot", "code", Some("key"), &options)
+                .expect("moonshot code endpoint should build");
+        assert!(provider.supports_vision());
+    }
 
     #[test]
     fn factory_synthetic() {
