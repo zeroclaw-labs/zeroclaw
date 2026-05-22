@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use zeroclaw_api::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use zeroclaw_config::sections::SectionShape;
@@ -75,12 +75,22 @@ pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".zeroclaw"))
 }
 
+// ── Notifications ────────────────────────────────────────────────
+
+/// A server-initiated notification (no `id` field).
+#[derive(Debug, Clone)]
+pub struct RpcNotification {
+    pub method: String,
+    pub params: Value,
+}
+
 // ── Client ───────────────────────────────────────────────────────
 
 pub struct RpcClient {
     rpc: Arc<RpcOutbound>,
     _read_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
+    notifications: broadcast::Sender<RpcNotification>,
 }
 
 impl RpcClient {
@@ -105,6 +115,8 @@ impl RpcClient {
         });
 
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
+        let notif_tx_for_reader = notif_tx.clone();
 
         let rpc_for_reader = rpc.clone();
         let read_task = tokio::spawn(async move {
@@ -126,6 +138,12 @@ impl RpcClient {
                         .get(field::ERROR)
                         .and_then(|e| serde_json::from_value(e.clone()).ok());
                     rpc_for_reader.dispatch_response(id, result, error);
+                } else if let Some(method) = frame.get(field::METHOD).and_then(Value::as_str) {
+                    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+                    let _ = notif_tx_for_reader.send(RpcNotification {
+                        method: method.to_string(),
+                        params,
+                    });
                 }
             }
         });
@@ -148,6 +166,7 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             server_version,
+            notifications: notif_tx,
         })
     }
 
@@ -158,6 +177,24 @@ impl RpcClient {
             .await
             .map_err(|e| anyhow::anyhow!("RPC {method}: {} ({})", e.message, e.code))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
+    }
+
+    // ── Notifications ─────────────────────────────────────────────
+
+    /// Get a receiver for server-initiated notifications.
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
+        self.notifications.subscribe()
+    }
+
+    /// Ask the daemon to start streaming log events as notifications.
+    pub async fn logs_subscribe(&self) -> Result<()> {
+        let _: Value = self.call("logs/subscribe", serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Query persisted log events from the daemon.
+    pub async fn logs_query(&self, params: LogsQueryParams) -> Result<LogsQueryResult> {
+        self.call("logs/query", serde_json::to_value(params)?).await
     }
 
     // ── Typed config helpers ─────────────────────────────────────
@@ -483,4 +520,41 @@ pub struct SkillsDeleteResult {
     pub bundle: String,
     pub name: String,
     pub deleted: bool,
+}
+
+// ── Logs types ───────────────────────────────────────────────────
+
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LogsQueryParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity_min: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub hide_internal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LogsQueryResult {
+    pub events: Vec<serde_json::Value>,
+    pub next_cursor: Option<(String, String)>,
+    pub at_end: bool,
 }

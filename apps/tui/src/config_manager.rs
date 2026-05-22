@@ -2,7 +2,10 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -20,25 +23,22 @@ use zeroclaw_config::traits::{ConfigFieldEntry, ConfigTab, PropKind};
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::theme;
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
-pub async fn run(rpc: &RpcClient) -> Result<()> {
-    let mut term = init_terminal()?;
-    let result = App::new(rpc).run(&mut term).await;
-    restore_terminal(&mut term)?;
-    result
-}
-
-fn init_terminal() -> Result<Term> {
+pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
-fn restore_terminal(term: &mut Term) -> Result<()> {
+pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -85,7 +85,7 @@ enum FilterAction {
 
 // ── App state ────────────────────────────────────────────────────
 
-struct App<'a> {
+pub(crate) struct App<'a> {
     rpc: &'a RpcClient,
     screen: Screen,
     sections: Vec<ConfigSectionEntry>,
@@ -134,7 +134,7 @@ struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    fn new(rpc: &'a RpcClient) -> Self {
+    pub(crate) fn new(rpc: &'a RpcClient) -> Self {
         Self {
             rpc,
             screen: Screen::SectionList,
@@ -175,33 +175,63 @@ impl<'a> App<'a> {
         }
     }
 
-    async fn run(&mut self, term: &mut Term) -> Result<()> {
+    /// Load initial data from the daemon. Call once before draw/handle_key.
+    pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
         self.templates = self.rpc.config_templates().await?;
+        Ok(())
+    }
 
-        loop {
-            self.draw(term)?;
-
-            let key = match wait_key()? {
-                Some(k) => k,
-                None => continue,
-            };
-
-            self.status_msg = None;
-
-            match &self.screen {
-                Screen::SectionList => {
-                    if self.handle_section_list(key).await? {
-                        return Ok(());
-                    }
-                }
-                Screen::TypeList { .. } => self.handle_type_list(key).await?,
-                Screen::AliasList { .. } => self.handle_alias_list(key).await?,
-                Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
-                Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
-                Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
+    /// Draw the current screen into the given area.
+    pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
+        match &self.screen {
+            Screen::SectionList => self.draw_section_list(frame, area),
+            Screen::TypeList { section_idx } => {
+                self.draw_type_list(frame, area, *section_idx);
+            }
+            Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => {
+                self.draw_alias_list(frame, area, *section_idx, breadcrumb);
+            }
+            Screen::AliasCreate { breadcrumb, .. } => {
+                self.draw_alias_create(frame, area, breadcrumb);
+            }
+            Screen::FieldList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => {
+                self.draw_field_list(frame, area, *section_idx, breadcrumb);
+            }
+            Screen::FieldEdit {
+                breadcrumb,
+                field_idx,
+                ..
+            } => {
+                self.draw_field_edit(frame, area, breadcrumb, *field_idx);
             }
         }
+    }
+
+    /// Handle a key event. Returns `Ok(true)` when the user wants to
+    /// quit this mode (Esc/q at the top-level section list).
+    pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        self.status_msg = None;
+
+        match &self.screen {
+            Screen::SectionList => {
+                return self.handle_section_list(key).await;
+            }
+            Screen::TypeList { .. } => self.handle_type_list(key).await?,
+            Screen::AliasList { .. } => self.handle_alias_list(key).await?,
+            Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
+            Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
+            Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
+        }
+        Ok(false)
     }
 
     // ── Data loading ─────────────────────────────────────────────
@@ -1565,36 +1595,7 @@ impl<'a> App<'a> {
     fn draw(&mut self, term: &mut Term) -> Result<()> {
         term.draw(|frame| {
             let area = frame.area();
-            match &self.screen {
-                Screen::SectionList => self.draw_section_list(frame, area),
-                Screen::TypeList { section_idx } => {
-                    self.draw_type_list(frame, area, *section_idx);
-                }
-                Screen::AliasList {
-                    section_idx,
-                    breadcrumb,
-                    ..
-                } => {
-                    self.draw_alias_list(frame, area, *section_idx, breadcrumb);
-                }
-                Screen::AliasCreate { breadcrumb, .. } => {
-                    self.draw_alias_create(frame, area, breadcrumb);
-                }
-                Screen::FieldList {
-                    section_idx,
-                    breadcrumb,
-                    ..
-                } => {
-                    self.draw_field_list(frame, area, *section_idx, breadcrumb);
-                }
-                Screen::FieldEdit {
-                    breadcrumb,
-                    field_idx,
-                    ..
-                } => {
-                    self.draw_field_edit(frame, area, breadcrumb, *field_idx);
-                }
-            }
+            self.draw_into(frame, area);
         })?;
         Ok(())
     }
@@ -2417,7 +2418,7 @@ fn edit_in_external_editor(
 
 // ── Input ────────────────────────────────────────────────────────
 
-fn wait_key() -> Result<Option<KeyEvent>> {
+pub(crate) fn wait_key() -> Result<Option<KeyEvent>> {
     loop {
         match event::read()? {
             Event::Key(key) => {

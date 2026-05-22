@@ -934,6 +934,41 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    pub struct LogsQueryParams {
+        #[serde(default)]
+        pub since_ts: Option<String>,
+        #[serde(default)]
+        pub until_ts: Option<String>,
+        #[serde(default)]
+        pub until_id: Option<String>,
+        #[serde(default)]
+        pub severity_min: Option<u8>,
+        #[serde(default)]
+        pub q: Option<String>,
+        #[serde(default)]
+        pub category: Option<String>,
+        #[serde(default)]
+        pub action: Option<String>,
+        #[serde(default)]
+        pub outcome: Option<String>,
+        #[serde(default)]
+        pub trace_id: Option<String>,
+        #[serde(default)]
+        pub hide_internal: bool,
+        #[serde(default)]
+        pub limit: Option<usize>,
+    }
+}
+
+rpc_type! {
+    pub struct LogsQueryResult {
+        pub events: Vec<serde_json::Value>,
+        pub next_cursor: Option<(String, String)>,
+        pub at_end: bool,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Session update notifications ─────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════

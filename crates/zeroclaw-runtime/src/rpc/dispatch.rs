@@ -113,6 +113,7 @@ pub enum Method {
 
     // Logs / Events
     LogsSubscribe,
+    LogsQuery,
 }
 
 impl Method {
@@ -181,6 +182,7 @@ impl Method {
         (Method::ConfigCatalogModels, "config/catalog-models"),
         // Logs
         (Method::LogsSubscribe, "logs/subscribe"),
+        (Method::LogsQuery, "logs/query"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -379,6 +381,7 @@ impl RpcDispatcher {
 
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
+            Method::LogsQuery => self.handle_logs_query(&req.params).await,
         };
 
         if is_notification {
@@ -1484,6 +1487,44 @@ impl RpcDispatcher {
             }
         });
         to_result(LogsSubscribeResult { subscribed: true })
+    }
+
+    async fn handle_logs_query(&self, params: &Value) -> RpcResult {
+        let p: LogsQueryParams = parse_params(params)?;
+
+        let path = zeroclaw_log::current_log_path()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+
+        let filter = zeroclaw_log::LogFilter {
+            since_ts: p.since_ts,
+            until_ts: p.until_ts,
+            until_id: p.until_id,
+            action: p.action,
+            category: p.category,
+            outcome: p.outcome,
+            severity_min: p.severity_min,
+            trace_id: p.trace_id,
+            q: p.q,
+            hide_internal: p.hide_internal,
+            field_eq: std::collections::BTreeMap::new(),
+        };
+
+        let limit = p.limit.unwrap_or(200);
+
+        let page = zeroclaw_log::load_page(&path, &filter, limit)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+
+        let events: Vec<serde_json::Value> = page
+            .events
+            .into_iter()
+            .filter_map(|evt| serde_json::to_value(evt).ok())
+            .collect();
+
+        to_result(LogsQueryResult {
+            events,
+            next_cursor: page.next_cursor,
+            at_end: page.at_end,
+        })
     }
 
     // ── Wire helpers ─────────────────────────────────────────────

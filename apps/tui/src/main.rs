@@ -4,8 +4,13 @@ use std::time::Duration;
 
 use clap::Parser;
 
+mod acp;
+mod app;
+mod chat;
 mod client;
 mod config_manager;
+mod dashboard;
+mod logs;
 mod theme;
 mod widgets;
 
@@ -47,7 +52,7 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    config_manager::run(&rpc).await
+    app::run(&rpc).await
 }
 
 fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
