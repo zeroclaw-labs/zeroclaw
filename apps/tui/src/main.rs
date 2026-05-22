@@ -42,12 +42,17 @@ struct Cli {
     /// Example: `--connect wss://host:9781`
     #[arg(long)]
     connect: Option<String>,
+
+    /// Skip TLS certificate verification for WSS connections.
+    /// Required for self-signed certificates. Only used with --connect.
+    #[arg(long)]
+    tls_skip_verify: bool,
 }
 
 /// Where the TUI should connect.
 enum ConnectTarget {
     UnixSocket(PathBuf),
-    Wss(String),
+    Wss { url: String, skip_verify: bool },
 }
 
 #[tokio::main]
@@ -91,7 +96,10 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let target = if let Some(url) = cli.connect {
-        ConnectTarget::Wss(url)
+        ConnectTarget::Wss {
+            url,
+            skip_verify: cli.tls_skip_verify,
+        }
     } else {
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         let socket = client::resolve_socket_path(&config_dir)?;
@@ -110,7 +118,9 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        ConnectTarget::Wss(url) => client::RpcClient::connect_wss(url, None, None).await?,
+        ConnectTarget::Wss { url, skip_verify } => {
+            client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+        }
     };
 
     let mut term = config_manager::init_terminal()?;
@@ -179,9 +189,14 @@ async fn run_with_reconnect(
                     client::RpcClient::connect(socket, prev_id.as_deref(), prev_sig.as_deref())
                         .await
                 }
-                ConnectTarget::Wss(url) => {
-                    client::RpcClient::connect_wss(url, prev_id.as_deref(), prev_sig.as_deref())
-                        .await
+                ConnectTarget::Wss { url, skip_verify } => {
+                    client::RpcClient::connect_wss(
+                        url,
+                        prev_id.as_deref(),
+                        prev_sig.as_deref(),
+                        *skip_verify,
+                    )
+                    .await
                 }
             };
             if let Ok(c) = result {

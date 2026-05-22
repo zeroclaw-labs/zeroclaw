@@ -13667,6 +13667,7 @@ dependencies = [
  "futures-util",
  "libc",
  "ratatui",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

@@ -343,17 +343,30 @@ impl RpcClient {
     ///
     /// Same handshake and reconnect semantics as [`connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
+    ///
+    /// When `tls_skip_verify` is true, certificate verification is
+    /// disabled — required for self-signed certs on remote hosts.
     pub async fn connect_wss(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
+        tls_skip_verify: bool,
     ) -> Result<Self> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
-            .await
-            .with_context(|| format!("WSS connect to {url}"))?;
+        let connector = if tls_skip_verify {
+            Some(tokio_tungstenite::Connector::Rustls(
+                Self::insecure_tls_config(),
+            ))
+        } else {
+            None
+        };
+
+        let (ws_stream, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+                .await
+                .with_context(|| format!("WSS connect to {url}"))?;
 
         let (mut sink, mut stream) = ws_stream.split();
 
@@ -466,6 +479,61 @@ impl RpcClient {
             tui_id,
             tui_sig,
         })
+    }
+
+    /// Build a rustls `ClientConfig` that accepts any server certificate.
+    fn insecure_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+        use std::sync::Arc;
+
+        /// Verifier that accepts every certificate without checking.
+        #[derive(Debug)]
+        struct NoVerify;
+
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls::pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls::pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+
+        Arc::new(config)
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
