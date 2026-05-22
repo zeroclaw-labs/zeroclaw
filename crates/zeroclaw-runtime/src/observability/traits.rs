@@ -63,8 +63,11 @@ mod tests {
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

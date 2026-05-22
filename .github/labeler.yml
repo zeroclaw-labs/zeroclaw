@@ -18,7 +18,11 @@
 "ci":
   - changed-files:
       - any-glob-to-any-file:
-          - ".github/**"
+          - ".github/codeql/**"
+          - ".github/workflows/**"
+          - ".github/*.yaml"
+          - ".github/*.yml"
+          - ".github/*.json"
           - ".githooks/**"
 
 "core":
