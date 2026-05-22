@@ -1,69 +1,535 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use std::sync::Arc;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use tokio::sync::{broadcast, mpsc};
 
-use crate::client::RpcClient;
+use crate::client::{
+    ApprovalDecision, RpcClient, RpcNotification, SessionPromptResult, SessionUpdate, method,
+    parse_session_update,
+};
 use crate::theme;
+use zeroclaw_api::jsonrpc::RpcOutbound;
 
-// ── Legacy stub (used by app.rs tab switcher) ────────────────────
+// ── Chat pane (tab mode) ─────────────────────────────────────────
+
+enum ChatPhase {
+    /// Showing agent picker (or loading the list).
+    PickAgent {
+        agents: Vec<String>,
+        list_state: ListState,
+        loading: bool,
+    },
+    /// Active chat session.
+    Active(ChatState),
+    /// Unrecoverable error.
+    Error(String),
+}
 
 pub(crate) struct Chat<'a> {
     rpc: &'a RpcClient,
+    rpc_out: Arc<RpcOutbound>,
+    notif_rx: broadcast::Receiver<RpcNotification>,
+    turn_result_tx: mpsc::Sender<anyhow::Result<SessionPromptResult>>,
+    turn_result_rx: mpsc::Receiver<anyhow::Result<SessionPromptResult>>,
+    phase: ChatPhase,
 }
 
 impl<'a> Chat<'a> {
     pub(crate) fn new(rpc: &'a RpcClient) -> Self {
-        Self { rpc }
+        let (turn_result_tx, turn_result_rx) = mpsc::channel(4);
+        Self {
+            rpc,
+            rpc_out: rpc.rpc.clone(),
+            notif_rx: rpc.subscribe_notifications(),
+            turn_result_tx,
+            turn_result_rx,
+            phase: ChatPhase::PickAgent {
+                agents: Vec::new(),
+                list_state: ListState::default(),
+                loading: true,
+            },
+        }
     }
 
-    pub(crate) fn draw(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let block = Block::default()
-            .title(Span::styled(" Chat ", theme::title_style()))
-            .borders(Borders::ALL)
-            .border_style(theme::dim_style());
+    /// Fetch agent list. If exactly one enabled agent, auto-start a session.
+    pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
+        let agents = match self.rpc.agents_status().await {
+            Ok(result) => result
+                .agents
+                .into_iter()
+                .filter(|a| a.enabled)
+                .map(|a| a.alias)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                self.phase = ChatPhase::Error(format!("Failed to fetch agents: {e}"));
+                return Ok(());
+            }
+        };
 
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        if agents.is_empty() {
+            self.phase = ChatPhase::Error(
+                "No enabled agents. Configure an agent in the Config tab.".to_string(),
+            );
+            return Ok(());
+        }
 
-        let chunks = Layout::default()
+        if agents.len() == 1 {
+            self.start_session(&agents[0]).await;
+            return Ok(());
+        }
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        self.phase = ChatPhase::PickAgent {
+            agents,
+            list_state,
+            loading: false,
+        };
+        Ok(())
+    }
+
+    async fn start_session(&mut self, agent_alias: &str) {
+        match self.rpc.session_new(agent_alias, None).await {
+            Ok(session) => {
+                self.phase =
+                    ChatPhase::Active(ChatState::new(session.session_id, agent_alias.to_string()));
+            }
+            Err(e) => {
+                self.phase = ChatPhase::Error(format!("Failed to create session: {e}"));
+            }
+        }
+    }
+
+    // ── Drain channels (called from draw) ────────────────────────
+
+    fn drain_notifications(&mut self) {
+        loop {
+            match self.notif_rx.try_recv() {
+                Ok(notif) if notif.method == "session/update" => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        if let Some(update) = parse_session_update(&notif.params) {
+                            state.apply_update(update);
+                        }
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                _ => break,
+            }
+        }
+    }
+
+    fn drain_turn_results(&mut self) {
+        while let Ok(result) = self.turn_result_rx.try_recv() {
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                match result {
+                    Ok(r) => state.commit_turn(r.content),
+                    Err(e) => state.commit_turn(format!("[error: {e}]")),
+                }
+            }
+        }
+    }
+
+    // ── Drawing ──────────────────────────────────────────────────
+
+    pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.drain_notifications();
+        self.drain_turn_results();
+
+        match &mut self.phase {
+            ChatPhase::PickAgent {
+                agents,
+                list_state,
+                loading,
+            } => {
+                draw_agent_picker(frame, area, agents, list_state, *loading);
+            }
+            ChatPhase::Active(state) => {
+                render(frame, state, area);
+            }
+            ChatPhase::Error(msg) => {
+                draw_error(frame, area, msg);
+            }
+        }
+    }
+
+    // ── Key handling ─────────────────────────────────────────────
+
+    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Determine which phase we're in without holding a borrow on self.
+        // For the picker, extract what we need; for active, delegate below.
+        match &mut self.phase {
+            ChatPhase::PickAgent {
+                agents,
+                list_state,
+                loading,
+            } => {
+                if *loading {
+                    return false;
+                }
+                match key.code {
+                    KeyCode::Up => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::Down => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < agents.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(i) = list_state.selected() {
+                            if let Some(alias) = agents.get(i).cloned() {
+                                self.start_session(&alias).await;
+                            }
+                        }
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => return true,
+                    _ => {}
+                }
+                return false;
+            }
+            ChatPhase::Error(_) => {
+                return matches!(key.code, KeyCode::Char('q') | KeyCode::Esc);
+            }
+            ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
+        }
+
+        // Active phase — borrow state directly to avoid double &mut self.
+        let ChatPhase::Active(ref mut state) = self.phase else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.turn_in_flight {
+                    let _ = self.rpc.session_cancel(&state.session_id).await;
+                    state.turn_in_flight = false;
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(pa) = state.take_pending_approval() {
+                    let _ = self
+                        .rpc
+                        .session_approve(
+                            &state.session_id,
+                            &pa.request_id,
+                            ApprovalDecision::AllowOnce,
+                        )
+                        .await;
+                } else if !state.turn_in_flight {
+                    let msg = state.take_input();
+                    if !msg.is_empty() {
+                        state.push_user_message(msg.clone());
+                        let sid = state.session_id.clone();
+                        let rpc_arc = self.rpc_out.clone();
+                        let tx = self.turn_result_tx.clone();
+                        tokio::spawn(async move {
+                            let result = RpcClient::call_static::<SessionPromptResult>(
+                                &rpc_arc,
+                                method::SESSION_PROMPT,
+                                serde_json::json!({"session_id": sid, "prompt": msg}),
+                            )
+                            .await;
+                            let _ = tx.send(result).await;
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(pa) = state.take_pending_approval() {
+                    let _ = self
+                        .rpc
+                        .session_approve(
+                            &state.session_id,
+                            &pa.request_id,
+                            ApprovalDecision::Reject,
+                        )
+                        .await;
+                }
+            }
+            KeyCode::Char('a') if state.pending_approval().is_some() => {
+                if let Some(pa) = state.take_pending_approval() {
+                    let _ = self
+                        .rpc
+                        .session_approve(
+                            &state.session_id,
+                            &pa.request_id,
+                            ApprovalDecision::AllowAlways,
+                        )
+                        .await;
+                }
+            }
+            KeyCode::Char(c) => {
+                if !state.turn_in_flight {
+                    state.push_input_char(c);
+                }
+            }
+            KeyCode::Backspace => {
+                state.pop_input_char();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Returns true when the pane is accepting text input (blocks `?` help).
+    pub(crate) fn wants_text_input(&self) -> bool {
+        matches!(self.phase, ChatPhase::Active(_))
+    }
+}
+
+// ── Agent picker rendering ───────────────────────────────────────
+
+fn draw_agent_picker(
+    frame: &mut Frame,
+    area: Rect,
+    agents: &[String],
+    list_state: &mut ListState,
+    loading: bool,
+) {
+    let block = Block::default()
+        .title(Span::styled(" Chat ", theme::title_style()))
+        .borders(Borders::ALL)
+        .border_style(theme::dim_style());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if loading {
+        let p = Paragraph::new("Loading agents...")
+            .alignment(Alignment::Center)
+            .style(theme::dim_style());
+        let vert = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Fill(1),
                 Constraint::Length(1),
-                Constraint::Length(1),
                 Constraint::Fill(1),
             ])
             .split(inner);
-
-        let hint = Paragraph::new(Line::from(vec![
-            Span::styled("Coming soon ", theme::body_style()),
-            Span::styled("— press ", theme::dim_style()),
-            Span::styled("F1", theme::accent_style()),
-            Span::styled(" to switch to Config", theme::dim_style()),
-        ]))
-        .alignment(Alignment::Center);
-
-        let version = Paragraph::new(Line::from(Span::styled(
-            format!("daemon v{}", self.rpc.server_version),
-            theme::dim_style(),
-        )))
-        .alignment(Alignment::Center);
-
-        frame.render_widget(hint, chunks[1]);
-        frame.render_widget(version, chunks[2]);
+        frame.render_widget(p, vert[1]);
+        return;
     }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
-        matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("Select an agent ", theme::body_style()),
+        Span::styled("(Up/Down, Enter)", theme::dim_style()),
+    ]));
+    frame.render_widget(header, chunks[0]);
+
+    let items: Vec<ListItem> = agents
+        .iter()
+        .map(|a| ListItem::new(Span::styled(a.as_str(), theme::body_style())))
+        .collect();
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, chunks[1], list_state);
+}
+
+// ── Error rendering ──────────────────────────────────────────────
+
+fn draw_error(frame: &mut Frame, area: Rect, msg: &str) {
+    let block = Block::default()
+        .title(Span::styled(" Chat ", theme::title_style()))
+        .borders(Borders::ALL)
+        .border_style(theme::dim_style());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    let p = Paragraph::new(Line::from(Span::styled(
+        msg,
+        Style::default().fg(Color::Red),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(p, chunks[1]);
+}
+
+// ── Active chat rendering ────────────────────────────────────────
+
+fn render(f: &mut Frame, state: &ChatState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+
+    render_conversation(f, state, chunks[0]);
+    render_input(f, state, chunks[1]);
+
+    if state.pending_approval().is_some() {
+        render_approval_overlay(f, state, area);
     }
 }
 
-// ── ChatState / ChatEntry ─────────────────────────────────────────
+fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
 
-use crate::client::SessionUpdate;
+    for entry in state.entries() {
+        match entry {
+            ChatEntry::UserMessage(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "You: ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(text.as_str()),
+                ]));
+            }
+            ChatEntry::AgentMessage(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Agent: ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(text.as_str()),
+                ]));
+            }
+            ChatEntry::AgentThought(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "(thinking) ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(text.as_str(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            ChatEntry::Tool {
+                name,
+                input,
+                result,
+                ..
+            } => {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                let truncated: String = input_str.chars().take(60).collect();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[tool: {name}] "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(truncated),
+                ]));
+                if let Some(r) = result {
+                    let result_truncated: String = r.chars().take(60).collect();
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{2514}\u{2500} ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(result_truncated),
+                    ]));
+                }
+            }
+        }
+    }
+
+    if !state.current_agent_text().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Agent: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(state.current_agent_text()),
+        ]));
+    }
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", state.agent_alias)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+fn render_input(f: &mut Frame, state: &ChatState, area: Rect) {
+    let label = if state.turn_in_flight {
+        " (thinking\u{2026}) "
+    } else {
+        " > "
+    };
+    let p =
+        Paragraph::new(state.input()).block(Block::default().borders(Borders::ALL).title(label));
+    f.render_widget(p, area);
+}
+
+fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+    let pa = match state.pending_approval() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Length(12),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Min(60),
+            Constraint::Percentage(10),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
+    let text = format!(
+        "Approve tool call: {}  [{}s]\n\n  {}\n\n  Enter=Allow  a=Always  Ctrl+D=Reject",
+        pa.tool_name, pa.timeout_secs, pa.arguments_summary
+    );
+    let p = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Approval Required ")
+                .style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, overlay_area);
+}
+
+// ── ChatState / ChatEntry ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
@@ -231,23 +697,16 @@ impl ChatState {
     }
 }
 
-// ── Interactive run() entry point ─────────────────────────────────
+// ── Standalone run() entry point (used by --agent CLI flag) ──────
 
 use std::io::Stdout;
 
 use crossterm::{
-    event::{Event, KeyEventKind, KeyModifiers},
+    event::{Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    style::{Color, Modifier, Style},
-    widgets::{Clear, Wrap},
-};
-
-use crate::client::{ApprovalDecision, SessionPromptResult};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -285,15 +744,14 @@ async fn chat_loop(
 ) -> anyhow::Result<()> {
     let mut state = ChatState::new(session_id.clone(), agent_alias.to_string());
 
-    // We hold an optional in-flight prompt future using a channel to carry the
-    // result back from a spawned task. Because RpcClient is not Clone/Send+
-    // 'static, we use a channel where the spawned side just fires-and-forgets
-    // a completion value.
     let (turn_result_tx, mut turn_result_rx) =
         tokio::sync::mpsc::channel::<anyhow::Result<SessionPromptResult>>(2);
 
     loop {
-        term.draw(|f| render(f, &state))?;
+        term.draw(|f| {
+            let area = f.area();
+            render(f, &state, area);
+        })?;
 
         tokio::select! {
             maybe_event = async {
@@ -331,7 +789,7 @@ async fn chat_loop(
                                         tokio::spawn(async move {
                                             let result = RpcClient::call_static::<SessionPromptResult>(
                                                 &rpc_arc,
-                                                crate::client::method::SESSION_PROMPT,
+                                                method::SESSION_PROMPT,
                                                 serde_json::json!({"session_id": sid, "prompt": msg}),
                                             )
                                             .await;
@@ -400,158 +858,6 @@ async fn chat_loop(
     Ok(())
 }
 
-fn render(f: &mut Frame, state: &ChatState) {
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(area);
-
-    render_conversation(f, state, chunks[0]);
-    render_input(f, state, chunks[1]);
-
-    if state.pending_approval().is_some() {
-        render_approval_overlay(f, state, area);
-    }
-}
-
-fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    for entry in state.entries() {
-        match entry {
-            ChatEntry::UserMessage(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "You: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.as_str()),
-                ]));
-            }
-            ChatEntry::AgentMessage(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Agent: ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.as_str()),
-                ]));
-            }
-            ChatEntry::AgentThought(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "(thinking) ",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(text.as_str(), Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            ChatEntry::Tool {
-                name,
-                input,
-                result,
-                ..
-            } => {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
-                let truncated: String = input_str.chars().take(60).collect();
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("[tool: {name}] "),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::raw(truncated),
-                ]));
-                if let Some(r) = result {
-                    let result_truncated: String = r.chars().take(60).collect();
-                    lines.push(Line::from(vec![
-                        Span::styled("  \u{2514}\u{2500} ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(result_truncated),
-                    ]));
-                }
-            }
-        }
-    }
-
-    if !state.current_agent_text().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Agent: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(state.current_agent_text()),
-        ]));
-    }
-
-    let p = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", state.agent_alias)),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, area);
-}
-
-fn render_input(f: &mut Frame, state: &ChatState, area: Rect) {
-    let label = if state.turn_in_flight {
-        " (thinking\u{2026}) "
-    } else {
-        " > "
-    };
-    let p =
-        Paragraph::new(state.input()).block(Block::default().borders(Borders::ALL).title(label));
-    f.render_widget(p, area);
-}
-
-fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
-    let pa = match state.pending_approval() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Length(12),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let overlay_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(10),
-            Constraint::Min(60),
-            Constraint::Percentage(10),
-        ])
-        .split(vert[1])[1];
-
-    f.render_widget(Clear, overlay_area);
-
-    let text = format!(
-        "Approve tool call: {}  [{}s]\n\n  {}\n\n  Enter=Allow  a=Always  Ctrl+D=Reject  e=Edit",
-        pa.tool_name, pa.timeout_secs, pa.arguments_summary
-    );
-    let p = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Approval Required ")
-                .style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, overlay_area);
-}
-
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -566,7 +872,7 @@ mod tests {
     async fn apply_update_during_turn_in_flight() {
         let mut s = state();
         s.turn_in_flight = true;
-        s.apply_update(crate::client::SessionUpdate::AgentMessageChunk {
+        s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "streaming...".to_string(),
         });
@@ -587,11 +893,11 @@ mod tests {
     #[test]
     fn text_chunk_accumulates() {
         let mut s = state();
-        s.apply_update(crate::client::SessionUpdate::AgentMessageChunk {
+        s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Hello".to_string(),
         });
-        s.apply_update(crate::client::SessionUpdate::AgentMessageChunk {
+        s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: " world".to_string(),
         });
@@ -601,13 +907,13 @@ mod tests {
     #[test]
     fn tool_call_followed_by_result_is_one_entry() {
         let mut s = state();
-        s.apply_update(crate::client::SessionUpdate::ToolCall {
+        s.apply_update(SessionUpdate::ToolCall {
             session_id: "sess-1".to_string(),
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
             raw_input: serde_json::json!({"command":"ls"}),
         });
-        s.apply_update(crate::client::SessionUpdate::ToolResult {
+        s.apply_update(SessionUpdate::ToolResult {
             session_id: "sess-1".to_string(),
             tool_call_id: "tc1".to_string(),
             name: "shell".to_string(),
@@ -627,7 +933,7 @@ mod tests {
     #[test]
     fn approval_request_sets_pending_approval() {
         let mut s = state();
-        s.apply_update(crate::client::SessionUpdate::ApprovalRequest {
+        s.apply_update(SessionUpdate::ApprovalRequest {
             session_id: "sess-1".to_string(),
             request_id: "req-1".to_string(),
             tool_name: "shell".to_string(),
@@ -643,7 +949,7 @@ mod tests {
     #[test]
     fn turn_commit_flushes_streaming_buffer() {
         let mut s = state();
-        s.apply_update(crate::client::SessionUpdate::AgentMessageChunk {
+        s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Done".to_string(),
         });

@@ -58,6 +58,7 @@ pub async fn run(rpc: &RpcClient, mut term: &mut config_manager::Term) -> Result
     config_app.init().await?;
     let mut acp_pane = acp::Acp::new(rpc);
     let mut chat_pane = chat::Chat::new(rpc);
+    chat_pane.init().await?;
     let mut logs_pane = logs::Logs::new(rpc);
     logs_pane.init().await?;
 
@@ -172,6 +173,7 @@ pub async fn run(rpc: &RpcClient, mut term: &mut config_manager::Term) -> Result
                     let in_text_input = match mode {
                         Mode::Dashboard => dashboard_pane.wants_text_input(),
                         Mode::Config => config_app.wants_text_input(),
+                        Mode::Chat => chat_pane.wants_text_input(),
                         Mode::Logs => logs_pane.wants_text_input(),
                         _ => false,
                     };
@@ -191,7 +193,7 @@ pub async fn run(rpc: &RpcClient, mut term: &mut config_manager::Term) -> Result
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, &mut term).await?,
                     Mode::ACP => acp_pane.handle_key(key),
-                    Mode::Chat => chat_pane.handle_key(key),
+                    Mode::Chat => chat_pane.handle_key(key).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                 };
                 if quit {
