@@ -487,7 +487,8 @@ mod tests {
 
     fn test_security_with_gated(cfg: &Config, patterns: Vec<&str>) -> Arc<SecurityPolicy> {
         Arc::new(
-            SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir)
+            SecurityPolicy::for_agent(cfg, TEST_AGENT)
+                .expect("test-agent has resolvable profiles")
                 .with_gated_commands(patterns.into_iter().map(String::from).collect()),
         )
     }
@@ -1037,7 +1038,11 @@ mod tests {
         // ordinary validate_command_execution rejection.
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security_with_gated(&cfg, vec!["echo *"]));
+        let tool = CronAddTool::new(
+            cfg.clone(),
+            test_security_with_gated(&cfg, vec!["echo *"]),
+            TEST_AGENT,
+        );
         let result = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "0 * * * *" },
@@ -1057,7 +1062,11 @@ mod tests {
     async fn non_gated_command_can_be_scheduled() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronAddTool::new(cfg.clone(), test_security_with_gated(&cfg, vec!["echo *"]));
+        let tool = CronAddTool::new(
+            cfg.clone(),
+            test_security_with_gated(&cfg, vec!["echo *"]),
+            TEST_AGENT,
+        );
         let result = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "0 * * * *" },
