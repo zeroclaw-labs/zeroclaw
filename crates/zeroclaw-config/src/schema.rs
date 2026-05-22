@@ -5628,6 +5628,9 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
+    #[serde(default)]
+    pub headed: Option<bool>,
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
@@ -5662,6 +5665,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
@@ -17859,6 +17863,7 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
@@ -17877,6 +17882,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
@@ -17896,6 +17902,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
@@ -17912,6 +17919,21 @@ default_temperature = 0.7
         assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
+    }
+
+    #[test]
+    async fn browser_config_parses_headed_true() {
+        let parsed: BrowserConfig = toml::from_str(
+            r#"
+backend = "agent_browser"
+headed = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.backend, "agent_browser");
+        assert_eq!(parsed.headed, Some(true));
+        assert!(parsed.native_headless);
     }
 
     #[test]
