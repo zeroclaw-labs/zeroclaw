@@ -13228,6 +13228,7 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-providers",
  "zeroclaw-runtime",
+ "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
 ]
 

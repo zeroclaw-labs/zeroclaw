@@ -23,43 +23,63 @@ pub mod media_pipeline;
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
+#[cfg(feature = "channel-bluesky")]
 pub use crate::bluesky::BlueskyChannel;
+#[cfg(feature = "channel-clawdtalk")]
 pub use crate::clawdtalk::ClawdTalkChannel;
+#[cfg(feature = "channel-dingtalk")]
 pub use crate::dingtalk::DingTalkChannel;
+#[cfg(feature = "channel-discord")]
 pub use crate::discord::DiscordChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-imessage")]
 pub use crate::imessage::IMessageChannel;
+#[cfg(feature = "channel-irc")]
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
 #[cfg(feature = "channel-line")]
 pub use crate::line::LineChannel;
+#[cfg(feature = "channel-linq")]
 pub use crate::linq::LinqChannel;
+#[cfg(feature = "channel-mattermost")]
 pub use crate::mattermost::MattermostChannel;
+#[cfg(feature = "channel-mochat")]
 pub use crate::mochat::MochatChannel;
+#[cfg(feature = "channel-nextcloud")]
 pub use crate::nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use crate::nostr::NostrChannel;
+#[cfg(feature = "channel-notion")]
 pub use crate::notion::NotionChannel;
+#[cfg(feature = "channel-qq")]
 pub use crate::qq::QQChannel;
+#[cfg(feature = "channel-reddit")]
 pub use crate::reddit::RedditChannel;
+#[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
+#[cfg(feature = "channel-slack")]
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
+#[cfg(feature = "channel-wati")]
 pub use crate::wati::WatiChannel;
+#[cfg(feature = "channel-webhook")]
 pub use crate::webhook::WebhookChannel;
 #[cfg(feature = "channel-wechat")]
 pub use crate::wechat::WeChatChannel;
+#[cfg(feature = "channel-wecom")]
 pub use crate::wecom::WeComChannel;
+#[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
@@ -95,9 +115,9 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -2409,6 +2429,50 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
+fn starts_with_visible_tool_call_tag_example(response: &str) -> bool {
+    let lower = response.trim_start().to_ascii_lowercase();
+    let starts_with_tool_tag = lower.starts_with("<tool_call")
+        || lower.starts_with("<toolcall")
+        || lower.starts_with("<tool-call")
+        || lower.starts_with("<invoke");
+
+    starts_with_tool_tag && zeroclaw_tool_call_parser::looks_like_tool_protocol_example(response)
+}
+
+fn should_suppress_top_level_tool_protocol_response(
+    response: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if zeroclaw_tool_call_parser::looks_like_tool_protocol_example(response) {
+        return false;
+    }
+
+    if zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope_for_known_tools(
+        response,
+        known_tool_names,
+    ) {
+        return true;
+    }
+
+    if let Some(kind) = zeroclaw_tool_call_parser::classify_tool_protocol_envelope(response) {
+        return matches!(
+            kind,
+            zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::TaggedToolCall
+        ) || (!known_tool_names.is_empty()
+            && (matches!(
+                kind,
+                zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::ToolResult
+            ) || zeroclaw_tool_call_parser::tool_protocol_envelope_mentions_known_tool(
+                response,
+                known_tool_names,
+            )));
+    }
+
+    // If the broad envelope detector still matches after classification failed,
+    // this is malformed internal protocol JSON rather than ordinary content.
+    zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2417,11 +2481,23 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip any [Used tools: ...] prefix that the LLM may have echoed from
     // history context. Trim first to handle leading/trailing whitespace.
     let trimmed_response = response.trim();
+    // Final channel guardrail: reuse the parser classifier so channel cleanup
+    // cannot drift from runtime tool-protocol detection.
+    if should_suppress_top_level_tool_protocol_response(trimmed_response, &known_tool_names) {
+        return String::new();
+    }
     let stripped_summary = strip_tool_summary_prefix(trimmed_response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
-    let stripped_xml = strip_tool_call_tags(&stripped_summary);
+    let stripped_xml = if starts_with_visible_tool_call_tag_example(&stripped_summary) {
+        stripped_summary
+    } else {
+        strip_tool_call_tags(&stripped_summary)
+    };
     // Strip isolated tool-call JSON artifacts
-    let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
+    let stripped_fenced_json =
+        strip_fenced_tool_protocol_artifacts(&stripped_xml, &known_tool_names);
+    let stripped_json =
+        strip_isolated_tool_json_artifacts(&stripped_fenced_json, &known_tool_names);
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
@@ -2549,6 +2625,31 @@ fn sanitize_tool_json_value(
     known_tool_names: &HashSet<String>,
     saw_tool_call_payload: bool,
 ) -> Option<(String, bool)> {
+    if let Some(kind) =
+        zeroclaw_tool_call_parser::classify_tool_protocol_envelope(&value.to_string())
+    {
+        if known_tool_names.is_empty() {
+            return None;
+        }
+
+        if matches!(
+            kind,
+            zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::ToolResult
+        ) {
+            return Some((String::new(), true));
+        }
+
+        if !zeroclaw_tool_call_parser::tool_protocol_envelope_mentions_known_tool(
+            &value.to_string(),
+            known_tool_names,
+        ) {
+            return None;
+        }
+
+        let content = safe_protocol_envelope_content(value);
+        return Some((content, true));
+    }
+
     if is_tool_call_payload(value, known_tool_names) {
         return Some((String::new(), true));
     }
@@ -2588,6 +2689,23 @@ fn sanitize_tool_json_value(
     None
 }
 
+fn safe_protocol_envelope_content(value: &serde_json::Value) -> String {
+    let content = value
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if content.is_empty()
+        || zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(content)
+        || zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope(content)
+    {
+        return String::new();
+    }
+
+    content.to_string()
+}
+
 fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
     let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
     let line_end = message[end..]
@@ -2595,6 +2713,119 @@ fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> boo
         .map_or(message.len(), |idx| end + idx);
 
     message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
+}
+
+fn is_inside_markdown_code_fence(message: &str, index: usize) -> bool {
+    // This intentionally uses a lightweight fence parity check. The sanitizer only
+    // needs to avoid re-processing JSON in ordinary triple-backtick fences that
+    // `strip_fenced_tool_protocol_artifacts` already handles; it is not a full
+    // Markdown parser for inline code spans or longer fence runs.
+    let mut in_fence = false;
+    let mut cursor = 0usize;
+    while let Some(rel_pos) = message[cursor..index].find("```") {
+        in_fence = !in_fence;
+        cursor += rel_pos + 3;
+    }
+    in_fence
+}
+
+fn isolated_malformed_tool_protocol_segment_end(
+    message: &str,
+    start: usize,
+    known_tool_names: &HashSet<String>,
+) -> Option<usize> {
+    let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    if !message[line_start..start].trim().is_empty() {
+        return None;
+    }
+
+    let mut end = start;
+    // Malformed JSON has no serde byte offset. Scan forward from an isolated
+    // JSON candidate start, but stop before ordinary prose resumes.
+    for line in message[start..].split_inclusive('\n') {
+        let trimmed = line.trim();
+        if end > start
+            && !trimmed.is_empty()
+            && !trimmed.starts_with(['{', '[', ']', '}'])
+            && !trimmed.starts_with('"')
+        {
+            break;
+        }
+        end += line.len();
+        let candidate = &message[start..end];
+        if zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope_for_known_tools(
+            candidate,
+            known_tool_names,
+        ) {
+            return Some(end);
+        }
+    }
+
+    None
+}
+
+fn is_tool_protocol_fence_language(language: &str) -> bool {
+    let lower = language.trim().to_ascii_lowercase();
+    lower == "tool_call"
+        || lower == "toolcall"
+        || lower == "tool-call"
+        || lower == "invoke"
+        || lower
+            .strip_prefix("tool")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) && !rest.trim().is_empty())
+}
+
+fn strip_fenced_tool_protocol_artifacts(
+    message: &str,
+    known_tool_names: &HashSet<String>,
+) -> String {
+    if zeroclaw_tool_call_parser::looks_like_tool_protocol_example(message) {
+        return message.to_string();
+    }
+
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_open) = message[cursor..].find("```") {
+        let open_start = cursor + rel_open;
+        let language_start = open_start + 3;
+        let Some(line_end_rel) = message[language_start..].find('\n') else {
+            break;
+        };
+        let line_end = language_start + line_end_rel;
+        let language = message[language_start..line_end]
+            .trim()
+            .trim_end_matches('\r');
+        let body_start = line_end + 1;
+        let Some(close_rel) = message[body_start..].find("```") else {
+            break;
+        };
+        let close_start = body_start + close_rel;
+        let close_end = close_start + 3;
+
+        let fence_block = &message[open_start..close_end];
+        let should_strip = if language.eq_ignore_ascii_case("json") {
+            should_suppress_top_level_tool_protocol_response(
+                message[body_start..close_start].trim(),
+                known_tool_names,
+            )
+        } else {
+            is_tool_protocol_fence_language(language)
+                && zeroclaw_tool_call_parser::contains_tool_protocol_tag_call(fence_block)
+        };
+
+        if should_strip {
+            cleaned.push_str(&message[cursor..open_start]);
+            cursor = close_end;
+            continue;
+        }
+
+        cleaned.push_str(&message[cursor..close_end]);
+        cursor = close_end;
+    }
+
+    cleaned.push_str(&message[cursor..]);
+    cleaned
 }
 
 fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
@@ -2610,6 +2841,14 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
 
         let start = cursor + rel_start;
         cleaned.push_str(&message[cursor..start]);
+        if is_inside_markdown_code_fence(message, start) {
+            let Some(ch) = message[start..].chars().next() else {
+                break;
+            };
+            cleaned.push(ch);
+            cursor = start + ch.len_utf8();
+            continue;
+        }
 
         let candidate = &message[start..];
         let mut stream =
@@ -2633,6 +2872,13 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
                     continue;
                 }
             }
+        }
+
+        if let Some(end) =
+            isolated_malformed_tool_protocol_segment_end(message, start, known_tool_names)
+        {
+            cursor = end;
+            continue;
         }
 
         let Some(ch) = message[start..].chars().next() else {
@@ -3603,6 +3849,9 @@ async fn process_channel_message_body(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
+                        ctx.prompt_config
+                            .agent(ctx.agent_alias.as_str())
+                            .is_some_and(|agent| agent.strict_tool_parsing),
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
@@ -4656,6 +4905,7 @@ fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
         #[cfg(feature = "channel-telegram")]
@@ -4683,6 +4933,7 @@ fn build_channel_by_id(
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
+        #[cfg(feature = "channel-discord")]
         "discord" => {
             let dc = config
                 .channels
@@ -4716,6 +4967,11 @@ fn build_channel_by_id(
                 .with_approval_timeout_secs(dc.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-discord"))]
+        "discord" => {
+            anyhow::bail!("Discord channel requires the `channel-discord` feature");
+        }
+        #[cfg(feature = "channel-slack")]
         "slack" => {
             let sl = config
                 .channels
@@ -4744,6 +5000,11 @@ fn build_channel_by_id(
                 .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-slack"))]
+        "slack" => {
+            anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-mattermost")]
         "mattermost" => {
             let mm = config
                 .channels
@@ -4772,6 +5033,11 @@ fn build_channel_by_id(
                 .with_discover_dms(mm.discover_dms.unwrap_or(true)),
             ))
         }
+        #[cfg(not(feature = "channel-mattermost"))]
+        "mattermost" => {
+            anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
+        }
+        #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
                 .channels
@@ -4797,6 +5063,10 @@ fn build_channel_by_id(
                 )
                 .with_approval_timeout_secs(sg.approval_timeout_secs),
             ))
+        }
+        #[cfg(not(feature = "channel-signal"))]
+        "signal" => {
+            anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -4856,6 +5126,7 @@ fn build_channel_by_id(
                 anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
             }
         }
+        #[cfg(feature = "channel-qq")]
         "qq" => {
             let qq = config
                 .channels
@@ -4874,6 +5145,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-qq"))]
+        "qq" => {
+            anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
         "lark" => {
             #[cfg(feature = "channel-lark")]
@@ -4896,6 +5171,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Lark channel requires the `channel-lark` feature");
             }
         }
+        #[cfg(feature = "channel-dingtalk")]
         "dingtalk" => {
             let dt = config
                 .channels
@@ -4918,6 +5194,11 @@ fn build_channel_by_id(
                 .with_proxy_url(dt.proxy_url.clone()),
             ))
         }
+        #[cfg(not(feature = "channel-dingtalk"))]
+        "dingtalk" => {
+            anyhow::bail!("DingTalk channel requires the `channel-dingtalk` feature");
+        }
+        #[cfg(feature = "channel-wecom")]
         "wecom" => {
             let wc = config
                 .channels
@@ -4935,6 +5216,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-wecom"))]
+        "wecom" => {
+            anyhow::bail!("WeCom channel requires the `channel-wecom` feature");
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -4955,7 +5240,7 @@ fn build_channel_by_id(
                     peer_resolver,
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
-                    wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                    wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_persistence(config_arc.clone())
                 .with_workspace_dir(config.data_dir.clone()),
@@ -4965,6 +5250,7 @@ fn build_channel_by_id(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-nextcloud")]
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -4993,6 +5279,11 @@ fn build_channel_by_id(
                 .with_streaming(nc.stream_mode, nc.draft_update_interval_ms),
             ))
         }
+        #[cfg(not(feature = "channel-nextcloud"))]
+        "nextcloud_talk" | "nextcloud-talk" => {
+            anyhow::bail!("Nextcloud Talk channel requires the `channel-nextcloud` feature");
+        }
+        #[cfg(feature = "channel-wati")]
         "wati" => {
             let wati_cfg = config
                 .channels
@@ -5014,6 +5305,11 @@ fn build_channel_by_id(
                 wati_cfg.proxy_url.clone(),
             )))
         }
+        #[cfg(not(feature = "channel-wati"))]
+        "wati" => {
+            anyhow::bail!("WATI channel requires the `channel-wati` feature");
+        }
+        #[cfg(feature = "channel-linq")]
         "linq" => {
             let lq = config
                 .channels
@@ -5032,6 +5328,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-linq"))]
+        "linq" => {
+            anyhow::bail!("Linq channel requires the `channel-linq` feature");
         }
         #[cfg(feature = "channel-email")]
         "email" => {
@@ -5071,6 +5371,7 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(feature = "channel-irc")]
         "irc" => {
             let irc_cfg = config
                 .channels
@@ -5098,6 +5399,11 @@ fn build_channel_by_id(
                 mention_only: irc_cfg.mention_only,
             })))
         }
+        #[cfg(not(feature = "channel-irc"))]
+        "irc" => {
+            anyhow::bail!("IRC channel requires the `channel-irc` feature");
+        }
+        #[cfg(feature = "channel-twitter")]
         "twitter" => {
             let tw = config
                 .channels
@@ -5116,6 +5422,11 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(not(feature = "channel-twitter"))]
+        "twitter" => {
+            anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
+        }
+        #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
                 .channels
@@ -5136,6 +5447,11 @@ fn build_channel_by_id(
                 mc.poll_interval_secs,
             )))
         }
+        #[cfg(not(feature = "channel-mochat"))]
+        "mochat" => {
+            anyhow::bail!("Mochat channel requires the `channel-mochat` feature");
+        }
+        #[cfg(feature = "channel-imessage")]
         "imessage" => {
             if !config.channels.imessage.contains_key("default") {
                 anyhow::bail!("iMessage channel is not configured");
@@ -5147,6 +5463,10 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("imessage", &alias))
             };
             Ok(Arc::new(IMessageChannel::new(alias, peer_resolver)))
+        }
+        #[cfg(not(feature = "channel-imessage"))]
+        "imessage" => {
+            anyhow::bail!("iMessage channel requires the `channel-imessage` feature");
         }
         "line" => {
             #[cfg(feature = "channel-line")]
@@ -5289,6 +5609,7 @@ fn collect_configured_channels(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[allow(unused_mut)]
     let mut channels = Vec::new();
 
     // Shadow `config` with a read guard so the existing body keeps
@@ -5340,6 +5661,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
         if !active_channel_aliases.contains(&format!("discord.{alias}")) {
             continue;
@@ -5394,6 +5716,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-slack")]
     for (alias, sl) in &config.channels.slack {
         if !active_channel_aliases.contains(&format!("slack.{alias}")) {
             continue;
@@ -5431,6 +5754,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-mattermost")]
     for (alias, mm) in &config.channels.mattermost {
         if !active_channel_aliases.contains(&format!("mattermost.{alias}")) {
             continue;
@@ -5466,6 +5790,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-imessage")]
     for (alias, im) in &config.channels.imessage {
         if !active_channel_aliases.contains(&format!("imessage.{alias}")) {
             continue;
@@ -5542,6 +5867,7 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-signal")]
     for (alias, sig) in &config.channels.signal {
         if !active_channel_aliases.contains(&format!("signal.{alias}")) {
             continue;
@@ -5574,6 +5900,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
     for (alias, wa) in &config.channels.whatsapp {
         if !active_channel_aliases.contains(&format!("whatsapp.{alias}")) {
             continue;
@@ -5593,6 +5920,7 @@ fn collect_configured_channels(
         match wa.backend_type() {
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
+                #[cfg(feature = "channel-whatsapp-cloud")]
                 if wa.is_cloud_config() {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
@@ -5622,6 +5950,15 @@ fn collect_configured_channels(
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
+                    );
+                }
+                #[cfg(not(feature = "channel-whatsapp-cloud"))]
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "WhatsApp Cloud API backend requires 'channel-whatsapp-cloud' feature. Build/run with --features channel-whatsapp-cloud"
                     );
                 }
             }
@@ -5678,6 +6015,7 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "channel-linq")]
     for (alias, lq) in &config.channels.linq {
         if !active_channel_aliases.contains(&format!("linq.{alias}")) {
             continue;
@@ -5702,6 +6040,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-wati")]
     for (alias, wati_cfg) in &config.channels.wati {
         if !active_channel_aliases.contains(&format!("wati.{alias}")) {
             continue;
@@ -5730,6 +6069,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-nextcloud")]
     for (alias, nc) in &config.channels.nextcloud_talk {
         if !active_channel_aliases.contains(&format!("nextcloud_talk.{alias}")) {
             continue;
@@ -5808,6 +6148,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-irc")]
     for (alias, irc) in &config.channels.irc {
         if !active_channel_aliases.contains(&format!("irc.{alias}")) {
             continue;
@@ -5908,6 +6249,7 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-dingtalk")]
     for (alias, dt) in &config.channels.dingtalk {
         if !active_channel_aliases.contains(&format!("dingtalk.{alias}")) {
             continue;
@@ -5935,6 +6277,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-qq")]
     for (alias, qq) in &config.channels.qq {
         if !active_channel_aliases.contains(&format!("qq.{alias}")) {
             continue;
@@ -5963,6 +6306,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-twitter")]
     for (alias, tw) in &config.channels.twitter {
         if !active_channel_aliases.contains(&format!("twitter.{alias}")) {
             continue;
@@ -5986,6 +6330,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
             continue;
@@ -6011,6 +6356,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-wecom")]
     for (alias, wc) in &config.channels.wecom {
         if !active_channel_aliases.contains(&format!("wecom.{alias}")) {
             continue;
@@ -6052,7 +6398,7 @@ fn collect_configured_channels(
             peer_resolver,
             wechat.api_base_url.clone(),
             wechat.cdn_base_url.clone(),
-            wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+            wechat.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
         ) {
             Ok(channel) => {
                 channels.push(ConfiguredChannel {
@@ -6086,6 +6432,7 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "channel-clawdtalk")]
     for (alias, ct) in &config.channels.clawdtalk {
         if !active_channel_aliases.contains(&format!("clawdtalk.{alias}")) {
             continue;
@@ -6101,6 +6448,7 @@ fn collect_configured_channels(
     }
 
     // Notion database poller channel
+    #[cfg(feature = "channel-notion")]
     if config.notion.enabled && !config.notion.database_id.trim().is_empty() {
         let notion_api_key = config.notion.api_key.trim().to_string();
         if notion_api_key.is_empty() {
@@ -6130,6 +6478,7 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "channel-reddit")]
     for (alias, rd) in &config.channels.reddit {
         if !active_channel_aliases.contains(&format!("reddit.{alias}")) {
             continue;
@@ -6151,6 +6500,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-bluesky")]
     for (alias, bs) in &config.channels.bluesky {
         if !active_channel_aliases.contains(&format!("bluesky.{alias}")) {
             continue;
@@ -6203,6 +6553,7 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "channel-webhook")]
     for (alias, wh) in &config.channels.webhook {
         if !active_channel_aliases.contains(&format!("webhook.{alias}")) {
             continue;
@@ -6745,6 +7096,12 @@ pub async fn start_channels(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+            native_tools,
+            agent.strict_tool_parsing,
+            &mut tool_descs,
+            &mut deferred_section,
+        );
         let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
             &workspace,
             &model,
@@ -6758,7 +7115,7 @@ pub async fn start_channels(
             agent.compact_context,
             agent.max_system_prompt_chars,
         );
-        if !native_tools {
+        if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 tools_registry.as_ref(),
                 &effective_tool_names,
@@ -7235,6 +7592,7 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
+    let _ = config;
 
     // Scan for credential leaks before delivering
     let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
@@ -7265,6 +7623,7 @@ pub async fn deliver_announcement(
         ))
     })?;
     let channel_type = raw_type.to_ascii_lowercase();
+    #[allow(unused_variables)]
     let not_configured = || {
         ::zeroclaw_log::record!(
             ERROR,
@@ -7289,6 +7648,7 @@ pub async fn deliver_announcement(
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(feature = "channel-discord")]
         "discord" => {
             let dc = config
                 .channels
@@ -7310,6 +7670,11 @@ pub async fn deliver_announcement(
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-discord"))]
+        "discord" => {
+            anyhow::bail!("Discord channel requires the `channel-discord` feature");
+        }
+        #[cfg(feature = "channel-slack")]
         "slack" => {
             let sl = config
                 .channels
@@ -7329,6 +7694,11 @@ pub async fn deliver_announcement(
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-slack"))]
+        "slack" => {
+            anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
                 .channels
@@ -7349,6 +7719,10 @@ pub async fn deliver_announcement(
                 sg.ignore_stories,
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-signal"))]
+        "signal" => {
+            anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -7374,6 +7748,7 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-webhook")]
         "webhook" => {
             let wh = config
                 .channels
@@ -7391,9 +7766,19 @@ pub async fn deliver_announcement(
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-webhook"))]
+        "webhook" => {
+            anyhow::bail!("Webhook channel requires the `channel-webhook` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
+    #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(feature = "channel-wechat")]
+fn expand_tilde_in_path(path: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
 #[cfg(test)]
@@ -7825,6 +8210,20 @@ mod tests {
         assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
         assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
         assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    #[test]
+    fn expand_tilde_in_path_expands_home_prefix() {
+        let expanded = expand_tilde_in_path("~/wechat-state");
+        assert!(!expanded.starts_with("~"));
+        assert!(expanded.ends_with("wechat-state"));
+
+        let absolute = expand_tilde_in_path("/absolute/path");
+        assert_eq!(absolute, PathBuf::from("/absolute/path"));
+
+        let relative = expand_tilde_in_path("relative/path");
+        assert_eq!(relative, PathBuf::from("relative/path"));
     }
 
     #[test]
@@ -11815,6 +12214,49 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_strict_non_native_prompt_hides_text_tool_protocol() {
+        let ws = make_workspace();
+        let mut tool_descs = vec![("shell", "Run commands")];
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+
+        let expose_text_protocol =
+            apply_text_tool_prompt_policy(false, true, &mut tool_descs, &mut deferred_section);
+
+        let mut prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "gpt-4o",
+            &tool_descs,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+        );
+        if expose_text_protocol {
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+            let effective_tool_names: HashSet<&str> =
+                tools_registry.iter().map(|tool| tool.name()).collect();
+            prompt.push_str(&build_tool_instructions_for_names(
+                &tools_registry,
+                &effective_tool_names,
+            ));
+        }
+        if !deferred_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&deferred_section);
+        }
+
+        assert!(!expose_text_protocol);
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(!prompt.contains("<tool_call>"));
+        assert!(!prompt.contains("mcp__example"));
+    }
+
+    #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -13559,6 +14001,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(state, ChannelHealthState::Timeout);
     }
 
+    #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
         let mut config = Config::default();
@@ -15202,6 +15645,299 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_schema_json_array_without_tools() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
+
+        let result = sanitize_channel_response(schema, &tools);
+
+        assert_eq!(result, schema);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_calls_audit_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let audit_json =
+            r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
+
+        let result = sanitize_channel_response(audit_json, &tools);
+
+        assert_eq!(result, audit_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_reference_function_call_json_without_tools() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let reference_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(reference_json, &tools);
+
+        assert_eq!(result, reference_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_reference_function_call_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let reference_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(reference_json, &tools);
+
+        assert_eq!(result, reference_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_unknown_tool_calls_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}]}"#;
+
+        let result = sanitize_channel_response(business_json, &tools);
+
+        assert_eq!(result, business_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_malformed_unknown_tool_calls_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(business_json, &tools);
+
+        assert_eq!(result, business_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_json_fenced_tool_protocol_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"Here is a protocol example:
+```json
+{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
+```"#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_registered_tool_json_array() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"[{"name":"mock_price","parameters":{"symbol":"BTC"}}]"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_internal_tool_protocol_envelopes() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"{"toolcalls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_json_fenced_internal_tool_protocol() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"```json
+{"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_json_fenced_internal_tool_protocol() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = r#"Intro
+```json
+{"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
+```
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("mock_price"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_tool_call_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = r#"Let me call it:
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_call"));
+        assert!(!result.contains("shell"));
+        assert!(!result.contains("command"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_call_fenced_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_standalone_tool_call_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_standalone_tool_name_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"```tool shell
+{"command":"pwd"}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_call_tag_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+This is an example, not an invocation."#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_tagged_tool_call_before_trailing_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert_eq!(result, "Done.");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_malformed_top_level_protocol() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"{"tool_call_id":"call_1","content":"raw"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_malformed_protocol_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response =
+            "Intro\n{\"tool_calls\":[{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}\nDone";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done"));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("arguments"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_multiline_embedded_malformed_protocol_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = "Intro\n{\n  \"tool_calls\": [{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}}\nDone";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done"));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("arguments"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_keeps_protocol_explanation_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let explanation =
+            "A markdown block starting with ```tool can be used in protocol examples.";
+
+        let result = sanitize_channel_response(explanation, &tools);
+
+        assert_eq!(result, explanation);
+    }
+
+    #[test]
+    fn sanitize_channel_response_keeps_safe_protocol_envelope_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = "Intro text\n{\"content\":\"A markdown block starting with ```tool can be used in examples.\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("A markdown block starting with ```tool"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_calls"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_isolated_tool_result_envelope_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response =
+            "Intro text\n{\"tool_call_id\":\"call_1\",\"content\":\"raw tool output\"}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_call_id"));
+        assert!(!result.contains("raw tool output"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_nested_protocol_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = "Intro text\n{\"content\":\"{\\\"toolcalls\\\":[{\\\"name\\\":\\\"mock_price\\\",\\\"arguments\\\":{\\\"symbol\\\":\\\"BTC\\\"}}]}\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("toolcalls"));
+        assert!(!result.contains("shell"));
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──

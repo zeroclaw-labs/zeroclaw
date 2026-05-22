@@ -14,6 +14,7 @@ zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
