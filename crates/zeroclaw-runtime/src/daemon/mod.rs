@@ -1273,6 +1273,7 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
+                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
@@ -1310,6 +1311,7 @@ mod tests {
         let mut config = Config::default();
         config.channels.mattermost.insert(
             "default".to_string(),
+                default_target: None,
             zeroclaw_config::schema::MattermostConfig {
                 enabled: true,
                 url: "https://mattermost.example.com".into(),
@@ -1444,6 +1446,7 @@ mod tests {
         config.heartbeat.to = Some("123456".into());
         config.channels.telegram.insert(
             "default".to_string(),
+                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
@@ -1469,6 +1472,7 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
+                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),

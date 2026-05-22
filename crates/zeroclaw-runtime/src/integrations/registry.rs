@@ -225,6 +225,7 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
+                default_target: None,
             TelegramConfig {
                 enabled: true,
                 bot_token: "123:ABC".into(),
@@ -283,6 +284,7 @@ mod tests {
         let mut config = Config::default();
         config.channels.matrix.insert(
             "default".to_string(),
+                default_target: None,
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
