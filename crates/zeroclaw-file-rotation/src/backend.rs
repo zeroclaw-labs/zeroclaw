@@ -102,6 +102,14 @@ impl BackendState {
                 .map_err(|e| RotationError::io(&self.path, e))?;
         }
 
+        // Flush before dropping to ensure data reaches the OS buffer cache.
+        // tokio::fs::File::write_all returns Ready once data is submitted to
+        // the blocking thread, not once it is written to the fd. Without an
+        // explicit flush, a synchronous drop may close the fd before the
+        // blocking thread completes the write, silently losing data.
+        file.flush()
+            .await
+            .map_err(|e| RotationError::io(&self.path, e))?;
         drop(file);
 
         // 5. Re-apply permissions after write (in case OS changed them)
