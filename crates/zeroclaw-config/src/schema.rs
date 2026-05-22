@@ -2802,6 +2802,11 @@ pub struct AliasedAgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// When true, only native provider tool calls are executable. Text fallback
+    /// parsing remains disabled, so XML/markdown/GLM-looking text is treated as
+    /// final assistant text.
+    #[serde(default)]
+    pub strict_tool_parsing: bool,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
@@ -2910,6 +2915,7 @@ impl Default for AliasedAgentConfig {
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -16367,6 +16373,7 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(!cfg.strict_tool_parsing);
     }
 
     #[test]
@@ -16379,6 +16386,7 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -16390,6 +16398,7 @@ tool_dispatcher = "xml"
         assert_eq!(agent.max_history_messages, 80);
         assert!(agent.parallel_tools);
         assert_eq!(agent.tool_dispatcher, "xml");
+        assert!(agent.strict_tool_parsing);
     }
 
     #[test]
