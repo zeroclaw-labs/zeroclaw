@@ -66,11 +66,12 @@ pub(crate) fn list_scroll(
 /// regions.
 pub(crate) fn tab_click_index(
     mouse_col: u16,
+    mouse_row: u16,
     tab_area: Rect,
     labels: &[&str],
     sep_width: usize,
 ) -> Option<usize> {
-    if !in_rect(mouse_col, tab_area.y, tab_area) {
+    if !in_rect(mouse_col, mouse_row, tab_area) {
         return None;
     }
     let mut x = tab_area.x as usize;

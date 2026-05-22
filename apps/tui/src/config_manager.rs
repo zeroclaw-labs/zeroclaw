@@ -286,6 +286,7 @@ impl<'a> App<'a> {
                         let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
                         if let Some(idx) = mouse::tab_click_index(
                             mouse.column,
+                            mouse.row,
                             tab_rect,
                             &display_refs,
                             3, // " │ " separator

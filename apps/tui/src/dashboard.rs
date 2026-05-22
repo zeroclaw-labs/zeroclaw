@@ -95,6 +95,7 @@ pub(crate) struct Dashboard<'a> {
     tab_area: Rect,
     list_area: Rect,
     detail_area: Option<Rect>,
+    double_click: mouse::DoubleClickTracker,
 }
 
 impl<'a> Dashboard<'a> {
@@ -130,6 +131,7 @@ impl<'a> Dashboard<'a> {
             tab_area: Rect::default(),
             list_area: Rect::default(),
             detail_area: None,
+            double_click: mouse::DoubleClickTracker::new(),
         }
     }
 
@@ -1571,13 +1573,13 @@ impl<'a> Dashboard<'a> {
             MouseEventKind::Down(MouseButton::Left) => {
                 // Tab bar clicks
                 let labels: Vec<&str> = TABS.iter().map(|t| t.label()).collect();
-                if let Some(idx) = mouse::tab_click_index(col, self.tab_area, &labels, 3) {
+                if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &labels, 3) {
                     self.tab = TABS[idx];
                     return;
                 }
 
                 // List clicks
-                if mouse::in_rect(col, row, self.list_area) {
+                if mouse::in_rect(col, row, self.list_area) && self.has_detail_pane() {
                     let count = self.active_list_count();
                     let list_area = self.list_area;
                     let state = self.active_list_state_mut();
@@ -1585,6 +1587,14 @@ impl<'a> Dashboard<'a> {
                         mouse::list_click_index(row, list_area, state.offset(), count)
                     {
                         state.select(Some(idx));
+                        if self.detail_open {
+                            self.detail_scroll = 0;
+                        }
+                        if self.double_click.click(col, row) {
+                            self.detail_open = true;
+                            self.detail_scroll = 0;
+                            self.detail_pct = 50;
+                        }
                     }
                 }
             }
