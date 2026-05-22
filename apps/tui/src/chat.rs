@@ -272,6 +272,12 @@ impl<'a> Chat<'a> {
                         .await;
                 }
             }
+            KeyCode::Left => {
+                state.move_cursor_left();
+            }
+            KeyCode::Right => {
+                state.move_cursor_right();
+            }
             KeyCode::Char(c) => {
                 if !state.turn_in_flight {
                     state.push_input_char(c);
@@ -394,11 +400,11 @@ fn render(f: &mut Frame, state: &ChatState, area: Rect) {
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
     } else {
-        // Place the terminal cursor at the end of the input text.
-        // Clamp to the inner width so it never lands on the right border.
+        // Place the terminal cursor at the editing position.
+        // Visual column = char count of the text before the cursor byte offset.
         let ia = chunks[1];
-        let cx = (ia.x + 1 + state.input().chars().count() as u16)
-            .min(ia.x + ia.width.saturating_sub(2));
+        let visual = state.input()[..state.cursor()].chars().count() as u16;
+        let cx = (ia.x + 1 + visual).min(ia.x + ia.width.saturating_sub(2));
         f.set_cursor_position((cx, ia.y + 1));
     }
 }
@@ -652,6 +658,8 @@ pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
     input: String,
+    /// Byte offset of the editing cursor within `input`. Always on a char boundary.
+    cursor: usize,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
@@ -665,6 +673,7 @@ impl ChatState {
             session_id,
             agent_alias,
             input: String::new(),
+            cursor: 0,
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -677,15 +686,48 @@ impl ChatState {
         &self.input
     }
 
-    pub fn push_input_char(&mut self, c: char) {
-        self.input.push(c);
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
+    /// Insert `c` at the cursor position and advance the cursor.
+    pub fn push_input_char(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character immediately before the cursor (backspace).
     pub fn pop_input_char(&mut self) {
-        self.input.pop();
+        if self.cursor > 0 {
+            let prev = self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.input.remove(prev);
+            self.cursor = prev;
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor < self.input.len() {
+            let c = self.input[self.cursor..].chars().next().unwrap();
+            self.cursor += c.len_utf8();
+        }
     }
 
     pub fn take_input(&mut self) -> String {
+        self.cursor = 0;
         std::mem::take(&mut self.input)
     }
 
