@@ -2,15 +2,15 @@
 setlocal enabledelayedexpansion
 
 :: ============================================================================
-:: ZeroClaw Windows Setup Script
-:: Simplifies building and installing ZeroClaw on Windows.
+:: QuantClaw Windows Setup Script
+:: Simplifies building and installing QuantClaw on Windows.
 :: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
 :: ============================================================================
 
 set "VERSION=0.6.2"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
-set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
+set "REPO=https://github.com/quant-speed/quantclaw"
 
 :: Colors via ANSI (Windows 10+ Terminal)
 set "GREEN=[32m"
@@ -32,7 +32,7 @@ if "%~1"=="--full"     set "MODE=full"     & goto :start
 :start
 echo.
 echo %BOLD%%BLUE%=========================================%RESET%
-echo %BOLD%%BLUE%  ZeroClaw Windows Setup  v%VERSION%%RESET%
+echo %BOLD%%BLUE%  QuantClaw Windows Setup  v%VERSION%%RESET%
 echo %BOLD%%BLUE%=========================================%RESET%
 echo.
 
@@ -158,11 +158,11 @@ if %ERRORLEVEL% EQU 0 (
 
 if not defined DOWNLOAD_URL (
     :: Fallback: construct URL from known release pattern
-    set "DOWNLOAD_URL=https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-%TARGET%.zip"
+    set "DOWNLOAD_URL=https://github.com/quant-speed/quantclaw/releases/latest/download/quantclaw-%TARGET%.zip"
 )
 
 echo   Downloading from release...
-curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
+curl -sSfL -o "%TEMP%\quantclaw-windows.zip" "!DOWNLOAD_URL!"
 if %ERRORLEVEL% NEQ 0 (
     echo   %YELLOW%Prebuilt binary not available. Falling back to source build - standard%RESET%
     goto :build_standard
@@ -170,17 +170,17 @@ if %ERRORLEVEL% NEQ 0 (
 
 :: Extract
 echo   Extracting...
-mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
-tar -xf "%TEMP%\zeroclaw-windows.zip" -C "%USERPROFILE%\.zeroclaw\bin"
+mkdir "%USERPROFILE%\.quantclaw\bin" 2>nul
+tar -xf "%TEMP%\quantclaw-windows.zip" -C "%USERPROFILE%\.quantclaw\bin"
 if %ERRORLEVEL% NEQ 0 (
-    powershell -Command "Expand-Archive -Force '%TEMP%\zeroclaw-windows.zip' '%USERPROFILE%\.zeroclaw\bin'"
+    powershell -Command "Expand-Archive -Force '%TEMP%\quantclaw-windows.zip' '%USERPROFILE%\.quantclaw\bin'"
 )
 
 :: Add to PATH if not already there
-echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
+echo %PATH% | findstr /I /C:".quantclaw\bin" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
-    set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
+    setx PATH "%PATH%;%USERPROFILE%\.quantclaw\bin" >nul 2>&1
+    set "PATH=%PATH%;%USERPROFILE%\.quantclaw\bin"
     echo   %GREEN%OK%RESET% Added to PATH
 )
 
@@ -208,15 +208,15 @@ goto :do_build
 :: ---- Build from source ----
 :do_build
 echo.
-echo %BOLD%[3/5] Building ZeroClaw (%BUILD_DESC%)...%RESET%
+echo %BOLD%[3/5] Building QuantClaw (%BUILD_DESC%)...%RESET%
 echo   Target: %TARGET%
 
 :: Ensure we're in the repo root (check for Cargo.toml)
 if not exist "Cargo.toml" (
-    echo   %RED%ERROR: Cargo.toml not found. Run this script from the zeroclaw repository root.%RESET%
+    echo   %RED%ERROR: Cargo.toml not found. Run this script from the quantclaw repository root.%RESET%
     echo   Example:
     echo     git clone %REPO%
-    echo     cd zeroclaw
+    echo     cd quantclaw
     echo     setup.bat
     goto :error_exit
 )
@@ -243,15 +243,15 @@ echo   %GREEN%OK%RESET% Build succeeded.
 :: Copy binary to a convenient location
 echo.
 echo %BOLD%[4/5] Installing binary...%RESET%
-mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
-copy /Y "target\%TARGET%\release\zeroclaw.exe" "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" >nul
-echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+mkdir "%USERPROFILE%\.quantclaw\bin" 2>nul
+copy /Y "target\%TARGET%\release\quantclaw.exe" "%USERPROFILE%\.quantclaw\bin\quantclaw.exe" >nul
+echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.quantclaw\bin\quantclaw.exe
 
 :: Add to PATH if not already there
-echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
+echo %PATH% | findstr /I /C:".quantclaw\bin" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
-    set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
+    setx PATH "%PATH%;%USERPROFILE%\.quantclaw\bin" >nul 2>&1
+    set "PATH=%PATH%;%USERPROFILE%\.quantclaw\bin"
     echo   %GREEN%OK%RESET% Added to PATH
 )
 
@@ -262,15 +262,15 @@ goto verify
 echo.
 echo %BOLD%[5/5] Verifying installation...%RESET%
 
-"%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" --version >nul 2>&1
+"%USERPROFILE%\.quantclaw\bin\quantclaw.exe" --version >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
-    for /f "tokens=*" %%v in ('"%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" --version 2^>nul') do (
+    for /f "tokens=*" %%v in ('"%USERPROFILE%\.quantclaw\bin\quantclaw.exe" --version 2^>nul') do (
         echo   %GREEN%OK%RESET% %%v
     )
 ) else (
-    zeroclaw --version >nul 2>&1
+    quantclaw --version >nul 2>&1
     if %ERRORLEVEL% EQU 0 (
-        for /f "tokens=*" %%v in ('zeroclaw --version 2^>nul') do (
+        for /f "tokens=*" %%v in ('quantclaw --version 2^>nul') do (
             echo   %GREEN%OK%RESET% %%v
         )
     ) else (
@@ -280,7 +280,7 @@ if %ERRORLEVEL% EQU 0 (
 
 echo.
 echo %BOLD%%GREEN%=========================================%RESET%
-echo %BOLD%%GREEN%  ZeroClaw setup complete!%RESET%
+echo %BOLD%%GREEN%  QuantClaw setup complete!%RESET%
 echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
@@ -289,17 +289,17 @@ echo     2. Run: zeroclaw onboard
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
 echo.
 echo   Alternative install via Scoop:
-echo     scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
-echo     scoop install zeroclaw
+echo     scoop bucket add quantclaw https://github.com/quant-speed/scoop-quantclaw
+echo     scoop install quantclaw
 echo.
-echo   Documentation: https://github.com/zeroclaw-labs/zeroclaw
+echo   Documentation: https://github.com/quant-speed/quantclaw
 echo.
 goto :end
 
 :: ---- Help ----
 :show_help
 echo.
-echo ZeroClaw Windows Setup Script
+echo QuantClaw Windows Setup Script
 echo.
 echo Usage: setup.bat [OPTIONS]
 echo.

@@ -1,4 +1,4 @@
-//! Performance benchmarks for ZeroClaw hot paths.
+//! Performance benchmarks for QuantClaw hot paths.
 //!
 //! Benchmarks cover:
 //!   - Tool dispatch (XML parsing, native parsing)
@@ -169,7 +169,7 @@ fn bench_xml_parsing(c: &mut Criterion) {
         text: Some(
             r#"Here is my analysis.
 <tool_call>
-{"name": "search", "arguments": {"query": "zeroclaw architecture"}}
+{"name": "search", "arguments": {"query": "quantclaw architecture"}}
 </tool_call>
 Let me know if you need more."#
                 .into(),
@@ -252,7 +252,7 @@ fn bench_memory_operations(c: &mut Criterion) {
         for i in 0..100 {
             mem.store(
                 &format!("key_{i}"),
-                &format!("Content entry number {i} about zeroclaw agent runtime"),
+                &format!("Content entry number {i} about quantclaw agent runtime"),
                 MemoryCategory::Core,
                 None,
             )
@@ -281,7 +281,7 @@ fn bench_memory_operations(c: &mut Criterion) {
     c.bench_function("memory_recall_top10", |b| {
         b.iter(|| {
             rt.block_on(async {
-                mem.recall(black_box("zeroclaw agent"), 10, None, None, None)
+                mem.recall(black_box("quantclaw agent"), 10, None, None, None)
                     .await
                     .unwrap()
             })

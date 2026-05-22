@@ -10,7 +10,7 @@
 //! - The fallback request succeeds
 //!
 //! Requires:
-//! - Live Gemini OAuth profile in `~/.zeroclaw/auth-profiles.json` with refresh_token
+//! - Live Gemini OAuth profile in `~/.quantclaw/auth-profiles.json` with refresh_token
 //! - GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET env vars
 //!
 //! Run manually: `cargo test gemini_fallback_oauth_refresh -- --ignored --nocapture`
@@ -38,10 +38,10 @@ use std::path::PathBuf;
 #[tokio::test]
 #[ignore = "requires live Gemini OAuth credentials with refresh_token"]
 async fn gemini_warmup_refreshes_expired_oauth_token() -> Result<()> {
-    // Find ~/.zeroclaw/auth-profiles.json
+    // Find ~/.quantclaw/auth-profiles.json
     let home = env::var("HOME").expect("HOME env var not set");
-    let zeroclaw_dir = PathBuf::from(home).join(".zeroclaw");
-    let auth_profiles_path = zeroclaw_dir.join("auth-profiles.json");
+    let quantclaw_dir = PathBuf::from(home).join(".quantclaw");
+    let auth_profiles_path = quantclaw_dir.join("auth-profiles.json");
 
     if !auth_profiles_path.exists() {
         eprintln!(

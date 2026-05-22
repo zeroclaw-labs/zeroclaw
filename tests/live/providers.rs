@@ -14,7 +14,7 @@ const RECALL_TEMPERATURE: f64 = 0.0;
 /// Sends a real multi-turn conversation to OpenAI Codex and verifies
 /// the model retains context from earlier messages.
 ///
-/// Requires valid OAuth credentials in `~/.zeroclaw/`.
+/// Requires valid OAuth credentials in `~/.quantclaw/`.
 /// Run manually: `cargo test e2e_live_openai_codex_multi_turn -- --ignored`
 #[tokio::test]
 #[ignore = "requires live OpenAI Codex OAuth credentials"]

@@ -1,0 +1,20 @@
+[Unit]
+Description=QuantClaw Rust Agent
+Documentation=https://github.com/quantclaw/quantclaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=gpio spi i2c
+WorkingDirectory=/home/pi/quantclaw_rust_app/current
+ExecStart=/usr/local/bin/quantclaw gateway --config-dir /home/pi/quantclaw_rust_app/.quantclaw
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/pi/quantclaw_rust_app/.env
+Environment=RUST_LOG=info
+Environment=HOME=/home/pi
+
+[Install]
+WantedBy=multi-user.target

@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use zeroclaw::memory::sqlite::SqliteMemory;
-use zeroclaw::memory::traits::{Memory, MemoryCategory};
-use zeroclaw::providers::ToolCall;
+use quantclaw::memory::sqlite::SqliteMemory;
+use quantclaw::memory::traits::{Memory, MemoryCategory};
+use quantclaw::providers::ToolCall;
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
 use crate::support::{CountingTool, EchoTool, MockModelProvider};
@@ -213,8 +213,8 @@ async fn agent_auto_saves_and_recalls_memory() {
 /// Verify ContextCompressor.with_memory saves summary to memory before splice.
 #[tokio::test]
 async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
-    use zeroclaw::providers::traits::ChatMessage;
+    use quantclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
+    use quantclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
@@ -316,7 +316,7 @@ async fn agent_handles_interleaved_tools_and_text() {
 /// Agent survives large tool output (truncation should kick in).
 #[tokio::test]
 async fn agent_survives_large_tool_output() {
-    use zeroclaw::tools::{Tool, ToolResult};
+    use quantclaw::tools::{Tool, ToolResult};
 
     /// Tool that returns a very large output.
     struct LargeOutputTool;
@@ -537,9 +537,9 @@ async fn memory_survives_rapid_consolidation() {
 /// SQLite session backend stores and loads messages correctly.
 #[tokio::test]
 async fn session_backend_persists_messages() {
-    use zeroclaw::channels::session_backend::SessionBackend;
-    use zeroclaw::channels::session_sqlite::SqliteSessionBackend;
-    use zeroclaw::providers::traits::ChatMessage;
+    use quantclaw::channels::session_backend::SessionBackend;
+    use quantclaw::channels::session_sqlite::SqliteSessionBackend;
+    use quantclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -559,8 +559,8 @@ async fn session_backend_persists_messages() {
 /// Session state transitions work correctly.
 #[tokio::test]
 async fn session_state_transitions() {
-    use zeroclaw::channels::session_backend::SessionBackend;
-    use zeroclaw::channels::session_sqlite::SqliteSessionBackend;
+    use quantclaw::channels::session_backend::SessionBackend;
+    use quantclaw::channels::session_sqlite::SqliteSessionBackend;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -570,7 +570,7 @@ async fn session_state_transitions() {
     assert!(state.is_none(), "Initial state should be absent");
 
     // Create the session row by appending a message (set_session_state only UPDATEs)
-    use zeroclaw::providers::traits::ChatMessage;
+    use quantclaw::providers::traits::ChatMessage;
     let msg = ChatMessage::user("hello".to_string());
     backend.append("test_session", &msg).unwrap();
 

@@ -3,11 +3,11 @@
   "name": "ZeroClaw",
   "version": "0.8.0-beta-1",
   "description": "Fast, small, and fully autonomous AI personal assistant infrastructure. Deploy anywhere, swap anything. 100% Rust.",
-  "logo": "zeroclaw.png",
+  "logo": "quantclaw.png",
   "links": {
-    "github": "https://github.com/zeroclaw-labs/zeroclaw",
-    "website": "https://zeroclaw.com/",
-    "docs": "https://github.com/zeroclaw-labs/zeroclaw#readme"
+    "github": "https://github.com/quant-speed/quantclaw",
+    "website": "https://quantclaw.com/",
+    "docs": "https://github.com/quant-speed/quantclaw#readme"
   },
   "tags": ["ai", "self-hosted"]
 }

@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.7
+
+# Dockerfile.build-aarch64 - 为 Raspberry Pi/Linux ARM64 构建完整发布产物
+# 使用方法:
+#   docker build -f Dockerfile.build-aarch64 -t quantclaw-builder:aarch64 .
+#   docker create --name extract-aarch64 quantclaw-builder:aarch64
+#   docker cp extract-aarch64:/quantclaw ./quantclaw-aarch64
+#   docker cp extract-aarch64:/web-dist ./web-dist
+#   docker rm extract-aarch64
+
+FROM node:22-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
+COPY web/ .
+RUN npm run build
+
+FROM --platform=linux/amd64 rust:1.94-slim AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    binutils-aarch64-linux-gnu \
+    gcc-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    pkg-config \
+    protobuf-compiler \
+    libssl-dev:arm64 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add aarch64-unknown-linux-gnu
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV PKG_CONFIG_SYSROOT_DIR=/
+ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+ENV OPENSSL_DIR=/usr
+ENV OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu
+ENV OPENSSL_INCLUDE_DIR=/usr/include
+
+WORKDIR /app
+ARG FEATURES="hardware,peripheral-rpi"
+
+# Workspace resolution requires the Tauri member manifest even though we do not
+# build the desktop app in this image.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates/ crates/
+COPY firmware/ firmware/
+COPY src/ src/
+COPY benches/ benches/
+COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+RUN mkdir -p apps/tauri/src && \
+    printf 'fn main() {}\n' > apps/tauri/src/main.rs && \
+    printf 'fn main() {}\n' > apps/tauri/build.rs
+
+# On Windows workspaces, symlinks may be checked out as plain text files.
+# Normalize firmware pointer files back to symlinks so include_{str,bytes}! paths resolve.
+RUN set -eux; \
+    for p in crates/quantclaw-hardware/firmware crates/quantclaw-runtime/firmware crates/quantclaw-runtime/src/firmware; do \
+    if [ -f "$p" ]; then \
+    t="$(tr -d '\r\n' < "$p")"; \
+    rm -f "$p"; \
+    ln -s "$t" "$p"; \
+    fi; \
+    done
+
+RUN cargo build --locked --target aarch64-unknown-linux-gnu --features "${FEATURES}" --release && \
+    cp target/aarch64-unknown-linux-gnu/release/quantclaw /out-quantclaw && \
+    aarch64-linux-gnu-strip /out-quantclaw
+
+RUN ls -lh /out-quantclaw
+
+FROM alpine:3.22 AS export
+COPY --from=builder /out-quantclaw /quantclaw
+COPY --from=web-builder /web/dist /web-dist

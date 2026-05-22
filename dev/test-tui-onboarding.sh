@@ -25,13 +25,13 @@ echo -e "${DIM}Profile: ${PROFILE}${RESET}"
 echo
 
 # ── Step 1: Build ────────────────────────────────────────────────────
-echo -e "${BOLD}[1/3] Building zeroclaw (${PROFILE})...${RESET}"
+echo -e "${BOLD}[1/3] Building quantclaw (${PROFILE})...${RESET}"
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --release 2>&1
-  BIN="$REPO_ROOT/target/release/zeroclaw"
+  BIN="$REPO_ROOT/target/release/quantclaw"
 else
   cargo build 2>&1
-  BIN="$REPO_ROOT/target/debug/zeroclaw"
+  BIN="$REPO_ROOT/target/debug/quantclaw"
 fi
 
 if [[ ! -x "$BIN" ]]; then
@@ -58,7 +58,7 @@ echo -e "${DIM}Navigate with arrow keys / j/k, Enter to select, Esc to go back, 
 echo -e "${DIM}Walk through every screen to verify feature parity with OpenClaw.${RESET}"
 echo
 echo -e "${BOLD}Checklist:${RESET}"
-echo "  [ ] Welcome screen renders with ZEROCLAW banner"
+echo "  [ ] Welcome screen renders with QUANTCLAW banner"
 echo "  [ ] Security warning panel with full text + y/N prompt"
 echo "  [ ] Setup mode selection (QuickStart / Full / Skip)"
 echo "  [ ] Existing config detected panel"

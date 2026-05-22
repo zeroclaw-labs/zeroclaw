@@ -1,4 +1,4 @@
-/target
+﻿/target
 /target-*/
 /docs/book/book/
 /docs/book/po/messages.pot
@@ -50,7 +50,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
-.zeroclaw/*
+.quantclaw/*
 
 # Claude Code project settings (machine-specific directory config)
 .claude/settings.json

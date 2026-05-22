@@ -1,11 +1,11 @@
-name: zeroclaw-local-ci
+name: quantclaw-local-ci
 
 services:
     local-ci:
         build:
             context: ..
             dockerfile: dev/ci/Dockerfile
-        container_name: zeroclaw-local-ci
+        container_name: quantclaw-local-ci
         working_dir: /workspace
         environment:
             - CARGO_TERM_COLOR=always

@@ -1,4 +1,4 @@
-# Contributing to ZeroClaw
+# Contributing to QuantClaw
 
 Thanks for your interest. Every kind of contribution helps — code, docs, bug reports, design feedback. This file is the first stop; the full contributor guide lives in the [docs book](docs/book/src/contributing/how-to.md).
 

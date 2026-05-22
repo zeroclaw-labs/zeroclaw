@@ -165,7 +165,7 @@
       "command": "cargo",
       "args": ["watch", "-x", "run -- gateway", "-i", "web/"],
       "options": {
-        "env": { "ZEROCLAW_REQUIRE_PAIRING": "false" }
+        "env": { "QUANTCLAW_REQUIRE_PAIRING": "false" }
       },
       "dependsOn": ["Dev: Kill Stale Port"],
       "dependsOrder": "sequence",

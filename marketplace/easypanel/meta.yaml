@@ -1,6 +1,6 @@
-name: ZeroClaw
+name: QuantClaw
 description: |
-  ZeroClaw is a fast, small, and fully autonomous AI personal assistant
+  QuantClaw is a fast, small, and fully autonomous AI personal assistant
   infrastructure built in 100% Rust. Deploy anywhere, swap anything.
   Connect any LLM provider (OpenRouter, OpenAI, Anthropic, Ollama) and
   interact via a built-in web dashboard, REST API, or WebSocket gateway.
@@ -9,7 +9,7 @@ description: |
   autonomous tool use.
 
 instructions: |
-  After deployment, access the ZeroClaw gateway at the assigned domain
+  After deployment, access the QuantClaw gateway at the assigned domain
   on port 42617. Set your LLM provider API key in the environment
   variables. The default provider is OpenRouter — get a key at
   https://openrouter.ai/keys. You can switch to OpenAI, Anthropic,
@@ -21,17 +21,17 @@ changeLog:
 
 links:
   - label: Website
-    url: https://zeroclaw.com
+    url: https://quantclaw.com
   - label: Documentation
-    url: https://github.com/zeroclaw-labs/zeroclaw#readme
+    url: https://github.com/quant-speed/quantclaw#readme
   - label: Github
-    url: https://github.com/zeroclaw-labs/zeroclaw
+    url: https://github.com/quant-speed/quantclaw
 
 contributors:
   - name: theonlyhennygod
     url: https://github.com/theonlyhennygod
 
-logo: zeroclaw.png
+logo: quantclaw.png
 
 schema:
   type: object
@@ -44,7 +44,7 @@ schema:
     appServiceName:
       type: string
       title: App Service Name
-      default: zeroclaw
+      default: quantclaw
     appServiceImage:
       type: string
       title: App Service Image

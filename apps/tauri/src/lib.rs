@@ -1,4 +1,4 @@
-//! ZeroClaw Desktop — Tauri application library.
+//! QuantClaw Desktop — Tauri application library.
 
 pub mod capabilities;
 pub mod commands;
@@ -58,7 +58,7 @@ async fn auto_pair(state: &state::SharedState) -> Option<String> {
 /// skips the pairing dialog. Uses Tauri's WebviewWindow scripting API.
 fn inject_token_into_webview<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>, token: &str) {
     let escaped = token.replace('\\', "\\\\").replace('\'', "\\'");
-    let script = format!("localStorage.setItem('zeroclaw_token', '{escaped}')");
+    let script = format!("localStorage.setItem('quantclaw_token', '{escaped}')");
     // WebviewWindow scripting is the standard Tauri API for running JS in the WebView.
     let _ = window.eval(&script);
 }

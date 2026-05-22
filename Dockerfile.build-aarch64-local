@@ -1,0 +1,44 @@
+# Dockerfile.build-aarch64-local - 本地构建 aarch64 版本
+# 使用方法: docker build -f Dockerfile.build-aarch64-local -t quantclaw:aarch64 .
+# 注意: 需要先在本地构建前端 (cd web && npm run build)
+
+FROM --platform=linux/arm64 rust:1.88-bookworm AS builder
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 复制项目文件
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+COPY benches/ benches/
+
+# 复制本地已构建的前端（避免在ARM64容器中构建前端）
+COPY web/dist/ web/dist/
+
+# 修改 Cargo.toml 排除 apps/tauri（因为它需要额外的源文件）
+RUN sed -i 's/, "apps\/tauri"//' Cargo.toml
+
+# 设置环境变量强制使用 ring 后端（避免 aws-lc-sys）
+ENV AWS_LC_SYS_CMAKE_BUILDER=0
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+
+# 构建 release 版本（原生 arm64 编译，不需要交叉编译）
+# 使用 --no-default-features 避免某些默认的 aws-lc 依赖
+RUN cargo build --release && \
+    cp target/release/quantclaw /app/quantclaw && \
+    strip /app/quantclaw
+
+# 验证
+RUN file /app/quantclaw && ls -lh /app/quantclaw
+
+# 导出阶段
+FROM scratch AS export
+COPY --from=builder /app/quantclaw /quantclaw
