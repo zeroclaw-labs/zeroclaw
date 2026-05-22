@@ -198,8 +198,8 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 }
 
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
-    let channels = config.channels.channels();
-    let configured = channels.iter().filter(|(_, c)| *c).count();
+    let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
+    let configured = channels.iter().filter(|e| e.configured).count();
     CheckResult::pass(
         "channels",
         format!(

@@ -2193,11 +2193,11 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (channel, configured) in config.channels.channels() {
+            for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
                 println!(
                     "  {:9} {}",
-                    channel.name(),
-                    if configured {
+                    entry.name,
+                    if entry.configured {
                         "✅ configured"
                     } else {
                         "❌ not configured"
@@ -2507,10 +2507,8 @@ async fn main() -> Result<()> {
                 {
                     let schema = schemars::schema_for!(config::Config);
                     let value = match path.as_deref() {
-                        None => {
-                            serde_json::to_value(&schema)
-                                .context("failed to serialize JSON Schema")?
-                        }
+                        None => serde_json::to_value(&schema)
+                            .context("failed to serialize JSON Schema")?,
                         Some(prop_path) => {
                             let full = serde_json::to_value(&schema)
                                 .context("failed to serialize JSON Schema")?;

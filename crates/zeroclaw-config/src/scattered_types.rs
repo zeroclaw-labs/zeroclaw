@@ -618,6 +618,15 @@ pub struct VoiceCallConfig {
     pub excluded_tools: Vec<String>,
 }
 
+impl crate::traits::ChannelConfig for VoiceCallConfig {
+    fn name() -> &'static str {
+        "Voice Call"
+    }
+    fn desc() -> &'static str {
+        "outbound voice call channel"
+    }
+}
+
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {

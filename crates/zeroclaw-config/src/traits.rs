@@ -327,6 +327,14 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
+/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub configured: bool,
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name

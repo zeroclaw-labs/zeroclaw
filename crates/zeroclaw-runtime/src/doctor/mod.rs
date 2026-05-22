@@ -610,7 +610,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Channel: at least one configured
     let cc = &config.channels;
-    let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
+    let has_channel = cc.channels().iter().any(|info| info.configured);
 
     if has_channel {
         items.push(DiagItem::ok(cat, "at least one channel configured"));
