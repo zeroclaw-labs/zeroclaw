@@ -25,7 +25,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-web-target,target=/app/target,sharing=locked \
     cargo web build
 
-# Dockerfile.debian — Shell-equipped variant of the ZeroClaw container.
+# Dockerfile.debian — Shell-equipped variant of the QuantClaw container.
 #
 # The default Dockerfile produces a distroless "release" image with no shell,
 # which is ideal for minimal attack surface but prevents the agent from using
@@ -35,7 +35,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 # essential CLI tools so the agent can operate as a full coding assistant.
 #
 # Build:
-#   docker build -f Dockerfile.debian -t zeroclaw:debian .
+#   docker build -f Dockerfile.debian -t quantclaw:debian .
 #
 # Or with docker compose:
 #   docker compose -f docker-compose.yml -f docker-compose.debian.yml up
@@ -121,9 +121,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    strip /app/zeroclaw
-RUN size=$(stat -c%s /app/zeroclaw) && \
+    cp target/release/quantclaw /app/quantclaw && \
+    strip /app/quantclaw
+RUN size=$(stat -c%s /app/quantclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage).
@@ -146,8 +146,8 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
         '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
-        > /zeroclaw-data/.zeroclaw/config.toml && \
-    chown -R 65534:65534 /zeroclaw-data
+        > /quantclaw-data/.quantclaw/config.toml && \
+    chown -R 65534:65534 /quantclaw-data
 
 # ── Stage 2: Runtime (Debian with shell) ─────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -173,14 +173,14 @@ ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV QUANTCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
-WORKDIR /zeroclaw-data
+WORKDIR /quantclaw-data
 USER 65534:65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
-    CMD ["zeroclaw", "status", "--format=exit-code"]
-ENTRYPOINT ["zeroclaw"]
+    CMD ["quantclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["quantclaw"]
 CMD ["daemon"]

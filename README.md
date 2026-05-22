@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="docs/assets/quantclaw-banner.png" alt="QuantClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
+<h1 align="center">🦀 QuantClaw — Personal AI Assistant</h1>
 
 <p align="center">
   <strong>You own the agent. You own the data. You own the machine it runs on.</strong>
@@ -40,8 +40,8 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 Or clone and run:
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 ./install.sh
 ```
 
@@ -172,11 +172,11 @@ Built and maintained by the community — original creator [@theonlyhennygod](ht
 Thanks to the communities that incubated early work: **Harvard University**, **MIT**, **Sundai Club**, and every contributor pushing it forward.
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#quant-speed/quantclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

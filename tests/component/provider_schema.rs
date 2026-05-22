@@ -7,8 +7,8 @@
 //! for each model_provider's API specification. Validates ChatMessage, ChatResponse,
 //! ToolCall, and AuthStyle serialization contracts.
 
-use zeroclaw::providers::compatible::AuthStyle;
-use zeroclaw::providers::traits::{ChatMessage, ChatResponse, ToolCall};
+use quantclaw::providers::compatible::AuthStyle;
+use quantclaw::providers::traits::{ChatMessage, ChatResponse, ToolCall};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ChatMessage serialization

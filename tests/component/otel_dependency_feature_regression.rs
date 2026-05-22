@@ -1,7 +1,7 @@
 #[test]
 fn opentelemetry_otlp_uses_blocking_reqwest_client() {
-    // opentelemetry-otlp lives in zeroclaw-runtime (moved from root during workspace split)
-    let manifest = include_str!("../../crates/zeroclaw-runtime/Cargo.toml");
+    // opentelemetry-otlp lives in quantclaw-runtime (moved from root during workspace split)
+    let manifest = include_str!("../../crates/quantclaw-runtime/Cargo.toml");
     let otlp_line = manifest
         .lines()
         .find(|line: &&str| line.trim_start().starts_with("opentelemetry-otlp ="))

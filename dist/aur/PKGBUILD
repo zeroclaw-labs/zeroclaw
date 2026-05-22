@@ -1,17 +1,17 @@
-# Maintainer: zeroclaw-labs <bot@zeroclaw.dev>
-pkgname=zeroclawlabs
-_reponame=zeroclaw
+# Maintainer: quant-speed <bot@quantclaw.dev>
+pkgname=quantspeed
+_reponame=quantclaw
 pkgver=0.6.9
 pkgrel=1
 pkgdesc="Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 arch=('x86_64' 'aarch64')
-url="https://github.com/zeroclaw-labs/zeroclaw"
+url="https://github.com/quant-speed/quantclaw"
 license=('MIT' 'Apache-2.0')
 depends=('gcc-libs' 'openssl')
 makedepends=('cargo' 'git' 'nodejs' 'npm')
-provides=('zeroclaw')
-conflicts=('zeroclaw')
-source=("${pkgname}-${pkgver}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v${pkgver}.tar.gz")
+provides=('quantclaw')
+conflicts=('quantclaw')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/quant-speed/quantclaw/archive/refs/tags/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
@@ -35,7 +35,7 @@ build() {
 
 package() {
   cd "${_reponame}-${pkgver}"
-  install -Dm0755 -t "${pkgdir}/usr/bin/" "target/dist/zeroclaw"
+  install -Dm0755 -t "${pkgdir}/usr/bin/" "target/dist/quantclaw"
 
   # Install web dashboard assets (served from filesystem at runtime)
   install -dm0755 "${pkgdir}/usr/share/${pkgname}/web/dist"

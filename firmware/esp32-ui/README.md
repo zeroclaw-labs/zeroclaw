@@ -1,6 +1,6 @@
-# ZeroClaw ESP32 UI Firmware
+# QuantClaw ESP32 UI Firmware
 
-Slint-based graphical UI firmware scaffold for ZeroClaw edge scenarios on ESP32.
+Slint-based graphical UI firmware scaffold for QuantClaw edge scenarios on ESP32.
 
 ## Scope of This Crate
 
@@ -92,7 +92,7 @@ These components are placeholders to keep future hardware integration incrementa
 
 1. Wire real display driver initialization in `src/main.rs`
 2. Attach touch input events to Slint callbacks
-3. Connect UI state with ZeroClaw edge/runtime messaging
+3. Connect UI state with QuantClaw edge/runtime messaging
 4. Add board-specific pin maps with explicit target profiles
 
 ## License
@@ -103,4 +103,4 @@ MIT - See root `LICENSE`
 
 - [Slint ESP32 Documentation](https://slint.dev/esp32)
 - [ESP-IDF Rust Book](https://esp-rs.github.io/book/)
-- [ZeroClaw Hardware Design](../../docs/hardware/hardware-peripherals-design.md)
+- [QuantClaw Hardware Design](../../docs/hardware/hardware-peripherals-design.md)

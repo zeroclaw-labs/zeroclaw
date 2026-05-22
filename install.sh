@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-# ── ZeroClaw installer ───────────────────────────────────────────
-# Builds and installs ZeroClaw from source.
+# ── QuantClaw installer ───────────────────────────────────────────
+# Builds and installs QuantClaw from source.
 # All feature lists and version info read from Cargo.toml — nothing hardcoded.
 # POSIX sh — no bash required. Works on Alpine, Debian, macOS, everywhere.
 
-REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
+REPO_URL="https://github.com/quant-speed/quantclaw.git"
 
 # ── Output helpers (terminal-aware) ──────────────────────────────
 
@@ -53,7 +53,7 @@ validate_feature() {
 list_features() {
   parse_cargo_toml "$1"
   echo
-  printf "%s — available build features\n" "$(bold "ZeroClaw v${VERSION}")"
+  printf "%s — available build features\n" "$(bold "QuantClaw v${VERSION}")"
   echo
 
   printf "  %s\n" "$(bold "Default") (included unless --minimal):"
@@ -281,8 +281,8 @@ Examples:
   $0 --uninstall                               # remove ZeroClaw
 
 Environment:
-  ZEROCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.zeroclaw/src)
-  ZEROCLAW_CARGO_FEATURES  Extra cargo features (legacy; prefer --features)
+  QUANTCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.quantclaw/src)
+  QUANTCLAW_CARGO_FEATURES  Extra cargo features (legacy; prefer --features)
 EOF
 }
 
@@ -290,10 +290,10 @@ EOF
 
 do_uninstall() {
   echo
-  printf "%s\n" "$(bold "Uninstalling ZeroClaw")"
+  printf "%s\n" "$(bold "Uninstalling QuantClaw")"
   echo
 
-  local bin="$CARGO_HOME/bin/zeroclaw"
+  local bin="$CARGO_HOME/bin/quantclaw"
 
   if [ -f "$bin" ]; then
     "$bin" service stop 2>/dev/null || true
@@ -304,7 +304,7 @@ do_uninstall() {
     warn "Binary not found at $bin"
   fi
 
-  local config_dir="$PREFIX/.zeroclaw"
+  local config_dir="$PREFIX/.quantclaw"
   if [ -d "$config_dir" ]; then
     if [ -t 0 ]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
@@ -318,19 +318,19 @@ do_uninstall() {
     fi
   fi
 
-  # Check if another zeroclaw still lurks in PATH
+  # Check if another quantclaw still lurks in PATH
   local other_bin
-  other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  other_bin=$(PATH="$ORIGINAL_PATH" command -v quantclaw 2>/dev/null || true)
   if [ -n "$other_bin" ]; then
     local other_version
     other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
     echo
-    warn "Another zeroclaw found at $other_bin (v$other_version)"
+    warn "Another quantclaw found at $other_bin (v$other_version)"
     warn "Remove it manually if you want a full uninstall"
   fi
 
   echo
-  info "ZeroClaw uninstalled"
+  info "QuantClaw uninstalled"
   exit 0
 }
 
@@ -492,8 +492,8 @@ PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-feat
 WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 
 # Support legacy env var
-if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
-  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$ZEROCLAW_CARGO_FEATURES"
+if [ -n "${QUANTCLAW_CARGO_FEATURES:-}" ]; then
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$QUANTCLAW_CARGO_FEATURES"
 fi
 
 while [ $# -gt 0 ]; do
@@ -531,7 +531,7 @@ while [ $# -gt 0 ]; do
     -V|--version)
       if [ -f "Cargo.toml" ]; then
         parse_cargo_toml "Cargo.toml"
-        echo "install.sh for ZeroClaw v$VERSION"
+        echo "install.sh for QuantClaw v$VERSION"
       else
         echo "install.sh (version unknown — not in repo)"
       fi
@@ -545,7 +545,7 @@ done
 
 CARGO_HOME="${CARGO_HOME:-$PREFIX/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$PREFIX/.rustup}"
-INSTALL_DIR="${ZEROCLAW_INSTALL_DIR:-$PREFIX/.zeroclaw/src}"
+INSTALL_DIR="${QUANTCLAW_INSTALL_DIR:-$PREFIX/.quantclaw/src}"
 ORIGINAL_PATH="$PATH"
 PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_HOME RUSTUP_HOME PATH
@@ -628,13 +628,13 @@ fi
 if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
 echo
-printf "%s\n" "$(bold "ZeroClaw — source install")"
+printf "%s\n" "$(bold "QuantClaw — source install")"
 if [ "$PREFIX" != "$HOME" ]; then
   printf "  prefix: %s\n" "$(bold "$PREFIX")"
 fi
 echo
 
-if [ -f "Cargo.toml" ] && grep -q "zeroclaw" "Cargo.toml" 2>/dev/null; then
+if [ -f "Cargo.toml" ] && grep -q "quantclaw" "Cargo.toml" 2>/dev/null; then
   INSTALL_DIR="$(pwd)"
   info "Building from $(pwd)"
 elif [ -d "$INSTALL_DIR/.git" ]; then
@@ -681,7 +681,7 @@ fi
 if [ "$DRY_RUN" != true ]; then
   RUST_VERSION=$(rustc --version | awk '{print $2}')
   if ! version_gte "$RUST_VERSION" "$MSRV"; then
-    die "Rust $RUST_VERSION is too old. ZeroClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
+    die "Rust $RUST_VERSION is too old. QuantClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
   fi
   info "Rust $RUST_VERSION (>= $MSRV)"
 fi
@@ -765,12 +765,12 @@ fi
 
 # ── Detect existing installs ──────────────────────────────────────
 
-PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v quantclaw 2>/dev/null || true)
 if [ -n "$PATH_BIN" ]; then
   PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-  TARGET_BIN="$CARGO_HOME/bin/zeroclaw"
+  TARGET_BIN="$CARGO_HOME/bin/quantclaw"
   if [ "$PATH_BIN" != "$TARGET_BIN" ]; then
-    warn "zeroclaw found at $PATH_BIN (v$PATH_VERSION)"
+    warn "quantclaw found at $PATH_BIN (v$PATH_VERSION)"
     warn "This install targets $TARGET_BIN"
     warn "The old binary will shadow the new one unless removed or PATH is reordered"
   else
@@ -801,8 +801,8 @@ if [ "$DRY_RUN" = true ]; then
   printf "%s\n" "$(bold "Dry run — nothing will be built or installed")"
   echo
   info "Source:   $INSTALL_DIR"
-  info "Binary:   $CARGO_HOME/bin/zeroclaw"
-  info "Config:   $PREFIX/.zeroclaw/"
+  info "Binary:   $CARGO_HOME/bin/quantclaw"
+  info "Config:   $PREFIX/.quantclaw/"
   info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
   echo
   if [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ]; then
@@ -826,7 +826,7 @@ fi
 # ── Build and install ─────────────────────────────────────────────
 
 echo
-printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
+printf "%s\n" "$(bold "Building QuantClaw v$VERSION")"
 if [ -n "$CARGO_FLAGS" ]; then
   info "Feature flags: $CARGO_FLAGS"
 else
@@ -856,18 +856,18 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────
 
-BIN="$CARGO_HOME/bin/zeroclaw"
+BIN="$CARGO_HOME/bin/quantclaw"
 if [ -f "$BIN" ]; then
   SIZE=$(du -h "$BIN" | awk '{print $1}')
   NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
   echo
   info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
 
-  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v quantclaw 2>/dev/null || true)
   if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
     ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
     echo
-    warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
+    warn "$(bold "WARNING:") quantclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
     warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
     warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
   fi
@@ -950,5 +950,5 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
 fi
 
 echo
-info "Done. Run $(bold "zeroclaw agent") to start chatting."
+info "Done. Run $(bold "quantclaw agent") to start chatting."
 echo

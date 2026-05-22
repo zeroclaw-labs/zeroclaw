@@ -1,6 +1,6 @@
-# ZeroClaw Development Environment
+# QuantClaw Development Environment
 
-A fully containerized development sandbox for ZeroClaw agents. This environment allows you to develop, test, and debug the agent in isolation without modifying your host system.
+A fully containerized development sandbox for QuantClaw agents. This environment allows you to develop, test, and debug the agent in isolation without modifying your host system.
 
 ## Directory Structure
 
@@ -27,15 +27,15 @@ Run all commands from the repository root using the helper script:
 
 Builds the agent from source and starts both containers.
 
-### 2. Enter Agent Container (`zeroclaw-dev`)
+### 2. Enter Agent Container (`quantclaw-dev`)
 
 ```bash
 ./dev/cli.sh agent
 ```
 
-Use this to run `zeroclaw` CLI commands manually, debug the binary, or check logs internally.
+Use this to run `quantclaw` CLI commands manually, debug the binary, or check logs internally.
 
-- **Path**: `/zeroclaw-data`
+- **Path**: `/quantclaw-data`
 - **User**: `nobody` (65534)
 
 ### 3. Enter Sandbox (`sandbox`)
@@ -60,19 +60,19 @@ Use this to act as the "user" or "environment" the agent interacts with.
     ```bash
     ./dev/cli.sh agent
     # inside container:
-    zeroclaw --version
+    quantclaw --version
     ```
 
 ### 5. Persistence & Shared Workspace
 
 The `playground/` directory (in repo root) is mounted as the shared workspace:
 
-- **Agent**: `/zeroclaw-data/workspace`
+- **Agent**: `/quantclaw-data/workspace`
 - **Sandbox**: `/home/developer/workspace`
 
 Files created by the agent are visible to the sandbox user, and vice versa. The directory is git-ignored and auto-populated on first run — the agent creates `brain.db`, `sessions.db`, personality files (`IDENTITY.md`, `SOUL.md`), and hygiene state automatically.
 
-The agent configuration lives in `target/.zeroclaw` (mounted to `/zeroclaw-data/.zeroclaw`), so settings persist across container rebuilds.
+The agent configuration lives in `target/.quantclaw` (mounted to `/quantclaw-data/.quantclaw`), so settings persist across container rebuilds.
 
 ### 6. Cleanup
 
@@ -82,7 +82,7 @@ Stop containers and remove volumes and generated config:
 ./dev/cli.sh clean
 ```
 
-**Note:** This removes `target/.zeroclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe workspace data, manually delete `playground/`.
+**Note:** This removes `target/.quantclaw` (config/DB) but leaves the `playground/` directory intact. To fully wipe workspace data, manually delete `playground/`.
 
 ## Local CI/CD (Docker-Only)
 
@@ -148,7 +148,7 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 
 ### Isolation model
 
-- Rust compilation, tests, and audit/deny tools run in `zeroclaw-local-ci` container.
+- Rust compilation, tests, and audit/deny tools run in `quantclaw-local-ci` container.
 - Your host filesystem is mounted at `/workspace`; no host Rust toolchain is required.
 - Cargo build artifacts are written to container volume `/ci-target` (not your host `target/`).
 - Docker smoke stage uses your Docker daemon to build image layers, but build steps execute in containers.
@@ -156,7 +156,7 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 ### Build cache notes
 
 - Both `Dockerfile` and `dev/ci/Dockerfile` use BuildKit cache mounts for Cargo registry/git data.
-- The root `Dockerfile` also caches Rust `target/` (`id=zeroclaw-target`) to speed repeat local image builds.
+- The root `Dockerfile` also caches Rust `target/` (`id=quantclaw-target`) to speed repeat local image builds.
 - Local CI reuses named Docker volumes for Cargo registry/git and target outputs.
 - `./dev/ci.sh docker-smoke` and `./dev/ci.sh all` now use `docker buildx` local cache at `.cache/buildx-smoke` when available.
 - The CI image keeps Rust toolchain defaults from `rust:1.92-slim` and installs pinned toolchain `1.92.0` (no custom `CARGO_HOME`/`RUSTUP_HOME` overrides), preventing repeated toolchain bootstrapping on each run.

@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use zeroclaw::channels::telegram::TelegramChannel;
-use zeroclaw::channels::{Channel, SendMessage};
+use quantclaw::channels::telegram::TelegramChannel;
+use quantclaw::channels::{Channel, SendMessage};
 
 /// Helper: create a TelegramChannel pointing at a mock server.
 fn test_channel(mock_url: &str) -> TelegramChannel {

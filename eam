@@ -1,0 +1,6 @@
+[33md373ed8a[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32msync/upstream-2026-05-21[m[33m)[m chore: 重命名项目为ZeroClaw并更新基础配置与依赖
+[33md3c2a589[m refactor: 完成项目重命名为ZeroClaw v0.8.0-beta与配置体系重构
+[33mc746998f[m[33m ([m[1;31mupstream/master[m[33m, [m[1;31mupstream/HEAD[m[33m)[m fix(policy): allow multiline heredocs in SecurityPolicy command splitting (#6816)
+[33m4fb0ef26[m feat(skills): emit positive log when skill tools are registered (#6072)
+[33m565deaf3[m fix(runtime,channels): keep malformed tool protocol internal (#6736)
+[33mefe4ebf2[m fix(tools/web_search): surface DuckDuckGo anomaly-modal block (#6373) (#6625)

@@ -1,4 +1,4 @@
-//! ZeroClaw Pico firmware — JSON-over-serial peripheral.
+//! QuantClaw Pico firmware — JSON-over-serial peripheral.
 //!
 //! Listens for newline-delimited JSON on UART0 (GP0=TX, GP1=RX).
 //! LED on GP25 (onboard LED on standard Pico).
@@ -14,7 +14,7 @@ use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::uart::{Config, Uart};
 use heapless::String;
-use zeroclaw_fw_protocol::{copy_id, write_err, write_ok, Command};
+use quantclaw_fw_protocol::{copy_id, write_err, write_ok, Command};
 use {defmt_rtt as _, panic_probe as _};
 
 /// Onboard LED pin on standard Raspberry Pi Pico
@@ -34,7 +34,7 @@ async fn main(_spawner: Spawner) {
     let mut uart = Uart::new_blocking(p.UART0, p.PIN_0, p.PIN_1, config);
     let mut led = Output::new(p.PIN_25, Level::Low);
 
-    info!("ZeroClaw Pico firmware ready on UART0 (115200)");
+    info!("QuantClaw Pico firmware ready on UART0 (115200)");
 
     let mut line_buf: heapless::Vec<u8, 256> = heapless::Vec::new();
     let mut id_buf = [0u8; 16];

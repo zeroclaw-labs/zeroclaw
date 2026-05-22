@@ -7,7 +7,7 @@ exclude = ["plugins/image-gen-fal"]
 version = "0.8.0-beta-1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository = "https://github.com/quant-speed/quantclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
@@ -58,7 +58,7 @@ include = [
 ]
 
 [[bin]]
-name = "zeroclaw"
+name = "quantclaw"
 path = "src/main.rs"
 
 [[bin]]
@@ -67,7 +67,7 @@ path = "src/bin/zeroclaw-acp-bridge.rs"
 required-features = ["acp-bridge"]
 
 [lib]
-name = "zeroclaw"
+name = "quantclaw"
 path = "src/lib.rs"
 
 [dependencies]
@@ -98,7 +98,7 @@ tokio-util = { version = "0.7", default-features = false }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 
 # HTTP client - minimal features
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "blocking", "multipart", "stream", "socks", "http2"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -200,15 +200,14 @@ nostr-sdk = { version = "0.44", default-features = false, optional = true }
 which = { version = "8.0", optional = true }
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"], optional = true }
 tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 regex = "1.10"
 hostname = { version = "0.4.2", optional = true }
-rustls = { version = "0.23", optional = true }
-rustls-pemfile = { version = "2", optional = true }
-rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+rustls = "0.22"
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
@@ -252,12 +251,12 @@ default = [
 # Without this, you get the kernel: config + providers + memory + CLI chat.
 # Gateway and TUI onboarding are opt-in separately (included in `default`).
 agent-runtime = [
-    "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:quantclaw-runtime", "dep:quantclaw-channels", "dep:quantclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
-    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:native-tls", "dep:tokio-native-tls",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",

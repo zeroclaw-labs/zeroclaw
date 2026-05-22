@@ -313,7 +313,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     let (model_provider, recorded) =
         RecordingModelProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: zeroclaw\n[/Memory context]\n\n";
+    let memory_context = "[Memory context]\n- project: quantclaw\n[/Memory context]\n\n";
     let loader = StaticMemoryLoader::new(memory_context);
 
     let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(Box::new(loader)));
@@ -330,7 +330,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     // Turn 1: user message is enriched
     let req1_user = requests[0].iter().find(|m| m.role == "user").unwrap();
     assert!(req1_user.content.contains("[Memory context]"));
-    assert!(req1_user.content.contains("project: zeroclaw"));
+    assert!(req1_user.content.contains("project: quantclaw"));
     assert!(req1_user.content.ends_with("first question"));
 
     // Turn 2: both user messages enriched, assistant from turn 1 present

@@ -29,7 +29,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+ARG QUANTCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -107,9 +107,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    strip /app/zeroclaw
-RUN size=$(stat -c%s /app/zeroclaw) && \
+    cp target/release/quantclaw /app/quantclaw && \
+    strip /app/quantclaw
+RUN size=$(stat -c%s /app/quantclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage).
@@ -132,8 +132,8 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
         '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
-        > /zeroclaw-data/.zeroclaw/config.toml && \
-    chown -R 65534:65534 /zeroclaw-data
+        > /quantclaw-data/.quantclaw/config.toml && \
+    chown -R 65534:65534 /quantclaw-data
 
 # ── Stage 2: Development Runtime (Debian) ────────────────────
 FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
@@ -151,8 +151,8 @@ COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
-COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
-RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
+COPY dev/config.template.toml /quantclaw-data/.quantclaw/config.toml
+RUN chown 65534:65534 /quantclaw-data/.quantclaw/config.toml
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
@@ -168,12 +168,12 @@ ENV HOME=/zeroclaw-data
 #   docker run -e ZEROCLAW_providers__models__anthropic__default__api_key=sk-ant-... ...
 ENV ZEROCLAW_gateway__port=42617
 
-WORKDIR /zeroclaw-data
+WORKDIR /quantclaw-data
 USER 65534:65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
-    CMD ["zeroclaw", "status", "--format=exit-code"]
-ENTRYPOINT ["zeroclaw"]
+    CMD ["quantclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["quantclaw"]
 CMD ["daemon"]
 
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
@@ -193,14 +193,14 @@ ENV HOME=/zeroclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden
 #ENV PROVIDER=
-ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV QUANTCLAW_GATEWAY_PORT=42617
 
 # API_KEY must be provided at runtime!
 
-WORKDIR /zeroclaw-data
+WORKDIR /quantclaw-data
 USER 65534:65534
 EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
-    CMD ["zeroclaw", "status", "--format=exit-code"]
-ENTRYPOINT ["zeroclaw"]
+    CMD ["quantclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["quantclaw"]
 CMD ["daemon"]

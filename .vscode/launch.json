@@ -14,7 +14,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Agent",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/quantclaw",
       "args": ["agent"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -23,17 +23,17 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Gateway",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/quantclaw",
       "args": ["gateway"],
       "cwd": "${workspaceFolder}",
-      "env": { "ZEROCLAW_REQUIRE_PAIRING": "false" },
+      "env": { "QUANTCLAW_REQUIRE_PAIRING": "false" },
       "preLaunchTask": "Build: Debug"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Daemon",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/quantclaw",
       "args": ["daemon"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -42,7 +42,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Status",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/quantclaw",
       "args": ["status"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"
@@ -51,7 +51,7 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Onboard",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "program": "${workspaceFolder}/target/debug/quantclaw",
       "args": ["onboard"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build: Debug"

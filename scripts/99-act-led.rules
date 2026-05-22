@@ -2,7 +2,7 @@
 # via the Linux LED subsystem sysfs interface.
 #
 # Without this rule /sys/class/leds/ACT/{brightness,trigger} are
-# root-only writable, which prevents zeroclaw from blinking the LED.
+# root-only writable, which prevents quantclaw from blinking the LED.
 SUBSYSTEM=="leds", KERNEL=="ACT", ACTION=="add", \
   RUN+="/bin/chgrp gpio /sys/%p/brightness", \
   RUN+="/bin/chmod g+w /sys/%p/brightness", \

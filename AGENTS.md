@@ -1,4 +1,4 @@
-# AGENTS.md — ZeroClaw
+# AGENTS.md — QuantClaw
 
 Cross-tool agent instructions for any AI coding assistant working on this repository.
 
@@ -84,19 +84,19 @@ Docs-only changes: run markdown lint and link-integrity checks. If touching boot
 
 ## Project Snapshot
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+QuantClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
 
 Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
 
 Key extension points:
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
-- `crates/zeroclaw-api/src/channel.rs` (`Channel`)
-- `crates/zeroclaw-api/src/tool.rs` (`Tool`)
-- `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
-- `crates/zeroclaw-api/src/observability_traits.rs` (`Observer`)
-- `crates/zeroclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
-- `crates/zeroclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+- `crates/quantclaw-api/src/provider.rs` (`Provider`)
+- `crates/quantclaw-api/src/channel.rs` (`Channel`)
+- `crates/quantclaw-api/src/tool.rs` (`Tool`)
+- `crates/quantclaw-api/src/memory_traits.rs` (`Memory`)
+- `crates/quantclaw-api/src/observability_traits.rs` (`Observer`)
+- `crates/quantclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
+- `crates/quantclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## Stability Tiers
 
@@ -151,7 +151,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - **Low risk**: docs/chore/tests-only changes
 - **Medium risk**: most `crates/*/src/**` behavior changes without boundary/security impact
-- **High risk**: `crates/zeroclaw-runtime/src/**` (especially `src/security/`), `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
+- **High risk**: `crates/quantclaw-runtime/src/**` (especially `src/security/`), `crates/quantclaw-gateway/src/**`, `crates/quantclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
 
 When uncertain, classify as higher risk.
 
