@@ -101,8 +101,14 @@ pub async fn run(
                     Mode::Logs => logs_pane.help_lines(),
                     _ => vec![("?", "This help")],
                 };
-                // Global keys always shown.
-                let mut lines = vec![("F1–F5", "Switch mode"), ("Ctrl+C", "Quit")];
+                // Global keys and first-run flow always shown.
+                let mut lines = vec![
+                    ("F1–F5", "Switch mode"),
+                    ("F2", "Configure providers and agents"),
+                    ("F4", "Chat once an agent is enabled"),
+                    ("?", "Open this help"),
+                    ("Ctrl+C", "Quit"),
+                ];
                 lines.push(("", ""));
                 lines.extend(help);
                 draw_help_modal(frame, frame.area(), &lines);
@@ -162,6 +168,9 @@ pub async fn run(
                         continue;
                     }
                     KeyCode::F(4) => {
+                        if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                            chat_pane.refresh_if_inactive().await?;
+                        }
                         mode = Mode::Chat;
                         continue;
                     }
@@ -241,7 +250,10 @@ pub async fn run(
                     }
                 }
             }
-            _ => {} // Resize, etc. — just redraw on next iteration
+            Event::Resize(_, _) => {
+                term.clear()?;
+            }
+            _ => {}
         }
     }
 

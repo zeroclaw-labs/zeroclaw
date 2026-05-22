@@ -75,7 +75,8 @@ impl<'a> Chat<'a> {
 
         if agents.is_empty() {
             self.phase = ChatPhase::Error(
-                "No enabled agents. Configure an agent in the Config tab.".to_string(),
+                "No enabled agents yet.\nPress F2 for Config, add a model provider and agent,\nthen return here with F4 to chat."
+                    .to_string(),
             );
             return Ok(());
         }
@@ -92,6 +93,13 @@ impl<'a> Chat<'a> {
             list_state,
             loading: false,
         };
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_if_inactive(&mut self) -> anyhow::Result<()> {
+        if matches!(self.phase, ChatPhase::Error(_)) {
+            self.init().await?;
+        }
         Ok(())
     }
 
@@ -359,20 +367,20 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let line_count = msg.lines().count().max(1) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(line_count),
             Constraint::Fill(1),
         ])
         .split(inner);
 
-    let p = Paragraph::new(Line::from(Span::styled(
-        msg,
-        Style::default().fg(Color::Red),
-    )))
-    .alignment(Alignment::Center);
+    let p = Paragraph::new(msg.to_string())
+        .style(Style::default().fg(Color::Red))
+        .wrap(Wrap { trim: true })
+        .alignment(Alignment::Center);
     frame.render_widget(p, chunks[1]);
 }
 
@@ -468,6 +476,12 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         ]));
     }
 
+    if lines.is_empty() {
+        let (headline, instruction) = empty_chat_hint(&state.agent_alias);
+        lines.push(Line::from(Span::styled(headline, theme::body_style())));
+        lines.push(Line::from(Span::styled(instruction, theme::dim_style())));
+    }
+
     let p = Paragraph::new(lines)
         .block(
             Block::default()
@@ -476,6 +490,13 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, area);
+}
+
+fn empty_chat_hint(agent_alias: &str) -> (String, &'static str) {
+    (
+        format!("Ready to chat with {agent_alias}."),
+        "Type a message below and press Enter.",
+    )
 }
 
 fn render_input(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -866,6 +887,13 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[test]
+    fn empty_chat_hint_points_to_first_prompt() {
+        let (headline, instruction) = empty_chat_hint("fred");
+        assert_eq!(headline, "Ready to chat with fred.");
+        assert_eq!(instruction, "Type a message below and press Enter.");
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use crate::theme;
 // ── Constants ────────────────────────────────────────────────────
 
 const POLL_INTERVAL_SECS: u64 = 5;
+const MEMORY_NOT_CONFIGURED_MESSAGE: &str = "Memory is not configured yet.\nPress F2 Config to add a memory backend,\nor ignore this tab until you need persistent memory.";
 
 // ── Tab enum ─────────────────────────────────────────────────────
 
@@ -68,6 +69,7 @@ pub(crate) struct Dashboard<'a> {
     health: Option<serde_json::Value>,
     sessions: Vec<SessionEntry>,
     agents: Vec<AgentStatusEntry>,
+    agents_loaded: bool,
     cost: Option<CostSummaryResult>,
     cron_jobs: Vec<CronJobEntry>,
     memories: Vec<MemoryEntryResult>,
@@ -110,6 +112,7 @@ impl<'a> Dashboard<'a> {
             health: None,
             sessions: Vec::new(),
             agents: Vec::new(),
+            agents_loaded: false,
             cost: None,
             cron_jobs: Vec::new(),
             memories: Vec::new(),
@@ -171,8 +174,14 @@ impl<'a> Dashboard<'a> {
                 if let Ok(c) = self.rpc.cost_query(None).await {
                     self.cost = Some(c);
                 }
-                if let Ok(a) = self.rpc.agents_status().await {
-                    self.agents = a.agents;
+                match self.rpc.agents_status().await {
+                    Ok(a) => {
+                        self.agents = a.agents;
+                        self.agents_loaded = true;
+                    }
+                    Err(_) => {
+                        self.agents_loaded = false;
+                    }
                 }
                 if let Ok(t) = self.rpc.tui_list().await {
                     self.tuis = t.tuis;
@@ -214,7 +223,7 @@ impl<'a> Dashboard<'a> {
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("not available") {
-                            self.memory_error = Some("Memory subsystem not configured".to_string());
+                            self.memory_error = Some(MEMORY_NOT_CONFIGURED_MESSAGE.to_string());
                         } else {
                             self.memory_error = Some(msg);
                         }
@@ -379,28 +388,48 @@ impl<'a> Dashboard<'a> {
     // ── Overview tab ─────────────────────────────────────────────
 
     fn draw_overview(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let show_start_here = self.should_show_start_here();
+        let constraints = if show_start_here {
+            vec![
+                Constraint::Length(8),                            // status box
+                Constraint::Length(7),                            // first-run guide
+                Constraint::Length(4 + self.agents.len() as u16), // agents
+                Constraint::Min(0),                               // connected TUIs
+            ]
+        } else {
+            vec![
                 Constraint::Length(8),                            // status box
                 Constraint::Length(4 + self.agents.len() as u16), // agents
                 Constraint::Min(0),                               // connected TUIs
-            ])
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(area);
+        let mut next_chunk = 0;
 
         // Status box
         let status_block = Block::default()
             .title(Span::styled(" Status ", theme::title_style()))
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
-        let inner = status_block.inner(chunks[0]);
-        frame.render_widget(status_block, chunks[0]);
+        let status_area = chunks[next_chunk];
+        next_chunk += 1;
+        let inner = status_block.inner(status_area);
+        frame.render_widget(status_block, status_area);
 
         if let Some(ref s) = self.status {
+            let (connection_label, connection_detail_label, connection_detail) =
+                connection_summary(&self.connect_label);
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Connected  ", theme::dim_style()),
-                    Span::styled(&self.connect_label, theme::accent_style()),
+                    Span::styled("Connection ", theme::dim_style()),
+                    Span::styled(connection_label, Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled(connection_detail_label, theme::dim_style()),
+                    Span::styled(connection_detail, theme::dim_style()),
                 ]),
                 Line::from(vec![
                     Span::styled("Server     ", theme::dim_style()),
@@ -459,41 +488,107 @@ impl<'a> Dashboard<'a> {
             frame.render_widget(Paragraph::new(lines), inner);
         }
 
+        if show_start_here {
+            self.draw_start_here(frame, chunks[next_chunk]);
+            next_chunk += 1;
+        }
+
         // Agents
         let agents_block = Block::default()
             .title(Span::styled(" Agents ", theme::title_style()))
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
-        let agents_inner = agents_block.inner(chunks[1]);
-        frame.render_widget(agents_block, chunks[1]);
+        let agents_area = chunks[next_chunk];
+        next_chunk += 1;
+        let agents_inner = agents_block.inner(agents_area);
+        frame.render_widget(agents_block, agents_area);
 
-        let items: Vec<ListItem> = self
-            .agents
-            .iter()
-            .map(|a| {
-                let status_style = if a.enabled {
-                    Style::default().fg(Color::Green)
-                } else {
-                    theme::dim_style()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if a.enabled { "\u{25cf} " } else { "\u{25cb} " },
-                        status_style,
-                    ),
-                    Span::styled(&a.alias, theme::body_style()),
-                    Span::styled(
-                        format!("  ({} active)", a.active_sessions),
-                        theme::dim_style(),
-                    ),
-                ]))
-            })
-            .collect();
+        if self.agents.is_empty() {
+            let line = if self.agents_loaded {
+                Line::from(vec![
+                    Span::styled("No agents configured. ", theme::dim_style()),
+                    Span::styled("Press F2", theme::accent_style()),
+                    Span::styled(" to add a provider and agent.", theme::dim_style()),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    "Agent status unavailable. Waiting for daemon status.",
+                    theme::dim_style(),
+                ))
+            };
+            frame.render_widget(Paragraph::new(line), agents_inner);
+        } else {
+            let items: Vec<ListItem> = self
+                .agents
+                .iter()
+                .map(|a| {
+                    let status_style = if a.enabled {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        theme::dim_style()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            if a.enabled { "\u{25cf} " } else { "\u{25cb} " },
+                            status_style,
+                        ),
+                        Span::styled(&a.alias, theme::body_style()),
+                        Span::styled(
+                            format!("  ({} active)", a.active_sessions),
+                            theme::dim_style(),
+                        ),
+                    ]))
+                })
+                .collect();
 
-        frame.render_widget(List::new(items), agents_inner);
+            frame.render_widget(List::new(items), agents_inner);
+        }
 
         // Connected TUIs
-        self.draw_tuis_panel(frame, chunks[2]);
+        self.draw_tuis_panel(frame, chunks[next_chunk]);
+    }
+
+    fn should_show_start_here(&self) -> bool {
+        let active_sessions = self.status.as_ref().map(|s| s.active_sessions).unwrap_or(0);
+        active_sessions == 0 && self.agents_loaded && self.agents.is_empty()
+    }
+
+    fn draw_start_here(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let block = Block::default()
+            .title(Span::styled(" Start here ", theme::title_style()))
+            .borders(Borders::ALL)
+            .border_style(theme::dim_style());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("1. ", theme::accent_style()),
+                Span::styled(
+                    "Press F2 Config to add a model provider.",
+                    theme::body_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("2. ", theme::accent_style()),
+                Span::styled(
+                    "Add or enable an agent that uses that provider.",
+                    theme::body_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("3. ", theme::accent_style()),
+                Span::styled(
+                    "Press F4 Chat to start talking to the agent.",
+                    theme::body_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("? ", theme::accent_style()),
+                Span::styled("opens key help. Ctrl+C quits.", theme::dim_style()),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
     }
 
     fn draw_tuis_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -838,7 +933,9 @@ impl<'a> Dashboard<'a> {
             let inner = block.inner(area);
             frame.render_widget(block, area);
             frame.render_widget(
-                Paragraph::new(Span::styled(err.clone(), theme::warn_style())),
+                Paragraph::new(err.clone())
+                    .style(theme::warn_style())
+                    .wrap(Wrap { trim: true }),
                 inner,
             );
             return;
@@ -1727,6 +1824,50 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
         Span::styled(format!("{label}{}", " ".repeat(pad)), theme::dim_style()),
         Span::styled(value.to_string(), theme::body_style()),
     ])
+}
+
+fn connection_summary(connect_label: &str) -> (&'static str, &'static str, String) {
+    if let Some(socket) = connect_label.strip_prefix("unix:") {
+        ("Local daemon", "Socket     ", socket.to_string())
+    } else {
+        ("Remote daemon", "Endpoint   ", connect_label.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MEMORY_NOT_CONFIGURED_MESSAGE, connection_summary};
+
+    #[test]
+    fn memory_not_configured_message_points_to_next_action() {
+        assert!(MEMORY_NOT_CONFIGURED_MESSAGE.contains("Memory is not configured yet."));
+        assert!(MEMORY_NOT_CONFIGURED_MESSAGE.contains("Press F2 Config"));
+        assert!(!MEMORY_NOT_CONFIGURED_MESSAGE.contains("subsystem"));
+    }
+
+    #[test]
+    fn connection_summary_names_local_socket_without_error_coloring_text() {
+        assert_eq!(
+            connection_summary("unix:/tmp/daemon.sock"),
+            (
+                "Local daemon",
+                "Socket     ",
+                "/tmp/daemon.sock".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn connection_summary_names_remote_endpoint() {
+        assert_eq!(
+            connection_summary("wss://example.test:9781"),
+            (
+                "Remote daemon",
+                "Endpoint   ",
+                "wss://example.test:9781".to_string(),
+            )
+        );
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
