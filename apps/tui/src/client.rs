@@ -50,7 +50,6 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CLOSE: &str = "session/close";
-    pub const SESSION_LIST: &str = "session/list";
     pub const AGENTS_LIST: &str = "agents/list";
     pub const SESSION_APPROVE: &str = "session/approve";
 }
@@ -921,6 +920,37 @@ mod session_method_tests {
         );
         let result = task.await.unwrap().unwrap();
         assert!(result.acknowledged);
+    }
+
+    #[tokio::test]
+    async fn session_approve_reject_with_edit_sends_replacement() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_approve(
+                    "s1",
+                    "req-2",
+                    ApprovalDecision::RejectWithEdit {
+                        replacement: "let x = 99;".to_string(),
+                    },
+                )
+                .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["params"]["decision"], "reject_with_edit");
+        assert_eq!(req["params"]["replacement"], "let x = 99;");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({"session_id":"s1","request_id":"req-2","acknowledged":true})),
+            None,
+        );
+        task.await.unwrap().unwrap();
     }
 }
 
