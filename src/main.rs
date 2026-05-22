@@ -2503,31 +2503,40 @@ async fn main() -> Result<()> {
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema { path } => {
-                let schema = schemars::schema_for!(config::Config);
-                let value = match path.as_deref() {
-                    None => {
-                        serde_json::to_value(&schema).context("failed to serialize JSON Schema")?
-                    }
-                    Some(prop_path) => {
-                        let full = serde_json::to_value(&schema)
-                            .context("failed to serialize JSON Schema")?;
-                        // Embed the requested path so consumers see the same hint
-                        // shape that OPTIONS /api/config/prop returns. Per-path
-                        // subtree extraction is a follow-up that walks the schema
-                        // by JSON Pointer; for now we attach the hint and return
-                        // the whole-config schema, mirroring the HTTP behavior.
-                        let mut out = full;
-                        if let serde_json::Value::Object(ref mut map) = out {
-                            map.insert(
-                                "x-zeroclaw-requested-path".into(),
-                                serde_json::Value::String(prop_path.into()),
-                            );
+                #[cfg(feature = "schema-export")]
+                {
+                    let schema = schemars::schema_for!(config::Config);
+                    let value = match path.as_deref() {
+                        None => {
+                            serde_json::to_value(&schema)
+                                .context("failed to serialize JSON Schema")?
                         }
-                        out
-                    }
-                };
-                println!("{}", serde_json::to_string_pretty(&value)?);
-                Ok(())
+                        Some(prop_path) => {
+                            let full = serde_json::to_value(&schema)
+                                .context("failed to serialize JSON Schema")?;
+                            // Embed the requested path so consumers see the same hint
+                            // shape that OPTIONS /api/config/prop returns. Per-path
+                            // subtree extraction is a follow-up that walks the schema
+                            // by JSON Pointer; for now we attach the hint and return
+                            // the whole-config schema, mirroring the HTTP behavior.
+                            let mut out = full;
+                            if let serde_json::Value::Object(ref mut map) = out {
+                                map.insert(
+                                    "x-zeroclaw-requested-path".into(),
+                                    serde_json::Value::String(prop_path.into()),
+                                );
+                            }
+                            out
+                        }
+                    };
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    Ok(())
+                }
+                #[cfg(not(feature = "schema-export"))]
+                {
+                    let _ = path;
+                    anyhow::bail!("zeroclaw was built without the 'schema-export' feature")
+                }
             }
             ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();

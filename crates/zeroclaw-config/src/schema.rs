@@ -10087,6 +10087,26 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.get("default"))),
                 !self.bluesky.is_empty(),
             ),
+            #[cfg(feature = "channel-twitter")]
+            (
+                Box::new(ConfigWrapper::new(self.twitter.get("default"))),
+                !self.twitter.is_empty(),
+            ),
+            #[cfg(feature = "channel-mochat")]
+            (
+                Box::new(ConfigWrapper::new(self.mochat.get("default"))),
+                !self.mochat.is_empty(),
+            ),
+            #[cfg(feature = "channel-line")]
+            (
+                Box::new(ConfigWrapper::new(self.line.get("default"))),
+                !self.line.is_empty(),
+            ),
+            #[cfg(feature = "channel-voice-call")]
+            (
+                Box::new(ConfigWrapper::new(self.voice_call.get("default"))),
+                !self.voice_call.is_empty(),
+            ),
             #[cfg(feature = "voice-wake")]
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.get("default"))),
