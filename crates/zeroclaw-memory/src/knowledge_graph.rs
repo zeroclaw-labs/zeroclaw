@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 // ── Domain types ────────────────────────────────────────────────
@@ -126,8 +126,6 @@ pub struct GraphStats {
 /// SQLite-backed knowledge graph.
 pub struct KnowledgeGraph {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
     max_nodes: usize,
 }
 
@@ -196,7 +194,6 @@ impl KnowledgeGraph {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path: db_path.to_path_buf(),
             max_nodes,
         })
     }

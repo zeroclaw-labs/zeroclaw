@@ -32,10 +32,10 @@ Before testing message flow:
 
 All config management goes through `zeroclaw config` or `zeroclaw onboard`. Do not hand-edit `~/.zeroclaw/config.toml`.
 
-Easiest: run the wizard and let it prompt for every Matrix field:
+Easiest: run the channels section and let it prompt for every Matrix field:
 
 ```bash
-zeroclaw onboard --channels-only
+zeroclaw onboard channels
 ```
 
 Or set individual fields after onboarding:
@@ -91,13 +91,13 @@ zeroclaw config set channels.matrix.user-id @bot:example.com
 zeroclaw service restart
 ```
 
-The wizard (`zeroclaw onboard --channels-only`) prompts for these same fields if you'd rather work through it interactively.
+`zeroclaw onboard channels` prompts for these same fields if you'd rather work through them interactively.
 
 ### Notes
 
 - **Keep a copy of the token** when you first paste it. Secrets are encrypted at rest and `zeroclaw config get` will print `[masked]` for the token field; you can't retrieve it later. Stash it in a scratch note if you'll need it for the curl validation snippets in §5C.
 - **Reuse the same `device_id` on every restart** — changing it forces a new server-side device registration, which breaks key sharing and verification in encrypted rooms. The auto-recovery path in §8 handles the rare cases where wiping is genuinely the right call.
-- **Rotating the access token later** without re-running the wizard:
+- **Rotating the access token later** without re-running `zeroclaw onboard channels`:
   ```bash
   zeroclaw config set channels.matrix.access-token    # prompts, masked
   zeroclaw service restart
@@ -293,7 +293,7 @@ A recovery key lets ZeroClaw automatically restore room keys and cross-signing s
 
 #### Step 2 — Add the recovery key to ZeroClaw
 
-Either path works. The onboarding wizard is easier for fresh installs; `zeroclaw config set` is preferred for existing installs.
+Either path works. `zeroclaw onboard channels` is easier for fresh installs; `zeroclaw config set` is preferred for existing installs.
 
 **Option A — during onboarding:**
 

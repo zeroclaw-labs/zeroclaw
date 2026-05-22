@@ -83,7 +83,7 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
-    let autonomy_cfg = zeroclaw_config::schema::AutonomyConfig {
+    let autonomy_cfg = zeroclaw_config::schema::RiskProfileConfig {
         level: autonomy_level,
         ..Default::default()
     };
@@ -110,7 +110,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     skills: &[Skill],
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
-    autonomy_config: Option<&zeroclaw_config::schema::AutonomyConfig>,
+    autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tools: bool,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
@@ -332,7 +332,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
         prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
         prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
+        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+        prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (Channel Capabilities)
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────

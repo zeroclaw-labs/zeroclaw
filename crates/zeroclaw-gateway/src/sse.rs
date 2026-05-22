@@ -150,36 +150,20 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
         // ship to SSE subscribers.
         let json = match event {
             zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-                provider, model, ..
+                model_provider,
+                model,
+                ..
             } => serde_json::json!({
                 "type": "llm_request",
-                "provider": provider,
+                "model_provider": model_provider,
                 "model": model,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                provider,
-                model,
-                duration,
-                success,
-                error_message,
-                input_tokens,
-                output_tokens,
-            } => serde_json::json!({
-                "type": "llm_response",
-                "provider": provider,
-                "model": model,
-                "duration_ms": duration.as_millis(),
-                "success": success,
-                "error_message": error_message,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
             zeroclaw_runtime::observability::ObserverEvent::ToolCall {
                 tool,
                 duration,
                 success,
+                ..
             } => serde_json::json!({
                 "type": "tool_call",
                 "tool": tool,
@@ -194,27 +178,6 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
-            zeroclaw_runtime::observability::ObserverEvent::TurnComplete => {
-                serde_json::json!({
-                    "type": "turn_complete",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-            }
-            zeroclaw_runtime::observability::ObserverEvent::ChannelMessage {
-                channel,
-                direction,
-            } => serde_json::json!({
-                "type": "channel_message",
-                "channel": channel,
-                "direction": direction,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            zeroclaw_runtime::observability::ObserverEvent::HeartbeatTick => {
-                serde_json::json!({
-                    "type": "heartbeat_tick",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-            }
             zeroclaw_runtime::observability::ObserverEvent::Error { component, message } => {
                 serde_json::json!({
                     "type": "error",
@@ -223,45 +186,32 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
-            zeroclaw_runtime::observability::ObserverEvent::AgentStart { provider, model } => {
+            zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+                model_provider,
+                model,
+            } => {
                 serde_json::json!({
                     "type": "agent_start",
-                    "provider": provider,
+                    "model_provider": model_provider,
                     "model": model,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 })
             }
             zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd,
             } => serde_json::json!({
                 "type": "agent_end",
-                "provider": provider,
+                "model_provider": model_provider,
                 "model": model,
                 "duration_ms": duration.as_millis(),
                 "tokens_used": tokens_used,
                 "cost_usd": cost_usd,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
-            zeroclaw_runtime::observability::ObserverEvent::CacheHit {
-                cache_type,
-                tokens_saved,
-            } => serde_json::json!({
-                "type": "cache_hit",
-                "cache_type": cache_type,
-                "tokens_saved": tokens_saved,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            zeroclaw_runtime::observability::ObserverEvent::CacheMiss { cache_type } => {
-                serde_json::json!({
-                    "type": "cache_miss",
-                    "cache_type": cache_type,
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
-            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -304,8 +254,11 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: std::time::Duration::from_millis(42),
             success: true,
+            arguments: None,
+            result: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -324,6 +277,7 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "mcp_filesystem__read_file".into(),
+            tool_call_id: None,
             arguments: None,
         });
 
@@ -336,13 +290,9 @@ mod tests {
     fn unmapped_events_are_skipped() {
         let (obs, mut rx, buffer) = make_broadcast();
 
-        // HandStarted is intentionally not in BroadcastObserver's match arms;
-        // it falls through to `_ => return` and must never reach the SSE stream.
-        obs.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
+        obs.record_event(&ObserverEvent::HeartbeatTick);
 
-        assert!(rx.try_recv().is_err(), "HandStarted should not broadcast");
+        assert!(rx.try_recv().is_err(), "heartbeat should not broadcast");
         assert!(buffer.snapshot().is_empty());
     }
 
@@ -392,8 +342,11 @@ mod tests {
 
         observer.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: std::time::Duration::from_millis(7),
             success: true,
+            arguments: None,
+            result: None,
         });
 
         let value = rx

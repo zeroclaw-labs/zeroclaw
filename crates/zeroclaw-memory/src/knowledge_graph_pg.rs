@@ -45,8 +45,15 @@ where
             let _ = tx.send(f());
         })
         .context("failed to spawn pg knowledge graph thread")?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("pg knowledge graph thread terminated unexpectedly"))?
+    rx.await.map_err(|_| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "pg knowledge graph thread terminated unexpectedly"
+        );
+        anyhow::Error::msg("pg knowledge graph thread terminated unexpectedly")
+    })?
 }
 
 impl PgKnowledgeGraph {

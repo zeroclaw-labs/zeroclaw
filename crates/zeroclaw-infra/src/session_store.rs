@@ -8,7 +8,7 @@
 use crate::session_backend::SessionBackend;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Append-only JSONL session store for channel conversations.
@@ -183,6 +183,10 @@ impl SessionBackend for SessionStore {
                     last_activity,
                     message_count: 0,
                     key,
+                    agent_alias: None,
+                    channel_id: None,
+                    room_id: None,
+                    sender_id: None,
                 }
             })
             .collect()

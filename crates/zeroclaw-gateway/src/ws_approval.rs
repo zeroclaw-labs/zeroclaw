@@ -59,6 +59,17 @@ impl WsApprovalChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for WsApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "ws_approval"
+    }
+}
+
 #[async_trait]
 impl Channel for WsApprovalChannel {
     fn name(&self) -> &str {

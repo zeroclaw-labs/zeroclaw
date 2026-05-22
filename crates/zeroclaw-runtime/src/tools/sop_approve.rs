@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::warn;
 
 use crate::sop::types::SopRunAction;
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
@@ -59,17 +58,31 @@ impl Tool for SopApproveTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let run_id = args
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter"))?;
+        let run_id = args.get("run_id").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "run_id"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'run_id' parameter")
+        })?;
 
         // Lock engine, approve, snapshot run for audit, then drop lock
         let (result, run_snapshot) = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+            let mut engine = self.engine.lock().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP engine lock poisoned"
+                );
+
+                anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+            })?;
 
             match engine.approve_step(run_id) {
                 Ok(action) => {
@@ -85,7 +98,13 @@ impl Tool for SopApproveTool {
             && let Some(ref run) = run_snapshot
             && let Err(e) = audit.log_approval(run, run.current_step).await
         {
-            warn!("SOP audit log after approve failed: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP audit log after approve failed"
+            );
         }
 
         // Metrics collector (independent of audit)

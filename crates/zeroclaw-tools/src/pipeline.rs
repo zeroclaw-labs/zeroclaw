@@ -253,8 +253,16 @@ impl Tool for PipelineTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let request: PipelineRequest = serde_json::from_value(args)
-            .map_err(|e| anyhow::anyhow!("Invalid pipeline request: {e}"))?;
+        let request: PipelineRequest = serde_json::from_value(args).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "pipeline: invalid request"
+            );
+            anyhow::Error::msg(format!("Invalid pipeline request: {e}"))
+        })?;
 
         // Validate before execution.
         if let Err(e) = self.validate(&request) {

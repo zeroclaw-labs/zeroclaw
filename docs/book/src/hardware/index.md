@@ -40,11 +40,16 @@ With the feature enabled, the agent gains these tools:
 - `peripheral_probe` — discover attached boards and sensors
 - `peripheral_flash` — flash firmware to a connected microcontroller
 
-All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Restrict device access via:
+All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
 ```toml
-[security.sandbox]
-allow_devices = ["/dev/gpiochip0", "/dev/i2c-1", "/dev/ttyUSB0"]
+[peripherals]
+enabled = true
+
+[[peripherals.boards]]
+board = "nucleo-f401re"
+transport = "serial"
+path = "/dev/ttyACM0"
 ```
 
 ## Running on a Raspberry Pi
