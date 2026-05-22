@@ -44,6 +44,15 @@ pub mod method {
     pub const SKILLS_WRITE: &str = "skills/write";
     pub const SKILLS_CREATE: &str = "skills/write";
     pub const SKILLS_DELETE: &str = "skills/delete";
+    // Session
+    pub const SESSION_NEW: &str = "session/new";
+    pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_CONFIGURE: &str = "session/configure";
+    pub const SESSION_CLOSE: &str = "session/close";
+    pub const SESSION_LIST: &str = "session/list";
+    pub const AGENTS_LIST: &str = "agents/list";
+    pub const SESSION_APPROVE: &str = "session/approve";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -455,6 +464,100 @@ impl RpcClient {
         )
         .await
     }
+
+    // ── Session methods ──────────────────────────────────────────
+
+    pub async fn session_new(
+        &self,
+        agent_alias: &str,
+        cwd: Option<&str>,
+    ) -> Result<SessionNewResult> {
+        self.call(
+            method::SESSION_NEW,
+            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd }),
+        )
+        .await
+    }
+
+    pub async fn session_prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<SessionPromptResult> {
+        self.call(
+            method::SESSION_PROMPT,
+            serde_json::json!({ "session_id": session_id, "prompt": prompt }),
+        )
+        .await
+    }
+
+    pub async fn session_cancel(&self, session_id: &str) -> Result<SessionCancelResult> {
+        self.call(
+            method::SESSION_CANCEL,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_configure(
+        &self,
+        session_id: &str,
+        overrides: SessionConfigureOverrides,
+    ) -> Result<SessionConfigureResult> {
+        self.call(
+            method::SESSION_CONFIGURE,
+            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
+    pub async fn session_close(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_CLOSE,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn session_approve(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<SessionApproveResult> {
+        let mut params = serde_json::json!({
+            "session_id": session_id,
+            "request_id": request_id,
+            "decision": decision.kind(),
+        });
+        if let ApprovalDecision::RejectWithEdit { ref replacement } = decision {
+            params["replacement"] = serde_json::Value::String(replacement.clone());
+        }
+        self.call(method::SESSION_APPROVE, params).await
+    }
+
+    pub async fn agents_list(&self) -> Result<AgentsListResult> {
+        self.call(method::AGENTS_LIST, serde_json::json!({})).await
+    }
+
+    // ── Test-only constructors ────────────────────────────────────
+
+    /// Test-only constructor that skips the Unix socket connect + initialize handshake.
+    #[cfg(test)]
+    pub fn with_rpc(rpc: Arc<RpcOutbound>) -> Self {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+        Self {
+            rpc,
+            _read_task: tokio::spawn(async {}),
+            _router_task: tokio::spawn(async {}),
+            server_version: "test".to_string(),
+            notifications_bcast: notif_tx,
+            notifications: rx,
+        }
+    }
 }
 
 // ── Response types (client-side, minimal) ────────────────────────
@@ -653,7 +756,173 @@ pub struct LogsQueryResult {
     pub at_end: bool,
 }
 
+// ── Session / Agents types ───────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionNewResult {
+    pub session_id: String,
+    pub agent_alias: String,
+    pub message_count: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionPromptResult {
+    pub session_id: String,
+    pub stop_reason: String,
+    pub content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionCancelResult {
+    pub session_id: String,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureResult {
+    pub session_id: String,
+    pub overrides: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionApproveResult {
+    pub session_id: String,
+    pub request_id: String,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentEntry {
+    pub alias: String,
+    pub enabled: bool,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentsListResult {
+    pub agents: Vec<AgentEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    Reject,
+    RejectWithEdit { replacement: String },
+}
+
+impl ApprovalDecision {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowAlways => "allow_always",
+            Self::Reject => "reject",
+            Self::RejectWithEdit { .. } => "reject_with_edit",
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod session_method_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    #[tokio::test]
+    async fn session_new_sends_correct_wire_params() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client.session_new("my-agent", Some("/tmp/work")).await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["agent_alias"], "my-agent");
+        assert_eq!(req["params"]["cwd"], "/tmp/work");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s42","agent_alias":"my-agent","message_count":0})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.session_id, "s42");
+    }
+
+    #[tokio::test]
+    async fn session_cancel_sends_session_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_cancel("s1").await });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/cancel");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","cancelled":true})),
+            None,
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_approve_sends_decision_and_request_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client.session_approve("s1", "req-1", ApprovalDecision::AllowOnce).await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/approve");
+        assert_eq!(req["params"]["decision"], "allow_once");
+        assert_eq!(req["params"]["request_id"], "req-1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","request_id":"req-1","acknowledged":true})),
+            None,
+        );
+        let result = task.await.unwrap().unwrap();
+        assert!(result.acknowledged);
+    }
+}
 
 #[cfg(test)]
 mod notification_tests {
