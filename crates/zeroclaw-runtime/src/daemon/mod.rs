@@ -1273,7 +1273,6 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
-                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
@@ -1285,6 +1284,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1311,7 +1311,6 @@ mod tests {
         let mut config = Config::default();
         config.channels.mattermost.insert(
             "default".to_string(),
-                default_target: None,
             zeroclaw_config::schema::MattermostConfig {
                 enabled: true,
                 url: "https://mattermost.example.com".into(),
@@ -1326,6 +1325,7 @@ mod tests {
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -1446,7 +1446,6 @@ mod tests {
         config.heartbeat.to = Some("123456".into());
         config.channels.telegram.insert(
             "default".to_string(),
-                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
@@ -1458,6 +1457,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -1472,7 +1472,6 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
-                default_target: None,
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
@@ -1484,6 +1483,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.

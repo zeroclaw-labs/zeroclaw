@@ -16259,7 +16259,6 @@ auto_save = true
                 cli: true,
                 telegram: HashMap::from([(
                     "default".to_string(),
-                        default_target: None,
                     TelegramConfig {
                         enabled: true,
                         bot_token: "123:ABC".into(),
@@ -16271,6 +16270,7 @@ auto_save = true
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
+                        default_target: None,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -17033,7 +17033,6 @@ default_temperature = 0.7
         );
         config.channels.lark.insert(
             "feishu".to_string(),
-                default_target: None,
             LarkConfig {
                 enabled: true,
                 app_id: "cli_feishu_123".into(),
@@ -17046,6 +17045,7 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -17220,7 +17220,6 @@ default_temperature = 0.7
 
     #[test]
     async fn telegram_config_serde() {
-            default_target: None,
         let tc = TelegramConfig {
             enabled: true,
             bot_token: "123:XYZ".into(),
@@ -17232,6 +17231,7 @@ default_temperature = 0.7
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -17252,7 +17252,6 @@ default_temperature = 0.7
 
     #[test]
     async fn discord_config_serde() {
-            default_target: None,
         let dc = DiscordConfig {
             enabled: true,
             bot_token: "discord-token".into(),
@@ -17269,6 +17268,7 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17278,7 +17278,6 @@ default_temperature = 0.7
 
     #[test]
     async fn discord_config_empty_guild_ids() {
-            default_target: None,
         let dc = DiscordConfig {
             enabled: true,
             bot_token: "tok".into(),
@@ -17295,6 +17294,7 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17333,7 +17333,6 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
 
     #[test]
     async fn matrix_config_serde() {
-            default_target: None,
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://matrix.org".into(),
@@ -17352,6 +17351,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -17367,7 +17367,6 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
 
     #[test]
     async fn matrix_config_toml_roundtrip() {
-            default_target: None,
         let mc = MatrixConfig {
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
@@ -17386,6 +17385,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -17424,7 +17424,6 @@ allowed_users = ["@u:matrix.org"]
 
     #[test]
     async fn signal_config_serde() {
-            default_target: None,
         let sc = SignalConfig {
             enabled: true,
             http_url: "http://127.0.0.1:8686".into(),
@@ -17436,6 +17435,7 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -17449,7 +17449,6 @@ allowed_users = ["@u:matrix.org"]
 
     #[test]
     async fn signal_config_toml_roundtrip() {
-            default_target: None,
         let sc = SignalConfig {
             enabled: true,
             http_url: "http://localhost:8080".into(),
@@ -17461,6 +17460,7 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -17499,7 +17499,6 @@ allowed_users = ["@u:matrix.org"]
             )]),
             matrix: HashMap::from([(
                 "default".to_string(),
-                    default_target: None,
                 MatrixConfig {
                     enabled: true,
                     homeserver: "https://m.org".into(),
@@ -17518,6 +17517,7 @@ allowed_users = ["@u:matrix.org"]
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
+                    default_target: None,
                 },
             )]),
             signal: HashMap::new(),
@@ -17735,7 +17735,6 @@ bot_token = "xoxb-tok"
 
     #[test]
     async fn whatsapp_config_serde() {
-            default_target: None,
         let wc = WhatsAppConfig {
             enabled: true,
             access_token: Some("EAABx...".into()),
@@ -17756,6 +17755,7 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -17766,7 +17766,6 @@ bot_token = "xoxb-tok"
 
     #[test]
     async fn whatsapp_config_toml_roundtrip() {
-            default_target: None,
         let wc = WhatsAppConfig {
             enabled: true,
             access_token: Some("tok".into()),
@@ -17787,6 +17786,7 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -17820,7 +17820,6 @@ allowed_numbers = ["+1", "+2"]
 
     #[test]
     async fn whatsapp_config_backend_type_cloud_precedence_when_ambiguous() {
-            default_target: None,
         let wc = WhatsAppConfig {
             enabled: true,
             access_token: Some("tok".into()),
@@ -17841,6 +17840,7 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -17848,7 +17848,6 @@ allowed_numbers = ["+1", "+2"]
 
     #[test]
     async fn whatsapp_config_backend_type_web() {
-            default_target: None,
         let wc = WhatsAppConfig {
             enabled: true,
             access_token: None,
@@ -17869,6 +17868,7 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -17888,7 +17888,6 @@ allowed_numbers = ["+1", "+2"]
             signal: HashMap::new(),
             whatsapp: HashMap::from([(
                 "default".to_string(),
-                    default_target: None,
                 WhatsAppConfig {
                     enabled: true,
                     access_token: Some("tok".into()),
@@ -17909,6 +17908,7 @@ allowed_numbers = ["+1", "+2"]
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
+                    default_target: None,
                 },
             )]),
             linq: HashMap::new(),
@@ -18973,7 +18973,6 @@ default_model = "legacy-model"
         config.secrets.encrypt = true;
         config.channels.lark.insert(
             "feishu".to_string(),
-                default_target: None,
             LarkConfig {
                 enabled: true,
                 app_id: "cli_feishu_123".into(),
@@ -18986,6 +18985,7 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         config.save().await.unwrap();
@@ -19442,7 +19442,6 @@ api_token = "tok"
 
     #[test]
     async fn lark_config_serde() {
-            default_target: None,
         let lc = LarkConfig {
             enabled: true,
             app_id: "cli_123456".into(),
@@ -19455,6 +19454,7 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            default_target: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -19467,7 +19467,6 @@ api_token = "tok"
 
     #[test]
     async fn lark_config_toml_roundtrip() {
-            default_target: None,
         let lc = LarkConfig {
             enabled: true,
             app_id: "cli_123456".into(),
@@ -19480,6 +19479,7 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            default_target: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -19871,7 +19871,6 @@ require_otp_to_resume = true
         };
         config.channels.telegram.insert(
             "default".to_string(),
-                default_target: None,
             TelegramConfig {
                 enabled: true,
                 bot_token: plaintext_token.into(),
@@ -19883,6 +19882,7 @@ require_otp_to_resume = true
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -20707,7 +20707,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn matrix_secret_fields_discovered() {
-            default_target: None,
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -20726,6 +20725,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -20740,7 +20740,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn matrix_secret_fields_empty_not_set() {
-            default_target: None,
         let mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -20759,6 +20758,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -20766,7 +20766,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn set_secret_updates_field() {
-            default_target: None,
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -20785,6 +20784,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -20793,7 +20793,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn set_secret_unknown_name_fails() {
-            default_target: None,
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -20812,6 +20811,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -20831,7 +20831,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             .api_key = Some("test-key".into());
         config.channels.matrix.insert(
             "default".to_string(),
-                default_target: None,
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
@@ -20850,6 +20849,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -20864,7 +20864,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut config = Config::default();
         config.channels.matrix.insert(
             "default".to_string(),
-                default_target: None,
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
@@ -20883,6 +20882,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
 
@@ -20906,7 +20906,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut config = Config::default();
         config.channels.matrix.insert(
             "default".to_string(),
-                default_target: None,
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
@@ -20925,6 +20924,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         config
@@ -20957,7 +20957,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let dir = TempDir::new().unwrap();
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
-            default_target: None,
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -20976,6 +20975,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         // Encrypt
@@ -20995,7 +20995,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let dir = TempDir::new().unwrap();
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
-            default_target: None,
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -21014,6 +21013,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21029,7 +21029,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let dir = TempDir::new().unwrap();
         let store = crate::secrets::SecretStore::new(dir.path(), false);
 
-            default_target: None,
         let mut mx = MatrixConfig {
             enabled: true,
             homeserver: "https://m.org".into(),
@@ -21048,6 +21047,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21057,7 +21057,6 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     // ── Property method tests ──
 
-            default_target: None,
     fn test_matrix_config() -> MatrixConfig {
         MatrixConfig {
             enabled: true,
@@ -21077,6 +21076,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            default_target: None,
         }
     }
 

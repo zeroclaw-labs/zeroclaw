@@ -225,7 +225,6 @@ mod tests {
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
-                default_target: None,
             TelegramConfig {
                 enabled: true,
                 bot_token: "123:ABC".into(),
@@ -237,6 +236,7 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         let entries = all_integrations(&config);
@@ -284,7 +284,6 @@ mod tests {
         let mut config = Config::default();
         config.channels.matrix.insert(
             "default".to_string(),
-                default_target: None,
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
@@ -303,6 +302,7 @@ mod tests {
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         let entries = all_integrations(&config);
