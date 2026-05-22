@@ -357,6 +357,31 @@ impl WhatsAppWebChannel {
         candidates
     }
 
+    /// Compute the reply target, converting LID→phone for DMs when necessary.
+    ///
+    /// LID JIDs (e.g. `76188559093817@lid`) are internal WhatsApp routing
+    /// identifiers that cannot receive messages. For non-group chats with an
+    /// LID-based JID, this converts to a phone JID (`digits@s.whatsapp.net`)
+    /// using `mapped_phone` from the LID→phone lookup. Groups are returned
+    /// unchanged.
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target(
+        chat_jid: &str,
+        is_lid: bool,
+        is_group: bool,
+        mapped_phone: Option<&str>,
+    ) -> String {
+        if !is_group && is_lid {
+            mapped_phone
+                .map(|p| p.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                .filter(|d| !d.is_empty())
+                .map(|digits| format!("{digits}@s.whatsapp.net"))
+                .unwrap_or_else(|| chat_jid.to_string())
+        } else {
+            chat_jid.to_string()
+        }
+    }
+
     /// Normalize phone number to E.164 format
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone(&self, phone: &str) -> String {
@@ -1059,25 +1084,15 @@ impl Channel for WhatsAppWebChannel {
                                     .cloned();
 
                                 let is_group = info.source.is_group;
-
-                                // LID JIDs (e.g. 76188559093817@lid) are internal
-                                // identifiers that cannot receive messages; replies
-                                // must go to the phone JID (digits@s.whatsapp.net).
-                                // Convert LID→phone for all DMs upfront.
-                                let reply_target = if !is_group && info.source.chat.is_lid() {
-                                    normalized
-                                        .as_ref()
-                                        .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
-                                        .filter(|d| !d.is_empty())
-                                        .map(|digits| {
-                                            let target = format!("{digits}@s.whatsapp.net");
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": chat, "to": target})), "LID→phone reply target");
-                                            target
-                                        })
-                                        .unwrap_or_else(|| chat.clone())
-                                } else {
-                                    chat.clone()
-                                };
+                                let reply_target = Self::compute_reply_target(
+                                    &chat,
+                                    info.source.chat.is_lid(),
+                                    is_group,
+                                    mapped_phone.as_deref(),
+                                );
+                                if reply_target != chat {
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": chat, "to": reply_target})), "LID→phone reply target");
+                                }
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -1805,6 +1820,77 @@ mod tests {
         let candidates =
             WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
         assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_converts_lid_dm_to_phone() {
+        // Non-group LID DM with mapped_phone → phone JID
+        let chat_jid = "76188559093817@lid";
+        let is_lid = true;
+        let is_group = false;
+        let result = WhatsAppWebChannel::compute_reply_target(
+            chat_jid,
+            is_lid,
+            is_group,
+            Some("15551234567"),
+        );
+        assert_eq!(
+            result, "15551234567@s.whatsapp.net",
+            "LID DM must convert to phone JID for reply delivery"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_lid_dm_without_phone_fallback() {
+        // Non-group LID DM without mapped_phone → falls back to chat JID
+        let chat_jid = "76188559093817@lid";
+        let is_lid = true;
+        let is_group = false;
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid, is_lid, is_group, None);
+        assert_eq!(
+            result, chat_jid,
+            "LID DM without mapped_phone must fall back to original chat JID"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_non_lid_dm_unchanged() {
+        // Non-LID DM → original chat JID (no conversion needed)
+        let chat_jid = "15551234567@s.whatsapp.net";
+        let is_lid = false;
+        let is_group = false;
+        let result = WhatsAppWebChannel::compute_reply_target(
+            chat_jid,
+            is_lid,
+            is_group,
+            Some("15551234567"),
+        );
+        assert_eq!(
+            result, chat_jid,
+            "Non-LID DM must preserve original chat JID"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_group_unchanged() {
+        // Group chat → original chat JID (groups don't need conversion)
+        let chat_jid = "120363012345678901@g.us";
+        let is_lid = false;
+        let is_group = true;
+        let result = WhatsAppWebChannel::compute_reply_target(
+            chat_jid,
+            is_lid,
+            is_group,
+            Some("15551234567"),
+        );
+        assert_eq!(
+            result, chat_jid,
+            "Group chat must preserve original chat JID"
+        );
     }
 
     // ── lid_rejection_diagnostic: scoped LID warning ────
