@@ -793,6 +793,7 @@ impl DelegateTool {
             &model,
             &[],
             &self.workspace_dir,
+            false,
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -1439,6 +1440,7 @@ impl DelegateTool {
         model_name: &str,
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
+        sends_native_tool_specs: bool,
     ) -> Option<String> {
         // Resolve skill bundle directories. With one or more configured
         // bundles, load + concat skills from each. With none, fall back to
@@ -1458,7 +1460,14 @@ impl DelegateTool {
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
-        let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
+        let empty_tools: &[Box<dyn Tool>] = &[];
+        let expose_text_tools = sends_native_tool_specs || !agent_config.strict_tool_parsing;
+        let prompt_tools = if expose_text_tools {
+            sub_tools
+        } else {
+            empty_tools
+        };
+        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
         let shell_policy = if has_shell {
             "## Shell Policy\n\n\
              - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
@@ -1475,12 +1484,12 @@ impl DelegateTool {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
             model_name,
-            tools: sub_tools,
+            tools: prompt_tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            sends_native_tool_specs: false,
+            sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
@@ -1592,6 +1601,7 @@ impl DelegateTool {
             model,
             &sub_tools,
             &self.workspace_dir,
+            model_provider.supports_native_tools(),
         );
 
         let mut history = Vec::new();
@@ -1640,6 +1650,7 @@ impl DelegateTool {
                 None,
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
+                agent_config.strict_tool_parsing,
                 0,    // max_tool_result_chars: inherit from parent config in future
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future
@@ -1891,6 +1902,50 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    struct TextFallbackToolModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for TextFallbackToolModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(
+                    r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for TextFallbackToolModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TextFallbackToolModelProvider"
         }
     }
 
@@ -2386,6 +2441,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
+        let mut config = agentic_agent_config();
+        config.strict_tool_parsing = true;
+        let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "agentic",
+                &config,
+                "model-test",
+                &prompt_tools,
+                Path::new("/tmp"),
+                false,
+            )
+            .expect("prompt should render");
+        assert!(
+            !prompt.contains("## Tools"),
+            "strict delegate prompt should not advertise text tool instructions"
+        );
+        assert!(
+            !prompt.contains("echo_tool"),
+            "strict delegate prompt should hide text-only tool schemas"
+        );
+
+        let model_provider = TextFallbackToolModelProvider;
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("<tool_call>"),
+            "strict subagent should return fallback-looking text unchanged"
+        );
+        assert!(
+            !result.output.contains("echo:ignored"),
+            "strict subagent must not execute text fallback tool calls"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -2736,7 +2845,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -2804,7 +2913,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2854,7 +2963,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2926,7 +3035,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2959,7 +3068,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace)
+            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
             .unwrap();
 
         assert!(
