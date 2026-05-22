@@ -88,10 +88,10 @@ impl BackendState {
             .map_err(|e| RotationError::io(&self.path, e))?;
 
         use tokio::io::AsyncWriteExt;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|e| RotationError::io(&self.path, e))?;
-        file.write_all(b"\n")
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        file.write_all(buf.as_bytes())
             .await
             .map_err(|e| RotationError::io(&self.path, e))?;
 
