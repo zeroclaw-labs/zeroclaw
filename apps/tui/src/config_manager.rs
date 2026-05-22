@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -131,6 +131,11 @@ pub(crate) struct App<'a> {
     skills_body_loaded: String,
     skills_frontmatter: crate::client::SkillFrontmatter,
     skills_frontmatter_loaded: crate::client::SkillFrontmatter,
+    // Mouse support
+    last_main_area: Rect,
+    last_list_offset: usize,
+    last_tab_area: Option<Rect>,
+    double_click: crate::mouse::DoubleClickTracker,
 }
 
 impl<'a> App<'a> {
@@ -172,6 +177,10 @@ impl<'a> App<'a> {
             skills_body_loaded: String::new(),
             skills_frontmatter: Default::default(),
             skills_frontmatter_loaded: Default::default(),
+            last_main_area: Rect::default(),
+            last_list_offset: 0,
+            last_tab_area: None,
+            double_click: crate::mouse::DoubleClickTracker::new(),
         }
     }
 
@@ -184,34 +193,43 @@ impl<'a> App<'a> {
 
     /// Draw the current screen into the given area.
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
+        // Clone values out of `screen` so draw methods can take `&mut self`.
         match &self.screen {
             Screen::SectionList => self.draw_section_list(frame, area),
             Screen::TypeList { section_idx } => {
-                self.draw_type_list(frame, area, *section_idx);
+                let si = *section_idx;
+                self.draw_type_list(frame, area, si);
             }
             Screen::AliasList {
                 section_idx,
                 breadcrumb,
                 ..
             } => {
-                self.draw_alias_list(frame, area, *section_idx, breadcrumb);
+                let si = *section_idx;
+                let bc = breadcrumb.clone();
+                self.draw_alias_list(frame, area, si, &bc);
             }
             Screen::AliasCreate { breadcrumb, .. } => {
-                self.draw_alias_create(frame, area, breadcrumb);
+                let bc = breadcrumb.clone();
+                self.draw_alias_create(frame, area, &bc);
             }
             Screen::FieldList {
                 section_idx,
                 breadcrumb,
                 ..
             } => {
-                self.draw_field_list(frame, area, *section_idx, breadcrumb);
+                let si = *section_idx;
+                let bc = breadcrumb.clone();
+                self.draw_field_list(frame, area, si, &bc);
             }
             Screen::FieldEdit {
                 breadcrumb,
                 field_idx,
                 ..
             } => {
-                self.draw_field_edit(frame, area, breadcrumb, *field_idx);
+                let bc = breadcrumb.clone();
+                let fi = *field_idx;
+                self.draw_field_edit(frame, area, &bc, fi);
             }
         }
     }
@@ -232,6 +250,395 @@ impl<'a> App<'a> {
             Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
         }
         Ok(false)
+    }
+
+    /// Handle a mouse event forwarded from the app event loop.
+    pub(crate) async fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        _area: Rect,
+        term: &mut Term,
+    ) -> Result<()> {
+        use crate::mouse;
+
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Tab bar click (FieldList only).
+                if let Some(tab_rect) = self.last_tab_area {
+                    if mouse::in_rect(mouse.column, mouse.row, tab_rect) {
+                        let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
+                        // Each rendered label is "▸ <label>" (active, +2 chars) or
+                        // "<label>" (inactive). For hit testing we use the plain
+                        // label width + 2 for the active tab's prefix. However
+                        // `tab_click_index` just walks fixed widths, so build
+                        // display labels matching what draw_field_list renders.
+                        let display: Vec<String> = labels
+                            .iter()
+                            .enumerate()
+                            .map(|(i, l)| {
+                                if i == self.active_tab {
+                                    format!("▸ {l}")
+                                } else {
+                                    l.to_string()
+                                }
+                            })
+                            .collect();
+                        let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
+                        if let Some(idx) = mouse::tab_click_index(
+                            mouse.column,
+                            tab_rect,
+                            &display_refs,
+                            3, // " │ " separator
+                        ) {
+                            if idx != self.active_tab && idx < self.tab_names.len() {
+                                self.active_tab = idx;
+                                self.field_cursor =
+                                    self.tab_field_indices().first().copied().unwrap_or(0);
+                                self.deactivate_filter();
+                                self.on_tab_switched(term).await?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+
+                // List area click.
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                    let count = self.visible_count();
+                    if let Some(pos) = mouse::list_click_index(
+                        mouse.row,
+                        self.last_main_area,
+                        self.last_list_offset,
+                        count,
+                    ) {
+                        let is_double = self.double_click.click(mouse.column, mouse.row);
+                        self.set_visible_cursor(pos);
+                        if is_double {
+                            self.activate_mouse(term).await?;
+                        }
+                    }
+                }
+            }
+
+            MouseEventKind::ScrollUp => {
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                    let cur = self.visible_cursor();
+                    let count = self.visible_count();
+                    let next = mouse::list_scroll(cur, count, true, 3);
+                    self.set_visible_cursor(next);
+                }
+            }
+
+            MouseEventKind::ScrollDown => {
+                if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                    let cur = self.visible_cursor();
+                    let count = self.visible_count();
+                    let next = mouse::list_scroll(cur, count, false, 3);
+                    self.set_visible_cursor(next);
+                }
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ── Mouse helper methods ─────────────────────────────────────
+
+    /// Number of visible items for the current screen (respecting filters).
+    fn visible_count(&self) -> usize {
+        match &self.screen {
+            Screen::SectionList => {
+                let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+                self.filtered_indices(&labels).len()
+            }
+            Screen::TypeList { .. } => {
+                let names: Vec<String> = self
+                    .types
+                    .iter()
+                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                    .collect();
+                self.filtered_indices(&names).len()
+            }
+            Screen::AliasList { .. } => {
+                let vis = self.filtered_indices(&self.aliases);
+                // +1 for [+ Add] when not filtering
+                if self.filter.is_none() {
+                    vis.len() + 1
+                } else {
+                    vis.len()
+                }
+            }
+            Screen::AliasCreate { .. } => 0,
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => {
+                            if self.personality_active_file.is_some() {
+                                0
+                            } else {
+                                self.personality_files.len()
+                            }
+                        }
+                        ConfigTab::Skills => {
+                            if self.skills_active.is_some() {
+                                0
+                            } else {
+                                self.skills_list.len()
+                            }
+                        }
+                        _ => self.visible_field_count(),
+                    }
+                } else {
+                    self.visible_field_count()
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    self.filtered_indices(&self.select_items).len()
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Helper: visible field count for the regular (non-composite) field list.
+    fn visible_field_count(&self) -> usize {
+        let tab_indices = self.tab_field_indices();
+        let tab_names: Vec<String> = tab_indices
+            .iter()
+            .map(|&i| {
+                self.fields[i]
+                    .path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&self.fields[i].path)
+                    .to_string()
+            })
+            .collect();
+        let filter_vis = self.filtered_indices(&tab_names);
+        filter_vis.len()
+    }
+
+    /// Current cursor position in visible (filtered) coordinates.
+    fn visible_cursor(&self) -> usize {
+        match &self.screen {
+            Screen::SectionList => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    let labels: Vec<String> =
+                        self.sections.iter().map(|s| s.label.clone()).collect();
+                    self.filtered_indices(&labels)
+                        .iter()
+                        .position(|&i| i == self.section_cursor)
+                        .unwrap_or(0)
+                }
+            }
+            Screen::TypeList { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    let names: Vec<String> = self
+                        .types
+                        .iter()
+                        .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                        .collect();
+                    self.filtered_indices(&names)
+                        .iter()
+                        .position(|&i| i == self.type_cursor)
+                        .unwrap_or(0)
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.alias_cursor
+                }
+            }
+            Screen::AliasCreate { .. } => 0,
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => self.personality_cursor,
+                        ConfigTab::Skills => self.skills_cursor,
+                        _ => self.visible_field_cursor(),
+                    }
+                } else {
+                    self.visible_field_cursor()
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.filter.is_some() {
+                    self.filter_cursor
+                } else {
+                    self.select_cursor
+                }
+            }
+        }
+    }
+
+    /// Helper: current field cursor in visible coordinates.
+    fn visible_field_cursor(&self) -> usize {
+        if self.filter.is_some() {
+            return self.filter_cursor;
+        }
+        let tab_indices = self.tab_field_indices();
+        let tab_names: Vec<String> = tab_indices
+            .iter()
+            .map(|&i| {
+                self.fields[i]
+                    .path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&self.fields[i].path)
+                    .to_string()
+            })
+            .collect();
+        let filter_vis = self.filtered_indices(&tab_names);
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+        visible
+            .iter()
+            .position(|&i| i == self.field_cursor)
+            .unwrap_or(0)
+    }
+
+    /// Set the cursor from a visible (filtered) position.
+    fn set_visible_cursor(&mut self, pos: usize) {
+        match &self.screen {
+            Screen::SectionList => {
+                let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
+                let visible = self.filtered_indices(&labels);
+                if self.filter.is_some() {
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else if let Some(&orig) = visible.get(pos) {
+                    self.section_cursor = orig;
+                }
+            }
+            Screen::TypeList { .. } => {
+                let names: Vec<String> = self
+                    .types
+                    .iter()
+                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
+                    .collect();
+                let visible = self.filtered_indices(&names);
+                if self.filter.is_some() {
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else if let Some(&orig) = visible.get(pos) {
+                    self.type_cursor = orig;
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    let visible = self.filtered_indices(&self.aliases);
+                    self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                } else {
+                    let total = if self.filter.is_none() {
+                        self.aliases.len() + 1 // +1 for [+ Add]
+                    } else {
+                        self.aliases.len()
+                    };
+                    self.alias_cursor = pos.min(total.saturating_sub(1));
+                }
+            }
+            Screen::AliasCreate { .. } => {}
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    match self.tab_names[self.active_tab] {
+                        ConfigTab::Personality => {
+                            self.personality_cursor =
+                                pos.min(self.personality_files.len().saturating_sub(1));
+                        }
+                        ConfigTab::Skills => {
+                            self.skills_cursor = pos.min(self.skills_list.len().saturating_sub(1));
+                        }
+                        _ => self.set_visible_field_cursor(pos),
+                    }
+                } else {
+                    self.set_visible_field_cursor(pos);
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    let visible = self.filtered_indices(&self.select_items);
+                    if self.filter.is_some() {
+                        self.filter_cursor = pos.min(visible.len().saturating_sub(1));
+                    } else if pos < visible.len() {
+                        self.select_cursor = pos;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper: set field cursor from visible position.
+    fn set_visible_field_cursor(&mut self, pos: usize) {
+        let tab_indices = self.tab_field_indices();
+        let tab_names: Vec<String> = tab_indices
+            .iter()
+            .map(|&i| {
+                self.fields[i]
+                    .path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&self.fields[i].path)
+                    .to_string()
+            })
+            .collect();
+        let filter_vis = self.filtered_indices(&tab_names);
+        let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
+        if self.filter.is_some() {
+            self.filter_cursor = pos.min(filter_vis.len().saturating_sub(1));
+        } else if let Some(&orig) = visible.get(pos) {
+            self.field_cursor = orig;
+        }
+    }
+
+    /// Activate the currently selected item (double-click equivalent of Enter).
+    async fn activate_mouse(&mut self, term: &mut Term) -> Result<()> {
+        match &self.screen {
+            Screen::SectionList => {
+                let idx = self.section_cursor;
+                self.enter_section(idx).await?;
+            }
+            Screen::TypeList { .. } => {
+                let idx = self.type_cursor;
+                self.enter_type(idx).await?;
+            }
+            Screen::AliasList { .. } => {
+                if self.alias_cursor < self.aliases.len() {
+                    let idx = self.alias_cursor;
+                    self.enter_alias(idx).await?;
+                }
+                // If on [+ Add], double-click does nothing — use keyboard.
+            }
+            Screen::AliasCreate { .. } => {}
+            Screen::FieldList { .. } => {
+                if self.is_composite_tab() {
+                    // Double-click on personality file or skill opens editor —
+                    // that requires async loading which mirrors the Enter key
+                    // handler. For now, no-op on composite tabs.
+                } else if self.field_cursor < self.fields.len() {
+                    self.enter_field_edit(self.field_cursor, term).await;
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    let visible = self.filtered_indices(&self.select_items);
+                    let cursor = if self.filter.is_some() {
+                        self.filter_cursor
+                    } else {
+                        self.select_cursor
+                    };
+                    if let Some(&orig) = visible.get(cursor) {
+                        self.commit_select(orig).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // ── Data loading ─────────────────────────────────────────────
@@ -1600,7 +2007,7 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    fn draw_section_list(&self, frame: &mut Frame, area: Rect) {
+    fn draw_section_list(&mut self, frame: &mut Frame, area: Rect) {
         let r = regions(area);
 
         render_breadcrumb(frame, r.breadcrumb, &["Config"]);
@@ -1655,6 +2062,9 @@ impl<'a> App<'a> {
             r.main,
             &mut state,
         );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
             "↑↓=navigate  Enter=open  Esc=clear filter"
@@ -1664,7 +2074,7 @@ impl<'a> App<'a> {
         self.draw_footer(frame, r, hints);
     }
 
-    fn draw_type_list(&self, frame: &mut Frame, area: Rect, section_idx: usize) {
+    fn draw_type_list(&mut self, frame: &mut Frame, area: Rect, section_idx: usize) {
         let r = regions(area);
         let section = &self.sections[section_idx];
 
@@ -1726,6 +2136,9 @@ impl<'a> App<'a> {
             r.main,
             &mut state,
         );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
             "↑↓=navigate  Enter=open  Esc=clear filter"
@@ -1736,7 +2149,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_alias_list(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         section_idx: usize,
@@ -1803,6 +2216,9 @@ impl<'a> App<'a> {
             r.main,
             &mut state,
         );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
             "↑↓=navigate  Enter=open  Esc=clear filter"
@@ -1812,7 +2228,7 @@ impl<'a> App<'a> {
         self.draw_footer(frame, r, hints);
     }
 
-    fn draw_alias_create(&self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
+    fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
         let r = regions(area);
 
         let bc: Vec<&str> = std::iter::once("Config")
@@ -1841,7 +2257,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_field_list(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         _section_idx: usize,
@@ -1890,6 +2306,7 @@ impl<'a> App<'a> {
 
         // Composite tabs get custom rendering.
         if self.is_composite_tab() {
+            self.last_tab_area = tab_area;
             match self.tab_names[self.active_tab] {
                 ConfigTab::Personality => {
                     self.draw_personality_tab(frame, r);
@@ -1981,6 +2398,9 @@ impl<'a> App<'a> {
             r.main,
             &mut state,
         );
+        self.last_main_area = r.main;
+        self.last_list_offset = state.offset();
+        self.last_tab_area = tab_area;
 
         let hints = if self.filter.is_some() {
             "↑↓=navigate  Enter=edit  Esc=clear filter"
@@ -1994,7 +2414,7 @@ impl<'a> App<'a> {
 
     // ── Composite tab draw methods ──────────────────────────────
 
-    fn draw_personality_tab(&self, frame: &mut Frame, r: Regions) {
+    fn draw_personality_tab(&mut self, frame: &mut Frame, r: Regions) {
         if let Some(filename) = &self.personality_active_file {
             // Editor mode: show file content as editable text.
             let dirty = self.personality_content != self.personality_loaded;
@@ -2089,6 +2509,8 @@ impl<'a> App<'a> {
                 r.main,
                 &mut state,
             );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
 
             self.draw_footer(
                 frame,
@@ -2098,7 +2520,7 @@ impl<'a> App<'a> {
         }
     }
 
-    fn draw_skills_tab(&self, frame: &mut Frame, r: Regions) {
+    fn draw_skills_tab(&mut self, frame: &mut Frame, r: Regions) {
         if let Some(name) = &self.skills_active {
             // Editor mode.
             let dirty = self.skills_body != self.skills_body_loaded;
@@ -2171,6 +2593,8 @@ impl<'a> App<'a> {
                 r.main,
                 &mut state,
             );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
 
             self.draw_footer(
                 frame,
@@ -2181,7 +2605,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_field_edit(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         breadcrumb: &[String],
@@ -2245,6 +2669,9 @@ impl<'a> App<'a> {
                 r.main,
                 &mut state,
             );
+            self.last_main_area = r.main;
+            self.last_list_offset = state.offset();
+            self.last_tab_area = None;
 
             let hints = if self.filter.is_some() {
                 "↑↓=navigate  Enter=save  Esc=clear filter"

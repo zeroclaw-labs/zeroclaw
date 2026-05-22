@@ -256,6 +256,52 @@ impl LogEntry {
 
         lines
     }
+
+    /// Plain-text rendering of the detail fields for clipboard.
+    fn clipboard_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Timestamp  {}\n", self.timestamp));
+        out.push_str(&format!(
+            "Severity   {} ({})\n",
+            severity_label(self.severity_number),
+            self.severity_number
+        ));
+        out.push_str(&format!("Category   {}\n", self.category));
+        out.push_str(&format!("Action     {}\n", self.action));
+        if !self.outcome.is_empty() && self.outcome != "unknown" {
+            out.push_str(&format!("Outcome    {}\n", self.outcome));
+        }
+        if let Some(ms) = self.duration_ms {
+            out.push_str(&format!("Duration   {ms}ms\n"));
+        }
+        if !self.message.is_empty() {
+            out.push_str(&format!("\nMessage\n{}\n", self.message));
+        }
+        if self.trace_id.is_some() || self.span_id.is_some() {
+            out.push('\n');
+            if let Some(tid) = &self.trace_id {
+                out.push_str(&format!("trace_id   {tid}\n"));
+            }
+            if let Some(sid) = &self.span_id {
+                out.push_str(&format!("span_id    {sid}\n"));
+            }
+        }
+        if !self.zeroclaw.is_empty() {
+            out.push_str("\nAttribution\n");
+            for (k, v) in &self.zeroclaw {
+                let pad = 12usize.saturating_sub(k.len());
+                out.push_str(&format!("{k}{}{v}\n", " ".repeat(pad)));
+            }
+        }
+        if !self.attributes.is_null() {
+            out.push_str("\nAttributes\n");
+            if let Ok(pretty) = serde_json::to_string_pretty(&self.attributes) {
+                out.push_str(&pretty);
+                out.push('\n');
+            }
+        }
+        out
+    }
 }
 
 // ── Logs pane ────────────────────────────────────────────────────
@@ -281,6 +327,9 @@ pub(crate) struct Logs<'a> {
     loading: bool,
     // Viewport
     list_height: u16,
+    last_list_area: Rect,
+    last_detail_area: Option<Rect>,
+    double_click: crate::mouse::DoubleClickTracker,
 }
 
 impl<'a> Logs<'a> {
@@ -303,6 +352,9 @@ impl<'a> Logs<'a> {
             at_end: false,
             loading: false,
             list_height: 0,
+            last_list_area: Rect::default(),
+            last_detail_area: None,
+            double_click: crate::mouse::DoubleClickTracker::new(),
         }
     }
 
@@ -476,7 +528,7 @@ impl<'a> Logs<'a> {
         let help = if self.search_active {
             "Enter:apply  Esc:cancel"
         } else if self.detail_open {
-            "Esc:close  /:search  +/-:sev  J/K:scroll detail  c:clear"
+            "Esc:close  /:search  +/-:sev  J/K:scroll  y:yank  c:clear"
         } else {
             "j/k:scroll  /:search  Enter:detail  +/-:sev  f:follow  c:clear"
         };
@@ -546,14 +598,17 @@ impl<'a> Logs<'a> {
                     Constraint::Percentage(self.detail_pct),
                 ])
                 .split(content_chunk);
+            self.last_detail_area = Some(hsplit[1]);
             self.draw_list(frame, hsplit[0], &filtered);
             self.draw_detail(frame, hsplit[1]);
         } else {
+            self.last_detail_area = None;
             self.draw_list(frame, content_chunk, &filtered);
         }
     }
 
     fn draw_list(&mut self, frame: &mut ratatui::Frame, area: Rect, filtered: &[usize]) {
+        self.last_list_area = area;
         // Track inner height (minus borders) for scroll centering.
         self.list_height = area.height.saturating_sub(2);
 
@@ -659,6 +714,12 @@ impl<'a> Logs<'a> {
                     self.search_query.clear();
                     self.search_buf.clear();
                     self.refilter(anchor);
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(idx) = self.selected_event_idx() {
+                    let text = self.events[idx].clipboard_text();
+                    crate::mouse::copy_osc52(&text);
                 }
             }
             KeyCode::Char('/') => {
@@ -783,43 +844,61 @@ impl<'a> Logs<'a> {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, content_area: Rect) {
-        let is_scroll_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-        let is_scroll_down = matches!(mouse.kind, MouseEventKind::ScrollDown);
-        if !is_scroll_up && !is_scroll_down {
-            return;
-        }
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, _content_area: Rect) {
+        use crate::mouse;
+        use crossterm::event::MouseButton;
 
         let col = mouse.column;
         let row = mouse.row;
-        if !content_area.contains((col, row).into()) {
-            return;
-        }
+        let filtered_len = self.filtered_indices().len();
 
-        let in_detail = self.detail_open && col >= content_area.x + content_area.width / 2;
+        let in_list = mouse::in_rect(col, row, self.last_list_area);
+        let in_detail = self
+            .last_detail_area
+            .is_some_and(|r| mouse::in_rect(col, row, r));
 
-        if in_detail {
-            if is_scroll_down {
-                self.detail_scroll = self.detail_scroll.saturating_add(SCROLL_LINES as u16);
-            } else {
-                self.detail_scroll = self.detail_scroll.saturating_sub(SCROLL_LINES as u16);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_list {
+                    if let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.last_list_area,
+                        self.list_state.offset(),
+                        filtered_len,
+                    ) {
+                        self.follow = false;
+                        self.list_state.select(Some(idx));
+                        if self.detail_open {
+                            self.detail_scroll = 0;
+                        }
+                        if self.double_click.click(col, row) {
+                            self.detail_open = true;
+                            self.detail_scroll = 0;
+                            self.detail_pct = 50;
+                        }
+                    }
+                }
+                // Clicks in detail area are ignored (no selection there).
             }
-        } else {
-            let filtered_len = self.filtered_indices().len();
-            if filtered_len == 0 {
-                return;
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if in_detail {
+                    if up {
+                        self.detail_scroll = self.detail_scroll.saturating_sub(SCROLL_LINES as u16);
+                    } else {
+                        self.detail_scroll = self.detail_scroll.saturating_add(SCROLL_LINES as u16);
+                    }
+                } else if in_list && filtered_len > 0 {
+                    self.follow = false;
+                    let i = self.list_state.selected().unwrap_or(0);
+                    let new_i = mouse::list_scroll(i, filtered_len, up, SCROLL_LINES);
+                    self.list_state.select(Some(new_i));
+                    if self.detail_open {
+                        self.detail_scroll = 0;
+                    }
+                }
             }
-            self.follow = false;
-            let i = self.list_state.selected().unwrap_or(0);
-            let new_i = if is_scroll_down {
-                (i + SCROLL_LINES).min(filtered_len - 1)
-            } else {
-                i.saturating_sub(SCROLL_LINES)
-            };
-            self.list_state.select(Some(new_i));
-            if self.detail_open {
-                self.detail_scroll = 0;
-            }
+            _ => {}
         }
     }
 

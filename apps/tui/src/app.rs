@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
@@ -17,10 +15,20 @@ use crate::client::RpcClient;
 use crate::config_manager;
 use crate::dashboard;
 use crate::logs;
+use crate::mouse;
 use crate::theme;
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
+
+/// Mode bar label table. Shared between drawing and click detection.
+const MODE_LABELS: [(&str, &str, Mode); 5] = [
+    ("F1", " Dashboard ", Mode::Dashboard),
+    ("F2", " Config ", Mode::Config),
+    ("F3", " ACP ", Mode::ACP),
+    ("F4", " Chat ", Mode::Chat),
+    ("F5", " Logs ", Mode::Logs),
+];
 
 // ── Mode enum ────────────────────────────────────────────────────
 
@@ -39,6 +47,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
     let mut term = config_manager::init_terminal()?;
 
     let mut mode = Mode::Dashboard;
+    let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
 
     let mut dashboard_pane = dashboard::Dashboard::new(rpc);
@@ -57,6 +66,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(frame.area());
 
+            bar_area = chunks[0];
             draw_mode_bar(frame, chunks[0], mode);
             content_area = chunks[1];
 
@@ -122,8 +132,28 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 }
             }
             Event::Mouse(mouse) => {
-                if mode == Mode::Logs {
-                    logs_pane.handle_mouse(mouse, content_area);
+                // Mode bar clicks
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    let labels: Vec<(&str, &str)> =
+                        MODE_LABELS.iter().map(|(k, l, _)| (*k, *l)).collect();
+                    if let Some(n) =
+                        mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &labels)
+                    {
+                        mode = MODE_LABELS[(n - 1) as usize].2;
+                        continue;
+                    }
+                }
+                // Forward to active pane
+                match mode {
+                    Mode::Config => {
+                        config_app
+                            .handle_mouse(mouse, content_area, &mut term)
+                            .await?;
+                    }
+                    Mode::Logs => {
+                        logs_pane.handle_mouse(mouse, content_area);
+                    }
+                    _ => {}
                 }
             }
             _ => {} // Resize, etc. — just redraw on next iteration
@@ -137,16 +167,8 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
 // ── Mode bar ─────────────────────────────────────────────────────
 
 fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
-    let tabs = [
-        ("F1", " Dashboard ", Mode::Dashboard),
-        ("F2", " Config ", Mode::Config),
-        ("F3", " ACP ", Mode::ACP),
-        ("F4", " Chat ", Mode::Chat),
-        ("F5", " Logs ", Mode::Logs),
-    ];
-
     let mut spans = Vec::new();
-    for (key, label, m) in &tabs {
+    for (key, label, m) in &MODE_LABELS {
         let key_style = theme::dim_style();
         let label_style = if *m == active {
             theme::selected_style().add_modifier(Modifier::BOLD)

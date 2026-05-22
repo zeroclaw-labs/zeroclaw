@@ -11,6 +11,7 @@ mod client;
 mod config_manager;
 mod dashboard;
 mod logs;
+mod mouse;
 mod theme;
 mod widgets;
 
