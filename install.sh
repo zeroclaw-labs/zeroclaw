@@ -21,6 +21,8 @@ warn()  { printf "  ${YELLOW}⚠${RESET} %s\n" "$*" >&2; }
 die()   { printf "  ${RED}✗${RESET} %s\n" "$*" >&2; exit 1; }
 bold()  { printf "${BOLD}%s${RESET}" "$*"; }
 
+TUI_BIN_NAME="zeroclaw-tui"
+
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
 
 parse_cargo_toml() {
@@ -191,6 +193,7 @@ install_prebuilt() {
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install TUI to $CARGO_HOME/bin/$TUI_BIN_NAME (if in tarball)"
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
   fi
@@ -230,6 +233,9 @@ install_prebuilt() {
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+  if [ -f "$tmp_dir/$TUI_BIN_NAME" ]; then
+    install -m 755 "$tmp_dir/$TUI_BIN_NAME" "$CARGO_HOME/bin/$TUI_BIN_NAME"
+  fi
 
   # Install web dashboard assets bundled in the release tarball
   if [ -d "$tmp_dir/web/dist" ]; then
@@ -260,6 +266,7 @@ Options:
   --features X,Y       Select specific features — source only (comma-separated)
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
   --without-gateway    Force the gateway feature off (overrides preset/feature default)
+  --without-tui        Skip building the TUI ($TUI_BIN_NAME)
   --list-features      Print all available features and exit
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
@@ -302,6 +309,12 @@ do_uninstall() {
     info "Removed $bin"
   else
     warn "Binary not found at $bin"
+  fi
+
+  local tui_bin="$CARGO_HOME/bin/$TUI_BIN_NAME"
+  if [ -f "$tui_bin" ]; then
+    rm -f "$tui_bin"
+    info "Removed $tui_bin"
   fi
 
   local config_dir="$PREFIX/.zeroclaw"
@@ -374,8 +387,11 @@ interactive_feature_picker() {
         picker_features="${picker_features:+$picker_features }$feat" ;;
     esac
   done
+  # TUI is a separate binary, not a cargo feature — append as pseudo-entry
+  picker_features="${picker_features:+$picker_features }$TUI_BIN_NAME"
 
-  selected=""
+  # TUI is pre-checked (on by default)
+  selected="$TUI_BIN_NAME"
   # Prompt-side output goes to stderr so the picker's stdout — captured
   # by the caller's `PICKED=$(interactive_feature_picker …)` — only
   # carries the final selection. Without this redirect every prompt
@@ -490,6 +506,7 @@ PREFIX="$HOME"
 INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""         # ""=unset, "minimal"=alias for --minimal, "full"=default-features
 WITH_GATEWAY=""   # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
+WITHOUT_TUI=""    # ""=unset (default: install TUI), "true"=skip TUI
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -516,6 +533,7 @@ while [ $# -gt 0 ]; do
       shift; USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$1" ;;
     --with-gateway)    WITH_GATEWAY="true" ;;
     --without-gateway) WITH_GATEWAY="false" ;;
+    --without-tui)    WITHOUT_TUI=true ;;
     --list-features)  LIST_FEATURES=true ;;
     --prefix)
       if [ $# -lt 2 ]; then
@@ -615,6 +633,11 @@ fi
     SIZE=$(du -h "$BIN" | awk '{print $1}')
     echo
     info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
+  fi
+  TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
+  if [ -f "$TUI_BIN" ]; then
+    TUI_SIZE=$(du -h "$TUI_BIN" | awk '{print $1}')
+    info "Installed: $TUI_BIN ($TUI_SIZE)"
   fi
 }
 
@@ -738,9 +761,14 @@ if [ -t 0 ] \
     && [ "$MINIMAL" != true ] \
     && [ -z "$USER_FEATURES" ] \
     && [ -z "$PRESET" ] \
-    && [ -z "$WITH_GATEWAY" ] \
-    && [ "$DRY_RUN" != true ]; then
+    && [ -z "$WITH_GATEWAY" ]; then
   PICKED=$(interactive_feature_picker "Cargo.toml")
+  # Extract TUI preference (pseudo-entry, not a cargo feature)
+  case ",$PICKED," in
+    *,"$TUI_BIN_NAME",*) ;;
+    *) WITHOUT_TUI=true ;;
+  esac
+  PICKED=$(printf '%s' "$PICKED" | tr ',' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd, -)
   if [ -n "$PICKED" ]; then
     USER_FEATURES="$PICKED"
     info "Picked features: $USER_FEATURES"
@@ -794,34 +822,6 @@ fi
 
 apply_low_mem_lto_default
 
-# ── Dry run ───────────────────────────────────────────────────────
-
-if [ "$DRY_RUN" = true ]; then
-  echo
-  printf "%s\n" "$(bold "Dry run — nothing will be built or installed")"
-  echo
-  info "Source:   $INSTALL_DIR"
-  info "Binary:   $CARGO_HOME/bin/zeroclaw"
-  info "Config:   $PREFIX/.zeroclaw/"
-  info "Rust:     $CARGO_HOME (CARGO_HOME), $RUSTUP_HOME (RUSTUP_HOME)"
-  echo
-  if [ -n "${CARGO_PROFILE_RELEASE_LTO:-}" ]; then
-    info "env:      CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO"
-  fi
-  if [ -n "$CARGO_FLAGS" ]; then
-    info "cargo install --path . --locked --force $CARGO_FLAGS"
-  else
-    info "cargo install --path . --locked --force"
-  fi
-
-  EXPORT_LINE=$(shell_export_syntax)
-  PROFILE=$(detect_shell_profile)
-  echo
-  printf "  %s (%s):\n" "$(bold "Shell profile")" "$PROFILE"
-  printf "    %s\n" "$EXPORT_LINE"
-  echo
-  exit 0
-fi
 
 # ── Build and install ─────────────────────────────────────────────
 
@@ -834,8 +834,13 @@ else
 fi
 echo
 
-# shellcheck disable=SC2086
-cargo install --path . --locked --force $CARGO_FLAGS
+if [ "$DRY_RUN" = true ]; then
+  # shellcheck disable=SC2086
+  info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
+else
+  # shellcheck disable=SC2086
+  cargo install --path . --locked --force $CARGO_FLAGS
+fi
 
 # ── Web dashboard (gateway feature only) ──────────────────────────
 # When the install includes the `gateway` feature, build `web/dist` so
@@ -851,28 +856,69 @@ case "$CARGO_FLAGS" in
     esac ;;
 esac
 if [ "$WANT_GATEWAY" = true ]; then
-  build_web_dashboard "$INSTALL_DIR"
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would build web dashboard"
+  else
+    build_web_dashboard "$INSTALL_DIR"
+  fi
+fi
+
+# ── TUI (requires agent-runtime for daemon RPC) ──────────────────
+# The TUI connects to zeroclaw-runtime's RPC server. Without agent-runtime,
+# there's no daemon to connect to — skip the TUI build.
+
+WANT_TUI=true
+if [ "$WITHOUT_TUI" = true ]; then
+  WANT_TUI=false
+else
+  # agent-runtime is a default feature. If defaults are stripped
+  # (--minimal, --without-gateway), check whether it was re-added.
+  case "$CARGO_FLAGS" in
+    *--no-default-features*)
+      case ",$USER_FEATURES," in
+        *,agent-runtime,*) ;;
+        *) WANT_TUI=false ;;
+      esac ;;
+  esac
+fi
+
+if [ "$WANT_TUI" = true ]; then
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would run: cargo install --path apps/tui --locked --force"
+  else
+    echo
+    printf "%s\n" "$(bold "Building $TUI_BIN_NAME")"
+    echo
+    cargo install --path apps/tui --locked --force
+  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────
 
-BIN="$CARGO_HOME/bin/zeroclaw"
-if [ -f "$BIN" ]; then
-  SIZE=$(du -h "$BIN" | awk '{print $1}')
-  NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
-  echo
-  info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
-
-  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
-  if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
-    ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+if [ "$DRY_RUN" != true ]; then
+  BIN="$CARGO_HOME/bin/zeroclaw"
+  if [ -f "$BIN" ]; then
+    SIZE=$(du -h "$BIN" | awk '{print $1}')
+    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
     echo
-    warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
-    warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
-    warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
+    info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
+
+    ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+    if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
+      ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+      echo
+      warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
+      warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
+      warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
+    fi
+  else
+    warn "Binary not found at expected path: $BIN"
   fi
-else
-  warn "Binary not found at expected path: $BIN"
+  TUI_BIN="$CARGO_HOME/bin/$TUI_BIN_NAME"
+  if [ -f "$TUI_BIN" ]; then
+    TUI_SIZE=$(du -h "$TUI_BIN" | awk '{print $1}')
+    info "Installed: $TUI_BIN ($TUI_SIZE)"
+  fi
 fi
 
 fi  # end source build block
