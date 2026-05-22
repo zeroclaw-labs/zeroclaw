@@ -157,6 +157,17 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionListParams {
+        /// Full-text search query. When present, only sessions whose message
+        /// content matches (via FTS5) are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit: Option<usize>,
+    }
+}
+
+rpc_type! {
     pub struct SessionListResult {
         pub sessions: Vec<SessionEntry>,
     }
@@ -594,6 +605,8 @@ rpc_type! {
         pub alias: String,
         pub enabled: bool,
         pub active_sessions: usize,
+        #[serde(default)]
+        pub channels: Vec<String>,
     }
 }
 

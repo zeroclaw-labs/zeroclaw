@@ -320,7 +320,7 @@ impl RpcDispatcher {
             Method::SessionPrompt => self.handle_session_prompt(&req.params).await,
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params),
-            Method::SessionList => self.handle_session_list().await,
+            Method::SessionList => self.handle_session_list(&req.params).await,
             Method::SessionMessages => self.handle_session_messages(&req.params).await,
             Method::SessionState => self.handle_session_state(&req.params).await,
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
@@ -422,16 +422,33 @@ impl RpcDispatcher {
 
     async fn handle_status(&self) -> RpcResult {
         let ids = self.ctx.sessions.list_ids().await;
+        // Count persisted sessions (channel-originated) that aren't already
+        // in the in-memory RPC store.
+        let persisted_count = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .map(|b| b.list_sessions_with_metadata().len())
+            .unwrap_or(0);
+        let total = ids.len().max(persisted_count);
         to_result(StatusResult {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: RPC_PROTOCOL_VERSION,
-            active_sessions: ids.len(),
+            active_sessions: total,
             session_ids: ids,
         })
     }
 
     fn handle_health(&self) -> RpcResult {
-        Ok(crate::health::snapshot_json())
+        let mut val = crate::health::snapshot_json();
+        if let Some(obj) = val.as_object_mut() {
+            let stats = crate::process_stats::sample();
+            obj.insert(
+                "process".to_string(),
+                serde_json::to_value(&stats).unwrap_or_default(),
+            );
+        }
+        Ok(val)
     }
 
     // ── Session handlers ─────────────────────────────────────────
@@ -455,14 +472,12 @@ impl RpcDispatcher {
 
         // Register the RPC approval channel so tool-call approvals route
         // through session/approve instead of being auto-denied.
-        let approval_ch = Arc::new(
-            crate::rpc::approval_channel::RpcApprovalChannel::new(
-                "rpc",
-                session_id.clone(),
-                Arc::clone(&self.rpc),
-                Arc::clone(&self.ctx.approval_pending),
-            ),
-        );
+        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
+            "rpc",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.ctx.approval_pending),
+        ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let cwd = req.cwd.as_deref().unwrap_or(".");
@@ -608,14 +623,30 @@ impl RpcDispatcher {
         }
     }
 
-    async fn handle_session_list(&self) -> RpcResult {
+    async fn handle_session_list(&self, params: &Value) -> RpcResult {
         let backend = self
             .ctx
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let req: SessionListParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let all = backend.list_sessions_with_metadata();
+
+        // Use FTS when a query is provided, plain list otherwise.
+        let all = if let Some(ref keyword) = req.query {
+            if keyword.trim().is_empty() {
+                backend.list_sessions_with_metadata()
+            } else {
+                use zeroclaw_infra::session_backend::SessionQuery;
+                backend.search(&SessionQuery {
+                    keyword: Some(keyword.clone()),
+                    limit: req.limit,
+                })
+            }
+        } else {
+            backend.list_sessions_with_metadata()
+        };
+
         let sessions: Vec<SessionEntry> = all
             .into_iter()
             .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
@@ -654,15 +685,29 @@ impl RpcDispatcher {
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        let session_key = format!("rpc_{}", req.session_id);
-        let messages: Vec<MessageEntry> = backend
-            .load(&session_key)
-            .iter()
-            .map(|m| MessageEntry {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
+
+        // Try the raw id first (channel sessions store as-is), then
+        // prefixed variants for RPC/gateway-originated sessions.
+        let candidates = [
+            req.session_id.clone(),
+            format!("rpc_{}", req.session_id),
+            format!("gw_{}", req.session_id),
+        ];
+        let mut messages = Vec::new();
+        for key in &candidates {
+            let loaded = backend.load(key);
+            if !loaded.is_empty() {
+                messages = loaded
+                    .iter()
+                    .map(|m| MessageEntry {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                    })
+                    .collect();
+                break;
+            }
+        }
+
         to_result(SessionMessagesResult {
             session_id: req.session_id,
             messages,
@@ -676,30 +721,46 @@ impl RpcDispatcher {
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        let session_key = format!("rpc_{}", req.session_id);
-        match backend.get_session_state(&session_key) {
-            Ok(Some(ss)) => to_result(SessionStateResult {
-                session_id: req.session_id,
-                state: ss.state,
-                turn_id: ss.turn_id,
-                turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
-            }),
-            Ok(None) => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
-            Err(e) => Err(rpc_err(
-                INTERNAL_ERROR,
-                format!("Failed to get session state: {e}"),
-            )),
+        let candidates = [
+            req.session_id.clone(),
+            format!("rpc_{}", req.session_id),
+            format!("gw_{}", req.session_id),
+        ];
+        for key in &candidates {
+            match backend.get_session_state(key) {
+                Ok(Some(ss)) => {
+                    return to_result(SessionStateResult {
+                        session_id: req.session_id,
+                        state: ss.state,
+                        turn_id: ss.turn_id,
+                        turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                    });
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to get session state: {e}"),
+                    ));
+                }
+            }
         }
+        Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
     }
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         // Remove from in-memory store.
         self.ctx.sessions.remove(&req.session_id).await;
-        // Remove from persistent backend.
+        // Remove from persistent backend — try raw id, then prefixed variants.
         if let Some(ref backend) = self.ctx.session_backend {
-            let session_key = format!("rpc_{}", req.session_id);
-            let _ = backend.delete_session(&session_key);
+            for key in &[
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ] {
+                let _ = backend.delete_session(key);
+            }
         }
         to_result(SessionDeleteResult {
             session_id: req.session_id,
@@ -714,10 +775,16 @@ impl RpcDispatcher {
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        let session_key = format!("rpc_{}", req.session_id);
-        backend
-            .set_session_name(&session_key, &req.name)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Rename failed: {e}")))?;
+        // Try all candidate keys — UPDATE on a missing key is a no-op.
+        for key in &[
+            req.session_id.clone(),
+            format!("rpc_{}", req.session_id),
+            format!("gw_{}", req.session_id),
+        ] {
+            backend
+                .set_session_name(key, &req.name)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Rename failed: {e}")))?;
+        }
         to_result(SessionRenameResult {
             session_id: req.session_id,
             name: req.name,
@@ -736,7 +803,10 @@ impl RpcDispatcher {
                 zeroclaw_api::channel::ChannelApprovalResponse::Deny
             }
             other => {
-                return Err(rpc_err(INVALID_PARAMS, format!("unknown decision: {other}")))
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("unknown decision: {other}"),
+                ));
             }
         };
 
@@ -1148,16 +1218,36 @@ impl RpcDispatcher {
 
     async fn handle_agents_status(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let _session_ids = self.ctx.sessions.list_ids().await;
+
+        // Count sessions from the persisted backend (covers channel-originated
+        // sessions) + in-memory RPC sessions, deduped by taking the max.
+        let rpc_counts = self.ctx.sessions.count_by_agent().await;
+        let mut backend_counts = std::collections::HashMap::<String, usize>::new();
+        if let Some(ref backend) = self.ctx.session_backend {
+            for meta in backend.list_sessions_with_metadata() {
+                let alias = meta.agent_alias.or_else(|| {
+                    meta.channel_id
+                        .as_deref()
+                        .and_then(|c| config.agent_for_channel(c))
+                        .map(str::to_string)
+                });
+                if let Some(a) = alias {
+                    *backend_counts.entry(a).or_default() += 1;
+                }
+            }
+        }
+
         let agents: Vec<AgentStatusEntry> = config
             .agents
             .iter()
             .map(|(alias, agent_cfg)| {
-                // TODO: filter session_ids by agent_alias once sessions track it
+                let rpc = *rpc_counts.get(alias).unwrap_or(&0);
+                let persisted = *backend_counts.get(alias).unwrap_or(&0);
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
-                    active_sessions: 0,
+                    active_sessions: rpc.max(persisted),
+                    channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
                 }
             })
             .collect();
@@ -1425,26 +1515,109 @@ impl RpcDispatcher {
     // ── Config introspection handlers ───────────────────────────
 
     fn handle_config_sections(&self) -> RpcResult {
-        use zeroclaw_config::sections::{ONBOARDING_SECTIONS, SectionShape};
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_config::sections::{
+            ONBOARDING_SECTIONS, Section, SectionShape, section_help, section_index_for_key,
+        };
+
         let config = self.ctx.config.read().clone();
-        let sections: Vec<ConfigSectionEntry> = ONBOARDING_SECTIONS
+
+        // Schema-driven: walk Config::prop_fields() to discover ALL
+        // top-level section roots, not just ONBOARDING_SECTIONS.
+        let mut roots: std::collections::BTreeSet<String> = config
+            .prop_fields()
             .iter()
-            .map(|&section| {
-                let completed = crate::onboard::section_has_signal(&config, section);
-                let has_picker = matches!(
-                    section.shape(),
-                    SectionShape::TypedFamilyMap | SectionShape::OneTierAliasMap
-                );
+            .filter_map(|f| f.name.split('.').next().map(str::to_string))
+            .collect();
+
+        // Hidden system fields the user never edits.
+        const HIDDEN: &[&str] = &[
+            "schema_version",
+            "onboard_state",
+            "onboard-state",
+            "config_path",
+            "workspace_dir",
+            "env_overridden_paths",
+            "pre_override_snapshots",
+        ];
+        for h in HIDDEN {
+            roots.remove(*h);
+        }
+
+        // Map-keyed sections surface even when empty.
+        let all_map_paths: Vec<&'static str> =
+            Config::map_key_sections().iter().map(|s| s.path).collect();
+        for &prefix in &all_map_paths
+            .iter()
+            .filter_map(|p| p.split('.').next())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            roots.insert(prefix.to_string());
+        }
+
+        // Inject synthetic onboarding sections (e.g. personality).
+        for s in ONBOARDING_SECTIONS {
+            roots.insert(s.as_str().to_string());
+        }
+
+        // Drop bare parents when a dotted child exists
+        // (`providers` vanishes once `providers.models` is present).
+        let parents_with_children: std::collections::HashSet<String> = roots
+            .iter()
+            .filter_map(|k| k.split_once('.').map(|(p, _)| p.to_string()))
+            .collect();
+        roots.retain(|k| k.contains('.') || !parents_with_children.contains(k));
+
+        // Hide cost.rates subtree.
+        roots.retain(|k| !k.starts_with("cost.rates"));
+
+        // Sort: onboarding sections in canonical order first, rest alpha.
+        let mut ordered: Vec<String> = roots.into_iter().collect();
+        ordered.sort_by(
+            |a, b| match (section_index_for_key(a), section_index_for_key(b)) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            },
+        );
+
+        // Picker eligibility: map-keyed section or onboarding section
+        // with a picker shape.
+        let section_has_picker_for_key = |key: &str| -> bool {
+            let key_dot = format!("{key}.");
+            all_map_paths.iter().any(|p| {
+                *p == key
+                    || p.strip_prefix(&key_dot)
+                        .is_some_and(|rest| !rest.contains('.'))
+            })
+        };
+
+        let sections: Vec<ConfigSectionEntry> = ordered
+            .into_iter()
+            .map(|key| {
+                let wizard = Section::from_key(&key);
+                let has_picker = match wizard {
+                    Some(w) => matches!(
+                        w.shape(),
+                        SectionShape::TypedFamilyMap | SectionShape::OneTierAliasMap
+                    ),
+                    None => section_has_picker_for_key(&key),
+                };
+                let completed = wizard
+                    .map(|w| crate::onboard::section_has_signal(&config, w))
+                    .unwrap_or(false);
+                let label = humanize_section_key(&key);
                 ConfigSectionEntry {
-                    key: section.as_str().to_string(),
-                    label: section.as_str().replace(['-', '_'], " "),
-                    help: section.help().to_string(),
+                    help: section_help(&key).to_string(),
                     has_picker,
                     completed,
                     ready: false,
                     group: String::new(),
-                    is_onboarding: true,
-                    shape: Some(section.shape()),
+                    is_onboarding: wizard.is_some(),
+                    shape: wizard.map(Section::shape),
+                    label,
+                    key,
                 }
             })
             .collect();
@@ -1599,6 +1772,21 @@ impl RpcDispatcher {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Humanize a section key for display (`risk-profiles` → `Risk profiles`).
+fn humanize_section_key(key: &str) -> String {
+    match key {
+        "providers.models" => return "Model providers".to_string(),
+        "providers.tts" => return "TTS providers".to_string(),
+        "providers.transcription" => return "Transcription providers".to_string(),
+        _ => {}
+    }
+    let mut s = key.replace(['_', '-'], " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    s
+}
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))

@@ -52,6 +52,16 @@ pub mod method {
     pub const SESSION_CLOSE: &str = "session/close";
     pub const AGENTS_LIST: &str = "agents/list";
     pub const SESSION_APPROVE: &str = "session/approve";
+    // Dashboard
+    pub const STATUS: &str = "status";
+    pub const HEALTH: &str = "health";
+    pub const COST_QUERY: &str = "cost/query";
+    pub const SESSION_LIST: &str = "session/list";
+    pub const AGENTS_STATUS: &str = "agents/status";
+    pub const CRON_LIST: &str = "cron/list";
+    pub const MEMORY_LIST: &str = "memory/list";
+    pub const MEMORY_SEARCH: &str = "memory/search";
+    pub const SESSION_MESSAGES: &str = "session/messages";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -96,8 +106,14 @@ pub struct RpcNotification {
 
 #[derive(Debug, Clone)]
 pub enum SessionUpdate {
-    AgentMessageChunk { session_id: String, text: String },
-    AgentThoughtChunk { session_id: String, text: String },
+    AgentMessageChunk {
+        session_id: String,
+        text: String,
+    },
+    AgentThoughtChunk {
+        session_id: String,
+        text: String,
+    },
     ToolCall {
         session_id: String,
         tool_call_id: String,
@@ -541,6 +557,59 @@ impl RpcClient {
         self.call(method::AGENTS_LIST, serde_json::json!({})).await
     }
 
+    // ── Dashboard helpers ────────────────────────────────────────
+
+    pub async fn status(&self) -> Result<StatusResult> {
+        self.call(method::STATUS, serde_json::json!({})).await
+    }
+
+    pub async fn health(&self) -> Result<Value> {
+        self.call(method::HEALTH, serde_json::json!({})).await
+    }
+
+    pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
+        self.call(method::COST_QUERY, serde_json::json!({ "agent": agent }))
+            .await
+    }
+
+    pub async fn session_list(&self, query: Option<&str>) -> Result<SessionListResult> {
+        self.call(method::SESSION_LIST, serde_json::json!({ "query": query }))
+            .await
+    }
+
+    pub async fn agents_status(&self) -> Result<AgentsStatusResult> {
+        self.call(method::AGENTS_STATUS, serde_json::json!({}))
+            .await
+    }
+
+    pub async fn cron_list(&self) -> Result<CronListResult> {
+        self.call(method::CRON_LIST, serde_json::json!({})).await
+    }
+
+    pub async fn memory_list(&self, category: Option<&str>) -> Result<MemoryListResult> {
+        self.call(
+            method::MEMORY_LIST,
+            serde_json::json!({ "category": category }),
+        )
+        .await
+    }
+
+    pub async fn memory_search(&self, query: &str, limit: usize) -> Result<MemorySearchResult> {
+        self.call(
+            method::MEMORY_SEARCH,
+            serde_json::json!({ "query": query, "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn session_messages(&self, session_id: &str) -> Result<SessionMessagesResult> {
+        self.call(
+            method::SESSION_MESSAGES,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
     // ── Test-only constructors ────────────────────────────────────
 
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
@@ -837,6 +906,191 @@ impl ApprovalDecision {
     }
 }
 
+// ── Dashboard types ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StatusResult {
+    pub server_version: String,
+    pub protocol_version: u64,
+    pub active_sessions: usize,
+    pub session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionEntry {
+    pub session_id: String,
+    pub session_key: String,
+    pub created_at: String,
+    pub last_activity: String,
+    pub message_count: usize,
+    #[serde(default)]
+    pub agent_alias: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionListResult {
+    pub sessions: Vec<SessionEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentStatusEntry {
+    pub alias: String,
+    pub enabled: bool,
+    pub active_sessions: usize,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentsStatusResult {
+    pub agents: Vec<AgentStatusEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ModelStats {
+    pub model: String,
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    pub request_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentCostStats {
+    pub agent_alias: String,
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    pub request_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CostSummaryResult {
+    pub session_cost_usd: f64,
+    pub daily_cost_usd: f64,
+    pub monthly_cost_usd: f64,
+    pub total_tokens: u64,
+    pub request_count: usize,
+    #[serde(default)]
+    pub by_model: std::collections::HashMap<String, ModelStats>,
+    #[serde(default)]
+    pub by_agent: std::collections::HashMap<String, AgentCostStats>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CronSchedule {
+    Cron {
+        expr: String,
+        #[serde(default)]
+        tz: Option<String>,
+    },
+    At {
+        at: String,
+    },
+    Every {
+        every_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronJobEntry {
+    pub id: String,
+    pub expression: String,
+    pub schedule: CronSchedule,
+    pub command: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub agent_alias: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub created_at: String,
+    pub next_run: String,
+    #[serde(default)]
+    pub last_run: Option<String>,
+    #[serde(default)]
+    pub last_status: Option<String>,
+    #[serde(default)]
+    pub last_output: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CronListResult {
+    pub jobs: Vec<CronJobEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryEntryResult {
+    pub id: String,
+    pub key: String,
+    pub content: String,
+    pub category: String,
+    pub timestamp: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub importance: Option<f64>,
+    #[serde(default)]
+    pub agent_alias: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryListResult {
+    pub entries: Vec<MemoryEntryResult>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemorySearchResult {
+    pub entries: Vec<MemoryEntryResult>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionMessagesResult {
+    pub session_id: String,
+    pub messages: Vec<MessageEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MessageEntry {
+    pub role: String,
+    pub content: String,
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -855,9 +1109,8 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = tokio::spawn(async move {
-            client.session_new("my-agent", Some("/tmp/work")).await
-        });
+        let task =
+            tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
         let line = write_rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -889,11 +1142,7 @@ mod session_method_tests {
         assert_eq!(req["params"]["session_id"], "s1");
 
         let id = req["id"].as_str().unwrap().to_string();
-        rpc.dispatch_response(
-            &id,
-            Some(json!({"session_id":"s1","cancelled":true})),
-            None,
-        );
+        rpc.dispatch_response(&id, Some(json!({"session_id":"s1","cancelled":true})), None);
         task.await.unwrap().unwrap();
     }
 
@@ -903,7 +1152,9 @@ mod session_method_tests {
         let client = RpcClient::with_rpc(rpc.clone());
 
         let task = tokio::spawn(async move {
-            client.session_approve("s1", "req-1", ApprovalDecision::AllowOnce).await
+            client
+                .session_approve("s1", "req-1", ApprovalDecision::AllowOnce)
+                .await
         });
 
         let line = write_rx.recv().await.unwrap();
@@ -1014,13 +1265,10 @@ mod notification_tests {
             ))
             .unwrap();
 
-        let update = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            update_rx.recv(),
-        )
-        .await
-        .expect("timed out")
-        .expect("channel closed");
+        let update = tokio::time::timeout(std::time::Duration::from_millis(100), update_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
 
         assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
     }
@@ -1035,11 +1283,8 @@ mod notification_tests {
             .send(make_notification("other/event", serde_json::json!({})))
             .unwrap();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            update_rx.recv(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), update_rx.recv()).await;
         assert!(result.is_err(), "unknown method must be dropped");
     }
 }

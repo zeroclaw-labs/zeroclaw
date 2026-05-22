@@ -164,6 +164,16 @@ impl SessionStore {
     pub async fn count(&self) -> usize {
         self.sessions.lock().await.len()
     }
+
+    /// Count active sessions grouped by agent alias.
+    pub async fn count_by_agent(&self) -> HashMap<String, usize> {
+        let sessions = self.sessions.lock().await;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for session in sessions.values() {
+            *counts.entry(session.agent_alias.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
 }
 
 #[cfg(test)]

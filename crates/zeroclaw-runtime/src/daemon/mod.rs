@@ -331,15 +331,47 @@ pub async fn run(
         )
         .ok();
 
+        // Wire the memory subsystem so `memory/list` and `memory/search`
+        // work over the RPC socket (same pattern as the gateway).
+        let rpc_memory: Option<std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory>> = if config
+            .agents
+            .is_empty()
+        {
+            None
+        } else {
+            let fallback_key = config
+                .first_model_provider()
+                .and_then(|e| e.api_key.clone());
+            match zeroclaw_memory::create_memory_with_storage_and_routes(
+                &config.memory,
+                &config.embedding_routes,
+                config.resolve_active_storage(),
+                &config.data_dir,
+                fallback_key.as_deref(),
+            ) {
+                Ok(mem) => Some(std::sync::Arc::from(mem)),
+                Err(_e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "RPC memory subsystem unavailable"
+                    );
+                    None
+                }
+            }
+        };
+
         let rpc_ctx = std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
             session_backend,
-            memory: None,       // TODO: wire when memory subsystem is daemon-scoped
+            memory: rpc_memory,
             cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
-            approval_pending: std::sync::Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            approval_pending: std::sync::Arc::new(
+                crate::rpc::context::ApprovalPendingMap::default(),
+            ),
         });
 
         let socket_start = std::sync::Arc::new(socket_start);

@@ -52,6 +52,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
     let mut content_area = Rect::default();
 
     let mut dashboard_pane = dashboard::Dashboard::new(rpc);
+    dashboard_pane.init().await?;
     let mut config_app = config_manager::App::new(rpc);
     config_app.init().await?;
     let mut acp_pane = acp::Acp::new(rpc);
@@ -82,6 +83,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
                 let help = match mode {
+                    Mode::Dashboard => dashboard_pane.help_lines(),
                     Mode::Config => config_app.help_lines(),
                     Mode::Logs => logs_pane.help_lines(),
                     _ => vec![("?", "This help")],
@@ -96,6 +98,9 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
 
         // Poll for input with a timeout so live panes refresh periodically.
         if !event::poll(TICK)? {
+            if mode == Mode::Dashboard {
+                dashboard_pane.tick().await;
+            }
             continue;
         }
 
@@ -144,6 +149,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 // `?` opens help unless pane is in text-input mode.
                 if key.code == KeyCode::Char('?') {
                     let in_text_input = match mode {
+                        Mode::Dashboard => dashboard_pane.wants_text_input(),
                         Mode::Config => config_app.wants_text_input(),
                         Mode::Logs => logs_pane.wants_text_input(),
                         _ => false,
@@ -155,7 +161,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 }
 
                 let quit = match mode {
-                    Mode::Dashboard => dashboard_pane.handle_key(key),
+                    Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, &mut term).await?,
                     Mode::ACP => acp_pane.handle_key(key),
                     Mode::Chat => chat_pane.handle_key(key),
@@ -186,6 +192,9 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 }
                 // Forward to active pane
                 match mode {
+                    Mode::Dashboard => {
+                        dashboard_pane.handle_mouse(mouse, content_area);
+                    }
                     Mode::Config => {
                         config_app
                             .handle_mouse(mouse, content_area, &mut term)
