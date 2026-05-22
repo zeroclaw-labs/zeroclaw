@@ -527,10 +527,8 @@ impl<'a> Logs<'a> {
         // Status bar
         let help = if self.search_active {
             "Enter:apply  Esc:cancel"
-        } else if self.detail_open {
-            "Esc:close  /:search  +/-:sev  J/K:scroll  y:yank  c:clear"
         } else {
-            "j/k:scroll  /:search  Enter:detail  +/-:sev  f:follow  c:clear"
+            "?:help"
         };
 
         let status = Line::from(vec![
@@ -934,6 +932,48 @@ impl<'a> Logs<'a> {
             if pos > 0 {
                 self.min_severity = SEV_LEVELS[pos - 1];
             }
+        }
+    }
+
+    /// Whether the pane is in a text-input mode (search bar active).
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.search_active
+    }
+
+    /// Context-aware keybinding lines for the help modal.
+    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+        if self.search_active {
+            vec![("Enter", "Apply search"), ("Esc", "Cancel search")]
+        } else if self.detail_open {
+            vec![
+                ("Esc / Enter", "Close detail"),
+                ("j / k / \u{2191}\u{2193}", "Move list cursor"),
+                ("J / K / Shift+\u{2191}\u{2193}", "Scroll detail pane"),
+                ("Shift+\u{2190}\u{2192}", "Resize detail pane"),
+                ("/", "Search"),
+                ("+ / -", "Raise / lower severity filter"),
+                ("c", "Clear search filter"),
+                ("y", "Yank detail to clipboard"),
+                ("?", "This help"),
+            ]
+        } else {
+            vec![
+                ("j / k / \u{2191}\u{2193}", "Move cursor"),
+                ("G / End", "Jump to bottom (follow)"),
+                ("g / Home", "Jump to top"),
+                ("PgDn / PgUp", "Page down / up"),
+                ("Enter", "Open detail pane"),
+                ("f", "Toggle follow mode"),
+                ("/", "Search"),
+                ("+ / -", "Raise / lower severity filter"),
+                ("c", "Clear search filter"),
+                ("?", "This help"),
+                ("", ""),
+                (
+                    "Mouse",
+                    "Click to select, scroll wheel, double-click detail",
+                ),
+            ]
         }
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::acp;
@@ -47,6 +47,7 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
     let mut term = config_manager::init_terminal()?;
 
     let mut mode = Mode::Dashboard;
+    let mut show_help = false;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
 
@@ -77,6 +78,20 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
             }
+
+            // Help modal overlay (drawn last so it sits on top).
+            if show_help {
+                let help = match mode {
+                    Mode::Config => config_app.help_lines(),
+                    Mode::Logs => logs_pane.help_lines(),
+                    _ => vec![("?", "This help")],
+                };
+                // Global keys always shown.
+                let mut lines = vec![("F1–F5", "Switch mode"), ("Ctrl+C", "Quit")];
+                lines.push(("", ""));
+                lines.extend(help);
+                draw_help_modal(frame, frame.area(), &lines);
+            }
         })?;
 
         // Poll for input with a timeout so live panes refresh periodically.
@@ -93,6 +108,12 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 // Ctrl+C always quits
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     break;
+                }
+
+                // Help modal: any key dismisses it
+                if show_help {
+                    show_help = false;
+                    continue;
                 }
 
                 // Global keys: F1–F5 switch modes
@@ -120,6 +141,19 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                     _ => {}
                 }
 
+                // `?` opens help unless pane is in text-input mode.
+                if key.code == KeyCode::Char('?') {
+                    let in_text_input = match mode {
+                        Mode::Config => config_app.wants_text_input(),
+                        Mode::Logs => logs_pane.wants_text_input(),
+                        _ => false,
+                    };
+                    if !in_text_input {
+                        show_help = true;
+                        continue;
+                    }
+                }
+
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key),
                     Mode::Config => config_app.handle_key(key, &mut term).await?,
@@ -132,6 +166,13 @@ pub async fn run(rpc: &RpcClient) -> Result<()> {
                 }
             }
             Event::Mouse(mouse) => {
+                // Dismiss help on any click
+                if show_help {
+                    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                        show_help = false;
+                    }
+                    continue;
+                }
                 // Mode bar clicks
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     let labels: Vec<(&str, &str)> =
@@ -181,4 +222,57 @@ fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Help modal ───────────────────────────────────────────────────
+
+fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, lines: &[(&str, &str)]) {
+    // Compute minimum dimensions.
+    let key_width = lines.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let val_width = lines.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    // key column + "  " gap + value column + border padding (2 each side)
+    let inner_w = key_width + 2 + val_width;
+    let box_w = (inner_w + 4) as u16; // 2 border + 2 padding
+    let box_h = (lines.len() + 4) as u16; // 2 border + 1 title + 1 footer hint
+
+    // Center in the terminal area.
+    let x = area.x + area.width.saturating_sub(box_w) / 2;
+    let y = area.y + area.height.saturating_sub(box_h) / 2;
+    let modal_rect = Rect::new(x, y, box_w.min(area.width), box_h.min(area.height));
+
+    // Clear the area behind the modal.
+    frame.render_widget(Clear, modal_rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::dim_style())
+        .title(Span::styled(" Keybindings ", theme::heading_style()));
+
+    let inner = block.inner(modal_rect);
+    frame.render_widget(block, modal_rect);
+
+    // Render keybinding lines.
+    let mut text_lines: Vec<Line> = Vec::new();
+    for (key, desc) in lines {
+        if key.is_empty() && desc.is_empty() {
+            text_lines.push(Line::from(""));
+        } else {
+            text_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:>width$}", key, width = key_width),
+                    theme::accent_style(),
+                ),
+                Span::styled("  ", theme::dim_style()),
+                Span::styled(*desc, theme::body_style()),
+            ]));
+        }
+    }
+    // Footer hint
+    text_lines.push(Line::from(""));
+    text_lines.push(Line::from(Span::styled(
+        "Press any key to close",
+        theme::dim_style(),
+    )));
+
+    frame.render_widget(Paragraph::new(text_lines), inner);
 }

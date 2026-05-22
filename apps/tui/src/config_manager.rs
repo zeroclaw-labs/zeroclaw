@@ -2067,9 +2067,9 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓=navigate  Enter=open  Esc=clear filter"
+            "↑↓  Enter=open  Esc=clear filter"
         } else {
-            "↑↓/jk=navigate  Enter=open  /=filter  q=quit"
+            "?=help"
         };
         self.draw_footer(frame, r, hints);
     }
@@ -2141,9 +2141,9 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓=navigate  Enter=open  Esc=clear filter"
+            "↑↓  Enter=open  Esc=clear filter"
         } else {
-            "↑↓/jk=navigate  Enter=open  /=filter  Esc=back"
+            "?=help"
         };
         self.draw_footer(frame, r, hints);
     }
@@ -2221,9 +2221,9 @@ impl<'a> App<'a> {
         self.last_tab_area = None;
 
         let hints = if self.filter.is_some() {
-            "↑↓=navigate  Enter=open  Esc=clear filter"
+            "↑↓  Enter=open  Esc=clear filter"
         } else {
-            "↑↓/jk=navigate  Enter=open  x=delete  /=filter  Esc=back"
+            "?=help"
         };
         self.draw_footer(frame, r, hints);
     }
@@ -2403,11 +2403,9 @@ impl<'a> App<'a> {
         self.last_tab_area = tab_area;
 
         let hints = if self.filter.is_some() {
-            "↑↓=navigate  Enter=edit  Esc=clear filter"
-        } else if has_tabs {
-            "←→/hl=tabs  ↑↓/jk=navigate  Enter=edit  d=reset  /=filter  Esc=back"
+            "↑↓  Enter=edit  Esc=clear filter"
         } else {
-            "↑↓/jk=navigate  Enter=edit  d=reset  /=filter  Esc=back"
+            "?=help"
         };
         self.draw_footer(frame, r, hints);
     }
@@ -2512,11 +2510,7 @@ impl<'a> App<'a> {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            self.draw_footer(
-                frame,
-                r,
-                "←→/hl=tabs  ↑↓/jk=navigate  Enter=edit  t=template  Esc=back",
-            );
+            self.draw_footer(frame, r, "?=help");
         }
     }
 
@@ -2596,11 +2590,7 @@ impl<'a> App<'a> {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            self.draw_footer(
-                frame,
-                r,
-                "←→/hl=tabs  ↑↓/jk=navigate  Enter=edit  x=archive  Esc=back",
-            );
+            self.draw_footer(frame, r, "?=help");
         }
     }
 
@@ -2674,9 +2664,9 @@ impl<'a> App<'a> {
             self.last_tab_area = None;
 
             let hints = if self.filter.is_some() {
-                "↑↓=navigate  Enter=save  Esc=clear filter"
+                "↑↓  Enter=save  Esc=clear filter"
             } else {
-                "↑↓/jk=navigate  Enter=save  /=filter  Esc=cancel"
+                "?=help"
             };
             self.draw_footer(frame, r, hints);
         } else {
@@ -2724,6 +2714,201 @@ impl<'a> App<'a> {
             Paragraph::new(Span::styled(hints, theme::dim_style())),
             r.hints,
         );
+    }
+
+    /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).
+    pub(crate) fn wants_text_input(&self) -> bool {
+        if self.filter.is_some() {
+            return true;
+        }
+        match &self.screen {
+            Screen::AliasCreate { .. } => true,
+            Screen::FieldEdit { .. } if !self.is_select_edit() => true,
+            Screen::FieldList { .. } => {
+                self.personality_active_file.is_some() || self.skills_active.is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// Context-aware keybinding lines for the help modal.
+    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+        match &self.screen {
+            Screen::SectionList => {
+                if self.filter.is_some() {
+                    vec![
+                        ("\u{2191} / \u{2193}", "Navigate"),
+                        ("Enter", "Open section"),
+                        ("Esc", "Clear filter"),
+                        ("?", "This help"),
+                    ]
+                } else {
+                    vec![
+                        ("\u{2191}\u{2193} / j k", "Navigate"),
+                        ("Enter", "Open section"),
+                        ("/", "Filter"),
+                        ("q", "Quit"),
+                        ("?", "This help"),
+                        ("", ""),
+                        ("Mouse", "Click, scroll, double-click to open"),
+                    ]
+                }
+            }
+            Screen::TypeList { .. } => {
+                if self.filter.is_some() {
+                    vec![
+                        ("\u{2191} / \u{2193}", "Navigate"),
+                        ("Enter", "Open type"),
+                        ("Esc", "Clear filter"),
+                        ("?", "This help"),
+                    ]
+                } else {
+                    vec![
+                        ("\u{2191}\u{2193} / j k", "Navigate"),
+                        ("Enter", "Open type"),
+                        ("/", "Filter"),
+                        ("Esc", "Back"),
+                        ("?", "This help"),
+                        ("", ""),
+                        ("Mouse", "Click, scroll, double-click to open"),
+                    ]
+                }
+            }
+            Screen::AliasList { .. } => {
+                if self.filter.is_some() {
+                    vec![
+                        ("\u{2191} / \u{2193}", "Navigate"),
+                        ("Enter", "Open alias"),
+                        ("Esc", "Clear filter"),
+                        ("?", "This help"),
+                    ]
+                } else {
+                    vec![
+                        ("\u{2191}\u{2193} / j k", "Navigate"),
+                        ("Enter", "Open alias"),
+                        ("x", "Delete alias"),
+                        ("/", "Filter"),
+                        ("Esc", "Back"),
+                        ("?", "This help"),
+                        ("", ""),
+                        ("Mouse", "Click, scroll, double-click to open"),
+                    ]
+                }
+            }
+            Screen::AliasCreate { .. } => {
+                vec![
+                    ("Enter", "Create alias"),
+                    ("Esc", "Cancel"),
+                    ("?", "This help"),
+                ]
+            }
+            Screen::FieldList { .. } => {
+                if self.filter.is_some() {
+                    vec![
+                        ("\u{2191} / \u{2193}", "Navigate"),
+                        ("Enter", "Edit field"),
+                        ("Esc", "Clear filter"),
+                        ("?", "This help"),
+                    ]
+                } else if self.is_composite_tab() {
+                    match self.tab_names.get(self.active_tab) {
+                        Some(ConfigTab::Personality) => {
+                            if self.personality_active_file.is_some() {
+                                vec![
+                                    ("Ctrl+S", "Save"),
+                                    ("Esc", "Back to files"),
+                                    ("?", "This help"),
+                                ]
+                            } else {
+                                vec![
+                                    ("\u{2190}\u{2192} / h l", "Switch tabs"),
+                                    ("\u{2191}\u{2193} / j k", "Navigate"),
+                                    ("Enter", "Edit file"),
+                                    ("t", "Fill from template"),
+                                    ("Esc", "Back"),
+                                    ("?", "This help"),
+                                    ("", ""),
+                                    ("Mouse", "Click, scroll, click tabs"),
+                                ]
+                            }
+                        }
+                        Some(ConfigTab::Skills) => {
+                            if self.skills_active.is_some() {
+                                vec![
+                                    ("Ctrl+S", "Save"),
+                                    ("Esc", "Back to skills"),
+                                    ("?", "This help"),
+                                ]
+                            } else {
+                                vec![
+                                    ("\u{2190}\u{2192} / h l", "Switch tabs"),
+                                    ("\u{2191}\u{2193} / j k", "Navigate"),
+                                    ("Enter", "Edit skill"),
+                                    ("x", "Archive skill"),
+                                    ("Esc", "Back"),
+                                    ("?", "This help"),
+                                    ("", ""),
+                                    ("Mouse", "Click, scroll, click tabs"),
+                                ]
+                            }
+                        }
+                        _ => self.field_list_help(),
+                    }
+                } else {
+                    self.field_list_help()
+                }
+            }
+            Screen::FieldEdit { .. } => {
+                if self.is_select_edit() {
+                    if self.filter.is_some() {
+                        vec![
+                            ("\u{2191} / \u{2193}", "Navigate"),
+                            ("Enter", "Save selection"),
+                            ("Esc", "Clear filter"),
+                            ("?", "This help"),
+                        ]
+                    } else {
+                        vec![
+                            ("\u{2191}\u{2193} / j k", "Navigate"),
+                            ("Enter", "Save selection"),
+                            ("/", "Filter"),
+                            ("Esc", "Cancel"),
+                            ("?", "This help"),
+                            ("", ""),
+                            ("Mouse", "Click, scroll, double-click to save"),
+                        ]
+                    }
+                } else {
+                    vec![
+                        ("Enter", "Save value"),
+                        ("Esc", "Cancel"),
+                        ("?", "This help"),
+                    ]
+                }
+            }
+        }
+    }
+
+    fn field_list_help(&self) -> Vec<(&str, &str)> {
+        let has_tabs = !self.tab_names.is_empty();
+        let mut lines = Vec::new();
+        if has_tabs {
+            lines.push(("\u{2190}\u{2192} / h l", "Switch tabs"));
+        }
+        lines.push(("\u{2191}\u{2193} / j k", "Navigate"));
+        lines.push(("Enter", "Edit field"));
+        lines.push(("d", "Reset to default"));
+        lines.push(("/", "Filter"));
+        lines.push(("Esc", "Back"));
+        lines.push(("?", "This help"));
+        lines.push(("", ""));
+        let mouse = if has_tabs {
+            "Click, scroll, click tabs, double-click to edit"
+        } else {
+            "Click, scroll, double-click to edit"
+        };
+        lines.push(("Mouse", mouse));
+        lines
     }
 }
 
