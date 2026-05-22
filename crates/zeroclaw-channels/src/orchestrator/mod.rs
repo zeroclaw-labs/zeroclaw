@@ -2409,6 +2409,50 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
+fn starts_with_visible_tool_call_tag_example(response: &str) -> bool {
+    let lower = response.trim_start().to_ascii_lowercase();
+    let starts_with_tool_tag = lower.starts_with("<tool_call")
+        || lower.starts_with("<toolcall")
+        || lower.starts_with("<tool-call")
+        || lower.starts_with("<invoke");
+
+    starts_with_tool_tag && zeroclaw_tool_call_parser::looks_like_tool_protocol_example(response)
+}
+
+fn should_suppress_top_level_tool_protocol_response(
+    response: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if zeroclaw_tool_call_parser::looks_like_tool_protocol_example(response) {
+        return false;
+    }
+
+    if zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope_for_known_tools(
+        response,
+        known_tool_names,
+    ) {
+        return true;
+    }
+
+    if let Some(kind) = zeroclaw_tool_call_parser::classify_tool_protocol_envelope(response) {
+        return matches!(
+            kind,
+            zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::TaggedToolCall
+        ) || (!known_tool_names.is_empty()
+            && (matches!(
+                kind,
+                zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::ToolResult
+            ) || zeroclaw_tool_call_parser::tool_protocol_envelope_mentions_known_tool(
+                response,
+                known_tool_names,
+            )));
+    }
+
+    // If the broad envelope detector still matches after classification failed,
+    // this is malformed internal protocol JSON rather than ordinary content.
+    zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2417,11 +2461,23 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip any [Used tools: ...] prefix that the LLM may have echoed from
     // history context. Trim first to handle leading/trailing whitespace.
     let trimmed_response = response.trim();
+    // Final channel guardrail: reuse the parser classifier so channel cleanup
+    // cannot drift from runtime tool-protocol detection.
+    if should_suppress_top_level_tool_protocol_response(trimmed_response, &known_tool_names) {
+        return String::new();
+    }
     let stripped_summary = strip_tool_summary_prefix(trimmed_response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
-    let stripped_xml = strip_tool_call_tags(&stripped_summary);
+    let stripped_xml = if starts_with_visible_tool_call_tag_example(&stripped_summary) {
+        stripped_summary
+    } else {
+        strip_tool_call_tags(&stripped_summary)
+    };
     // Strip isolated tool-call JSON artifacts
-    let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
+    let stripped_fenced_json =
+        strip_fenced_tool_protocol_artifacts(&stripped_xml, &known_tool_names);
+    let stripped_json =
+        strip_isolated_tool_json_artifacts(&stripped_fenced_json, &known_tool_names);
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
@@ -2549,6 +2605,31 @@ fn sanitize_tool_json_value(
     known_tool_names: &HashSet<String>,
     saw_tool_call_payload: bool,
 ) -> Option<(String, bool)> {
+    if let Some(kind) =
+        zeroclaw_tool_call_parser::classify_tool_protocol_envelope(&value.to_string())
+    {
+        if known_tool_names.is_empty() {
+            return None;
+        }
+
+        if matches!(
+            kind,
+            zeroclaw_tool_call_parser::ToolProtocolEnvelopeKind::ToolResult
+        ) {
+            return Some((String::new(), true));
+        }
+
+        if !zeroclaw_tool_call_parser::tool_protocol_envelope_mentions_known_tool(
+            &value.to_string(),
+            known_tool_names,
+        ) {
+            return None;
+        }
+
+        let content = safe_protocol_envelope_content(value);
+        return Some((content, true));
+    }
+
     if is_tool_call_payload(value, known_tool_names) {
         return Some((String::new(), true));
     }
@@ -2588,6 +2669,23 @@ fn sanitize_tool_json_value(
     None
 }
 
+fn safe_protocol_envelope_content(value: &serde_json::Value) -> String {
+    let content = value
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if content.is_empty()
+        || zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(content)
+        || zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope(content)
+    {
+        return String::new();
+    }
+
+    content.to_string()
+}
+
 fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> bool {
     let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
     let line_end = message[end..]
@@ -2595,6 +2693,119 @@ fn is_line_isolated_json_segment(message: &str, start: usize, end: usize) -> boo
         .map_or(message.len(), |idx| end + idx);
 
     message[line_start..start].trim().is_empty() && message[end..line_end].trim().is_empty()
+}
+
+fn is_inside_markdown_code_fence(message: &str, index: usize) -> bool {
+    // This intentionally uses a lightweight fence parity check. The sanitizer only
+    // needs to avoid re-processing JSON in ordinary triple-backtick fences that
+    // `strip_fenced_tool_protocol_artifacts` already handles; it is not a full
+    // Markdown parser for inline code spans or longer fence runs.
+    let mut in_fence = false;
+    let mut cursor = 0usize;
+    while let Some(rel_pos) = message[cursor..index].find("```") {
+        in_fence = !in_fence;
+        cursor += rel_pos + 3;
+    }
+    in_fence
+}
+
+fn isolated_malformed_tool_protocol_segment_end(
+    message: &str,
+    start: usize,
+    known_tool_names: &HashSet<String>,
+) -> Option<usize> {
+    let line_start = message[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    if !message[line_start..start].trim().is_empty() {
+        return None;
+    }
+
+    let mut end = start;
+    // Malformed JSON has no serde byte offset. Scan forward from an isolated
+    // JSON candidate start, but stop before ordinary prose resumes.
+    for line in message[start..].split_inclusive('\n') {
+        let trimmed = line.trim();
+        if end > start
+            && !trimmed.is_empty()
+            && !trimmed.starts_with(['{', '[', ']', '}'])
+            && !trimmed.starts_with('"')
+        {
+            break;
+        }
+        end += line.len();
+        let candidate = &message[start..end];
+        if zeroclaw_tool_call_parser::looks_like_malformed_tool_protocol_envelope_for_known_tools(
+            candidate,
+            known_tool_names,
+        ) {
+            return Some(end);
+        }
+    }
+
+    None
+}
+
+fn is_tool_protocol_fence_language(language: &str) -> bool {
+    let lower = language.trim().to_ascii_lowercase();
+    lower == "tool_call"
+        || lower == "toolcall"
+        || lower == "tool-call"
+        || lower == "invoke"
+        || lower
+            .strip_prefix("tool")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) && !rest.trim().is_empty())
+}
+
+fn strip_fenced_tool_protocol_artifacts(
+    message: &str,
+    known_tool_names: &HashSet<String>,
+) -> String {
+    if zeroclaw_tool_call_parser::looks_like_tool_protocol_example(message) {
+        return message.to_string();
+    }
+
+    let mut cleaned = String::with_capacity(message.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_open) = message[cursor..].find("```") {
+        let open_start = cursor + rel_open;
+        let language_start = open_start + 3;
+        let Some(line_end_rel) = message[language_start..].find('\n') else {
+            break;
+        };
+        let line_end = language_start + line_end_rel;
+        let language = message[language_start..line_end]
+            .trim()
+            .trim_end_matches('\r');
+        let body_start = line_end + 1;
+        let Some(close_rel) = message[body_start..].find("```") else {
+            break;
+        };
+        let close_start = body_start + close_rel;
+        let close_end = close_start + 3;
+
+        let fence_block = &message[open_start..close_end];
+        let should_strip = if language.eq_ignore_ascii_case("json") {
+            should_suppress_top_level_tool_protocol_response(
+                message[body_start..close_start].trim(),
+                known_tool_names,
+            )
+        } else {
+            is_tool_protocol_fence_language(language)
+                && zeroclaw_tool_call_parser::contains_tool_protocol_tag_call(fence_block)
+        };
+
+        if should_strip {
+            cleaned.push_str(&message[cursor..open_start]);
+            cursor = close_end;
+            continue;
+        }
+
+        cleaned.push_str(&message[cursor..close_end]);
+        cursor = close_end;
+    }
+
+    cleaned.push_str(&message[cursor..]);
+    cleaned
 }
 
 fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<String>) -> String {
@@ -2610,6 +2821,14 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
 
         let start = cursor + rel_start;
         cleaned.push_str(&message[cursor..start]);
+        if is_inside_markdown_code_fence(message, start) {
+            let Some(ch) = message[start..].chars().next() else {
+                break;
+            };
+            cleaned.push(ch);
+            cursor = start + ch.len_utf8();
+            continue;
+        }
 
         let candidate = &message[start..];
         let mut stream =
@@ -2633,6 +2852,13 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
                     continue;
                 }
             }
+        }
+
+        if let Some(end) =
+            isolated_malformed_tool_protocol_segment_end(message, start, known_tool_names)
+        {
+            cursor = end;
+            continue;
         }
 
         let Some(ch) = message[start..].chars().next() else {
@@ -15202,6 +15428,299 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_schema_json_array_without_tools() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
+
+        let result = sanitize_channel_response(schema, &tools);
+
+        assert_eq!(result, schema);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_calls_audit_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let audit_json =
+            r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
+
+        let result = sanitize_channel_response(audit_json, &tools);
+
+        assert_eq!(result, audit_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_reference_function_call_json_without_tools() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let reference_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(reference_json, &tools);
+
+        assert_eq!(result, reference_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_reference_function_call_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let reference_json =
+            r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(reference_json, &tools);
+
+        assert_eq!(result, reference_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_unknown_tool_calls_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}]}"#;
+
+        let result = sanitize_channel_response(business_json, &tools);
+
+        assert_eq!(result, business_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_malformed_unknown_tool_calls_json_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
+
+        let result = sanitize_channel_response(business_json, &tools);
+
+        assert_eq!(result, business_json);
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_json_fenced_tool_protocol_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"Here is a protocol example:
+```json
+{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
+```"#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_registered_tool_json_array() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"[{"name":"mock_price","parameters":{"symbol":"BTC"}}]"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_internal_tool_protocol_envelopes() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"{"toolcalls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_json_fenced_internal_tool_protocol() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let internal = r#"```json
+{"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_json_fenced_internal_tool_protocol() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = r#"Intro
+```json
+{"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
+```
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("mock_price"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_tool_call_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = r#"Let me call it:
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_call"));
+        assert!(!result.contains("shell"));
+        assert!(!result.contains("command"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_call_fenced_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_standalone_tool_call_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_standalone_tool_name_fence() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"```tool shell
+{"command":"pwd"}
+```"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_tool_call_tag_example() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let example = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+This is an example, not an invocation."#;
+
+        let result = sanitize_channel_response(example, &tools);
+
+        assert_eq!(result, example);
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_tagged_tool_call_before_trailing_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+Done."#;
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert_eq!(result, "Done.");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_malformed_top_level_protocol() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let internal = r#"{"tool_call_id":"call_1","content":"raw"#;
+
+        let result = sanitize_channel_response(internal, &tools);
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_embedded_malformed_protocol_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response =
+            "Intro\n{\"tool_calls\":[{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}\nDone";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done"));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("arguments"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_multiline_embedded_malformed_protocol_json() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let response = "Intro\n{\n  \"tool_calls\": [{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}}\nDone";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro"));
+        assert!(result.contains("Done"));
+        assert!(!result.contains("tool_calls"));
+        assert!(!result.contains("arguments"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_keeps_protocol_explanation_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let explanation =
+            "A markdown block starting with ```tool can be used in protocol examples.";
+
+        let result = sanitize_channel_response(explanation, &tools);
+
+        assert_eq!(result, explanation);
+    }
+
+    #[test]
+    fn sanitize_channel_response_keeps_safe_protocol_envelope_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = "Intro text\n{\"content\":\"A markdown block starting with ```tool can be used in examples.\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("A markdown block starting with ```tool"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_calls"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_isolated_tool_result_envelope_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response =
+            "Intro text\n{\"tool_call_id\":\"call_1\",\"content\":\"raw tool output\"}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("tool_call_id"));
+        assert!(!result.contains("raw tool output"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_nested_protocol_content_with_tools() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let response = "Intro text\n{\"content\":\"{\\\"toolcalls\\\":[{\\\"name\\\":\\\"mock_price\\\",\\\"arguments\\\":{\\\"symbol\\\":\\\"BTC\\\"}}]}\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+
+        let result = sanitize_channel_response(response, &tools);
+
+        assert!(result.contains("Intro text"));
+        assert!(result.contains("Done."));
+        assert!(!result.contains("toolcalls"));
+        assert!(!result.contains("shell"));
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
