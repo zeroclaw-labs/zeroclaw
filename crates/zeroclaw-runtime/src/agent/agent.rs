@@ -1,3 +1,4 @@
+use super::loop_;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -2122,6 +2123,23 @@ pub async fn run(
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
+
+    // Populate channel-driven tool handles from the registered factory.
+    let channels_seed = loop_::seed_channel_handles(
+        &agent.channel_handles.ask_user,
+        &agent.channel_handles.reaction,
+        &agent.channel_handles.poll,
+        &agent.channel_handles.escalate,
+        &agent.channel_handles.channel_send,
+    );
+    if channels_seed > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"count": channels_seed})),
+            &format!("Registered {} channel(s) for CLI agent", channels_seed),
+        );
+    }
 
     let provider_name = effective_config
         .first_model_provider_type()

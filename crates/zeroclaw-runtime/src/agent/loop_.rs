@@ -57,7 +57,7 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
 ///   pos5 = `Option<PerToolChannelHandle>` (poll in loop_.rs named `reaction_handle`)
 ///   pos6 = `Option<PerToolChannelHandle>` (escalate)
 ///   pos7 = `Option<PerToolChannelHandle>` (channel_send)
-fn seed_channel_handles(
+pub(crate) fn seed_channel_handles(
     pos3: &Option<tools::PerToolChannelHandle>,
     pos4: &tools::PerToolChannelHandle,
     pos5: &Option<tools::PerToolChannelHandle>,
