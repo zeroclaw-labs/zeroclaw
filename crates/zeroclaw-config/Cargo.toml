@@ -49,13 +49,12 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-# `channel-nostr` and `voice-wake` gate optional schema fields
-# (`channels.nostr`, `channels.voice_wake`). They live in default so
-# the regression test suite (which migrates a comprehensive V1
-# fixture exercising every channel type) doesn't silently drop
-# those blocks on deserialize. Consumers that want a minimal
-# schema can opt out with `default-features = false`.
-default = ["schema-export", "clap", "channel-nostr", "voice-wake"]
+# schema-export and clap are the only defaults; all channel features
+# are opt-in via individual `channel-*` flags or the workspace
+# `default-channels` bundle. Consumers that need `channel-nostr` or
+# `voice-wake` (e.g. the regression test suite) must enable them
+# explicitly.
+default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
 clap = ["dep:clap"]
 channel-email = []
@@ -84,6 +83,7 @@ channel-wechat = []
 channel-wecom = []
 channel-clawdtalk = []
 channel-webhook = []
+channel-acp-server = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-line = []

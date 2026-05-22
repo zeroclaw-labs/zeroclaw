@@ -10102,16 +10102,12 @@ impl ChannelsConfig {
     }
 
     pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
-        let ret = self.channels_except_webhook();
+        let mut ret = self.channels_except_webhook();
         #[cfg(feature = "channel-webhook")]
-        let ret = {
-            let mut r = ret;
-            r.push((
-                Box::new(ConfigWrapper::new(self.webhook.get("default"))),
-                !self.webhook.is_empty(),
-            ));
-            r
-        };
+        ret.push((
+            Box::new(ConfigWrapper::new(self.webhook.get("default"))),
+            !self.webhook.is_empty(),
+        ));
         ret
     }
 }
