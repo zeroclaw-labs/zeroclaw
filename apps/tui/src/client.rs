@@ -44,6 +44,14 @@ pub mod method {
     pub const SKILLS_WRITE: &str = "skills/write";
     pub const SKILLS_CREATE: &str = "skills/write";
     pub const SKILLS_DELETE: &str = "skills/delete";
+    // Session
+    pub const SESSION_NEW: &str = "session/new";
+    pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_CONFIGURE: &str = "session/configure";
+    pub const SESSION_CLOSE: &str = "session/close";
+    pub const AGENTS_LIST: &str = "agents/list";
+    pub const SESSION_APPROVE: &str = "session/approve";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -84,13 +92,101 @@ pub struct RpcNotification {
     pub params: Value,
 }
 
+// ── Typed session updates ────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum SessionUpdate {
+    AgentMessageChunk { session_id: String, text: String },
+    AgentThoughtChunk { session_id: String, text: String },
+    ToolCall {
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+        raw_input: serde_json::Value,
+    },
+    ToolResult {
+        session_id: String,
+        tool_call_id: String,
+        name: String,
+        raw_output: String,
+    },
+    ApprovalRequest {
+        session_id: String,
+        request_id: String,
+        tool_name: String,
+        arguments_summary: String,
+        timeout_secs: u64,
+    },
+}
+
+pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate> {
+    let kind = params.get("type")?.as_str()?;
+    let sid = params.get("session_id")?.as_str()?.to_string();
+    match kind {
+        "agent_message_chunk" => Some(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: params.get("text")?.as_str()?.to_string(),
+        }),
+        "agent_thought_chunk" => Some(SessionUpdate::AgentThoughtChunk {
+            session_id: sid,
+            text: params.get("text")?.as_str()?.to_string(),
+        }),
+        "tool_call" => Some(SessionUpdate::ToolCall {
+            session_id: sid,
+            tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
+            name: params.get("name")?.as_str()?.to_string(),
+            raw_input: params.get("raw_input")?.clone(),
+        }),
+        "tool_result" => Some(SessionUpdate::ToolResult {
+            session_id: sid,
+            tool_call_id: params.get("tool_call_id")?.as_str()?.to_string(),
+            name: params.get("name")?.as_str()?.to_string(),
+            raw_output: params.get("raw_output")?.as_str()?.to_string(),
+        }),
+        "approval_request" => Some(SessionUpdate::ApprovalRequest {
+            session_id: sid,
+            request_id: params.get("request_id")?.as_str()?.to_string(),
+            tool_name: params.get("tool_name")?.as_str()?.to_string(),
+            arguments_summary: params.get("arguments_summary")?.as_str()?.to_string(),
+            timeout_secs: params.get("timeout_secs")?.as_u64().unwrap_or(30),
+        }),
+        _ => None,
+    }
+}
+
+pub fn spawn_notification_router(
+    mut bcast_rx: broadcast::Receiver<RpcNotification>,
+    update_tx: mpsc::Sender<SessionUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match bcast_rx.recv().await {
+                Ok(notif) => {
+                    if notif.method != "session/update" {
+                        continue;
+                    }
+                    if let Some(update) = parse_session_update(&notif.params) {
+                        if update_tx.send(update).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 // ── Client ───────────────────────────────────────────────────────
 
 pub struct RpcClient {
     rpc: Arc<RpcOutbound>,
     _read_task: tokio::task::JoinHandle<()>,
+    _router_task: tokio::task::JoinHandle<()>,
     pub server_version: String,
-    notifications: broadcast::Sender<RpcNotification>,
+    notifications_bcast: broadcast::Sender<RpcNotification>,
+    pub notifications: mpsc::Receiver<SessionUpdate>,
 }
 
 impl RpcClient {
@@ -162,11 +258,17 @@ impl RpcClient {
             .unwrap_or("unknown")
             .to_string();
 
+        let bcast_rx = notif_tx.subscribe();
+        let (update_tx, update_rx) = mpsc::channel::<SessionUpdate>(64);
+        let router_task = spawn_notification_router(bcast_rx, update_tx);
+
         Ok(Self {
             rpc,
             _read_task: read_task,
+            _router_task: router_task,
             server_version,
-            notifications: notif_tx,
+            notifications_bcast: notif_tx,
+            notifications: update_rx,
         })
     }
 
@@ -183,7 +285,7 @@ impl RpcClient {
 
     /// Get a receiver for server-initiated notifications.
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
-        self.notifications.subscribe()
+        self.notifications_bcast.subscribe()
     }
 
     /// Ask the daemon to start streaming log events as notifications.
@@ -360,6 +462,100 @@ impl RpcClient {
             serde_json::json!({ "bundle": bundle, "name": name }),
         )
         .await
+    }
+
+    // ── Session methods ──────────────────────────────────────────
+
+    pub async fn session_new(
+        &self,
+        agent_alias: &str,
+        cwd: Option<&str>,
+    ) -> Result<SessionNewResult> {
+        self.call(
+            method::SESSION_NEW,
+            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd }),
+        )
+        .await
+    }
+
+    pub async fn session_prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<SessionPromptResult> {
+        self.call(
+            method::SESSION_PROMPT,
+            serde_json::json!({ "session_id": session_id, "prompt": prompt }),
+        )
+        .await
+    }
+
+    pub async fn session_cancel(&self, session_id: &str) -> Result<SessionCancelResult> {
+        self.call(
+            method::SESSION_CANCEL,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_configure(
+        &self,
+        session_id: &str,
+        overrides: SessionConfigureOverrides,
+    ) -> Result<SessionConfigureResult> {
+        self.call(
+            method::SESSION_CONFIGURE,
+            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+        )
+        .await
+    }
+
+    pub async fn session_close(&self, session_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .call(
+                method::SESSION_CLOSE,
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn session_approve(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<SessionApproveResult> {
+        let mut params = serde_json::json!({
+            "session_id": session_id,
+            "request_id": request_id,
+            "decision": decision.kind(),
+        });
+        if let ApprovalDecision::RejectWithEdit { ref replacement } = decision {
+            params["replacement"] = serde_json::Value::String(replacement.clone());
+        }
+        self.call(method::SESSION_APPROVE, params).await
+    }
+
+    pub async fn agents_list(&self) -> Result<AgentsListResult> {
+        self.call(method::AGENTS_LIST, serde_json::json!({})).await
+    }
+
+    // ── Test-only constructors ────────────────────────────────────
+
+    /// Test-only constructor that skips the Unix socket connect + initialize handshake.
+    #[cfg(test)]
+    pub fn with_rpc(rpc: Arc<RpcOutbound>) -> Self {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+        Self {
+            rpc,
+            _read_task: tokio::spawn(async {}),
+            _router_task: tokio::spawn(async {}),
+            server_version: "test".to_string(),
+            notifications_bcast: notif_tx,
+            notifications: rx,
+        }
     }
 }
 
@@ -557,4 +753,293 @@ pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
     pub next_cursor: Option<(String, String)>,
     pub at_end: bool,
+}
+
+// ── Session / Agents types ───────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionNewResult {
+    pub session_id: String,
+    pub agent_alias: String,
+    pub message_count: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionPromptResult {
+    pub session_id: String,
+    pub stop_reason: String,
+    pub content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionCancelResult {
+    pub session_id: String,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionConfigureResult {
+    pub session_id: String,
+    pub overrides: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionApproveResult {
+    pub session_id: String,
+    pub request_id: String,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentEntry {
+    pub alias: String,
+    pub enabled: bool,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentsListResult {
+    pub agents: Vec<AgentEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowAlways,
+    Reject,
+    RejectWithEdit { replacement: String },
+}
+
+impl ApprovalDecision {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::AllowAlways => "allow_always",
+            Self::Reject => "reject",
+            Self::RejectWithEdit { .. } => "reject_with_edit",
+        }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod session_method_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    #[tokio::test]
+    async fn session_new_sends_correct_wire_params() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client.session_new("my-agent", Some("/tmp/work")).await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["agent_alias"], "my-agent");
+        assert_eq!(req["params"]["cwd"], "/tmp/work");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s42","agent_alias":"my-agent","message_count":0})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.session_id, "s42");
+    }
+
+    #[tokio::test]
+    async fn session_cancel_sends_session_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_cancel("s1").await });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/cancel");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","cancelled":true})),
+            None,
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_approve_sends_decision_and_request_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client.session_approve("s1", "req-1", ApprovalDecision::AllowOnce).await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/approve");
+        assert_eq!(req["params"]["decision"], "allow_once");
+        assert_eq!(req["params"]["request_id"], "req-1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","request_id":"req-1","acknowledged":true})),
+            None,
+        );
+        let result = task.await.unwrap().unwrap();
+        assert!(result.acknowledged);
+    }
+
+    #[tokio::test]
+    async fn session_approve_reject_with_edit_sends_replacement() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_approve(
+                    "s1",
+                    "req-2",
+                    ApprovalDecision::RejectWithEdit {
+                        replacement: "let x = 99;".to_string(),
+                    },
+                )
+                .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["params"]["decision"], "reject_with_edit");
+        assert_eq!(req["params"]["replacement"], "let x = 99;");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({"session_id":"s1","request_id":"req-2","acknowledged":true})),
+            None,
+        );
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn make_notification(method: &str, params: serde_json::Value) -> RpcNotification {
+        RpcNotification {
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_agent_message_chunk() {
+        let params = serde_json::json!({
+            "type": "agent_message_chunk",
+            "session_id": "s1",
+            "text": "hello"
+        });
+        let update = parse_session_update(&params).unwrap();
+        match update {
+            SessionUpdate::AgentMessageChunk { session_id, text } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_approval_request() {
+        let params = serde_json::json!({
+            "type": "approval_request",
+            "session_id": "s2",
+            "request_id": "req-1",
+            "tool_name": "shell",
+            "arguments_summary": "ls /tmp",
+            "timeout_secs": 60
+        });
+        let update = parse_session_update(&params).unwrap();
+        assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn router_converts_session_update_notifications() {
+        let (bcast_tx, bcast_rx) = broadcast::channel::<RpcNotification>(16);
+        let (update_tx, mut update_rx) = mpsc::channel::<SessionUpdate>(8);
+        let _task = spawn_notification_router(bcast_rx, update_tx);
+
+        bcast_tx
+            .send(make_notification(
+                "session/update",
+                serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "s1",
+                    "text": "streaming"
+                }),
+            ))
+            .unwrap();
+
+        let update = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            update_rx.recv(),
+        )
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+
+        assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
+    }
+
+    #[tokio::test]
+    async fn router_drops_unknown_method() {
+        let (bcast_tx, bcast_rx) = broadcast::channel::<RpcNotification>(16);
+        let (update_tx, mut update_rx) = mpsc::channel::<SessionUpdate>(8);
+        let _task = spawn_notification_router(bcast_rx, update_tx);
+
+        bcast_tx
+            .send(make_notification("other/event", serde_json::json!({})))
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            update_rx.recv(),
+        )
+        .await;
+        assert!(result.is_err(), "unknown method must be dropped");
+    }
 }

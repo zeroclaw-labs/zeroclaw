@@ -420,6 +420,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_approve_resolves_pending_approval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        tokio::spawn(async move {
+            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+
+        // Insert a fake pending approval directly into the shared map.
+        let (pending_tx, mut pending_rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        ctx.approval_pending
+            .insert("test-req-1".to_string(), pending_tx);
+
+        let approve_params = serde_json::json!({
+            "session_id": "unused",
+            "request_id": "test-req-1",
+            "decision": "allow_once",
+        });
+        writer
+            .write_all(
+                rpc_request(Method::SessionApprove, &approve_params, 10).as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let (_frame, result): (_, serde_json::Value) = read_result(&mut reader).await;
+        assert_eq!(result["acknowledged"], true);
+
+        let decision = pending_rx.try_recv().expect("decision should be resolved");
+        assert_eq!(
+            decision,
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn client_count_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());

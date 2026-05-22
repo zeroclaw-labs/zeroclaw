@@ -925,6 +925,28 @@ rpc_type! {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// ── Session approval ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+rpc_type! {
+    pub struct SessionApproveParams {
+        pub session_id: String,
+        pub request_id: String,
+        pub decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replacement: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionApproveResult {
+        pub session_id: String,
+        pub request_id: String,
+        pub acknowledged: bool,
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ── Logs ─────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 

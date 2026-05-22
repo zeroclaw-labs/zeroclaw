@@ -339,6 +339,7 @@ pub async fn run(
             cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
+            approval_pending: std::sync::Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
         });
 
         let socket_start = std::sync::Arc::new(socket_start);

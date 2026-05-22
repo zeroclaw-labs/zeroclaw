@@ -55,6 +55,7 @@ pub enum Method {
     SessionState,
     SessionDelete,
     SessionRename,
+    SessionApprove,
 
     // Memory
     MemoryList,
@@ -133,6 +134,7 @@ impl Method {
         (Method::SessionState, "session/state"),
         (Method::SessionDelete, "session/delete"),
         (Method::SessionRename, "session/rename"),
+        (Method::SessionApprove, "session/approve"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -323,6 +325,7 @@ impl RpcDispatcher {
             Method::SessionState => self.handle_session_state(&req.params).await,
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionRename => self.handle_session_rename(&req.params).await,
+            Method::SessionApprove => self.handle_session_approve(&req.params),
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -441,7 +444,7 @@ impl RpcDispatcher {
 
         let config = self.ctx.config.read().clone();
         let cwd_path = req.cwd.as_deref().map(std::path::Path::new);
-        let agent = crate::agent::agent::Agent::from_config_with_session_cwd_and_mcp(
+        let agent = crate::agent::agent::Agent::from_config_with_session_cwd_and_mcp_backchannel(
             &config,
             &req.agent_alias,
             cwd_path,
@@ -449,6 +452,18 @@ impl RpcDispatcher {
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+
+        // Register the RPC approval channel so tool-call approvals route
+        // through session/approve instead of being auto-denied.
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id.clone(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+            ),
+        );
+        agent.channel_handles().register_channel("rpc", approval_ch);
 
         let cwd = req.cwd.as_deref().unwrap_or(".");
         self.ctx
@@ -706,6 +721,31 @@ impl RpcDispatcher {
         to_result(SessionRenameResult {
             session_id: req.session_id,
             name: req.name,
+        })
+    }
+
+    fn handle_session_approve(&self, params: &Value) -> RpcResult {
+        let p: SessionApproveParams = parse_params(params)?;
+
+        let response = match p.decision.as_str() {
+            "allow_once" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            "allow_always" => zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+            "reject" | "reject_once" => zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+            "reject_with_edit" => {
+                // TODO(#6820): use DenyWithEdit when the variant is added in Task 10
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny
+            }
+            other => {
+                return Err(rpc_err(INVALID_PARAMS, format!("unknown decision: {other}")))
+            }
+        };
+
+        self.ctx.approval_pending.resolve(&p.request_id, response);
+
+        to_result(SessionApproveResult {
+            session_id: p.session_id,
+            request_id: p.request_id,
+            acknowledged: true,
         })
     }
 

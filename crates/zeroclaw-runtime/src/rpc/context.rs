@@ -5,16 +5,49 @@
 //! beyond `config` and `sessions` are `Option` so the context works in
 //! tests and minimal (kernel-only) daemon configurations.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
+use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
+
+/// Registry for in-flight tool approval requests.
+///
+/// The RpcApprovalChannel inserts a (request_id, oneshot::Sender) pair
+/// before sending the approval_request notification.
+/// handle_session_approve resolves it when the client sends session/approve.
+#[derive(Default)]
+pub struct ApprovalPendingMap {
+    inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
+}
+
+impl ApprovalPendingMap {
+    pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, tx);
+    }
+
+    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) {
+        let tx = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+        if let Some(tx) = tx {
+            let _ = tx.send(response);
+        }
+    }
+}
 
 /// Daemon-wide state shared across all RPC connections.
 pub struct RpcContext {
@@ -43,6 +76,9 @@ pub struct RpcContext {
     /// Write `true` to trigger a daemon-level config reload. Mirrors
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+
+    /// In-flight approval requests waiting for session/approve RPC calls.
+    pub approval_pending: Arc<ApprovalPendingMap>,
 }
 
 impl RpcContext {
@@ -58,6 +94,38 @@ impl RpcContext {
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+    use zeroclaw_api::channel::ChannelApprovalResponse;
+
+    #[test]
+    fn pending_map_insert_and_resolve() {
+        let map = ApprovalPendingMap::default();
+        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-1".to_string(), tx);
+        map.resolve("req-1", ChannelApprovalResponse::Approve);
+        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn pending_map_resolve_unknown_key_is_noop() {
+        let map = ApprovalPendingMap::default();
+        map.resolve("nonexistent", ChannelApprovalResponse::Deny);
+    }
+
+    #[test]
+    fn pending_map_insert_then_drop_is_safe() {
+        let map = ApprovalPendingMap::default();
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-2".to_string(), tx);
+        // _rx is dropped — resolve sends to a closed channel; must not panic
+        map.resolve("req-2", ChannelApprovalResponse::Approve);
     }
 }
