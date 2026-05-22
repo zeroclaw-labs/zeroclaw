@@ -27,6 +27,11 @@ struct Cli {
     /// Path to the ZeroClaw config directory
     #[arg(long)]
     config_dir: Option<PathBuf>,
+
+    /// Start in chat mode with this agent alias.
+    /// If omitted, opens the config manager.
+    #[arg(long, short = 'a')]
+    agent: Option<String>,
 }
 
 #[tokio::main]
@@ -45,7 +50,7 @@ async fn run() -> anyhow::Result<()> {
     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
     let socket = client::resolve_socket_path(&config_dir)?;
 
-    let rpc = match client::RpcClient::connect(&socket).await {
+    let mut rpc = match client::RpcClient::connect(&socket).await {
         Ok(c) => c,
         Err(_) => {
             spawn_ephemeral_daemon(&config_dir)?;
@@ -53,7 +58,11 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    app::run(&rpc).await
+    if let Some(alias) = cli.agent {
+        chat::run(&mut rpc, &alias).await
+    } else {
+        app::run(&rpc).await
+    }
 }
 
 fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
