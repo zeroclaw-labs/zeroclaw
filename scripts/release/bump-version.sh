@@ -64,6 +64,48 @@ if [[ -f "$TAURI_CONF" ]]; then
   changed=$((changed + 1))
 fi
 
+# ── Workspace Cargo.toml ───────────────────────────────────────────
+# Bumps [workspace.package] version (the root version inherited by every child
+# crate via `version.workspace = true`) and the version pins on every path dep
+# in [workspace.dependencies], skipping aardvark* which tracks an independent
+# version.
+echo "Workspace Cargo.toml..."
+ROOT_CARGO="$REPO_ROOT/Cargo.toml"
+if [[ -f "$ROOT_CARGO" ]]; then
+  before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  # [workspace.package] version — first bare `version = "..."` line in the file
+  sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
+  # [workspace.dependencies] path-dep version pins, skipping aardvark*
+  sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
+  after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
+    changed=$((changed + 1))
+  fi
+fi
+
+# ── Cargo.lock (workspace crates only) ─────────────────────────────
+# Re-resolves only the workspace member entries so their lockfile versions
+# track the new [workspace.package] / [workspace.dependencies] values. External
+# deps that happen to share a version string are left alone.
+echo "Cargo.lock..."
+ROOT_LOCK="$REPO_ROOT/Cargo.lock"
+if [[ -f "$ROOT_LOCK" ]] && command -v cargo >/dev/null 2>&1; then
+  before="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  ( cd "$REPO_ROOT" && cargo update --workspace --offline >/dev/null 2>&1 ) \
+    || ( cd "$REPO_ROOT" && cargo update --workspace >/dev/null 2>&1 ) \
+    || echo "  warn: cargo update --workspace failed; review Cargo.lock manually"
+  after="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
+  if [[ "$before" != "$after" ]]; then
+    echo "  updated: Cargo.lock"
+    changed=$((changed + 1))
+  fi
+elif [[ -f "$ROOT_LOCK" ]]; then
+  echo "  skip: cargo not on PATH; Cargo.lock not refreshed"
+fi
+
 # ── Marketplace: Dokploy ───────────────────────────────────────────
 echo "Marketplace templates..."
 bump "marketplace/dokploy/meta-entry.json" \
@@ -88,6 +130,52 @@ for wf in \
   bump "$wf" \
     '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+\)' \
     "(e.g. v${VERSION})"
+done
+
+# ── Docs book examples + matching i18n catalogs ────────────────────
+# Two surgical patterns, both anchored enough to skip release-runbook
+# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
+# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
+# to the version they were written for:
+#   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
+#   - /health response example `"version": "X.Y.Z"`
+# Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
+# with the release; `docs/book/po/*.po` mirrors the same swap into the
+# translation catalogs that the i18n pipeline reads.
+echo "Docs book examples..."
+docs_files=()
+while IFS= read -r -d '' f; do
+  docs_files+=("$f")
+done < <(find "$REPO_ROOT/docs/book/src" -type f -name '*.md' -print0)
+while IFS= read -r -d '' f; do
+  docs_files+=("$f")
+done < <(find "$REPO_ROOT/docs/book/po" -type f -name '*.po' -print0 2>/dev/null)
+for f in "${docs_files[@]}"; do
+  rel="${f#$REPO_ROOT/}"
+  # Image tags share one form across .md and .po (no quotes involved).
+  bump "$rel" \
+    'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+' \
+    "zeroclawlabs/zeroclaw:v${VERSION}"
+  # Version literal needs per-format dispatch: the unescaped pattern is
+  # a strict substring of the escaped one, so running both blindly
+  # would have the unescaped pass clobber the .po backslashes and
+  # leave malformed gettext strings.
+  case "$f" in
+    *.md)
+      bump "$rel" \
+        '"version": "[0-9]+\.[0-9]+\.[0-9]+"' \
+        "\"version\": \"${VERSION}\""
+      ;;
+    *.po)
+      # Single-quoted replacement so the literal backslashes survive
+      # bash *and* sed: sed sees `\\"` in the substitution, which it
+      # emits as a single backslash followed by a quote, restoring
+      # the gettext escaped form.
+      bump "$rel" \
+        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+\\"' \
+        '\\"version\\": \\"'"${VERSION}"'\\"'
+      ;;
+  esac
 done
 
 echo ""

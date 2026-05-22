@@ -118,7 +118,7 @@ where
             gpio_write(gpio2, gpio13, pin_num, value)?;
             Ok("done".into())
         }
-        _ => Err(anyhow::anyhow!("Unknown command: {}", req.cmd)),
+        _ => Err(anyhow::Error::msg(format!("Unknown command: {}", req.cmd))),
     };
 
     match result {

@@ -6,6 +6,8 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use quantclaw::tools::{Tool, ToolResult};
 
+zeroclaw_api::mock_tool_attribution!(EchoTool, CountingTool, FailingTool, RecordingTool);
+
 /// Simple tool that echoes its input argument.
 pub struct EchoTool;
 

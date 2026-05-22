@@ -1,7 +1,7 @@
 {
-  "id": "quantclaw",
-  "name": "QuantClaw",
-  "version": "0.6.9",
+  "id": "zeroclaw",
+  "name": "ZeroClaw",
+  "version": "0.8.0-beta-1",
   "description": "Fast, small, and fully autonomous AI personal assistant infrastructure. Deploy anywhere, swap anything. 100% Rust.",
   "logo": "quantclaw.png",
   "links": {
