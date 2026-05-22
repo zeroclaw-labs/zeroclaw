@@ -150,6 +150,23 @@ pub fn apply_compat_options(
     Box::new(p)
 }
 
+pub(crate) fn build_kimi_code_compat(
+    alias: &str,
+    key: Option<&str>,
+    base_url: &str,
+) -> OpenAiCompatibleModelProvider {
+    OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+        alias,
+        "Kimi Code",
+        base_url,
+        key,
+        AuthStyle::Bearer,
+        "KimiCLI/0.77",
+        true,
+    )
+    .with_models_dev_key("moonshotai")
+}
+
 /// Dispatch family construction by routing `(family, alias)` to the typed
 /// slot's `FamilyProviderFactory` impl. Generated from
 /// `for_each_model_provider_slot!` so the family list lives in exactly one
@@ -229,15 +246,16 @@ use zeroclaw_config::schema::{
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
-    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
-    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
-    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -464,6 +482,20 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
     const DEFAULT_URL: &'static str = crate::MOONSHOT_INTL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("moonshotai");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        let base_url = api_url.unwrap_or(Self::DEFAULT_URL);
+        if self.endpoint == MoonshotEndpoint::Code || base_url == crate::moonshot_code_base_url() {
+            return build_kimi_code_compat(alias, key, base_url);
+        }
+
+        self.build_compat_base(alias, key, api_url)
+    }
 }
 
 // ── Compat families with build_compat overrides ────────────────────────

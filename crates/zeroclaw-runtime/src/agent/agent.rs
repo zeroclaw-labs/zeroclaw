@@ -507,10 +507,11 @@ impl Agent {
         response: &zeroclaw_providers::ChatResponse,
     ) -> (String, Vec<ParsedToolCall>) {
         if self.tool_specs.is_empty() {
-            return (
-                strip_think_tags(&response.text.clone().unwrap_or_default()),
-                Vec::new(),
-            );
+            return (strip_think_tags(response.text_or_empty()), Vec::new());
+        }
+
+        if self.config.strict_tool_parsing && response.tool_calls.is_empty() {
+            return (strip_think_tags(response.text_or_empty()), Vec::new());
         }
 
         self.tool_dispatcher.parse_response(response)
@@ -1014,17 +1015,26 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+        let expose_text_tool_protocol =
+            !self.config.strict_tool_parsing || self.tool_dispatcher.should_send_tool_specs();
+        let no_tools: Vec<Box<dyn Tool>> = Vec::new();
+        let prompt_tools = if expose_text_tool_protocol {
+            &self.tools
+        } else {
+            &no_tools
+        };
+        let instructions = self.tool_dispatcher.prompt_instructions(prompt_tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
-            tools: &self.tools,
+            tools: prompt_tools,
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs(),
+            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs()
+                && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
@@ -2375,6 +2385,65 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    #[tokio::test]
+    async fn direct_agent_strict_tool_parsing_ignores_xml_dispatcher_calls() {
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some(
+                    r#"<tool_call>{"name":"echo","arguments":{"value":"ignored"}}</tool_call>"#
+                        .into(),
+                ),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            strict_tool_parsing: true,
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let system_prompt = agent
+            .build_system_prompt()
+            .expect("system prompt should render");
+        assert!(
+            !system_prompt.contains("## Tools"),
+            "strict parsing should not advertise text tool instructions"
+        );
+        assert!(
+            !system_prompt.contains("<tool_call"),
+            "strict parsing should not advertise XML tool calls"
+        );
+
+        let response = agent.turn("hi").await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(response.contains("<tool_call>"));
     }
 
     #[test]
