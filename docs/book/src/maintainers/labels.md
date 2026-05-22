@@ -8,6 +8,35 @@ Single reference for every label used on PRs and issues. Sources of truth:
 
 When definitions conflict, update the source file first, then sync this page.
 
+## Ownership boundaries
+
+Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
+
+When Project board automation is added, keep the split based on update frequency:
+
+- Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
+- Project board fields are appropriate for issue planning stage, active owner, dependency state, and roadmap grouping when those fields are actively maintained.
+- Native GitHub PR state owns fast-changing review state: review decision, required checks, mergeability, conflicts, and stale approvals.
+
+The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
+
+## Canonical spelling
+
+Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `tool:shell`, `security:policy`, and similar labels. The size and risk families intentionally keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`.
+
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Migrate open issues/PRs to the canonical no-space spelling before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+
+## Type labels
+
+Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
+
+| Label | Purpose |
+|---|---|
+| `type: ci` | CI, workflow, or repository automation work |
+| `type: dependencies` | Dependency or lockfile maintenance |
+| `type: docs` | Documentation-only or docs-primary work |
+| `type:rfc` | RFC issue or proposal; protected from stale closure |
+
 ## Path labels
 
 Applied automatically by `pr-path-labeler.yml` (the only labeling automation currently active). Globs live in `.github/labeler.yml`.
@@ -88,6 +117,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `provider:anthropic` | `anthropic.rs` |
 | `provider:azure-openai` | `azure_openai.rs` |
 | `provider:bedrock` | `bedrock.rs` |
+| `provider:claude-code` | `claude_code.rs` |
 | `provider:compatible` | `compatible.rs` |
 | `provider:copilot` | `copilot.rs` |
 | `provider:gemini` | `gemini.rs`, `gemini_cli.rs` |
@@ -158,12 +188,15 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 
 ## Status labels
 
-Track lifecycle state of RFCs and tracked work items. Applied manually.
+Track lifecycle state of RFCs and tracked work items. Applied manually unless a maintained workflow says otherwise.
 
 | Label | Description |
 |---|---|
-| `status:in-progress` | An open PR is actively targeting this issue |
+| `status:in-progress` | An open PR is actively targeting this issue. Owner-only planning should live on the Project board or in an issue comment unless the team explicitly broadens this label. |
 | `status:accepted` | RFC or work item ratified by the team |
+| `status:blocked` | Blocked on an external dependency, decision, or prerequisite |
+| `status:stale` | No author activity for the stale window; may close if not refreshed |
+| `status:no-stale` | Exempt from stale auto-close; requires a visible reason such as accepted roadmap work, active tracker status, or an external blocker |
 
 ## Triage labels
 
@@ -177,7 +210,8 @@ Applied manually — the auto-response automation that used to handle these was 
 | `duplicate` | Duplicate of an existing issue |
 | `stale-candidate` | Dormant PR or issue; candidate for closing |
 | `superseded` | Replaced by a newer PR |
-| `status:no-stale` | Exempt from stale automation; accepted but blocked work |
+
+Stale exemption uses `status:no-stale`, defined under Status labels above.
 
 ## Maintenance triggers
 
