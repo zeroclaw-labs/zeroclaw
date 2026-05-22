@@ -14741,6 +14741,7 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         // A channel is only collected when an enabled agent references it.
@@ -16284,6 +16285,7 @@ This is an example JSON object for profile settings."#;
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                default_target: None,
             },
         );
         let config_arc = Arc::new(RwLock::new(config));

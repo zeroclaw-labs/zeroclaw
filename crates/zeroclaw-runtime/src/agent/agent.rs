@@ -2647,7 +2647,7 @@ mod tests {
             always_ask: vec!["echo".into()],
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
@@ -2702,7 +2702,7 @@ mod tests {
             always_ask: vec!["echo".into()],
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
@@ -2755,7 +2755,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
@@ -2815,7 +2815,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
@@ -2880,7 +2880,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
