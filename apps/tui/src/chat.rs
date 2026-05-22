@@ -393,6 +393,13 @@ fn render(f: &mut Frame, state: &ChatState, area: Rect) {
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
+    } else {
+        // Place the terminal cursor at the end of the input text.
+        // Clamp to the inner width so it never lands on the right border.
+        let ia = chunks[1];
+        let cx = (ia.x + 1 + state.input().chars().count() as u16)
+            .min(ia.x + ia.width.saturating_sub(2));
+        f.set_cursor_position((cx, ia.y + 1));
     }
 }
 
