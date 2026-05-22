@@ -7600,6 +7600,19 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-lark")]
+        "lark" => {
+            let lk = config.channels.lark.get(alias).ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("lark", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-lark"))]
+        "lark" => {
+            anyhow::bail!("Lark channel requires the `channel-lark` feature");
+        }
         "webhook" => {
             let wh = config
                 .channels
@@ -15917,6 +15930,28 @@ Done."#;
         assert!(
             !prompt.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_routes_lark_to_lark_arm() {
+        // Verify that the "lark.<alias>" channel string is routed to the
+        // lark match arm and bails with "[channels.lark.<alias>] not
+        // configured" when no entry exists, rather than falling through
+        // to `other => bail!("unsupported delivery channel: ...")`.
+        let config = zeroclaw_config::schema::Config::default();
+        let err = deliver_announcement(&config, "lark.default", "oc_test_chat", None, "hi")
+            .await
+            .expect_err("expected lark arm to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "lark must route to lark arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.lark.default] not configured"),
+            "expected '[channels.lark.default] not configured' bail; got: {msg}"
         );
     }
 }
