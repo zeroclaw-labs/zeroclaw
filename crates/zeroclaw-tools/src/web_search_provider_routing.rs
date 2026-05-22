@@ -18,8 +18,8 @@ const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 
-pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResolution {
-    let normalized = raw_provider.trim().to_ascii_lowercase();
+pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
+    let normalized = raw_model_provider.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "" | "default" | "duckduckgo" | "ddg" | "duck-duck-go" | "duck_duck_go" => {
             WebSearchProviderResolution {
@@ -43,8 +43,8 @@ pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResol
             canonical_provider: TAVILY_PROVIDER,
             used_fallback: false,
         },
-        // Warns for unknown providers, falls back to default.
-        // Known non-default providers: Brave, SearXNG, Tavily.
+        // Warns for unknown model_providers, falls back to default.
+        // Known non-default model_providers: Brave, SearXNG, Tavily.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,

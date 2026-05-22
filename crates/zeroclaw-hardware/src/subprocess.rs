@@ -23,7 +23,11 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(SubprocessTool, ToolKind::Plugin);
 
 /// Subprocess timeout — kill the child process after this many seconds.
 const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
@@ -115,8 +119,19 @@ impl Tool for SubprocessTool {
     /// 6. Deserialize the line to `ToolResult`.
     /// 7. On timeout → return error `ToolResult`; on empty/bad output → error.
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let args_json = serde_json::to_string(&args)
-            .map_err(|e| anyhow::anyhow!("failed to serialise args: {}", e))?;
+        let args_json = serde_json::to_string(&args).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": self.manifest.tool.name,
+                        "error": format!("{}", e),
+                    })),
+                "subprocess plugin: failed to serialise tool args"
+            );
+            anyhow::Error::msg(format!("failed to serialise args: {e}"))
+        })?;
 
         // Spawn child process.
         let mut child = Command::new(&self.binary_path)
@@ -125,12 +140,22 @@ impl Tool for SubprocessTool {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to spawn plugin '{}' at {}: {}",
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": self.manifest.tool.name,
+                            "binary_path": self.binary_path.display().to_string(),
+                            "error": format!("{}", e),
+                        })),
+                    "subprocess plugin spawn failed"
+                );
+                anyhow::Error::msg(format!(
+                    "failed to spawn plugin '{}' at {}: {e}",
                     self.manifest.tool.name,
-                    self.binary_path.display(),
-                    e
-                )
+                    self.binary_path.display()
+                ))
             })?;
 
         // Write JSON args + newline to stdin, then drop stdin to signal EOF.
@@ -147,11 +172,21 @@ impl Tool for SubprocessTool {
                 && e.kind() != std::io::ErrorKind::BrokenPipe
             {
                 let _ = child.kill().await;
-                return Err(anyhow::anyhow!(
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": self.manifest.tool.name,
+                            "error": format!("{}", e),
+                        })),
+                    "subprocess plugin: failed to write args to stdin"
+                );
+                anyhow::bail!(
                     "failed to write args to plugin '{}' stdin: {}",
                     self.manifest.tool.name,
                     e
-                ));
+                );
             }
             // stdin dropped here → child receives EOF
         }

@@ -541,10 +541,8 @@ jobs:
           tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
           tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
 
-          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/data
           printf '%s\n' \
-            'workspace_dir = "/zeroclaw-data/workspace"' \
-            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
             'api_key = ""' \
             'default_provider = "openrouter"' \
             'default_model = "anthropic/claude-sonnet-4-20250514"' \

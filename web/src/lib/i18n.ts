@@ -404,6 +404,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agents',
     'nav.tools': 'Tools',
     'nav.cron': 'Scheduled Jobs',
     'nav.integrations': 'Integrations',
@@ -422,7 +423,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.uptime': 'Uptime',
     'dashboard.temperature': 'Temperature',
     'dashboard.gateway_port': 'Gateway Port',
-    'dashboard.version': 'Version',
     'dashboard.memory_backend': 'Memory Backend',
     'dashboard.paired': 'Paired',
     'dashboard.channels': 'Channels',
@@ -431,6 +431,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.overview': 'Overview',
     'dashboard.system_info': 'System Information',
     'dashboard.quick_actions': 'Quick Actions',
+    'dashboard.add_memory': 'Add memory',
 
     // Agent / Chat
     'agent.title': 'Agent Chat',
@@ -677,6 +678,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.pairing_code': 'Pairing Code',
     'auth.pair_button': 'Pair',
     'auth.logout': 'Logout',
+    'auth.logout_confirm': 'Log out of ZeroClaw?',
     'auth.pairing_success': 'Pairing successful!',
     'auth.pairing_failed': 'Pairing failed. Please try again.',
     'auth.enter_code': 'Enter your pairing code to connect to the agent.',
@@ -754,6 +756,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.tab_overview': 'Overview',
     'dashboard.tab_sessions': 'Sessions',
     'dashboard.tab_channels': 'Channels',
+    'dashboard.tab_memories': 'Memories',
+    'dashboard.tab_health': 'Health',
+    'dashboard.tab_cost': 'Cost',
     'dashboard.sessions_title': 'Active Sessions',
     'dashboard.no_sessions': 'No active sessions',
     'dashboard.session_id': 'Session ID',

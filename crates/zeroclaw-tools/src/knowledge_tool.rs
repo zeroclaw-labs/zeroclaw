@@ -93,10 +93,16 @@ impl Tool for KnowledgeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "knowledge_tool: missing action parameter"
+            );
+            anyhow::Error::msg("missing 'action' parameter")
+        })?;
 
         match action {
             "capture" => self.handle_capture(&args),
@@ -120,17 +126,62 @@ impl KnowledgeTool {
         let node_type_str = args
             .get("node_type")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'node_type' for capture"))?;
-        let title = args
-            .get("title")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'title' for capture"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "capture",
+                            "param": "node_type",
+                        })),
+                    "knowledge_tool: capture missing node_type"
+                );
+                anyhow::Error::msg("missing 'node_type' for capture")
+            })?;
+        let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "action": "capture",
+                        "param": "title",
+                    })),
+                "knowledge_tool: capture missing title"
+            );
+            anyhow::Error::msg("missing 'title' for capture")
+        })?;
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'content' for capture"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "capture",
+                            "param": "content",
+                        })),
+                    "knowledge_tool: capture missing content"
+                );
+                anyhow::Error::msg("missing 'content' for capture")
+            })?;
 
-        let node_type = NodeType::parse(node_type_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let node_type = NodeType::parse(node_type_str).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "node_type": node_type_str,
+                        "error": format!("{}", e),
+                    })),
+                "knowledge_tool: invalid node_type"
+            );
+            anyhow::Error::msg(format!("{e}"))
+        })?;
 
         let tags: Vec<String> = args
             .get("tags")
@@ -244,17 +295,62 @@ impl KnowledgeTool {
         let from_id = args
             .get("from_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'from_id' for relate"))?;
-        let to_id = args
-            .get("to_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'to_id' for relate"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "relate",
+                            "param": "from_id",
+                        })),
+                    "knowledge_tool: relate missing from_id"
+                );
+                anyhow::Error::msg("missing 'from_id' for relate")
+            })?;
+        let to_id = args.get("to_id").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "action": "relate",
+                        "param": "to_id",
+                    })),
+                "knowledge_tool: relate missing to_id"
+            );
+            anyhow::Error::msg("missing 'to_id' for relate")
+        })?;
         let relation_str = args
             .get("relation")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'relation' for relate"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "relate",
+                            "param": "relation",
+                        })),
+                    "knowledge_tool: relate missing relation"
+                );
+                anyhow::Error::msg("missing 'relation' for relate")
+            })?;
 
-        let relation = Relation::parse(relation_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let relation = Relation::parse(relation_str).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "relation": relation_str,
+                        "error": format!("{}", e),
+                    })),
+                "knowledge_tool: invalid relation"
+            );
+            anyhow::Error::msg(format!("{e}"))
+        })?;
 
         match self.graph.add_edge(from_id, to_id, relation) {
             Ok(()) => Ok(ToolResult {
@@ -275,7 +371,19 @@ impl KnowledgeTool {
             .get("query")
             .or_else(|| args.get("content"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'query' or 'content' for suggest"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "suggest",
+                            "missing": "query_or_content",
+                        })),
+                    "knowledge_tool: suggest missing query/content"
+                );
+                anyhow::Error::msg("missing 'query' or 'content' for suggest")
+            })?;
 
         let results = self.graph.query_by_similarity(query, 10)?;
         let suggestions: Vec<serde_json::Value> = results
@@ -342,7 +450,19 @@ impl KnowledgeTool {
         let text = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'content' for lessons_extract"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "lessons_extract",
+                            "param": "content",
+                        })),
+                    "knowledge_tool: lessons_extract missing content"
+                );
+                anyhow::Error::msg("missing 'content' for lessons_extract")
+            })?;
 
         // Simple keyword-based extraction: split on sentence boundaries, score by
         // signal keywords that commonly indicate lessons.

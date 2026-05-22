@@ -1,39 +1,17 @@
-//! Per-section field visibility + default-injection helpers.
+//! Per-section field visibility helpers.
 //!
 //! Used by both the CLI wizard (`onboard::offer_advanced_settings`) and the
-//! gateway HTTP endpoints (`/api/onboard/sections/.../items/...` for default
-//! injection, `/api/config/list` for filtering). One source of truth so the
-//! CLI and dashboard can't disagree about which fields apply to a given
-//! provider / memory backend / etc.
+//! gateway HTTP endpoints (`/api/config/list` for filtering). One source of
+//! truth so the CLI and dashboard can't disagree about which fields apply.
 //!
-//! Follow-up (#5960 deferral): a `#[configurable(family = "...")]` schema
-//! attribute would let the `Configurable` derive emit these filters
-//! automatically. Until that lands, the per-family lists below are the
-//! pragmatic stand-in.
-//!
-//! Issue #6175.
+//! Per-provider-family field exclusion is GONE as of #6273 — the typed-family
+//! ModelProviders container only exposes fields that genuinely apply to each
+//! family (every typed `*ModelProviderConfig` carries only its own surface),
+//! so there's nothing to suppress. Memory-backend exclusion stays because the
+//! `[memory]` section is still a single struct carrying every backend's
+//! sub-tables (the typed-family pattern hasn't been applied there).
 
-use anyhow::Result;
 use zeroclaw_config::schema::Config;
-
-/// Exclude list for `[providers.models.<name>]` field walks.
-///
-/// Returns leaf field names (kebab-case, the suffix after the
-/// `providers.models.<name>.` prefix in `prop_fields()`). A field absent
-/// from this list is shown for every provider.
-pub fn provider_family_excludes(provider: &str) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if provider != "azure_openai" {
-        out.push("azure-openai-resource");
-        out.push("azure-openai-deployment");
-        out.push("azure-openai-api-version");
-    }
-    if !matches!(provider, "openai" | "openai_codex") {
-        out.push("wire-api");
-        out.push("requires-openai-auth");
-    }
-    out
-}
 
 /// Exclude list for the top-level `[memory]` walk based on the active backend.
 ///
@@ -66,13 +44,6 @@ pub fn memory_backend_excludes(backend: &str) -> Vec<&'static str> {
 /// resolve any state-dependent rules (e.g. `memory.backend`), and returns
 /// the absolute paths to drop from the response.
 pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
-    if let Some(provider_key) = providers_models_key(prefix) {
-        return provider_family_excludes(provider_key)
-            .into_iter()
-            .map(|leaf| format!("providers.models.{provider_key}.{leaf}"))
-            .collect();
-    }
-
     if prefix == "memory" || prefix.is_empty() {
         let backend = if cfg.memory.backend.is_empty() {
             "sqlite"
@@ -81,15 +52,7 @@ pub fn excluded_paths(cfg: &Config, prefix: &str) -> Vec<String> {
         };
         return memory_backend_excludes(backend)
             .into_iter()
-            .map(|leaf| {
-                if leaf.ends_with('.') {
-                    // Sub-table prefix — represent as a path-prefix marker
-                    // that callers match with `starts_with`.
-                    format!("memory.{leaf}")
-                } else {
-                    format!("memory.{leaf}")
-                }
-            })
+            .map(|leaf| format!("memory.{leaf}"))
             .collect();
     }
 
@@ -105,128 +68,9 @@ pub fn is_excluded(path: &str, excludes: &[String]) -> bool {
         .any(|e| path == e || (e.ends_with('.') && path.starts_with(e)))
 }
 
-/// Extract the `<key>` from a `providers.models.<key>` prefix. Returns
-/// `None` when the prefix isn't a per-model walk.
-pub fn providers_models_key(prefix: &str) -> Option<&str> {
-    let rest = prefix.strip_prefix("providers.models.")?;
-    if rest.is_empty() || rest.contains('.') {
-        return None;
-    }
-    Some(rest)
-}
-
-/// Walk a freshly-constructed defaults struct (from
-/// `zeroclaw_providers::default_provider_config`, etc.) and copy its
-/// populated values into `cfg` under `target_prefix`, but only for paths
-/// the user hasn't already set.
-///
-/// Schema-driven: enumerates fields via the source's `prop_fields()`
-/// macro output. Adding a new field to the source struct propagates
-/// automatically — no per-field plumbing here.
-///
-/// `source_prefix` is the source struct's `configurable_prefix()` (e.g.
-/// `providers.models` for `ModelProviderConfig`). Each leaf gets rebased
-/// onto `target_prefix` before writing.
-fn apply_typed_defaults<S>(cfg: &mut Config, defaults: &S, source_prefix: &str, target_prefix: &str)
-where
-    S: PropFieldSource,
-{
-    let source_dot = format!("{source_prefix}.");
-    let target_dot = format!("{target_prefix}.");
-    for field in defaults.prop_fields() {
-        // Only direct leaves of the defaults struct — nested sub-tables
-        // need their own walks (they have their own configurable_prefix).
-        let Some(leaf) = field.name.strip_prefix(&source_dot) else {
-            continue;
-        };
-        if leaf.contains('.') {
-            continue;
-        }
-        // Sparse defaults: an unset field on the typed default struct means
-        // the source has no opinion; leave the target alone.
-        if field.display_value == "<unset>" {
-            continue;
-        }
-        let target_path = format!("{target_dot}{leaf}");
-        let current = cfg.get_prop(&target_path).unwrap_or_default();
-        if !current.is_empty() && current != "<unset>" {
-            // User has already set this field — don't clobber.
-            continue;
-        }
-        let _ = cfg.set_prop(&target_path, &field.display_value);
-    }
-}
-
-/// Trait-object-friendly view onto any `Configurable`-derived struct's
-/// `prop_fields()`. Lets `apply_typed_defaults` accept any source struct
-/// without naming concrete types.
-trait PropFieldSource {
-    fn prop_fields(&self) -> Vec<zeroclaw_config::traits::PropFieldInfo>;
-}
-
-impl PropFieldSource for zeroclaw_config::schema::ModelProviderConfig {
-    fn prop_fields(&self) -> Vec<zeroclaw_config::traits::PropFieldInfo> {
-        zeroclaw_config::schema::ModelProviderConfig::prop_fields(self)
-    }
-}
-
-/// Pre-populate the per-provider entry under `prefix` with the named
-/// provider's trait-derived defaults. Idempotent: existing user-set
-/// values aren't touched.
-///
-/// Source of truth is `zeroclaw_providers::default_provider_config(name)`
-/// — a typed `ModelProviderConfig`. We walk its `prop_fields()` and
-/// rebase each leaf onto `prefix` so e.g. the source's
-/// `providers.models.base-url` becomes the target's
-/// `providers.models.<key>.base-url`.
-pub fn apply_provider_trait_defaults(cfg: &mut Config, provider: &str, prefix: &str) -> Result<()> {
-    let defaults = zeroclaw_providers::default_provider_config(provider);
-    let source_prefix = zeroclaw_config::schema::ModelProviderConfig::configurable_prefix();
-    apply_typed_defaults(cfg, &defaults, source_prefix, prefix);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn azure_excludes_hide_for_non_azure() {
-        let excludes = provider_family_excludes("ollama");
-        assert!(excludes.contains(&"azure-openai-resource"));
-        assert!(excludes.contains(&"azure-openai-deployment"));
-        assert!(excludes.contains(&"azure-openai-api-version"));
-    }
-
-    #[test]
-    fn azure_excludes_keep_for_azure() {
-        let excludes = provider_family_excludes("azure_openai");
-        assert!(!excludes.contains(&"azure-openai-resource"));
-        assert!(!excludes.contains(&"azure-openai-deployment"));
-        assert!(!excludes.contains(&"azure-openai-api-version"));
-    }
-
-    #[test]
-    fn openai_specific_excludes_for_non_openai() {
-        let excludes = provider_family_excludes("anthropic");
-        assert!(excludes.contains(&"wire-api"));
-        assert!(excludes.contains(&"requires-openai-auth"));
-    }
-
-    #[test]
-    fn openai_specific_kept_for_openai_family() {
-        for p in &["openai", "openai_codex"] {
-            let excludes = provider_family_excludes(p);
-            assert!(
-                !excludes.contains(&"wire-api"),
-                "wire-api should show for {p}"
-            );
-            assert!(
-                !excludes.contains(&"requires-openai-auth"),
-                "requires-openai-auth should show for {p}"
-            );
-        }
-    }
 
     #[test]
     fn memory_excludes_hide_inactive_backends() {
@@ -244,22 +88,6 @@ mod tests {
         assert!(ex.contains(&"postgres."));
         assert!(ex.contains(&"sqlite-open-timeout-secs"));
         assert!(ex.contains(&"conversation-retention-days"));
-    }
-
-    #[test]
-    fn excluded_paths_for_provider_prefix() {
-        let cfg = Config::default();
-        let paths = excluded_paths(&cfg, "providers.models.ollama");
-        assert!(
-            paths
-                .iter()
-                .any(|p| p == "providers.models.ollama.azure-openai-resource")
-        );
-        assert!(
-            paths
-                .iter()
-                .any(|p| p == "providers.models.ollama.wire-api")
-        );
     }
 
     #[test]
@@ -282,78 +110,5 @@ mod tests {
         // Unrelated paths don't match.
         assert!(!is_excluded("memory.postgres.url", &excludes));
         assert!(!is_excluded("memory.foobar", &excludes));
-    }
-
-    #[test]
-    fn apply_provider_trait_defaults_populates_ollama_base_url() {
-        // The user-facing complaint: picking Ollama in the dashboard left
-        // base_url empty. After apply, it should match the provider's
-        // default_base_url() (http://localhost:11434).
-        let mut cfg = Config::default();
-        cfg.create_map_key("providers.models", "ollama")
-            .expect("create_map_key");
-
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama")
-            .expect("apply defaults");
-
-        let base_url = cfg
-            .get_prop("providers.models.ollama.base-url")
-            .expect("base-url");
-        assert!(
-            base_url.contains("11434"),
-            "expected ollama default base_url with port 11434, got: {base_url}"
-        );
-
-        // Temperature should also be populated (Ollama overrides to 0.0).
-        let temp = cfg
-            .get_prop("providers.models.ollama.temperature")
-            .expect("temperature");
-        assert!(
-            !temp.is_empty() && temp != "<unset>",
-            "temperature should be set"
-        );
-    }
-
-    #[test]
-    fn apply_provider_trait_defaults_skips_user_overrides() {
-        // If the user already set a value, apply shouldn't clobber it on a
-        // re-select / second call.
-        let mut cfg = Config::default();
-        cfg.create_map_key("providers.models", "ollama")
-            .expect("create_map_key");
-        cfg.set_prop("providers.models.ollama.base-url", "http://example:9999")
-            .expect("set base-url");
-
-        apply_provider_trait_defaults(&mut cfg, "ollama", "providers.models.ollama")
-            .expect("apply defaults");
-
-        let base_url = cfg
-            .get_prop("providers.models.ollama.base-url")
-            .expect("base-url");
-        assert_eq!(
-            base_url, "http://example:9999",
-            "user-set base_url must survive a defaults pass"
-        );
-    }
-
-    #[test]
-    fn providers_models_key_extracts_simple_segment() {
-        assert_eq!(
-            providers_models_key("providers.models.ollama"),
-            Some("ollama")
-        );
-        assert_eq!(
-            providers_models_key("providers.models.azure_openai"),
-            Some("azure_openai")
-        );
-        // A nested path (provider's field) returns None — only the bare
-        // per-model prefix triggers the family filter.
-        assert_eq!(
-            providers_models_key("providers.models.ollama.api-key"),
-            None
-        );
-        assert_eq!(providers_models_key("providers.models"), None);
-        assert_eq!(providers_models_key("providers"), None);
-        assert_eq!(providers_models_key(""), None);
     }
 }

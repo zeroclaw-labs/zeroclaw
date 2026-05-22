@@ -10,9 +10,11 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
@@ -47,7 +49,6 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
-tracing = { version = "0.1", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 hex = "0.4"
@@ -78,6 +79,7 @@ md5 = { version = "0.8", optional = true }
 
 [features]
 default = [
+    "channel-acp-server",
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
@@ -91,7 +93,7 @@ channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode", "dep:prost"]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
 channel-slack = []
@@ -120,7 +122,6 @@ channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tempfile = "3.26"

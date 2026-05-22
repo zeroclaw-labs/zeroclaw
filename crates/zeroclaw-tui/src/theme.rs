@@ -46,3 +46,12 @@ pub fn selected_style() -> Style {
 pub fn input_style() -> Style {
     Style::default().fg(ICY_WHITE)
 }
+
+/// Dim, italic style used for ghost-text default values in input prompts.
+/// Signals "this is the default that Enter will accept" without committing
+/// it to the buffer; vanishes on the first keystroke.
+pub fn placeholder_style() -> Style {
+    Style::default()
+        .fg(FROST_DIM)
+        .add_modifier(Modifier::ITALIC)
+}
