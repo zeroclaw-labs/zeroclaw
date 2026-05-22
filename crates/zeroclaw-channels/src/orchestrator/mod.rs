@@ -116,9 +116,9 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -3850,6 +3850,9 @@ async fn process_channel_message_body(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
+                        ctx.prompt_config
+                            .agent(ctx.agent_alias.as_str())
+                            .is_some_and(|agent| agent.strict_tool_parsing),
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
@@ -7035,6 +7038,12 @@ pub async fn start_channels(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+            native_tools,
+            agent.strict_tool_parsing,
+            &mut tool_descs,
+            &mut deferred_section,
+        );
         let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
             &workspace,
             &model,
@@ -7048,7 +7057,7 @@ pub async fn start_channels(
             agent.compact_context,
             agent.max_system_prompt_chars,
         );
-        if !native_tools {
+        if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 tools_registry.as_ref(),
                 &effective_tool_names,
@@ -12106,6 +12115,49 @@ BTC is currently around $65,000 based on latest tool output."#
             1,
             "protocol block should appear exactly once in the final prompt"
         );
+    }
+
+    #[test]
+    fn channel_strict_non_native_prompt_hides_text_tool_protocol() {
+        let ws = make_workspace();
+        let mut tool_descs = vec![("shell", "Run commands")];
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+
+        let expose_text_protocol =
+            apply_text_tool_prompt_policy(false, true, &mut tool_descs, &mut deferred_section);
+
+        let mut prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "gpt-4o",
+            &tool_descs,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+        );
+        if expose_text_protocol {
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+            let effective_tool_names: HashSet<&str> =
+                tools_registry.iter().map(|tool| tool.name()).collect();
+            prompt.push_str(&build_tool_instructions_for_names(
+                &tools_registry,
+                &effective_tool_names,
+            ));
+        }
+        if !deferred_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&deferred_section);
+        }
+
+        assert!(!expose_text_protocol);
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(!prompt.contains("<tool_call>"));
+        assert!(!prompt.contains("mcp__example"));
     }
 
     #[test]

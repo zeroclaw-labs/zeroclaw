@@ -22,9 +22,11 @@ import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight } from 'lucide-react';
 import {
   ApiError,
+  getCatalogModels,
   getMapKeys,
   getOnboardStatus,
   getProp,
+  getSectionPicker,
   getSections,
   patchConfig,
   reloadDaemon,
@@ -282,10 +284,10 @@ export default function Onboard() {
       if (!picked && !activeSection.ready) {
         return blockAdvance(['Choose a model provider, then set its required model and credential/auth.']);
       }
-      if (picked) {
-        const providerIssues = await modelProviderStepIssues(picked);
-        if (providerIssues.length > 0) return blockAdvance(providerIssues);
-      }
+      const providerIssues = picked
+        ? await modelProviderStepIssues(picked)
+        : await configuredLocalModelProviderStepIssues();
+      if (providerIssues.length > 0) return blockAdvance(providerIssues);
     }
 
     if (activeSection.key === 'storage' && !picked && !activeSection.ready) {
@@ -799,14 +801,81 @@ function providerRefForFieldsPrefix(fieldsPrefix: string): string | null {
   return providerType && providerAlias ? `${canonicalProviderRefSegment(providerType)}.${providerAlias}` : null;
 }
 
+function providerTypeForFieldsPrefix(fieldsPrefix: string): string | null {
+  const parts = fieldsPrefix.split('.');
+  return parts[0] === 'providers' && parts[1] === 'models' && parts[2] ? parts[2] : null;
+}
+
+async function hasCustomProviderEndpoint(fieldsPrefix: string): Promise<boolean> {
+  const uri = await getProp(`${fieldsPrefix}.uri`).catch(() => null);
+  return hasTextValue(uri?.value);
+}
+
+async function configuredLocalModelProviderStepIssues(): Promise<string[]> {
+  const picker = await getSectionPicker('providers.models').catch(() => null);
+  if (!picker) return [];
+
+  const issues: string[] = [];
+  for (const item of picker.items) {
+    const catalogProviderType = canonicalProviderRefSegment(item.key);
+    const catalog = await getCatalogModels(catalogProviderType).catch(() => null);
+    if (!(catalog?.local ?? isLocalModelProvider(catalogProviderType))) continue;
+
+    const mapPath = `providers.models.${typedMapPathSegment('providers.models', item.key)}`;
+    const aliases = await getMapKeys(mapPath).catch(() => null);
+    if (!aliases) continue;
+    for (const alias of aliases.keys) {
+      const fieldsPrefix = `${mapPath}.${alias}`;
+      const model = await getProp(`${fieldsPrefix}.model`).catch(() => null);
+      if (!hasTextValue(model?.value)) continue;
+      issues.push(...await modelProviderStepIssues({ item, fieldsPrefix }));
+    }
+  }
+  return issues;
+}
+
 async function modelProviderStepIssues(picked: { item: PickerItem; fieldsPrefix: string }): Promise<string[]> {
   const providerRef = providerRefForFieldsPrefix(picked.fieldsPrefix) ?? picked.item.label;
+  const providerType = providerTypeForFieldsPrefix(picked.fieldsPrefix);
+  const catalogProviderType = providerType ? canonicalProviderRefSegment(providerType) : null;
   const model = await getProp(`${picked.fieldsPrefix}.model`).catch(() => null);
-  if (!hasTextValue(model?.value)) {
+  const modelName = hasTextValue(model?.value) ? String(model?.value).trim() : '';
+  if (!modelName) {
     return [`Choose a model for model provider \`${providerRef}\`.`];
   }
 
-  if (isLocalPickerItem(picked.item)) return [];
+  if (catalogProviderType) {
+    try {
+      const catalog = await getCatalogModels(catalogProviderType);
+      if (catalog.local) {
+        if (await hasCustomProviderEndpoint(picked.fieldsPrefix)) return [];
+        if (!catalog.live) {
+          return [
+            `Start or configure the local provider for \`${providerRef}\` so ZeroClaw can list its installed models.`,
+          ];
+        }
+        if (catalog.models.length === 0) {
+          return [
+            `No installed models were found for local provider \`${providerRef}\`. Install a model or configure the provider endpoint first.`,
+          ];
+        }
+        if (!catalog.models.includes(modelName)) {
+          return [
+            `Model \`${modelName}\` was not found on local provider \`${providerRef}\`. Pick an installed model or install it first.`,
+          ];
+        }
+        return [];
+      }
+    } catch {
+      if (!isLocalModelProvider(catalogProviderType)) {
+        // Fall through to hosted credential checks below.
+      } else {
+        return [
+          `Start or configure the local provider for \`${providerRef}\` so ZeroClaw can list its installed models.`,
+        ];
+      }
+    }
+  }
 
   const apiKey = await getProp(`${picked.fieldsPrefix}.api-key`).catch(() => null);
   const openAiAuth = await getProp(`${picked.fieldsPrefix}.requires-openai-auth`).catch(() => null);
@@ -822,10 +891,6 @@ function isTruthyValue(value: unknown): boolean {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') return value.trim().toLowerCase() === 'true';
   return false;
-}
-
-function isLocalPickerItem(item: PickerItem): boolean {
-  return item.description?.toLowerCase().includes('local') ?? false;
 }
 
 function canonicalProviderRefSegment(providerType: string): string {

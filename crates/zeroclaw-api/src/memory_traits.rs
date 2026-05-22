@@ -218,7 +218,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
-    /// Remove all memories in a namespace (category).
+    /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
     /// Default: returns unsupported error. Backends that support bulk deletion override this.
     async fn purge_namespace(&self, _namespace: &str) -> anyhow::Result<usize> {
