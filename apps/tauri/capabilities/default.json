@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability set for QuantClaw Desktop",
-  "windows": ["main"],
+  "description": "Default capability set for ZeroClaw Desktop",
+  "windows": ["main", "onboarding"],
   "permissions": [
     "core:default",
     "shell:allow-open",
