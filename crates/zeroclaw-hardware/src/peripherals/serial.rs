@@ -12,8 +12,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
 use zeroclaw_config::schema::PeripheralBoardConfig;
+
+tool_attribution!(GpioReadTool, ToolKind::Plugin);
+tool_attribution!(GpioWriteTool, ToolKind::Plugin);
 
 /// Allowed serial path patterns (security: deny arbitrary paths).
 const ALLOWED_PATH_PREFIXES: &[&str] = &[
@@ -80,7 +85,19 @@ impl SerialTransport {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("Serial request timed out after {}s", SERIAL_TIMEOUT_SECS)
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "command": cmd,
+                        "timeout_secs": SERIAL_TIMEOUT_SECS,
+                    })),
+                "serial peripheral request timed out"
+            );
+            anyhow::Error::msg(format!(
+                "Serial request timed out after {SERIAL_TIMEOUT_SECS}s"
+            ))
         })??;
 
         let ok = resp["ok"].as_bool().unwrap_or(false);
@@ -114,10 +131,16 @@ impl SerialPeripheral {
     /// Create and connect to a serial peripheral.
     #[allow(clippy::unused_async)]
     pub async fn connect(config: &PeripheralBoardConfig) -> anyhow::Result<Self> {
-        let path = config
-            .path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Serial peripheral requires path"))?;
+        let path = config.path.as_deref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"board": config.board})),
+                "serial peripheral connect refused: config missing 'path'"
+            );
+            anyhow::Error::msg("Serial peripheral requires path")
+        })?;
 
         if !is_path_allowed(path) {
             anyhow::bail!(
@@ -128,7 +151,20 @@ impl SerialPeripheral {
 
         let port = tokio_serial::new(path, config.baud)
             .open_native_async()
-            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path, e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "path": path,
+                            "baud": config.baud,
+                            "error": format!("{}", e),
+                        })),
+                    "serial peripheral open failed"
+                );
+                anyhow::Error::msg(format!("Failed to open {path}: {e}"))
+            })?;
 
         let name = format!("{}-{}", config.board, path.replace('/', "_"));
         let transport = Arc::new(SerialTransport {
@@ -217,10 +253,16 @@ impl Tool for GpioReadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_read", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
         self.transport
             .request("gpio_read", json!({ "pin": pin }))
             .await
@@ -260,14 +302,26 @@ impl Tool for GpioWriteTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
-        let value = args
-            .get("value")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'value' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
+        let value = args.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "value"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'value' parameter")
+        })?;
         self.transport
             .request("gpio_write", json!({ "pin": pin, "value": value }))
             .await

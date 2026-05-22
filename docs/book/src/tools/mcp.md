@@ -17,17 +17,19 @@ Keep `deferred_loading = true` (the default) to load tool schemas on demand — 
 
 ## Security and Auto-Approval
 
-By default, any tool execution from an MCP server requires manual approval unless your autonomy level is set to `full`.
+By default, any tool execution from an MCP server requires manual approval unless the agent's risk-profile level is set to `full`.
 
-To automatically approve tools from a specific MCP server, add its prefix to the `auto_approve` list in the `[autonomy]` section:
+To automatically approve specific tools from an MCP server, add them to `auto_approve` on the agent's risk profile (`[risk_profiles.<alias>]`):
 
 ```toml
-[autonomy]
+[risk_profiles.assistant]
 auto_approve = [
-  "my_local_tool__read_file", # Allow specific tool from 'my_local_tool'
-  "my_remote_tool__get_weather" # Allow specific tool from 'my_remote_tool'
+  "my_local_tool__read_file",   # tool from `my_local_tool` MCP server
+  "my_remote_tool__get_weather" # tool from `my_remote_tool` MCP server
 ]
 ```
+
+See [Autonomy levels](../security/autonomy.md) for the full surface of per-profile fields.
 
 ## Tips
 

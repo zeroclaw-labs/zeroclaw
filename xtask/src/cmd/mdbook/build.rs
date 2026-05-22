@@ -56,11 +56,11 @@ pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> any
     let tpl_path = book.join("theme/lang-switcher.js.tpl");
     let js_path = book.join("theme/lang-switcher.js");
     let src = std::fs::read_to_string(&tpl_path).map_err(|e| {
-        anyhow::anyhow!(
+        anyhow::Error::msg(format!(
             "lang-switcher.js.tpl missing at {}: {e}. The template is the tracked source of \
              truth for the locale switcher; do not delete it.",
             tpl_path.display(),
-        )
+        ))
     })?;
     let locale_lines: String = entries
         .iter()
@@ -71,10 +71,10 @@ pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> any
 
     let start = src
         .find("const LOCALES = [")
-        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js.tpl: LOCALES array not found"))?;
+        .ok_or_else(|| anyhow::Error::msg("lang-switcher.js.tpl: LOCALES array not found"))?;
     let end = src[start..]
         .find("];")
-        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js.tpl: LOCALES closing ]; not found"))?;
+        .ok_or_else(|| anyhow::Error::msg("lang-switcher.js.tpl: LOCALES closing ]; not found"))?;
     let updated = format!("{}{}{}", &src[..start], new_block, &src[start + end + 2..]);
     std::fs::write(&js_path, updated)?;
     Ok(())

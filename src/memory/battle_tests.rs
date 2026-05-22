@@ -19,7 +19,7 @@ mod tests {
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
     }
 
@@ -388,6 +388,8 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
         }];
 
         let conflicts = conflict::find_text_conflicts(&entries, "User prefers Go", 0.3);
@@ -410,6 +412,8 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: Some("newer_id".into()), // already superseded
+            agent_alias: None,
+            agent_id: None,
         }];
 
         let conflicts =
@@ -433,6 +437,8 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
         }];
 
         // Exact same content should not be a conflict
@@ -514,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn audit_logs_all_operation_types() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -536,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn audit_with_namespaced_operations() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -561,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn audit_wrapping_sqlite_backend() {
         let tmp = TempDir::new().unwrap();
-        let inner = SqliteMemory::new(tmp.path()).unwrap();
+        let inner = SqliteMemory::new("test", tmp.path()).unwrap();
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         // Full round-trip through audited sqlite
@@ -583,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn audit_concurrent_operations() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = Arc::new(AuditedMemory::new(inner, tmp.path()).unwrap());
 
         let mut handles = Vec::new();
@@ -773,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_with_audited_sqlite() {
         let tmp = TempDir::new().unwrap();
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
         let audited = AuditedMemory::new(sqlite, tmp.path()).unwrap();
         let audited = Arc::new(audited);
 
@@ -913,7 +919,7 @@ mod tests {
 
         // First open: creates schema with all columns
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store_with_metadata(
                 "persist_key",
                 "persisted data",
@@ -928,7 +934,7 @@ mod tests {
 
         // Second open: migrations run again but are idempotent
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let entry = mem.get("persist_key").await.unwrap().unwrap();
             assert_eq!(entry.content, "persisted data");
             assert_eq!(entry.namespace, "test-ns");
@@ -937,7 +943,7 @@ mod tests {
 
         // Third open: still fine
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             assert!(mem.health_check().await);
             assert_eq!(mem.count().await.unwrap(), 1);
         }
@@ -1039,6 +1045,8 @@ mod tests {
             namespace: "my-namespace".into(),
             importance: Some(0.7),
             superseded_by: Some("newer-id".into()),
+            agent_alias: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

@@ -175,7 +175,15 @@ impl ImageGenTool {
         let image_url = resp_json
             .pointer("/images/0/url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image URL in fal.ai response"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "image_gen: fal.ai response missing image URL"
+                );
+                anyhow::Error::msg("No image URL in fal.ai response")
+            })?;
 
         // ── Download image ─────────────────────────────────────────
         let img_resp = client

@@ -7,7 +7,7 @@
 
 use std::io::{self, Stdout};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -298,8 +298,20 @@ impl OnboardUi for RatatuiUi {
         }
     }
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
+    async fn string(
+        &mut self,
+        prompt: &str,
+        current: Option<&str>,
+        placeholder: Option<&str>,
+    ) -> Result<Answer<String>> {
         let mut buffer = current.unwrap_or_default().to_string();
+        // If the caller pre-filled `current`, ignore `placeholder`
+        // (pre-fill wins; the user is editing).
+        let placeholder = if current.is_some() && !buffer.is_empty() {
+            None
+        } else {
+            placeholder.map(str::to_string)
+        };
         loop {
             let section = self.section.clone();
             let subsection = self.subsection.clone();
@@ -332,6 +344,7 @@ impl OnboardUi for RatatuiUi {
                         label: prompt,
                         input: &input,
                         masked: false,
+                        placeholder: placeholder.as_deref(),
                     },
                     r.input,
                 );
@@ -341,7 +354,17 @@ impl OnboardUi for RatatuiUi {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => return Ok(Answer::Value(buffer)),
+                } => {
+                    // Enter with an empty buffer + a placeholder default
+                    // commits the placeholder as the value. This is the
+                    // "ghost text disappears, default accepted" path.
+                    if buffer.is_empty()
+                        && let Some(default) = placeholder.as_deref().filter(|s| !s.is_empty())
+                    {
+                        return Ok(Answer::Value(default.to_string()));
+                    }
+                    return Ok(Answer::Value(buffer));
+                }
                 KeyEvent {
                     code: KeyCode::Esc, ..
                 } => return Ok(Answer::Back),
@@ -404,6 +427,7 @@ impl OnboardUi for RatatuiUi {
                         label: prompt,
                         input: &input,
                         masked: true,
+                        placeholder: None,
                     },
                     r.input,
                 );
@@ -439,7 +463,7 @@ impl OnboardUi for RatatuiUi {
         current: Option<usize>,
     ) -> Result<Answer<usize>> {
         if items.is_empty() {
-            return Err(anyhow!("no items to choose from"));
+            return Err(anyhow::Error::msg("no items to choose from"));
         }
         let mut filter = String::new();
         let mut cursor = current.unwrap_or(0).min(items.len() - 1);
@@ -604,7 +628,7 @@ impl OnboardUi for RatatuiUi {
     fn heading(&mut self, level: u8, text: &str) {
         // level 1 = section (breadcrumb root). Entering a new section
         // clears subsection, help, and log — the user is in a new phase.
-        // level 2 = subsection (e.g. picked provider / channel). Only
+        // level 2 = subsection (e.g. picked model_provider / channel). Only
         // clears help, since the log may still be carrying status from
         // just-completed subsection work.
         match level {
@@ -630,13 +654,23 @@ impl OnboardUi for RatatuiUi {
         } else {
             self.help = Some(msg.to_string());
         }
+        // A new field is being prompted — drop stale warns from the
+        // previous field. Status entries (informational) are preserved.
+        self.log.retain(|l| matches!(l.level, LogLevel::Status));
     }
 
     fn status(&mut self, msg: &str) {
-        self.log.push(LogLine {
-            level: LogLevel::Status,
-            text: msg.to_string(),
-        });
+        if msg.is_empty() {
+            // Empty status = clear sticky status entries. Mirrors
+            // `note("")` for help. Without this path the "Fetching
+            // models…" line lingers after the fetch completes.
+            self.log.retain(|l| !matches!(l.level, LogLevel::Status));
+        } else {
+            self.log.push(LogLine {
+                level: LogLevel::Status,
+                text: msg.to_string(),
+            });
+        }
         // Force a paint so the message is visible before any subsequent
         // blocking work (e.g. a models.dev fetch). Without this, the new
         // log line only surfaces when the next prompt triggers a draw,

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use tracing::info;
 
 use super::scout::ScoutResult;
 
@@ -28,8 +27,9 @@ impl Integrator {
     pub fn integrate(&self, candidate: &ScoutResult) -> Result<PathBuf> {
         let safe_name = sanitize_path_component(&candidate.name)?;
         let skill_dir = self.output_dir.join(&safe_name);
-        fs::create_dir_all(&skill_dir)
-            .with_context(|| format!("Failed to create dir: {}", skill_dir.display()))?;
+        fs::create_dir_all(&skill_dir).with_context(|| {
+            format!("Failed to create dir: {}", skill_dir.display().to_string())
+        })?;
 
         let toml_path = skill_dir.join("SKILL.toml");
         let md_path = skill_dir.join("SKILL.md");
@@ -38,15 +38,11 @@ impl Integrator {
         let md_content = self.generate_md(candidate);
 
         fs::write(&toml_path, &toml_content)
-            .with_context(|| format!("Failed to write {}", toml_path.display()))?;
+            .with_context(|| format!("Failed to write {}", toml_path.display().to_string()))?;
         fs::write(&md_path, &md_content)
-            .with_context(|| format!("Failed to write {}", md_path.display()))?;
+            .with_context(|| format!("Failed to write {}", md_path.display().to_string()))?;
 
-        info!(
-            skill = candidate.name.as_str(),
-            path = %skill_dir.display(),
-            "Integrated skill"
-        );
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"skill": candidate.name.as_str(), "path": skill_dir.display().to_string()})), "Integrated skill");
 
         Ok(skill_dir)
     }

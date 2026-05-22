@@ -84,8 +84,6 @@ curl -s http://localhost:42617/health/providers | jq
 }
 ```
 
-For fallback chains, the meta-provider reports its current working child.
-
 ### 4. Tool-call volume and blocks
 
 `/metrics/tools` (Prometheus format):

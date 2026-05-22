@@ -6,14 +6,14 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ### `zeroclaw-runtime`
 
-The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboarding wizard, and TUI. Depends on every other core and edge crate.
+The agent loop, security-policy enforcement, SOP engine, cron scheduler, onboarding sections, and TUI. Depends on every other core and edge crate.
 
 Notable submodules:
 
 - `agent/` — the main request/response loop, streaming, tool-call orchestration
 - `security/` — policy types, sandbox detection, OTP, emergency stop
 - `sop/` — Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
-- `onboard/` — the first-run wizard (`wizard.rs`)
+- `onboard/` — the interactive onboarding sections (`mod.rs`, plus per-shape UIs under `ui/`)
 - `memory/` — wraps `zeroclaw-memory` with runtime-level caching and consolidation schedules
 - `service/` — systemd / launchctl / Windows Service integration
 
@@ -42,15 +42,15 @@ The runtime depends only on these traits, not on concrete implementations. This 
 
 ### `zeroclaw-providers`
 
-All LLM client implementations plus the routing and fallback wrappers. See [Model Providers → Overview](../providers/overview.md) for the list.
+All LLM client implementations plus the routing and retry wrappers. See [Model Providers → Overview](../providers/overview.md) for the list.
 
 Structure:
 
 - `traits.rs` — re-exports from `zeroclaw-api` plus provider-internal helpers
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, … — one file per native provider
 - `compatible.rs` — a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
-- `router.rs` — multi-provider router that routes by task hint
-- `reliable.rs` — fallback-chain wrapper
+- `router.rs` — hint-based per-call model route selection
+- `reliable.rs` — same-provider retry / backoff / API-key rotation wrapper
 - `streaming.rs` — SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`
@@ -107,9 +107,21 @@ Dynamic plugin loader for out-of-process tool implementations. See [Developing �
 
 Hardware abstraction — GPIO, I2C, SPI, USB. Platform-gated. See [Hardware → Overview](../hardware/index.md).
 
+### `zeroclaw-log`
+
+The single emission surface for every log event in the workspace. Owns
+the on-disk JSONL schema (`LogEvent`), the alias-bound attribution
+registry (`ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES`), the
+`tracing-subscriber` Layer that captures every `tracing::*` call, the
+`record!` / `scope!` / `spawn!` macros, the rolling-trim writer, the
+paginated cursor reader behind `/api/logs`, and the bridge to the
+typed `Observer` for Prometheus / OTel consumers. See
+[`architecture/logging.md`](./logging.md).
+
 ### `zeroclaw-infra`
 
-Tracing, metrics, structured logging. All crates emit events via this layer.
+Process-level support: debouncers, watchdogs, the SQLite session
+backend. Not a tracing/metrics layer — that's `zeroclaw-log`.
 
 ### `zeroclaw-macros`
 

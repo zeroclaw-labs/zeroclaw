@@ -193,7 +193,17 @@ impl Tool for ShellTool {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "command"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing 'command' parameter")
+            })?;
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
@@ -230,9 +240,16 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut()
         // to get a mutable reference to the underlying command.
-        self.sandbox
-            .wrap_command(cmd.as_std_mut())
-            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "shell tool: sandbox wrap_command failed"
+            );
+            anyhow::Error::msg(format!("Sandbox error: {e}"))
+        })?;
 
         cmd.env_clear();
 

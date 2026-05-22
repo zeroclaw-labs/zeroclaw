@@ -12,9 +12,7 @@ const routeTitles: Record<string, string> = {
   '/tools': 'nav.tools',
   '/cron': 'nav.cron',
   '/integrations': 'nav.integrations',
-  '/memory': 'nav.memory',
   '/config': 'nav.config',
-  '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
   '/onboard': 'nav.onboard',
@@ -39,6 +37,12 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   // mapped here showed "Dashboard" for the first-run flow.
   const titleKey = routeTitles[location.pathname];
   const pageTitle = titleKey ? t(titleKey) : '';
+
+  const handleLogout = () => {
+    if (window.confirm(t('auth.logout_confirm'))) {
+      logout();
+    }
+  };
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -177,7 +181,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
           {/* Logout */}
           <button
             type="button"
-            onClick={logout}
+            onClick={handleLogout}
             className="h-9 px-3 rounded-xl text-xs transition-all flex items-center gap-1.5"
             style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
             onMouseEnter={(e) => {

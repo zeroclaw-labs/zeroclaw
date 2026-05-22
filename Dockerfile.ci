@@ -21,7 +21,7 @@ COPY bin/${TARGETARCH}/web/dist /usr/share/zeroclawlabs/web/dist
 COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
 
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 ENV ZEROCLAW_GATEWAY_PORT=42617
 
