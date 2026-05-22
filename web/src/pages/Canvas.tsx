@@ -93,10 +93,13 @@ export default function Canvas() {
 
   // Build srcdoc HTML for the iframe — avoids needing allow-same-origin to
   // access contentDocument.  Content types that don't need scripts get a
-  // restrictive CSP meta tag; HTML frames keep allow-scripts only.
+  // restrictive CSP meta tag; only the explicit `html` content type can
+  // execute scripts inside the opaque-origin sandbox.  Every other content
+  // type — including `eval` and any unrecognised type — renders an inert
+  // no-script document, so a previous frame's srcdoc can never remain
+  // visible or active across a content_type transition.
   const srcdoc = useMemo(() => {
     if (!currentFrame) return undefined;
-    if (currentFrame.content_type === 'eval') return undefined;
 
     const cs = getComputedStyle(document.documentElement);
     const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
@@ -105,9 +108,22 @@ export default function Canvas() {
     const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
     const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
 
-    // CSP that blocks all scripts — used for svg/markdown/text content types
+    // CSP that blocks all scripts — used for non-interactive content types
+    // and for the inert placeholder.
     const noScriptCsp =
       '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">';
+
+    // Inert placeholder document.  Used for `eval` (where iframe rendering
+    // is intentionally a no-op and execution happens out of band) and as
+    // the deny-by-default fallback for any unrecognised content_type.
+    // Replacing the previous srcdoc with this guarantees that stale frame
+    // content cannot retain capability across a transition.
+    const inertDoc =
+      `<!DOCTYPE html><html><head>${noScriptCsp}</head><body style="margin:0;background:${bgBase};"></body></html>`;
+
+    if (currentFrame.content_type === 'eval') {
+      return inertDoc;
+    }
 
     if (currentFrame.content_type === 'svg') {
       // Strip <script> tags and event-handler attributes from SVG to prevent XSS
@@ -133,8 +149,14 @@ export default function Canvas() {
       return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
     }
 
-    // HTML content type — scripts allowed but still sandboxed (no same-origin)
-    return currentFrame.content;
+    if (currentFrame.content_type === 'html') {
+      // Scripts allowed but still sandboxed (no same-origin).
+      return currentFrame.content;
+    }
+
+    // Unrecognised content_type — render inert rather than defaulting to
+    // scriptable HTML.  Future content types must be added explicitly above.
+    return inertDoc;
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
