@@ -58,16 +58,28 @@ webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
 # WhatsApp Web (optional)
-wa-rs = { version = "0.2", optional = true, default-features = false }
-wa-rs-core = { version = "0.2", optional = true, default-features = false }
-wa-rs-binary = { version = "0.2", optional = true, default-features = false }
-wa-rs-proto = { version = "0.2", optional = true, default-features = false }
+# Upstream crates from oxidezap/whatsapp-rust, temporarily pinned to commit
+# 9734fb2 (the MSRV-fix branch carrying oxidezap/whatsapp-rust#632). The
+# published 0.6.0 crate uses an `if let` guard at wacore/src/history_sync.rs:93
+# that is stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0. Pinning via a
+# plain `git` source (not `[patch.crates-io]`) keeps the workspace buildable
+# until oxidezap publishes the fix as 0.6.1, at which point this block
+# reverts to versioned crates.io deps.
+# Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false, features = ["tokio-runtime"] }
+wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
+wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
+waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.15", optional = true }
-wa-rs-ureq-http = { version = "0.2", optional = true }
-wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true }
+whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9734fb2ec544e22b7055147aa3e73b6889e3ff0d", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
+# `bytes` is required for the `Bytes` return types in wacore 0.6 storage
+# traits (SignalStore::get_session / load_prekey). Feature-gated to
+# whatsapp-web alongside the rest of the WA Web stack.
+bytes = { version = "1", optional = true }
 shellexpand = "3.1"
 
 # WeChat iLink (optional) — AES-128-ECB and MD5 are mandated by the iLink
@@ -93,7 +105,7 @@ channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
 channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode", "dep:prost"]
+whatsapp-web = ["dep:whatsapp-rust", "dep:wacore", "dep:wacore-binary", "dep:waproto", "dep:serde-big-array", "dep:whatsapp-rust-ureq-http-client", "dep:whatsapp-rust-tokio-transport", "dep:qrcode", "dep:bytes", "dep:prost"]
 # Channels with no optional deps (cfg gate only)
 channel-discord = []
 channel-slack = []
