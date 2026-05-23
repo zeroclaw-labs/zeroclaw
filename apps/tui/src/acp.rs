@@ -1,4 +1,4 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use crate::chat;
@@ -33,6 +33,10 @@ impl<'a> Acp<'a> {
 
     pub(crate) fn handle_paste(&mut self, text: &str) {
         self.inner.handle_paste(text);
+    }
+
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_mouse(mouse, area);
     }
 
     pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {

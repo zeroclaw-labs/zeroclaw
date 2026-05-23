@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -517,6 +520,16 @@ impl<'a> Chat<'a> {
         false
     }
 
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) {
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => state.scroll_up(3),
+                MouseEventKind::ScrollDown => state.scroll_down(3),
+                _ => {}
+            }
+        }
+    }
+
     /// Handle a bracketed paste event.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         let ChatPhase::Active(state) = &mut self.phase else {
@@ -716,7 +729,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
-fn render(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let show_cursor = state.pending_approval().is_none();
     let conv_area = state
         .input_bar
@@ -815,7 +828,7 @@ fn render_tool_entry<'a>(
     }
 }
 
-fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let selected = state.selected_entry;
 
@@ -943,7 +956,12 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
             }
         })
         .sum();
-    let scroll = total_rows.saturating_sub(inner_height);
+    let max_scroll = total_rows.saturating_sub(inner_height);
+    let scroll = if state.pinned_to_bottom {
+        max_scroll
+    } else {
+        state.scroll_offset.min(max_scroll)
+    };
 
     let p = Paragraph::new(lines)
         .block(
@@ -954,6 +972,21 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
+
+    state.last_total_rows = total_rows;
+    state.last_inner_height = inner_height;
+    state.scroll_offset = scroll;
+
+    let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
+        .position(scroll as usize)
+        .viewport_content_length(inner_height as usize);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut scrollbar_state,
+    );
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -1272,6 +1305,10 @@ pub struct ChatState {
     show_thoughts: bool,
     selected_entry: Option<usize>,
     session_overlay: SessionOverlay,
+    scroll_offset: u16,
+    pinned_to_bottom: bool,
+    last_total_rows: u16,
+    last_inner_height: u16,
 }
 
 impl ChatState {
@@ -1289,6 +1326,23 @@ impl ChatState {
             show_thoughts: true,
             selected_entry: None,
             session_overlay: SessionOverlay::None,
+            scroll_offset: 0,
+            pinned_to_bottom: true,
+            last_total_rows: 0,
+            last_inner_height: 0,
+        }
+    }
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.pinned_to_bottom = false;
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
+        if self.scroll_offset >= max {
+            self.pinned_to_bottom = true;
         }
     }
 
@@ -1521,7 +1575,7 @@ async fn chat_loop(
     loop {
         term.draw(|f| {
             let area = f.area();
-            render(f, &state, area);
+            render(f, &mut state, area);
         })?;
 
         tokio::select! {
