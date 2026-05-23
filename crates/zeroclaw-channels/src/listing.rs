@@ -6,197 +6,197 @@
 //! [`zeroclaw_config::schema::ChannelsConfig::channels`] instead.
 
 use zeroclaw_config::schema::ChannelsConfig;
-
-/// A compiled channel type together with its current configuration status.
-pub struct ChannelEntry {
-    pub name: &'static str,
-    pub desc: &'static str,
-    pub configured: bool,
-}
+use zeroclaw_config::traits::ChannelInfo;
 
 /// Returns one entry per channel type compiled into this binary.
 ///
 /// Entries appear in the same order as the orchestrator's dispatch table.
 /// Only channels enabled at compile time via `channel-*` / `voice-wake`
 /// feature flags are included.
-pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelEntry> {
+pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
     vec![
         #[cfg(feature = "channel-telegram")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Telegram",
             desc: "connect your bot",
             configured: !cfg.telegram.is_empty(),
         },
         #[cfg(feature = "channel-discord")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Discord",
             desc: "connect your bot",
             configured: !cfg.discord.is_empty(),
         },
         #[cfg(feature = "channel-slack")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Slack",
             desc: "connect your bot",
             configured: !cfg.slack.is_empty(),
         },
         #[cfg(feature = "channel-mattermost")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Mattermost",
             desc: "connect to your bot",
             configured: !cfg.mattermost.is_empty(),
         },
         #[cfg(feature = "channel-imessage")]
-        ChannelEntry {
+        ChannelInfo {
             name: "iMessage",
             desc: "macOS only",
             configured: !cfg.imessage.is_empty(),
         },
         #[cfg(feature = "channel-matrix")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Matrix",
             desc: "self-hosted chat",
             configured: !cfg.matrix.is_empty(),
         },
         #[cfg(feature = "channel-signal")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Signal",
             desc: "An open-source, encrypted messaging service",
             configured: !cfg.signal.is_empty(),
         },
         #[cfg(feature = "channel-whatsapp-cloud")]
-        ChannelEntry {
+        ChannelInfo {
             name: "WhatsApp",
             desc: "Business Cloud API",
             configured: !cfg.whatsapp.is_empty(),
         },
+        #[cfg(feature = "whatsapp-web")]
+        ChannelInfo {
+            name: "WhatsApp Web",
+            desc: "WhatsApp Web (session-based)",
+            configured: !cfg.whatsapp.is_empty(),
+        },
         #[cfg(feature = "channel-linq")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Linq",
             desc: "iMessage/RCS/SMS via Linq API",
             configured: !cfg.linq.is_empty(),
         },
         #[cfg(feature = "channel-wati")]
-        ChannelEntry {
+        ChannelInfo {
             name: "WATI",
             desc: "WhatsApp via WATI Business API",
             configured: !cfg.wati.is_empty(),
         },
         #[cfg(feature = "channel-nextcloud")]
-        ChannelEntry {
+        ChannelInfo {
             name: "NextCloud Talk",
             desc: "NextCloud Talk platform",
             configured: !cfg.nextcloud_talk.is_empty(),
         },
         #[cfg(feature = "channel-email")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Email",
             desc: "Email over IMAP/SMTP",
             configured: !cfg.email.is_empty(),
         },
         #[cfg(feature = "channel-email")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Gmail Push",
             desc: "Gmail Pub/Sub push notifications",
             configured: !cfg.gmail_push.is_empty(),
         },
         #[cfg(feature = "channel-irc")]
-        ChannelEntry {
+        ChannelInfo {
             name: "IRC",
             desc: "IRC over TLS",
             configured: !cfg.irc.is_empty(),
         },
         #[cfg(feature = "channel-lark")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Lark",
             desc: "Lark Bot",
             configured: !cfg.lark.is_empty(),
         },
         #[cfg(feature = "channel-dingtalk")]
-        ChannelEntry {
+        ChannelInfo {
             name: "DingTalk",
             desc: "DingTalk Stream Mode",
             configured: !cfg.dingtalk.is_empty(),
         },
         #[cfg(feature = "channel-wecom")]
-        ChannelEntry {
+        ChannelInfo {
             name: "WeCom",
             desc: "WeCom Bot Webhook",
             configured: !cfg.wecom.is_empty(),
         },
         #[cfg(feature = "channel-wechat")]
-        ChannelEntry {
+        ChannelInfo {
             name: "WeChat",
             desc: "WeChat iLink Bot",
             configured: !cfg.wechat.is_empty(),
         },
         #[cfg(feature = "channel-qq")]
-        ChannelEntry {
+        ChannelInfo {
             name: "QQ Official",
             desc: "Tencent QQ Bot",
             configured: !cfg.qq.is_empty(),
         },
         #[cfg(feature = "channel-nostr")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Nostr",
             desc: "Nostr DMs",
             configured: !cfg.nostr.is_empty(),
         },
         #[cfg(feature = "channel-clawdtalk")]
-        ChannelEntry {
+        ChannelInfo {
             name: "ClawdTalk",
             desc: "ClawdTalk Channel",
             configured: !cfg.clawdtalk.is_empty(),
         },
         #[cfg(feature = "channel-reddit")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Reddit",
             desc: "Reddit bot (OAuth2)",
             configured: !cfg.reddit.is_empty(),
         },
         #[cfg(feature = "channel-bluesky")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Bluesky",
             desc: "AT Protocol",
             configured: !cfg.bluesky.is_empty(),
         },
         #[cfg(feature = "channel-twitter")]
-        ChannelEntry {
+        ChannelInfo {
             name: "X/Twitter",
             desc: "X/Twitter Bot via API v2",
             configured: !cfg.twitter.is_empty(),
         },
         #[cfg(feature = "channel-mochat")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Mochat",
             desc: "Mochat Customer Service",
             configured: !cfg.mochat.is_empty(),
         },
         #[cfg(feature = "channel-line")]
-        ChannelEntry {
+        ChannelInfo {
             name: "LINE",
             desc: "connect your LINE bot",
             configured: !cfg.line.is_empty(),
         },
         #[cfg(feature = "channel-voice-call")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Voice Call",
             desc: "outbound voice call channel",
             configured: !cfg.voice_call.is_empty(),
         },
         #[cfg(feature = "voice-wake")]
-        ChannelEntry {
+        ChannelInfo {
             name: "VoiceWake",
             desc: "voice wake word detection",
             configured: !cfg.voice_wake.is_empty(),
         },
         #[cfg(feature = "channel-mqtt")]
-        ChannelEntry {
+        ChannelInfo {
             name: "MQTT",
             desc: "MQTT SOP Listener",
             configured: !cfg.mqtt.is_empty(),
         },
         #[cfg(feature = "channel-webhook")]
-        ChannelEntry {
+        ChannelInfo {
             name: "Webhook",
             desc: "HTTP endpoint",
             configured: !cfg.webhook.is_empty(),

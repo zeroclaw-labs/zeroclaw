@@ -5925,7 +5925,6 @@ fn collect_configured_channels(
             #[cfg(feature = "channel-whatsapp-cloud")]
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
-                #[cfg(feature = "channel-whatsapp-cloud")]
                 if wa.is_cloud_config() {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
