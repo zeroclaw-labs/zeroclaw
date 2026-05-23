@@ -147,7 +147,7 @@ journalctl --user -u zeroclaw --since "1 day ago" | grep -E 'Started|Stopped|fai
 log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'start|stop|error'
 ```
 
-If you're seeing repeated restarts, enable debug logging (`RUST_LOG=zeroclaw=debug` via the unit file's `Environment=`) and let one more crash happen to capture the full trace.
+If you're seeing repeated restarts, enable debug logging (`RUST_LOG=debug` via the unit file's `Environment=`) and let one more crash happen to capture the full trace.
 
 ## See also
 
