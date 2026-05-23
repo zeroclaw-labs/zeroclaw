@@ -355,8 +355,10 @@ impl AcpServer {
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
         let default_model = self
             .config
-            .first_model_provider()
-            .and_then(|e| e.model.clone());
+            .providers
+            .models
+            .iter_entries()
+            .find_map(|(_, _, e)| e.model.clone());
 
         let mut zeroclaw_meta = serde_json::json!({
             "maxSessions": self.acp_config.max_sessions,

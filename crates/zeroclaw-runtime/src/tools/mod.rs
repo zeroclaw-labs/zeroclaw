@@ -522,29 +522,22 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — always registered when a model_provider is configured
+    // LLM task tool — registered using the calling agent's provider
+    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = root_config
-            .first_model_provider_type()
-            .unwrap_or("openrouter")
-            .to_string();
-        let llm_task_model = root_config
-            .first_model_provider()
-            .and_then(|e| e.model.clone())
+        let llm_task_provider = family.to_string();
+        let llm_task_model = entry
+            .model
+            .clone()
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(root_config);
+            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.temperature)
-                .unwrap_or(0.7),
-            root_config
-                .first_model_provider()
-                .and_then(|e| e.api_key.clone()),
+            entry.temperature.unwrap_or(0.7),
+            entry.api_key.clone(),
             llm_task_runtime_options,
         )));
     }
@@ -1056,7 +1049,7 @@ pub fn all_tools_with_runtime(
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
     let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(root_config);
+        zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None

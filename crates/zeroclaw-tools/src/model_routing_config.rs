@@ -380,11 +380,6 @@ impl ModelRoutingConfigTool {
         }
 
         json!({
-            "default": {
-                "model_provider": cfg.first_model_provider_type(),
-                "model": cfg.first_model_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.first_model_provider().and_then(|e| e.temperature).unwrap_or(0.7),
-            },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
                 "rules_count": cfg.query_classification.rules.len(),
@@ -493,9 +488,6 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous first-provider entry for rollback on probe failure.
-        let previous_first_model_provider = cfg.first_model_provider().cloned();
-
         // Determine which models entry to update.
         let (type_k, alias_k) = match &provider_update {
             MaybeSet::Set(model_provider) => model_provider
@@ -503,7 +495,7 @@ impl ModelRoutingConfigTool {
                 .map(|(t, a)| (t.to_string(), a.to_string()))
                 .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
             MaybeSet::Null | MaybeSet::Unset => {
-                // Update whichever entry is already first, or create a placeholder.
+                // Update whichever entry already exists, or create a placeholder.
                 cfg.providers
                     .models
                     .iter_entries()
@@ -512,6 +504,9 @@ impl ModelRoutingConfigTool {
                     .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
         };
+
+        // Capture previous provider entry for rollback on probe failure.
+        let previous_provider_entry = cfg.providers.models.find(&type_k, &alias_k).cloned();
         let entry = cfg
             .providers
             .models
@@ -555,13 +550,17 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_model = cfg.first_model_provider().and_then(|e| e.model.clone());
+        let current_model = cfg
+            .providers
+            .models
+            .find(&type_k, &alias_k)
+            .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
         if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_first_model_provider
+                let reverted_model = previous_provider_entry
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
@@ -572,7 +571,7 @@ impl ModelRoutingConfigTool {
                 // family config are NOT touched — they survive the modify+
                 // restore cycle because we only ever mutated baseline fields
                 // (model, temperature, api_key) above.
-                if let Some(prev_entry) = previous_first_model_provider
+                if let Some(prev_entry) = previous_provider_entry
                     && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
                     *slot = prev_entry;
@@ -609,10 +608,11 @@ impl ModelRoutingConfigTool {
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
-        let api_key = self
-            .config
-            .first_model_provider()
-            .and_then(|e| e.api_key.as_deref());
+        let (family, alias) = provider_name
+            .split_once('.')
+            .unwrap_or((provider_name, "default"));
+        let entry = self.config.providers.models.find(family, alias);
+        let api_key = entry.and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
@@ -620,9 +620,7 @@ impl ModelRoutingConfigTool {
         let model_provider = match zeroclaw_providers::create_model_provider_with_url(
             provider_name,
             api_key,
-            self.config
-                .first_model_provider()
-                .and_then(|e| e.uri.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),

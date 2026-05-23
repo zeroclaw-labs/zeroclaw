@@ -900,7 +900,13 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
     let entries = zeroclaw_providers::list_model_providers();
 
     loop {
-        let current_type = cfg.first_model_provider_type().unwrap_or("").to_string();
+        let current_type = cfg
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, _, _)| ty.to_string())
+            .unwrap_or_default();
 
         let (picked, selected_base_url) = match &flags.model_provider {
             Some(forced) => (forced.clone(), None),

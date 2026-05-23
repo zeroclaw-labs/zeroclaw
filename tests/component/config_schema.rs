@@ -40,7 +40,9 @@ another_fake = 42
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -415,7 +417,11 @@ fn config_empty_toml_uses_default_temperature() {
     let config = migrate("");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)
@@ -441,7 +447,9 @@ fn config_only_temperature_parses() {
     let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 1.2)
@@ -467,7 +475,9 @@ value = 123
     );
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .find("openai", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -622,7 +632,11 @@ fn config_empty_parses_with_all_defaults() {
     assert!(config.channels.whatsapp.is_empty());
     assert!(
         (config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.7)

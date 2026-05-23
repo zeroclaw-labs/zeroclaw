@@ -155,7 +155,7 @@ define_provider_ref!(ChannelRef, "channels");
 
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
+/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
 /// macro so adding a new model_provider type is a one-line addition here, not a
 /// shotgun edit across multiple helpers.
 ///

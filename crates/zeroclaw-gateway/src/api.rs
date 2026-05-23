@@ -250,7 +250,12 @@ pub async fn handle_api_status(
                 (provider_ref, model, temperature, backend)
             }
             None => (
-                config.first_model_provider_alias(),
+                config
+                    .providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(ty, alias, _)| format!("{ty}.{alias}")),
                 state.model.clone(),
                 state.temperature,
                 state.mem.name().to_string(),

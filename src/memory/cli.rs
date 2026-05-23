@@ -39,15 +39,12 @@ fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");
     }
-    let fallback_api_key = config
-        .first_model_provider()
-        .and_then(|e| e.api_key.as_deref());
     create_memory_with_storage_and_routes(
         &config.memory,
         &config.embedding_routes,
         config.resolve_active_storage(),
         &config.data_dir,
-        fallback_api_key,
+        None,
     )
 }
 

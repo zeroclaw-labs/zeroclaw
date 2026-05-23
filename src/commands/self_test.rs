@@ -292,13 +292,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .first_model_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
+    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };

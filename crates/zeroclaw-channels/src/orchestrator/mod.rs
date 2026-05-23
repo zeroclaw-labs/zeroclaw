@@ -915,9 +915,12 @@ fn canonical_model_provider_name(name: &str) -> Option<String> {
 
 fn resolved_default_provider(config: &Config) -> String {
     config
-        .first_model_provider_type()
-        .unwrap_or("openrouter")
-        .to_string()
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+        .unwrap_or_else(|| "openrouter".to_string())
 }
 
 /// Resolve the default model for channel startup: the first configured
@@ -926,13 +929,15 @@ fn resolved_default_provider(config: &Config) -> String {
 /// global fallback provider — every callsite either resolves through an
 /// agent's `model_provider` or comes through `first_provider()`.
 fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    if let Some(m) = config
-        .first_model_provider()
-        .and_then(|e| e.model.as_deref())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        return Ok(m.to_string());
+    for (_, _, entry) in config.providers.models.iter_entries() {
+        if let Some(m) = entry
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            return Ok(m.to_string());
+        }
     }
     anyhow::bail!(
         "no model configured: no [providers.models.<type>.<alias>] entry has a \
@@ -943,7 +948,7 @@ fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
 
 /// Resolve runtime defaults from `config` against a specific dotted
 /// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
-/// resolution path. Falls back to `first_model_provider()` when
+/// resolution path. Falls back to `iter_entries().next()` when
 /// the reference is empty or doesn't resolve, preserving the conservative
 /// legacy behavior so misconfigured callsites still get safe defaults.
 fn runtime_defaults_from_config(
@@ -953,7 +958,14 @@ fn runtime_defaults_from_config(
     let dotted = model_provider.split_once('.');
     let entry = dotted
         .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
-        .or_else(|| config.first_model_provider());
+        .or_else(|| {
+            config
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
+        });
     // `default_model_provider` carries the dotted `<type>.<alias>` ref so
     // it compares equal to `route.model_provider` entries (also dotted),
     // letting `get_or_create_provider` short-circuit the cache when a
@@ -961,9 +973,7 @@ fn runtime_defaults_from_config(
     let default_model_provider = if !model_provider.is_empty() {
         model_provider.to_string()
     } else {
-        config
-            .first_model_provider_alias()
-            .unwrap_or_else(|| resolved_default_provider(config))
+        resolved_default_provider(config)
     };
     let model = entry
         .and_then(|e| e.model.clone())
@@ -6671,15 +6681,12 @@ pub async fn start_channels(
             })?
             .clone();
 
-        let agent_provider_entry = config
-            .model_provider_for_agent(agent_alias)
-            .or_else(|| config.first_model_provider());
+        let agent_provider_entry = config.model_provider_for_agent(agent_alias);
         let provider_name = config
             .agents
             .get(agent_alias)
             .map(|a| a.model_provider.as_str().to_string())
             .filter(|s| !s.is_empty())
-            .or_else(|| config.first_model_provider_alias())
             .unwrap_or_else(|| resolved_default_provider(&config));
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);

@@ -2221,9 +2221,9 @@ pub async fn run_tool_call_loop(
                         Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
                             ApprovalResponse::No
                         }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit { replacement }) => {
-                            ApprovalResponse::ReplaceWith(replacement)
-                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
+                            replacement,
+                        }) => ApprovalResponse::ReplaceWith(replacement),
                         // Channel doesn't support approval — auto-deny.
                         None => ApprovalResponse::No,
                     }
@@ -3162,8 +3162,12 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(&config);
+        let provider_runtime_options = match agent_provider_resolved.as_ref() {
+            Some((ty, alias, _)) => {
+                zeroclaw_providers::provider_runtime_options_for_alias(&config, ty, alias)
+            }
+            None => zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias),
+        };
 
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
@@ -4205,7 +4209,7 @@ pub async fn process_message(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let (provider_name, _provider_alias, agent_model_provider) = match config
+        let (provider_name, provider_alias, agent_model_provider) = match config
             .resolved_model_provider_for_agent(agent_alias)
         {
             Some(resolved) => (resolved.0, resolved.1.to_string(), Some(resolved.2.clone())),
@@ -4379,8 +4383,11 @@ pub async fn process_message(
              `model` set. Configure [model_providers.{provider_name}.<alias>] model = \"...\"."
             ),
         };
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(&config);
+        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+            &config,
+            provider_name,
+            &provider_alias,
+        );
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
@@ -4552,8 +4559,8 @@ pub async fn process_message(
             &agent.thinking,
         );
         let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
-        let effective_temperature: Option<f64> = config
-            .first_model_provider()
+        let effective_temperature: Option<f64> = agent_model_provider
+            .as_ref()
             .and_then(|e| e.temperature)
             .map(|t| {
                 crate::agent::thinking::clamp_temperature(

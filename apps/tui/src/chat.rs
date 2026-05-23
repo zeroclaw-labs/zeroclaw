@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -11,8 +12,8 @@ use ratatui::{
 use tokio::sync::{broadcast, mpsc};
 
 use crate::client::{
-    ApprovalDecision, RpcClient, RpcNotification, SessionPromptResult, SessionUpdate, method,
-    parse_session_update,
+    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionPromptResult, SessionUpdate,
+    method, parse_session_update,
 };
 use crate::diff;
 use crate::theme;
@@ -32,7 +33,7 @@ enum ChatPhase {
         loading: bool,
     },
     /// Active chat session.
-    Active(ChatState),
+    Active(Box<ChatState>),
     /// Unrecoverable error.
     Error(String),
 }
@@ -105,8 +106,10 @@ impl<'a> Chat<'a> {
     async fn start_session(&mut self, agent_alias: &str) {
         match self.rpc.session_new(agent_alias, None).await {
             Ok(session) => {
-                self.phase =
-                    ChatPhase::Active(ChatState::new(session.session_id, agent_alias.to_string()));
+                self.phase = ChatPhase::Active(Box::new(ChatState::new(
+                    session.session_id,
+                    agent_alias.to_string(),
+                )));
             }
             Err(e) => {
                 self.phase = ChatPhase::Error(format!("Failed to create session: {e}"));
@@ -120,10 +123,10 @@ impl<'a> Chat<'a> {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
-                    if let ChatPhase::Active(ref mut state) = self.phase {
-                        if let Some(update) = parse_session_update(&notif.params) {
-                            state.apply_update(update);
-                        }
+                    if let ChatPhase::Active(ref mut state) = self.phase
+                        && let Some(update) = parse_session_update(&notif.params)
+                    {
+                        state.apply_update(update);
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -192,10 +195,10 @@ impl<'a> Chat<'a> {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(i) = list_state.selected() {
-                            if let Some(alias) = agents.get(i).cloned() {
-                                self.start_session(&alias).await;
-                            }
+                        if let Some(i) = list_state.selected()
+                            && let Some(alias) = agents.get(i).cloned()
+                        {
+                            self.start_session(&alias).await;
                         }
                     }
                     KeyCode::Char('q') | KeyCode::Esc => return true,
@@ -214,9 +217,109 @@ impl<'a> Chat<'a> {
             return false;
         };
 
+        // ── Session overlay key handling ─────────────────────────
+        match &mut state.session_overlay {
+            SessionOverlay::List {
+                sessions,
+                list_state,
+            } => {
+                match key.code {
+                    KeyCode::Up => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    KeyCode::Down => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < sessions.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(i) = list_state.selected()
+                            && let Some(s) = sessions.get(i)
+                        {
+                            let new_sid = s.session_id.clone();
+                            let new_name = s.name.clone();
+                            let agent_alias = s
+                                .agent_alias
+                                .clone()
+                                .unwrap_or_else(|| state.agent_alias.clone());
+                            state.session_overlay = SessionOverlay::None;
+                            state.reset_for_session(new_sid.clone(), new_name);
+                            state.agent_alias = agent_alias.clone();
+                            // Rehydrate the session in the daemon so prompts work.
+                            let _ = self
+                                .rpc
+                                .session_new_with_id(&agent_alias, None, Some(&new_sid))
+                                .await;
+                            // Load persisted message history.
+                            if let Ok(msgs) = self.rpc.session_messages(&new_sid).await {
+                                for m in msgs.messages {
+                                    match m.role.as_str() {
+                                        "user" => {
+                                            state.entries.push(ChatEntry::UserMessage(m.content));
+                                        }
+                                        "assistant" => {
+                                            state.entries.push(ChatEntry::AgentMessage(m.content));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        state.session_overlay = SessionOverlay::None;
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            SessionOverlay::Rename { buf } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let name = std::mem::take(buf);
+                        if !name.is_empty()
+                            && self
+                                .rpc
+                                .session_rename(&state.session_id, &name)
+                                .await
+                                .is_ok()
+                        {
+                            state.session_name = Some(name);
+                        }
+                        state.session_overlay = SessionOverlay::None;
+                    }
+                    KeyCode::Esc => {
+                        state.session_overlay = SessionOverlay::None;
+                    }
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            SessionOverlay::None => { /* handled below */ }
+        }
+
+        // ── Normal active-chat key handling ──────────────────────
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if state.turn_in_flight {
+                    let _ = self.rpc.session_cancel(&state.session_id).await;
+                    state.turn_in_flight = false;
+                } else {
+                    return true;
+                }
+            }
+            KeyCode::Esc => {
+                if state.selected_entry.is_some() {
+                    state.selected_entry = None;
+                } else if state.turn_in_flight {
                     let _ = self.rpc.session_cancel(&state.session_id).await;
                     state.turn_in_flight = false;
                 } else {
@@ -282,12 +385,109 @@ impl<'a> Chat<'a> {
             KeyCode::Right => {
                 state.move_cursor_right();
             }
-            KeyCode::Char(c) => {
-                if !state.turn_in_flight {
-                    state.push_input_char(c);
+            // ── Session management ───────────────────────────────
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
+            {
+                // silently ignore errors — stays on current session
+                if let Ok(s) = self.rpc.session_new(&state.agent_alias, None).await {
+                    state.reset_for_session(s.session_id, None);
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
+            {
+                if let Ok(list) = self.rpc.session_list(None).await {
+                    // Only show non-channel sessions (raw agent chats).
+                    let chat_sessions: Vec<_> = list
+                        .sessions
+                        .into_iter()
+                        .filter(|s| s.channel_id.is_none())
+                        .collect();
+                    let mut ls = ListState::default();
+                    if !chat_sessions.is_empty() {
+                        ls.select(Some(0));
+                    }
+                    state.session_overlay = SessionOverlay::List {
+                        sessions: chat_sessions,
+                        list_state: ls,
+                    };
+                }
+            }
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
+            {
+                state.session_overlay = SessionOverlay::Rename { buf: String::new() };
+            }
+            // ── Thought toggle ───────────────────────────────────
+            // Only fires in command mode (empty input, no selection, no approval).
+            KeyCode::Char('t')
+                if state.input.is_empty()
+                    && state.pending_approval().is_none()
+                    && state.selected_entry.is_none() =>
+            {
+                state.show_thoughts = !state.show_thoughts;
+            }
+            // ── Entry selection & yank ───────────────────────────
+            KeyCode::Char('y') if state.selected_entry.is_some() => {
+                if let Some(idx) = state.selected_entry
+                    && let Some(entry) = state.entries.get(idx)
+                {
+                    crate::mouse::copy_osc52(&clipboard_text(entry));
+                }
+            }
+            // j/k only enter selection mode when input is empty (command mode).
+            KeyCode::Char('k')
+                if state.input.is_empty()
+                    && state.pending_approval().is_none()
+                    && !state.turn_in_flight =>
+            {
+                let len = state.entries.len();
+                if len > 0 {
+                    state.selected_entry = Some(match state.selected_entry {
+                        Some(i) => i.saturating_sub(1),
+                        None => len - 1,
+                    });
+                }
+            }
+            KeyCode::Up if state.pending_approval().is_none() && !state.turn_in_flight => {
+                let len = state.entries.len();
+                if len > 0 {
+                    state.selected_entry = Some(match state.selected_entry {
+                        Some(i) => i.saturating_sub(1),
+                        None => len - 1,
+                    });
+                }
+            }
+            KeyCode::Char('j')
+                if state.input.is_empty()
+                    && state.pending_approval().is_none()
+                    && !state.turn_in_flight =>
+            {
+                let len = state.entries.len();
+                if len > 0 {
+                    state.selected_entry = Some(match state.selected_entry {
+                        Some(i) if i + 1 < len => i + 1,
+                        Some(_) => len - 1,
+                        None => 0,
+                    });
+                }
+            }
+            KeyCode::Down if state.pending_approval().is_none() && !state.turn_in_flight => {
+                let len = state.entries.len();
+                if len > 0 {
+                    state.selected_entry = Some(match state.selected_entry {
+                        Some(i) if i + 1 < len => i + 1,
+                        Some(_) => len - 1,
+                        None => 0,
+                    });
+                }
+            }
+            // ── Text input ───────────────────────────────────────
+            KeyCode::Char(c) if !state.turn_in_flight && state.selected_entry.is_none() => {
+                state.push_input_char(c);
+            }
+            KeyCode::Backspace if state.selected_entry.is_none() => {
                 state.pop_input_char();
             }
             _ => {}
@@ -296,8 +496,88 @@ impl<'a> Chat<'a> {
     }
 
     /// Returns true when the pane is accepting text input (blocks `?` help).
+    ///
+    /// In active chat: text input mode is on when the user has started typing
+    /// (non-empty input buffer) and is not in selection mode or an overlay.
+    /// When input is empty we're in "command" mode — single-char keybindings
+    /// like `t`, `j`, `k`, `y`, `?` should work.
     pub(crate) fn wants_text_input(&self) -> bool {
-        matches!(self.phase, ChatPhase::Active(_))
+        match &self.phase {
+            ChatPhase::Active(s) => {
+                // Overlay has its own key handling (Rename captures chars).
+                if matches!(s.session_overlay, SessionOverlay::Rename { .. }) {
+                    return true;
+                }
+                if !matches!(s.session_overlay, SessionOverlay::None) {
+                    return false;
+                }
+                // Selection mode: single-char bindings active.
+                if s.selected_entry.is_some() {
+                    return false;
+                }
+                // Command mode when input is empty; text mode when typing.
+                !s.input.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+        match &self.phase {
+            ChatPhase::PickAgent { loading, .. } => {
+                if *loading {
+                    vec![("", "Loading agents\u{2026}")]
+                } else {
+                    vec![
+                        ("\u{2191}/\u{2193}", "Navigate"),
+                        ("Enter", "Select agent"),
+                        ("Esc", "Quit"),
+                    ]
+                }
+            }
+            ChatPhase::Error(_) => vec![("Esc", "Quit")],
+            ChatPhase::Active(state) => {
+                match &state.session_overlay {
+                    SessionOverlay::List { .. } => {
+                        return vec![
+                            ("\u{2191}/\u{2193}", "Navigate"),
+                            ("Enter", "Switch session"),
+                            ("Esc", "Close"),
+                        ];
+                    }
+                    SessionOverlay::Rename { .. } => {
+                        return vec![("Enter", "Submit name"), ("Esc", "Cancel")];
+                    }
+                    SessionOverlay::None => {}
+                }
+                if state.pending_approval().is_some() {
+                    vec![
+                        ("Enter", "Approve"),
+                        ("a", "Always approve"),
+                        ("Ctrl+D", "Deny"),
+                        ("Ctrl+C", "Cancel turn"),
+                    ]
+                } else if state.selected_entry.is_some() {
+                    vec![
+                        ("j / k", "Move cursor"),
+                        ("y", "Yank to clipboard"),
+                        ("Esc", "Deselect"),
+                    ]
+                } else if state.turn_in_flight {
+                    vec![("Ctrl+C / Esc", "Cancel turn")]
+                } else {
+                    vec![
+                        ("Enter", "Send message"),
+                        ("j / k", "Select entry"),
+                        ("t", "Toggle thoughts"),
+                        ("Ctrl+N", "New session"),
+                        ("Ctrl+S", "Session list"),
+                        ("Ctrl+R", "Rename session"),
+                        ("Ctrl+C", "Quit"),
+                    ]
+                }
+            }
+        }
     }
 }
 
@@ -428,17 +708,21 @@ fn render_tool_entry<'a>(
     const TOOL_FG: Color = Color::Rgb(180, 140, 255);
     const RESULT_FG: Color = Color::Rgb(130, 130, 130);
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("[tool: {name}] "),
-            Style::default().fg(TOOL_FG).add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("[tool: {name}] "),
+        Style::default().fg(TOOL_FG).add_modifier(Modifier::BOLD),
+    )]));
 
     match name {
         "file_edit" => {
-            let old = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let old = input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = input
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let ext = file_ext(input);
             lines.extend(diff::diff_lines(old, new, ext));
             for _ in 0..APPROVAL_OVERLAY_HEIGHT {
@@ -478,12 +762,33 @@ fn render_tool_entry<'a>(
             Style::default().fg(RESULT_FG),
         )));
     }
+
+    match &state.session_overlay {
+        SessionOverlay::List {
+            sessions,
+            list_state,
+        } => {
+            render_session_list_overlay(f, area, sessions, list_state);
+        }
+        SessionOverlay::Rename { buf } => {
+            render_rename_overlay(f, area, buf);
+        }
+        SessionOverlay::None => {}
+    }
 }
 
 fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+    let selected = state.selected_entry;
 
-    for entry in state.entries() {
+    for (idx, entry) in state.entries().iter().enumerate() {
+        let is_selected = selected == Some(idx);
+        let sel_mod = if is_selected {
+            Modifier::REVERSED
+        } else {
+            Modifier::empty()
+        };
+
         match entry {
             ChatEntry::UserMessage(text) => {
                 lines.push(Line::from(vec![
@@ -491,32 +796,49 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
                         "You: ",
                         Style::default()
                             .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                            .add_modifier(Modifier::BOLD | sel_mod),
                     ),
-                    Span::raw(text.as_str()),
+                    Span::styled(text.as_str(), Style::default().add_modifier(sel_mod)),
                 ]));
             }
             ChatEntry::AgentMessage(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Agent: ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text.as_str()),
-                ]));
+                let prefix = Line::from(vec![Span::styled(
+                    "Agent: ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD | sel_mod),
+                )]);
+                lines.push(prefix);
+                let md_lines = markdown_to_lines(text);
+                for mut line in md_lines {
+                    if is_selected {
+                        line = Line::from(
+                            line.spans
+                                .into_iter()
+                                .map(|s| {
+                                    s.patch_style(Style::default().add_modifier(Modifier::REVERSED))
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    lines.push(line);
+                }
             }
             ChatEntry::AgentThought(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "(thinking) ",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(text.as_str(), Style::default().fg(Color::DarkGray)),
-                ]));
+                if state.show_thoughts {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "(thinking) ",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC | sel_mod),
+                        ),
+                        Span::styled(
+                            text.as_str(),
+                            Style::default().fg(Color::DarkGray).add_modifier(sel_mod),
+                        ),
+                    ]));
+                }
             }
             ChatEntry::Tool {
                 name,
@@ -529,7 +851,20 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         }
     }
 
-    if !state.current_thought_text().is_empty() {
+    // Streaming text (in-flight agent response).
+    if !state.current_agent_text().is_empty() {
+        let prefix = Line::from(vec![Span::styled(
+            "Agent: ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )]);
+        lines.push(prefix);
+        lines.extend(markdown_to_lines(state.current_agent_text()));
+    }
+
+    // Streaming thought (in-flight).
+    if state.show_thoughts && !state.streaming_thought.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(
                 "(thinking) ",
@@ -538,20 +873,9 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
                     .add_modifier(Modifier::ITALIC),
             ),
             Span::styled(
-                state.current_thought_text(),
+                &state.streaming_thought,
                 Style::default().fg(Color::DarkGray),
             ),
-        ]));
-    }
-    if !state.current_agent_text().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Agent: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(state.current_agent_text()),
         ]));
     }
 
@@ -574,7 +898,7 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} ", state.agent_alias)),
+                .title(format!(" {} ", state.title())),
         )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -587,8 +911,30 @@ fn render_input(f: &mut Frame, state: &ChatState, area: Rect) {
     } else {
         " > "
     };
-    let p =
-        Paragraph::new(state.input()).block(Block::default().borders(Borders::ALL).title(label));
+    let block = Block::default().borders(Borders::ALL).title(label);
+
+    // When input is empty and idle, show hint text so keybindings are discoverable.
+    let content: Line = if state.input.is_empty()
+        && !state.turn_in_flight
+        && state.pending_approval().is_none()
+        && state.selected_entry.is_none()
+    {
+        Line::from(vec![
+            Span::styled("Type to chat", Style::default().fg(Color::DarkGray)),
+            Span::styled("  ?", Style::default().fg(Color::Yellow)),
+            Span::styled("=help ", Style::default().fg(Color::DarkGray)),
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::styled("=select ", Style::default().fg(Color::DarkGray)),
+            Span::styled("^N", Style::default().fg(Color::Yellow)),
+            Span::styled("=new ", Style::default().fg(Color::DarkGray)),
+            Span::styled("^S", Style::default().fg(Color::Yellow)),
+            Span::styled("=sessions", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(Span::raw(state.input()))
+    };
+
+    let p = Paragraph::new(content).block(block);
     f.render_widget(p, area);
 }
 
@@ -601,7 +947,10 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     // Anchor to the bottom of the given area.
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(APPROVAL_OVERLAY_HEIGHT)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(APPROVAL_OVERLAY_HEIGHT),
+        ])
         .split(area);
     let overlay_area = Layout::default()
         .direction(Direction::Horizontal)
@@ -669,6 +1018,190 @@ fn strip_content_fields(summary: &str) -> String {
         .to_string()
 }
 
+// ── Session overlay rendering ─────────────────────────────────────
+
+fn render_session_list_overlay(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[SessionEntry],
+    list_state: &ListState,
+) {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Min(8),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(40),
+            Constraint::Percentage(15),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Sessions (Enter=switch, Esc=close) ")
+        .style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+
+    let items: Vec<ListItem> = sessions
+        .iter()
+        .map(|s| {
+            let name = s.name.as_deref().unwrap_or(&s.session_id);
+            let agent = s.agent_alias.as_deref().unwrap_or("?");
+            let label = format!("{name}  ({agent}, {} msgs)", s.message_count);
+            ListItem::new(Span::styled(label, theme::body_style()))
+        })
+        .collect();
+
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    // Copy state to pass as mutable.
+    let mut ls = *list_state;
+    f.render_stateful_widget(list, inner, &mut ls);
+}
+
+fn render_rename_overlay(f: &mut Frame, area: Rect, buf: &str) {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Length(5),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let overlay_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Min(30),
+            Constraint::Percentage(20),
+        ])
+        .split(vert[1])[1];
+
+    f.render_widget(Clear, overlay_area);
+
+    let text = format!("New name: {buf}\u{2588}\n\nEnter=submit  Esc=cancel");
+    let p = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Rename Session ")
+                .style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, overlay_area);
+}
+
+// ── Markdown rendering ───────────────────────────────────────────
+
+fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
+    let opts = MdOptions::empty();
+    let parser = MdParser::new_ext(text, opts);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut in_bold = false;
+    let mut in_italic = false;
+    let mut in_code_block = false;
+    for event in parser {
+        match event {
+            MdEvent::Start(Tag::Strong) => in_bold = true,
+            MdEvent::End(TagEnd::Strong) => in_bold = false,
+            MdEvent::Start(Tag::Emphasis) => in_italic = true,
+            MdEvent::End(TagEnd::Emphasis) => in_italic = false,
+            MdEvent::Start(Tag::CodeBlock(_)) => {
+                // Flush current line.
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                in_code_block = true;
+            }
+            MdEvent::End(TagEnd::CodeBlock) => {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                in_code_block = false;
+            }
+            MdEvent::Start(Tag::Item) => {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                current_spans.push(Span::styled(
+                    "  \u{2022} ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            MdEvent::End(TagEnd::Item) if !current_spans.is_empty() => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            MdEvent::Start(Tag::Paragraph) => {}
+            MdEvent::End(TagEnd::Paragraph) if !current_spans.is_empty() => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            MdEvent::Text(t) => {
+                let owned = t.to_string();
+                if in_code_block {
+                    for code_line in owned.split('\n') {
+                        if !current_spans.is_empty() {
+                            lines.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                        current_spans.push(Span::styled(
+                            format!("\u{2502} {code_line}"),
+                            Style::default().fg(Color::White),
+                        ));
+                    }
+                } else {
+                    let mut style = Style::default();
+                    if in_bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if in_italic {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    current_spans.push(Span::styled(owned, style));
+                }
+            }
+            MdEvent::Code(t) => {
+                current_spans.push(Span::styled(
+                    t.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            MdEvent::SoftBreak => {
+                current_spans.push(Span::raw(" "));
+            }
+            MdEvent::HardBreak if !current_spans.is_empty() => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            _ => {}
+        }
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    // Fallback: if parsing produced nothing, return raw text.
+    if lines.is_empty() && !text.is_empty() {
+        lines.push(Line::from(Span::raw(text.to_string())));
+    }
+
+    lines
+}
+
 // ── ChatState / ChatEntry ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -693,9 +1226,22 @@ pub enum ChatEntry {
 }
 
 #[derive(Debug)]
+enum SessionOverlay {
+    None,
+    List {
+        sessions: Vec<SessionEntry>,
+        list_state: ListState,
+    },
+    Rename {
+        buf: String,
+    },
+}
+
+#[derive(Debug)]
 pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
+    session_name: Option<String>,
     input: String,
     /// Byte offset of the editing cursor within `input`. Always on a char boundary.
     cursor: usize,
@@ -704,6 +1250,9 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pub turn_in_flight: bool,
+    show_thoughts: bool,
+    selected_entry: Option<usize>,
+    session_overlay: SessionOverlay,
 }
 
 impl ChatState {
@@ -711,6 +1260,7 @@ impl ChatState {
         Self {
             session_id,
             agent_alias,
+            session_name: None,
             input: String::new(),
             cursor: 0,
             entries: Vec::new(),
@@ -718,6 +1268,17 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             turn_in_flight: false,
+            show_thoughts: true,
+            selected_entry: None,
+            session_overlay: SessionOverlay::None,
+        }
+    }
+
+    /// Display title: session name if set, otherwise agent alias.
+    pub fn title(&self) -> String {
+        match &self.session_name {
+            Some(name) => format!("{} — {}", self.agent_alias, name),
+            None => self.agent_alias.clone(),
         }
     }
 
@@ -852,11 +1413,10 @@ impl ChatState {
                         result,
                         ..
                     } = entry
+                        && id == &tool_call_id
                     {
-                        if id == &tool_call_id {
-                            *result = Some(raw_output);
-                            break;
-                        }
+                        *result = Some(raw_output);
+                        break;
                     }
                 }
             }
@@ -890,6 +1450,39 @@ impl ChatState {
     pub fn push_user_message(&mut self, msg: String) {
         self.entries.push(ChatEntry::UserMessage(msg));
         self.turn_in_flight = true;
+    }
+
+    /// Reset conversational state for a new or switched session.
+    pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
+        self.session_id = session_id;
+        self.session_name = name;
+        self.input.clear();
+        self.entries.clear();
+        self.streaming_text.clear();
+        self.streaming_thought.clear();
+        self.pending_approval = None;
+        self.turn_in_flight = false;
+        self.selected_entry = None;
+    }
+}
+
+fn clipboard_text(entry: &ChatEntry) -> String {
+    match entry {
+        ChatEntry::UserMessage(t) => format!("You: {t}"),
+        ChatEntry::AgentMessage(t) => format!("Agent: {t}"),
+        ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
+        ChatEntry::Tool {
+            name,
+            input,
+            result,
+            ..
+        } => {
+            let input_str = serde_json::to_string(input).unwrap_or_default();
+            match result {
+                Some(r) => format!("[tool: {name}] {input_str}\n  \u{2514}\u{2500} {r}"),
+                None => format!("[tool: {name}] {input_str}"),
+            }
+        }
     }
 }
 
@@ -1054,10 +1647,10 @@ async fn chat_loop(
                                     state.push_input_char(c);
                                 }
                             }
-                            KeyCode::Backspace => {
-                                if state.pending_approval().is_none() {
-                                    state.pop_input_char();
-                                }
+                            KeyCode::Backspace
+                                if state.pending_approval().is_none() =>
+                            {
+                                state.pop_input_char();
                             }
                             _ => {}
                         }
@@ -1102,10 +1695,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
     }
 
     crossterm::terminal::disable_raw_mode().ok();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
 
     let path = tmp.path().to_owned();
     let status = tokio::process::Command::new(&editor)
@@ -1114,10 +1704,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen
-    );
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
 
     if status.map(|s| s.success()).unwrap_or(false) {
         std::fs::read_to_string(&path).unwrap_or_else(|_| content.to_string())
@@ -1233,7 +1820,10 @@ mod tests {
             text: "reasoning...".to_string(),
         });
         assert_eq!(s.current_thought_text(), "reasoning...");
-        assert!(s.entries().is_empty(), "thought must not become an entry mid-turn");
+        assert!(
+            s.entries().is_empty(),
+            "thought must not become an entry mid-turn"
+        );
     }
 
     #[test]

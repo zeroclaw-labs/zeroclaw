@@ -366,15 +366,12 @@ pub async fn run(
         {
             None
         } else {
-            let fallback_key = config
-                .first_model_provider()
-                .and_then(|e| e.api_key.clone());
             match zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
                 &config.embedding_routes,
                 config.resolve_active_storage(),
                 &config.data_dir,
-                fallback_key.as_deref(),
+                None,
             ) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {

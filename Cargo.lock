@@ -13739,6 +13739,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "libc",
+ "pulldown-cmark",
  "ratatui",
  "rustls",
  "serde",

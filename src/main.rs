@@ -1501,18 +1501,17 @@ async fn main() -> Result<()> {
                         "`zeroclaw agent --agent {agent_alias}` is not configured (no [agents.{agent_alias}] entry)"
                     );
                 }
-                let final_temperature = temperature.unwrap_or_else(|| {
-                    config
-                        .first_model_provider()
-                        .and_then(|e| e.temperature)
-                        .unwrap_or(0.7)
-                });
+                let agent_entry = config.model_provider_for_agent(&agent_alias);
+                let final_temperature = temperature
+                    .unwrap_or_else(|| agent_entry.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &model_provider {
-                    // Upsert the requested model_provider type under "default" alias.
+                    // Parse --model-provider as "type.alias" or bare "type" (use agent alias as alias name).
+                    let (type_key, alias_key) =
+                        p.split_once('.').unwrap_or((p.as_str(), &agent_alias));
                     let entry = config
                         .providers
                         .models
-                        .ensure(p, "default")
+                        .ensure(type_key, alias_key)
                         .ok_or_else(|| {
                             ::zeroclaw_log::record!(
                                 WARN,
@@ -1521,11 +1520,11 @@ async fn main() -> Result<()> {
                                     ::zeroclaw_log::Action::Reject
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"family": p})),
+                                .with_attrs(::serde_json::json!({"family": type_key})),
                                 "ask CLI refused: --model-provider names an unknown family"
                             );
                             anyhow::Error::msg(format!(
-                                "Unknown model_provider family: {p}. \
+                                "Unknown model_provider family: {type_key}. \
                              Run `zeroclaw onboard model_providers` to see configured options."
                             ))
                         })?;
@@ -1533,22 +1532,27 @@ async fn main() -> Result<()> {
                         entry.model = Some(m.clone());
                     }
                     entry.temperature = Some(final_temperature);
-                } else if config.first_model_provider().is_none() {
+                    // Update the agent's model_provider to point to the override
+                    if let Some(agent_cfg) = config.agents.get_mut(&agent_alias) {
+                        agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+                    }
+                } else if config.model_provider_for_agent(&agent_alias).is_none() {
                     anyhow::bail!(
-                        "No model model_provider configured. Pass --model-provider <type> or run \
+                        "No model model_provider configured for agent {agent_alias}. \
+                         Pass --model-provider <type> or run \
                          `zeroclaw onboard model_providers` to configure one."
                     );
                 }
 
-                let provider_name = config.first_model_provider_type().unwrap_or("openai");
+                let (provider_name, resolved_entry) = config
+                    .resolved_model_provider_for_agent(&agent_alias)
+                    .map(|(ty, _alias, entry)| (ty, Some(entry)))
+                    .unwrap_or(("openai", None));
                 let model_provider = zeroclaw::providers::create_model_provider(
                     provider_name,
-                    config
-                        .first_model_provider()
-                        .and_then(|e| e.api_key.as_deref()),
+                    resolved_entry.and_then(|e| e.api_key.as_deref()),
                 )?;
-                let model_name = config
-                    .first_model_provider()
+                let model_name = resolved_entry
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
                 match message {
@@ -2104,17 +2108,21 @@ async fn main() -> Result<()> {
             println!("Workspace:   {}", config.data_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
-            println!(
-                "🤖 ModelProvider:      {}",
-                config.first_model_provider_type().unwrap_or("openrouter")
-            );
-            println!(
-                "   Model:         {}",
-                config
-                    .first_model_provider()
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("(default)")
-            );
+            let mut shown_provider = false;
+            for (family, alias, entry) in config.providers.models.iter_entries() {
+                let model = entry.model.as_deref().unwrap_or("(none)");
+                if !shown_provider {
+                    println!("🤖 ModelProvider:      {family}.{alias}");
+                    println!("   Model:         {model}");
+                    shown_provider = true;
+                } else {
+                    println!("   ModelProvider:      {family}.{alias}");
+                    println!("   Model:         {model}");
+                }
+            }
+            if !shown_provider {
+                println!("🤖 ModelProvider:      (none configured)");
+            }
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
                 "🧾 Trace storage:  {} ({})",
@@ -2271,11 +2279,12 @@ async fn main() -> Result<()> {
 
         Commands::Providers => {
             let model_providers = zeroclaw_providers::list_model_providers();
-            let current = config
-                .first_model_provider_type()
-                .unwrap_or("openrouter")
-                .trim()
-                .to_ascii_lowercase();
+            let configured_types: std::collections::HashSet<&str> = config
+                .providers
+                .models
+                .iter_entries()
+                .map(|(ty, _, _)| ty)
+                .collect();
             println!(
                 "Supported model model_providers ({} total):\n",
                 model_providers.len()
@@ -2283,8 +2292,8 @@ async fn main() -> Result<()> {
             println!("  ID (use in config)  DESCRIPTION");
             println!("  ─────────────────── ───────────");
             for p in &model_providers {
-                let is_active = p.name.eq_ignore_ascii_case(&current);
-                let marker = if is_active { " (active)" } else { "" };
+                let is_configured = configured_types.contains(p.name);
+                let marker = if is_configured { " (configured)" } else { "" };
                 let local_tag = if p.local { " [local]" } else { "" };
                 println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
             }
@@ -4333,9 +4342,9 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn agent_uses_first_provider_temperature_when_unset() {
-        // When the user doesn't pass --temperature, the kernel-only agent
-        // CLI walks `config.first_model_provider().temperature` before
+    fn agent_uses_provider_temperature_when_unset() {
+        // When the user doesn't pass --temperature, the agent CLI
+        // resolves from the agent's model_provider entry's temperature,
         // bottoming out at 0.7.
         let mut config = Config::default();
         config
@@ -4348,7 +4357,9 @@ mod tests {
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
-                .first_model_provider()
+                .providers
+                .models
+                .find("openai", "default")
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
         });
@@ -4366,8 +4377,11 @@ mod tests {
         let user_temperature: Option<f64> = std::hint::black_box(None);
         let final_temperature = user_temperature.unwrap_or_else(|| {
             config
-                .first_model_provider()
-                .and_then(|e| e.temperature)
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .and_then(|(_, _, e)| e.temperature)
                 .unwrap_or(0.7)
         });
 

@@ -29,11 +29,19 @@ fn config_default_has_expected_model() {
     // Default config has no model until configured
     assert!(
         config
-            .first_model_provider()
+            .providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(_, _, e)| e)
             .and_then(|e| e.model.as_deref())
             .is_none()
             || config
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.model.as_deref())
                 .is_some(),
         "default config should be constructible"
@@ -44,7 +52,11 @@ fn config_default_has_expected_model() {
 fn config_default_temperature_positive() {
     let config = Config::default();
     let temp = config
-        .first_model_provider()
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(_, _, e)| e)
         .and_then(|e| e.temperature)
         .unwrap_or(0.7);
     assert!(temp > 0.0, "default temperature should be positive");
@@ -146,16 +158,27 @@ fn config_toml_roundtrip_preserves_provider() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&toml_str)
         .expect("TOML should round-trip through migration");
 
-    assert_eq!(parsed.first_model_provider_type(), Some("deepseek"));
+    assert!(
+        parsed
+            .providers
+            .models
+            .find("deepseek", "default")
+            .is_some(),
+        "deepseek.default entry should survive round-trip"
+    );
     assert_eq!(
         parsed
-            .first_model_provider()
+            .providers
+            .models
+            .find("deepseek", "default")
             .and_then(|e| e.model.as_deref()),
         Some("deepseek-chat")
     );
     assert!(
         (parsed
-            .first_model_provider()
+            .providers
+            .models
+            .find("deepseek", "default")
             .and_then(|e| e.temperature)
             .unwrap_or(0.7)
             - 0.5)
@@ -234,10 +257,15 @@ fn config_file_write_read_roundtrip() {
     let parsed = zeroclaw::config::migration::migrate_to_current(&read_back)
         .expect("TOML should round-trip through migration");
 
-    assert_eq!(parsed.first_model_provider_type(), Some("mistral"));
+    assert!(
+        parsed.providers.models.find("mistral", "default").is_some(),
+        "mistral.default entry should survive round-trip"
+    );
     assert_eq!(
         parsed
-            .first_model_provider()
+            .providers
+            .models
+            .find("mistral", "default")
             .and_then(|e| e.model.as_deref()),
         Some("mistral-large")
     );

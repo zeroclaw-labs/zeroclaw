@@ -710,12 +710,15 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = state
-        .config
-        .read()
-        .first_model_provider_type()
-        .unwrap_or("unknown")
-        .to_string();
+    let provider_label = {
+        let cfg = state.config.read();
+        cfg.providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({

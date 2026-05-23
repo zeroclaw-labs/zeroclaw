@@ -99,8 +99,9 @@ pub async fn run(
                 let help = match mode {
                     Mode::Dashboard => dashboard_pane.help_lines(),
                     Mode::Config => config_app.help_lines(),
+                    Mode::ACP => vec![("?", "This help")],
+                    Mode::Chat => chat_pane.help_lines(),
                     Mode::Logs => logs_pane.help_lines(),
-                    _ => vec![("?", "This help")],
                 };
                 // Global keys always shown.
                 let mut lines = vec![("F1–F5", "Switch mode"), ("Ctrl+C", "Quit")];
@@ -238,7 +239,8 @@ pub async fn run(
                         Mode::Logs => {
                             logs_pane.handle_mouse(mouse, content_area);
                         }
-                        _ => {}
+                        Mode::ACP => {}
+                        Mode::Chat => {}
                     }
                 }
             }

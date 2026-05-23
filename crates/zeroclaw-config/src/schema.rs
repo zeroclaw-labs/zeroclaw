@@ -3030,52 +3030,6 @@ impl Config {
             .map(ToString::to_string)
     }
 
-    /// Return the first `ModelProviderConfig` (the shared base) from
-    /// `model_providers`, if any exists.
-    #[must_use]
-    pub fn first_model_provider(&self) -> Option<&ModelProviderConfig> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(_, _, base)| base)
-    }
-
-    /// Mutable form of [`Self::first_model_provider`].
-    pub fn first_model_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
-        self.providers
-            .models
-            .iter_entries_mut()
-            .next()
-            .map(|(_, _, base)| base)
-    }
-
-    /// Return the model-provider type key of the first entry in
-    /// `model_providers`, if any. Use this when callers need the bare
-    /// type name (e.g. provider routing factories that take
-    /// `"openrouter"` not `"openrouter.default"`).
-    #[must_use]
-    pub fn first_model_provider_type(&self) -> Option<&'static str> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, _, _)| ty)
-    }
-
-    /// Return the dotted `<type>.<alias>` identifier of the first
-    /// configured model-provider entry, if any. Use this when callers
-    /// need the alias reference (matches `agents.<x>.model_provider`
-    /// values).
-    #[must_use]
-    pub fn first_model_provider_alias(&self) -> Option<String> {
-        self.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-    }
-
     /// Resolve the risk profile for an explicit agent alias.
     ///
     /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
@@ -3115,10 +3069,9 @@ impl Config {
     /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
     ///
     /// This is the lookup the orchestrator uses to build per-agent
-    /// model_provider runtime options instead of falling back to
-    /// `first_model_provider()`, which silently collapses multiple aliases
-    /// under the same model_provider family to whichever entry happens to be
-    /// first. The matching split logic lives in
+    /// model_provider runtime options via explicit `<type>.<alias>`
+    /// resolution — there is no concept of a "first" or "default"
+    /// provider. The matching split logic lives in
     /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
     /// the delegation path; this helper exposes the same contract for the
     /// channel-server startup path.
@@ -15766,7 +15719,7 @@ mod tests {
         let c = Config::default();
         // No model_provider configured by default — set during onboarding.
         assert!(c.providers.models.is_empty());
-        assert!(c.first_model_provider().is_none());
+        assert!(c.providers.models.iter_entries().next().is_none());
         assert!(!c.skills.open_skills_enabled);
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
@@ -16396,7 +16349,11 @@ default_temperature = 0.7
         let parsed = parse_test_config(minimal);
         assert!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
@@ -16424,7 +16381,11 @@ default_temperature = 0.7
         // Temperature migrated onto the primary model_provider entry
         assert!(
             (parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.temperature)
                 .unwrap_or(0.7)
                 - 0.7)
@@ -16433,7 +16394,11 @@ default_temperature = 0.7
         );
         assert_eq!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e)
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             DEFAULT_DELEGATE_TIMEOUT_SECS
@@ -16572,7 +16537,9 @@ provider_timeout_secs = 300
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         assert_eq!(
             parsed
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.timeout_secs)
                 .unwrap_or(120),
             300
@@ -16592,8 +16559,10 @@ X-Title = "zeroclaw"
 "#;
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let headers = &parsed
-            .first_model_provider()
-            .expect("synthesized default model_provider")
+            .providers
+            .models
+            .find("openrouter", "default")
+            .expect("synthesized openrouter.default model_provider")
             .extra_headers;
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get("User-Agent").unwrap(), "MyApp/1.0");
@@ -16608,8 +16577,11 @@ default_temperature = 0.7
         let parsed = parse_test_config(raw);
         assert!(
             parsed
-                .first_model_provider()
-                .map(|e| e.extra_headers.is_empty())
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(_, _, e)| e.extra_headers.is_empty())
                 .unwrap_or(true)
         );
     }
@@ -18311,7 +18283,7 @@ requires_openai_auth = true
                 .and_then(|e| e.uri.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        assert!(config.first_model_provider().is_some());
+        assert!(config.providers.models.find("custom", "default").is_some());
     }
 
     #[test]
@@ -18749,7 +18721,9 @@ default_model = "legacy-model"
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("legacy-model")
         );
@@ -18862,7 +18836,9 @@ default_model = "persisted-profile"
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config
-                .first_model_provider()
+                .providers
+                .models
+                .find("openrouter", "default")
                 .and_then(|e| e.model.as_deref()),
             Some("persisted-profile")
         );
@@ -19513,7 +19489,7 @@ group_policy = "disabled"
             "test setup requires world-readable config"
         );
 
-        if let Some(entry) = config.first_model_provider_mut() {
+        if let Some(entry) = config.providers.models.ensure("openrouter", "default") {
             entry.temperature = Some(0.6);
         }
         config.save().await.unwrap();

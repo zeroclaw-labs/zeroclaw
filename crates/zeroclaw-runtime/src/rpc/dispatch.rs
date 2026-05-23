@@ -614,7 +614,10 @@ impl RpcDispatcher {
         // Restore persisted history if available.
         let mut message_count = 0;
         if let Some(ref backend) = self.ctx.session_backend {
-            let stored = backend.load(&format!("rpc_{session_id}"));
+            let session_key = format!("rpc_{session_id}");
+            // Persist agent alias so session/list can find this session.
+            let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+            let stored = backend.load(&session_key);
             if !stored.is_empty() {
                 self.ctx.sessions.seed_history(&session_id, &stored).await;
                 message_count = stored.len();

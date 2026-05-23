@@ -690,7 +690,7 @@ impl Agent {
             policy
         });
 
-        let (provider_name, _provider_alias, agent_model_provider) =
+        let (provider_name, provider_alias, agent_model_provider) =
             match config.resolved_model_provider_for_agent(agent_alias) {
                 Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
                 None => {
@@ -852,8 +852,11 @@ impl Agent {
             ),
         };
 
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(config);
+        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+            config,
+            provider_name,
+            provider_alias,
+        );
 
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
@@ -1148,9 +1151,9 @@ impl Agent {
                     Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
                         ApprovalResponse::No
                     }
-                    Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit { replacement }) => {
-                        ApprovalResponse::ReplaceWith(replacement)
-                    }
+                    Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
+                        replacement,
+                    }) => ApprovalResponse::ReplaceWith(replacement),
                     None => {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1954,43 +1957,52 @@ pub async fn run(
     let start = Instant::now();
 
     let mut effective_config = config;
-    if let Some(p) = provider_override {
+    if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
-        // in models and is set as the first (and only) entry for routing purposes.
-        if let Some((type_key, alias_key)) = p.split_once('.') {
-            effective_config
-                .providers
-                .models
-                .ensure(type_key, alias_key);
-        } else {
-            effective_config.providers.models.ensure(&p, "default");
+        // in models and update the agent's model_provider to reference it.
+        let (type_key, alias_key) = p.split_once('.').unwrap_or((p.as_str(), agent_alias));
+        effective_config
+            .providers
+            .models
+            .ensure(type_key, alias_key);
+        if let Some(agent_cfg) = effective_config.agents.get_mut(agent_alias) {
+            agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
         }
     }
-    if let Some(entry) = effective_config.first_model_provider_mut() {
-        if let Some(m) = model_override {
-            entry.model = Some(m);
+    // Apply model/temperature overrides to the agent's resolved provider entry.
+    if let Some(agent_cfg) = effective_config.agents.get(agent_alias) {
+        if let Some((fam, ali)) = agent_cfg.model_provider.split_once('.') {
+            if let Some(entry) = effective_config.providers.models.ensure(fam, ali) {
+                if let Some(m) = model_override {
+                    entry.model = Some(m);
+                }
+                entry.temperature = Some(temperature);
+            }
         }
-        entry.temperature = Some(temperature);
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
-    let provider_name = effective_config
-        .first_model_provider_type()
-        .unwrap_or("openrouter")
-        .to_string();
-    // `Agent::from_config` above has already errored if no model could be resolved,
-    // so this telemetry line should always find one. We keep `resolve_default_model`
-    // as a cheap secondary lookup and emit "<unresolved>" only if nothing matches —
-    // never silently substitute a hardcoded vendor model.
-    let model_name = effective_config
-        .first_model_provider()
-        .and_then(|e| e.model.as_deref())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| effective_config.resolve_default_model())
-        .unwrap_or_else(|| "<unresolved>".to_string());
+    let (provider_name, model_name) =
+        match effective_config.resolved_model_provider_for_agent(agent_alias) {
+            Some((ty, _alias, entry)) => {
+                let model = entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| effective_config.resolve_default_model())
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                (ty.to_string(), model)
+            }
+            None => (
+                provider_override.unwrap_or_else(|| "unknown".to_string()),
+                effective_config
+                    .resolve_default_model()
+                    .unwrap_or_else(|| "<unresolved>".to_string()),
+            ),
+        };
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         model_provider: provider_name.clone(),
@@ -2990,12 +3002,8 @@ mod tests {
             "test-profile".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        let provider_alias = config
-            .first_model_provider_type()
-            .expect("model_provider configured above")
-            .to_string();
         let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
-            model_provider: format!("{provider_alias}.default").into(),
+            model_provider: "custom.default".into(),
             risk_profile: "test-profile".to_string(),
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         };

@@ -937,7 +937,12 @@ fn agents_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
 }
 
 fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, alias: &str) {
-    let model_provider = cfg.first_model_provider_alias();
+    let model_provider = cfg
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(ty, alias, _)| format!("{ty}.{alias}"));
     let risk_profile = first_alias_preferring_default(cfg.risk_profiles.keys());
     let runtime_profile = first_alias_preferring_default(cfg.runtime_profiles.keys());
 

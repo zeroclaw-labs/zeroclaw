@@ -657,7 +657,7 @@ impl Default for ModelProviderRuntimeOptions {
 /// entry plus the global config's process-wide settings (zeroclaw_dir,
 /// secrets, runtime). Splits out the per-entry resolution so callers with
 /// agent context can pass in the alias-resolved entry instead of hitting
-/// `first_model_provider()`.
+/// `providers.models.find(type, alias)`.
 ///
 /// Pass `None` when no model_provider entry is resolvable (e.g. tests or fresh
 /// config with no models configured); falls back to safe defaults.
@@ -712,17 +712,13 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
 }
 
 /// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
-/// (`"<type>.<alias>"`). Falls back to `first_model_provider()` when the agent
-/// alias doesn't exist, doesn't have a `model_provider` set, or names a
-/// non-existent model_provider entry.
+/// (`"<type>.<alias>"`). Returns safe defaults when the agent alias doesn't
+/// exist, doesn't have a `model_provider` set, or names a non-existent entry.
 pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
-    let entry = config.model_provider_for_agent(agent_alias).or_else(|| {
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": agent_alias})), "model_provider_for_agent returned None; falling back to model_providers.first_model_provider()");
-        config.first_model_provider()
-    });
+    let entry = config.model_provider_for_agent(agent_alias);
     let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
 
     if let Some(agent) = config.agents.get(agent_alias)
@@ -746,13 +742,6 @@ pub fn provider_runtime_options_for_agent(
 
     options
 }
-
-pub fn provider_runtime_options_from_config(
-    config: &zeroclaw_config::schema::Config,
-) -> ModelProviderRuntimeOptions {
-    model_provider_runtime_options_from_model_provider_entry(config, config.first_model_provider())
-}
-
 /// Build runtime options for a specific dotted provider alias
 /// (`<family>.<alias>`). Mirrors `provider_runtime_options_for_agent` but
 /// keyed on the typed provider entry directly, so routed providers can
@@ -2319,8 +2308,8 @@ mod tests {
         // End-to-end path: setting `native_tools` on the first configured
         // model_provider entry must reach `ModelProviderRuntimeOptions` so the
         // Groq factory branch sees it. There is no global fallback; the
-        // orchestrator resolves per-agent and falls back to
-        // `first_model_provider()`.
+        // orchestrator resolves per-agent via explicit `<type>.<alias>`
+        // resolution.
         use zeroclaw_config::schema::{GroqModelProviderConfig, ModelProviderConfig};
         let mut config = zeroclaw_config::schema::Config::default();
         config.providers.models.groq.insert(
@@ -2334,7 +2323,8 @@ mod tests {
             },
         );
 
-        let options = provider_runtime_options_from_config(&config);
+        let entry = config.providers.models.find("groq", "default");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
         assert_eq!(
             options.native_tools,
             Some(true),
@@ -2787,7 +2777,7 @@ mod tests {
 
     /// Build a `Config` with two `anthropic` aliases at different base_urls
     /// so the test can prove `provider_runtime_options_for_agent` selects
-    /// the alias-specific entry rather than `first_model_provider()`.
+    /// the alias-specific entry via explicit `<type>.<alias>` resolution.
     fn config_with_two_anthropic_aliases() -> zeroclaw_config::schema::Config {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
@@ -2856,7 +2846,7 @@ mod tests {
     fn provider_runtime_options_for_agent_falls_back_to_first_provider_when_unknown_agent() {
         let config = config_with_two_anthropic_aliases();
         let opts = provider_runtime_options_for_agent(&config, "nonexistent");
-        // Falls back to first_model_provider() — order across HashMap is not
+        // Falls back to iter_entries().next() — order across HashMap is not
         // guaranteed but the URL must match one of the configured aliases.
         let url = opts.provider_api_url.as_deref().unwrap_or("");
         assert!(

@@ -50,6 +50,7 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_APPROVE: &str = "session/approve";
+    pub const SESSION_RENAME: &str = "session/rename";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -768,9 +769,21 @@ impl RpcClient {
         agent_alias: &str,
         cwd: Option<&str>,
     ) -> Result<SessionNewResult> {
+        self.session_new_with_id(agent_alias, cwd, None).await
+    }
+
+    /// Create or rehydrate a session. When `session_id` is `Some`, the daemon
+    /// creates the session with that ID, restoring persisted history if it
+    /// exists — effectively "attaching" to a prior session.
+    pub async fn session_new_with_id(
+        &self,
+        agent_alias: &str,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<SessionNewResult> {
         self.call(
             method::SESSION_NEW,
-            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd }),
+            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd, "session_id": session_id }),
         )
         .await
     }
@@ -808,6 +821,18 @@ impl RpcClient {
             params["replacement"] = serde_json::Value::String(replacement.clone());
         }
         self.call(method::SESSION_APPROVE, params).await
+    }
+
+    pub async fn session_rename(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<SessionRenameResult> {
+        self.call(
+            method::SESSION_RENAME,
+            serde_json::json!({ "session_id": session_id, "name": name }),
+        )
+        .await
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -1128,6 +1153,13 @@ pub struct SessionApproveResult {
     pub session_id: String,
     pub request_id: String,
     pub acknowledged: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionRenameResult {
+    pub session_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]

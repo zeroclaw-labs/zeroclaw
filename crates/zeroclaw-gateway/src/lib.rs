@@ -491,15 +491,26 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let fallback = config.first_model_provider();
-    let model_provider_name = config.first_model_provider_type().unwrap_or("openrouter");
+    let (boot_family, boot_alias, boot_entry) = config
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
+        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
+    let fallback = boot_entry;
+    let model_provider_name = boot_family.as_str();
     let model_provider: Arc<dyn ModelProvider> = Arc::from(
         zeroclaw_providers::create_resilient_model_provider_with_options(
             model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_from_config(&config),
+            &zeroclaw_providers::provider_runtime_options_for_alias(
+                &config,
+                &boot_family,
+                &boot_alias,
+            ),
         )?,
     );
     // Model resolution (1) the first-model_provider's `model`,
@@ -649,7 +660,7 @@ pub async fn run_gateway(
                 &config.data_dir,
                 &config.agents,
                 config
-                    .first_model_provider()
+                    .model_provider_for_agent(agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
                 &config,
                 Some(canvas_store.clone()),
@@ -2137,12 +2148,15 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .read()
-        .first_model_provider_type()
-        .unwrap_or("unknown")
-        .to_string();
+    let provider_label = {
+        let cfg = state.config.read();
+        cfg.providers
+            .models
+            .iter_entries()
+            .next()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
     let model_label = state.model.clone();
     let started_at = Instant::now();
 
