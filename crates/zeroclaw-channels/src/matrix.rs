@@ -4360,6 +4360,7 @@ mod tests {
     mod live_smoke {
         use std::{
             env,
+            sync::Arc,
             time::{Duration, SystemTime, UNIX_EPOCH},
         };
 
@@ -4396,19 +4397,24 @@ mod tests {
             let config = MatrixConfig {
                 enabled: true,
                 homeserver,
-                access_token,
+                access_token: Some(access_token),
                 allowed_rooms: vec![room_id.clone()],
                 stream_mode: StreamMode::Partial,
                 draft_update_interval_ms: 50,
                 multi_message_delay_ms: 0,
                 reply_in_thread: false,
-                ack_reactions: false,
+                ack_reactions: Some(false),
                 approval_timeout_secs: 1,
                 ..MatrixConfig::default()
             };
             let state_dir = TempDir::new().expect("temp state dir");
-            let channel =
-                MatrixChannel::new(config, state_dir.path().to_path_buf()).expect("matrix channel");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(|| Vec::<String>::new()),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
 
             let client = channel.ensure_client().await.expect("matrix client");
             client
