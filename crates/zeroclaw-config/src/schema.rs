@@ -4222,9 +4222,6 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// When true, also filter built-in tools (not just MCP tools).
-    #[serde(default)]
-    pub filter_builtins: bool,
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
