@@ -215,7 +215,7 @@ impl MediaDecryptor {
         let mut buf = encrypted.to_vec();
         let plaintext = cbc::Decryptor::<Aes256>::new(key.into(), iv.into())
             .decrypt_padded_mut::<NoPadding>(&mut buf)
-            .map_err(|_| anyhow::anyhow!("failed to decrypt WeCom media attachment"))?;
+            .map_err(|_| anyhow::Error::msg("failed to decrypt WeCom media attachment"))?;
         Ok(strip_wecom_padding(plaintext)?.to_vec())
     }
 }
@@ -322,7 +322,7 @@ impl WeComWsChannel {
         let tx = self.wait_for_ws_sender().await?;
         tx.send(WsOutbound::Frame(frame))
             .await
-            .map_err(|_| anyhow::anyhow!("WeCom WS outbound channel closed"))
+            .map_err(|_| anyhow::Error::msg("WeCom WS outbound channel closed"))
     }
 
     async fn ws_send_frame_and_wait_for_response(
@@ -379,9 +379,9 @@ impl WeComWsChannel {
             let result = if errcode == 0 {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!(
+                Err(anyhow::Error::msg(format!(
                     "WeCom command failed: req_id={req_id} errcode={errcode} errmsg={errmsg}"
-                ))
+                )))
             };
             let _ = waiter.send(result);
             return true;
@@ -420,9 +420,9 @@ impl WeComWsChannel {
         };
 
         for (req_id, waiter) in pending {
-            let _ = waiter.send(Err(anyhow::anyhow!(
+            let _ = waiter.send(Err(anyhow::Error::msg(format!(
                 "WeCom WebSocket disconnected before response: req_id={req_id} reason={reason}"
-            )));
+            ))));
         }
     }
 
