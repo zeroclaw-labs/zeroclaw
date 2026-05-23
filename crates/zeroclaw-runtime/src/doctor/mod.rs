@@ -95,7 +95,7 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let mut out = Vec::new();
 
     for provider_name in &targets {
-        let result = match zeroclaw_providers::create_model_provider(provider_name, None) {
+        let result = match create_doctor_model_provider(config, provider_name) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -227,6 +227,42 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
         .collect()
 }
 
+fn configured_model_provider_api_key<'a>(
+    config: &'a Config,
+    provider_name: &str,
+) -> Option<&'a str> {
+    let (family, alias) = provider_name
+        .split_once('.')
+        .unwrap_or((provider_name, "default"));
+
+    config
+        .providers
+        .models
+        .find(family, alias)
+        .and_then(|entry| entry.api_key.as_deref())
+}
+
+fn create_doctor_model_provider(
+    config: &Config,
+    provider_name: &str,
+) -> anyhow::Result<Box<dyn zeroclaw_api::model_provider::ModelProvider>> {
+    let api_key = configured_model_provider_api_key(config, provider_name);
+    let options = zeroclaw_providers::options_for_provider_ref(
+        config,
+        provider_name,
+        &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+    );
+
+    match provider_name.split_once('.') {
+        Some((family, alias)) => zeroclaw_providers::create_model_provider_for_alias(
+            config, family, alias, api_key, &options,
+        ),
+        None => {
+            zeroclaw_providers::create_model_provider_with_options(provider_name, api_key, &options)
+        }
+    }
+}
+
 pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
@@ -253,7 +289,7 @@ pub async fn run_models(
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        let outcome = match zeroclaw_providers::create_model_provider(provider_name, None) {
+        let outcome = match create_doctor_model_provider(config, provider_name) {
             Ok(handle) => handle.list_models().await,
             Err(e) => Err(e),
         };
@@ -1115,6 +1151,39 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn configured_model_provider_api_key_uses_alias_profile() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type")
+            .api_key = Some("redacted-test-key".to_string());
+
+        assert_eq!(
+            configured_model_provider_api_key(&config, "custom.local"),
+            Some("redacted-test-key")
+        );
+        assert_eq!(configured_model_provider_api_key(&config, "custom"), None);
+    }
+
+    #[test]
+    fn doctor_model_provider_uses_alias_profile() {
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("redacted-test-key".to_string());
+        profile.uri = Some("https://models.example.test/v1".to_string());
+
+        if let Err(error) = create_doctor_model_provider(&config, "custom.local") {
+            panic!("doctor model probe should build custom providers from alias config: {error}");
+        }
     }
 
     #[test]

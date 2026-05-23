@@ -230,7 +230,7 @@ mime_guess = { version = "2", optional = true }
 
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
-# Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
+# Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]

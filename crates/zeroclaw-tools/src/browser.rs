@@ -62,6 +62,7 @@ pub struct BrowserTool {
     allowed_domains: Vec<String>,
     session_name: Option<String>,
     backend: String,
+    headed: Option<bool>,
     #[allow(dead_code)] // read only with browser-native feature
     native_headless: bool,
     #[allow(dead_code)]
@@ -209,6 +210,7 @@ impl BrowserTool {
             allowed_domains,
             session_name,
             "agent_browser".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -222,6 +224,7 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        headed: Option<bool>,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
@@ -232,6 +235,7 @@ impl BrowserTool {
             allowed_domains: normalize_domains(allowed_domains),
             session_name,
             backend,
+            headed,
             native_headless,
             native_webdriver_url,
             native_chrome_path,
@@ -463,23 +467,7 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let agent_browser_bin = if cfg!(target_os = "windows") {
-            "agent-browser.cmd"
-        } else {
-            "agent-browser"
-        };
-        let mut cmd = Command::new(agent_browser_bin);
-
-        // When running as a service (systemd/OpenRC), the process may lack
-        // HOME which browsers need for profile directories.
-        if is_service_environment() {
-            ensure_browser_env(&mut cmd);
-        }
-
-        // Add session if configured
-        if let Some(ref session) = self.session_name {
-            cmd.arg("--session").arg(session);
-        }
+        let mut cmd = self.agent_browser_command();
 
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
@@ -526,6 +514,38 @@ impl BrowserTool {
                 error: Some(stderr.trim().to_string()),
             })
         }
+    }
+
+    fn agent_browser_command(&self) -> Command {
+        let agent_browser_bin = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+        let mut cmd = Command::new(agent_browser_bin);
+
+        match self.headed {
+            Some(true) => {
+                cmd.env("AGENT_BROWSER_HEADED", "1");
+            }
+            Some(false) => {
+                cmd.env_remove("AGENT_BROWSER_HEADED");
+            }
+            None => {}
+        }
+
+        // When running as a service (systemd/OpenRC), the process may lack
+        // HOME which browsers need for profile directories.
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
+        // Add session if configured
+        if let Some(ref session) = self.session_name {
+            cmd.arg("--session").arg(session);
+        }
+
+        cmd
     }
 
     /// Execute a browser action via agent-browser CLI
@@ -2511,6 +2531,75 @@ mod tests {
     }
 
     #[test]
+    fn agent_browser_command_inherits_headed_env_by_default() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_clears_headed_env_when_configured_false() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(false),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_sets_headed_env_when_configured() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(true),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+        );
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn browser_tool_accepts_auto_backend_config() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new_with_backend(
@@ -2518,6 +2607,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2534,6 +2624,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2553,6 +2644,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2573,6 +2665,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2594,6 +2687,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
