@@ -1012,6 +1012,22 @@ mod tests {
     }
 
     #[test]
+    fn cloud_suffix_preserved_for_private_remote_without_api_key() {
+        let p = OllamaProvider::new(Some("http://100.126.1.2:11434"), None);
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(!should_auth);
+    }
+
+    #[test]
+    fn cloud_suffix_preserved_for_private_remote_with_api_key() {
+        let p = OllamaProvider::new(Some("http://100.126.1.2:11434"), Some("ollama-key"));
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(should_auth);
+    }
+
+    #[test]
     fn remote_endpoint_auth_enabled_when_key_present() {
         let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
