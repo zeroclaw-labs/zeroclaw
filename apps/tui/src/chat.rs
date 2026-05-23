@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -173,7 +176,11 @@ impl<'a> Chat<'a> {
 
     // ── Key handling ─────────────────────────────────────────────
 
-    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        term: &mut crate::config_manager::Term,
+    ) -> bool {
         // Determine which phase we're in without holding a borrow on self.
         // For the picker, extract what we need; for active, delegate below.
         match &mut self.phase {
@@ -246,6 +253,7 @@ impl<'a> Chat<'a> {
                                 .agent_alias
                                 .clone()
                                 .unwrap_or_else(|| state.agent_alias.clone());
+                            let _ = self.rpc.session_close(&state.session_id).await;
                             state.session_overlay = SessionOverlay::None;
                             state.reset_for_session(new_sid.clone(), new_name);
                             state.agent_alias = agent_alias.clone();
@@ -418,11 +426,33 @@ impl<'a> Chat<'a> {
                         .await;
                 }
             }
+            KeyCode::Char('e') if state.pending_approval().is_some() => {
+                let is_edit_tool = state
+                    .pending_approval()
+                    .map(|pa| matches!(pa.tool_name.as_str(), "file_edit" | "file_write"))
+                    .unwrap_or(false);
+                if is_edit_tool && let Some(pa) = state.take_pending_approval() {
+                    let initial = pa.arguments_summary.clone();
+                    let edited = open_editor_for_content(&initial).await;
+                    let _ = term.clear();
+                    let _ = self
+                        .rpc
+                        .session_approve(
+                            &state.session_id,
+                            &pa.request_id,
+                            ApprovalDecision::RejectWithEdit {
+                                replacement: edited,
+                            },
+                        )
+                        .await;
+                }
+            }
             // ── Session management ───────────────────────────────
             KeyCode::Char('n')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
             {
                 if let Ok(s) = self.rpc.session_new(&state.agent_alias, None).await {
+                    let _ = self.rpc.session_close(&state.session_id).await;
                     state.reset_for_session(s.session_id, None);
                 }
             }
@@ -517,6 +547,20 @@ impl<'a> Chat<'a> {
         false
     }
 
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) {
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            // Let the file explorer handle mouse events first when open.
+            if state.input_bar.handle_mouse(mouse) {
+                return;
+            }
+            match mouse.kind {
+                MouseEventKind::ScrollUp => state.scroll_up(3),
+                MouseEventKind::ScrollDown => state.scroll_down(3),
+                _ => {}
+            }
+        }
+    }
+
     /// Handle a bracketed paste event.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         let ChatPhase::Active(state) = &mut self.phase else {
@@ -556,14 +600,6 @@ impl<'a> Chat<'a> {
             }
             _ => false,
         }
-    }
-
-    pub(crate) fn handle_mouse(
-        &mut self,
-        _mouse: crossterm::event::MouseEvent,
-        _content_area: Rect,
-    ) {
-        // No mouse handling for chat pane yet.
     }
 
     pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
@@ -724,7 +760,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
-fn render(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let show_cursor = state.pending_approval().is_none();
     let conv_area = state
         .input_bar
@@ -823,7 +859,7 @@ fn render_tool_entry<'a>(
     }
 }
 
-fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let selected = state.selected_entry;
 
@@ -951,7 +987,12 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
             }
         })
         .sum();
-    let scroll = total_rows.saturating_sub(inner_height);
+    let max_scroll = total_rows.saturating_sub(inner_height);
+    let scroll = if state.pinned_to_bottom {
+        max_scroll
+    } else {
+        state.scroll_offset.min(max_scroll)
+    };
 
     let p = Paragraph::new(lines)
         .block(
@@ -962,6 +1003,21 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
+
+    state.last_total_rows = total_rows;
+    state.last_inner_height = inner_height;
+    state.scroll_offset = scroll;
+
+    let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
+        .position(scroll as usize)
+        .viewport_content_length(inner_height as usize);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut scrollbar_state,
+    );
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -1279,6 +1335,10 @@ pub struct ChatState {
     show_thoughts: bool,
     selected_entry: Option<usize>,
     session_overlay: SessionOverlay,
+    scroll_offset: u16,
+    pinned_to_bottom: bool,
+    last_total_rows: u16,
+    last_inner_height: u16,
 }
 
 impl ChatState {
@@ -1296,6 +1356,23 @@ impl ChatState {
             show_thoughts: true,
             selected_entry: None,
             session_overlay: SessionOverlay::None,
+            scroll_offset: 0,
+            pinned_to_bottom: true,
+            last_total_rows: 0,
+            last_inner_height: 0,
+        }
+    }
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.pinned_to_bottom = false;
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
+        if self.scroll_offset >= max {
+            self.pinned_to_bottom = true;
         }
     }
 
@@ -1475,7 +1552,6 @@ fn clipboard_text(entry: &ChatEntry) -> String {
 /// Suspend the TUI, open `$EDITOR` with `content`, return the edited text.
 /// Restores raw mode and alternate screen before returning.
 /// Falls back to `content` unchanged if `$EDITOR` is unset or the process fails.
-#[cfg(test)]
 pub async fn open_editor_for_content(content: &str) -> String {
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
@@ -1507,6 +1583,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
         content.to_string()
     }
 }
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

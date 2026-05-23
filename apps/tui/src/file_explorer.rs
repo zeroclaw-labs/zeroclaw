@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -52,6 +52,7 @@ pub(crate) struct FileExplorerState {
     error: Option<String>,
     search_query: String,
     searching: bool,
+    last_list_area: Rect,
 }
 
 impl FileExplorerState {
@@ -66,6 +67,7 @@ impl FileExplorerState {
             error: None,
             search_query: String::new(),
             searching: false,
+            last_list_area: Rect::default(),
         };
         state.load_entries();
         if !state.entries.is_empty() {
@@ -356,8 +358,51 @@ impl FileExplorerState {
         }
     }
 
+    /// Handle mouse events (scroll and click-to-select).
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ExplorerAction {
+        use crate::mouse;
+
+        let col = mouse.column;
+        let row = mouse.row;
+        let area = self.last_list_area;
+        let visible = self.visible_entries();
+        let vis_len = visible.len();
+
+        if !mouse::in_rect(col, row, area) {
+            return ExplorerAction::None;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // The list has no border, so row offset is directly from area.y.
+                let row_in_list = (row - area.y) as usize;
+                let offset = self.list_state.offset();
+                let idx = offset + row_in_list;
+                if idx < vis_len {
+                    self.list_state.select(Some(idx));
+                }
+                ExplorerAction::None
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(i) = self.selected_idx() {
+                    let next = mouse::list_scroll(i, vis_len, true, 3);
+                    self.list_state.select(Some(next));
+                }
+                ExplorerAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(i) = self.selected_idx() {
+                    let next = mouse::list_scroll(i, vis_len, false, 3);
+                    self.list_state.select(Some(next));
+                }
+                ExplorerAction::None
+            }
+            _ => ExplorerAction::None,
+        }
+    }
+
     /// Render the file explorer as a centered modal overlay.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
         // Center the overlay: 80% height, 70% width.
         let vert = Layout::default()
             .direction(Direction::Vertical)
@@ -443,6 +488,7 @@ impl FileExplorerState {
                 .add_modifier(Modifier::REVERSED)
                 .fg(Color::Cyan),
         );
+        self.last_list_area = chunks[0];
         let mut ls = self.list_state;
         f.render_stateful_widget(list, chunks[0], &mut ls);
 

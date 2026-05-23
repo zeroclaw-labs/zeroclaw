@@ -1,4 +1,4 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
 use crate::chat;
@@ -23,20 +23,20 @@ impl<'a> Acp<'a> {
         self.inner.draw(frame, area);
     }
 
-    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
-        self.inner.handle_key(key).await
+    pub(crate) async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        term: &mut crate::config_manager::Term,
+    ) -> bool {
+        self.inner.handle_key(key, term).await
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
         self.inner.wants_text_input()
     }
 
-    pub(crate) fn handle_mouse(
-        &mut self,
-        mouse: crossterm::event::MouseEvent,
-        content_area: ratatui::layout::Rect,
-    ) {
-        self.inner.handle_mouse(mouse, content_area);
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_mouse(mouse, area);
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) {

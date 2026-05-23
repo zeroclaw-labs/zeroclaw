@@ -198,8 +198,8 @@ pub async fn run(
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, term).await?,
-                    Mode::Acp => acp_pane.handle_key(key).await,
-                    Mode::Chat => chat_pane.handle_key(key).await,
+                    Mode::Acp => acp_pane.handle_key(key, term).await,
+                    Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                 };
                 if quit {

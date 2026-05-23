@@ -46,6 +46,7 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_RENAME: &str = "session/rename";
+    pub const SESSION_CLOSE: &str = "session/close";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -805,12 +806,23 @@ impl RpcClient {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<SessionApproveResult> {
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "session_id": session_id,
             "request_id": request_id,
             "decision": decision.kind(),
         });
+        if let ApprovalDecision::RejectWithEdit { ref replacement } = decision {
+            params["replacement"] = serde_json::Value::String(replacement.clone());
+        }
         self.call(method::SESSION_APPROVE, params).await
+    }
+
+    pub async fn session_close(&self, session_id: &str) -> Result<Value> {
+        self.call(
+            method::SESSION_CLOSE,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
     }
 
     pub async fn session_rename(
@@ -1119,6 +1131,7 @@ pub enum ApprovalDecision {
     AllowOnce,
     AllowAlways,
     Reject,
+    RejectWithEdit { replacement: String },
 }
 
 impl ApprovalDecision {
@@ -1127,6 +1140,7 @@ impl ApprovalDecision {
             Self::AllowOnce => "allow_once",
             Self::AllowAlways => "allow_always",
             Self::Reject => "reject",
+            Self::RejectWithEdit { .. } => "reject_with_edit",
         }
     }
 }

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -297,6 +297,31 @@ impl InputBarState {
         InputBarAction::Consumed
     }
 
+    /// Forward mouse events to the file explorer when open.
+    /// Returns `true` if the event was consumed.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if let Some(explorer) = &mut self.file_explorer {
+            let action = explorer.handle_mouse(mouse);
+            match action {
+                ExplorerAction::Confirm(paths) => {
+                    for p in paths {
+                        if let Ok(att) = PendingAttachment::from_path(&p.to_string_lossy()) {
+                            self.add_attachment(att);
+                        }
+                    }
+                    self.file_explorer = None;
+                }
+                ExplorerAction::Cancel => {
+                    self.file_explorer = None;
+                }
+                ExplorerAction::None => {}
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     // ── Private helpers ──────────────────────────────────────
 
     fn handle_enter(&mut self) -> InputBarAction {
@@ -489,8 +514,8 @@ impl InputBarState {
     }
 
     /// Render the file explorer overlay on top of everything.
-    pub fn render_explorer_overlay(&self, f: &mut Frame, area: Rect) {
-        if let Some(explorer) = &self.file_explorer {
+    pub fn render_explorer_overlay(&mut self, f: &mut Frame, area: Rect) {
+        if let Some(explorer) = &mut self.file_explorer {
             explorer.render(f, area);
         }
     }
