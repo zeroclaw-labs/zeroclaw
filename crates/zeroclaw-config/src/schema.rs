@@ -10010,6 +10010,11 @@ impl ChannelsConfig {
                 configured: !self.whatsapp.is_empty(),
             },
             ChannelInfo {
+                name: "WhatsApp Web",
+                desc: "native WhatsApp Web (wa-rs)",
+                configured: self.whatsapp.values().any(|c| c.is_web_config()),
+            },
+            ChannelInfo {
                 name: "Linq",
                 desc: "iMessage/RCS/SMS via Linq API",
                 configured: !self.linq.is_empty(),
