@@ -1995,6 +1995,7 @@ impl Channel for DiscordChannel {
                         interruption_scope_id: thread_ts.clone(),
                         thread_ts,
                         attachments: media_attachments,
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

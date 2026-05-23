@@ -31,7 +31,7 @@ pub enum ChannelApprovalResponse {
 }
 
 /// A message received from or sent to a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
@@ -57,6 +57,8 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<MediaAttachment>,
+    /// Email subject for reply threading.
+    pub subject: Option<String>,
 }
 
 /// Message to send through a channel
@@ -72,6 +74,8 @@ pub struct SendMessage {
     /// File attachments to send with the message.
     /// Channels that don't support attachments ignore this field.
     pub attachments: Vec<MediaAttachment>,
+    /// Message-ID to set as In-Reply-To header (email threading).
+    pub in_reply_to: Option<String>,
 }
 
 impl SendMessage {
@@ -84,6 +88,7 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            in_reply_to: None,
         }
     }
 
@@ -100,7 +105,20 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            in_reply_to: None,
         }
+    }
+
+    /// Set the In-Reply-To header for email threading.
+    pub fn in_reply_to(mut self, msg_id: Option<String>) -> Self {
+        self.in_reply_to = msg_id;
+        self
+    }
+
+    /// Set the subject on an existing SendMessage (builder style).
+    pub fn subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
     }
 
     /// Set the thread identifier for threaded replies.
@@ -411,6 +429,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: Vec::new(),
+            subject: None,
         }
     }
 

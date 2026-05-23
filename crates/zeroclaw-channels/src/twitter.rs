@@ -349,6 +349,7 @@ impl Channel for TwitterChannel {
                                     .map(|s| s.to_string()),
                                 interruption_scope_id: None,
                                 attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

@@ -1280,6 +1280,7 @@ impl LarkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                     attachments: vec![],
+                        subject: None,
                     };
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
@@ -1940,6 +1941,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         }]
     }
 
@@ -2204,6 +2206,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
