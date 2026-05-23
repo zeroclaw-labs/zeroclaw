@@ -107,7 +107,9 @@ impl<'a> Chat<'a> {
     }
 
     async fn start_session(&mut self, agent_alias: &str) {
-        match self.rpc.session_new(agent_alias, None).await {
+        let cwd = std::env::current_dir().ok();
+        let cwd_str = cwd.as_deref().and_then(|p| p.to_str());
+        match self.rpc.session_new(agent_alias, cwd_str).await {
             Ok(session) => {
                 self.phase = ChatPhase::Active(Box::new(ChatState::new(
                     session.session_id,
@@ -393,7 +395,9 @@ impl<'a> Chat<'a> {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
             {
                 // silently ignore errors — stays on current session
-                if let Ok(s) = self.rpc.session_new(&state.agent_alias, None).await {
+                let cwd = std::env::current_dir().ok();
+                let cwd_str = cwd.as_deref().and_then(|p| p.to_str());
+                if let Ok(s) = self.rpc.session_new(&state.agent_alias, cwd_str).await {
                     state.reset_for_session(s.session_id, None);
                 }
             }
@@ -1579,8 +1583,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(rpc: &mut RpcClient, agent_alias: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().ok();
+    let cwd_str = cwd.as_deref().and_then(|p| p.to_str());
     let session = rpc
-        .session_new(agent_alias, None)
+        .session_new(agent_alias, cwd_str)
         .await
         .map_err(|e| anyhow::Error::msg(format!("failed to create session: {e}")))?;
 
