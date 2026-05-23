@@ -20,6 +20,7 @@
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
+#[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
@@ -5921,9 +5922,9 @@ fn collect_configured_channels(
         }
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
+            #[cfg(feature = "channel-whatsapp-cloud")]
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
-                #[cfg(feature = "channel-whatsapp-cloud")]
                 if wa.is_cloud_config() {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
@@ -5964,6 +5965,15 @@ fn collect_configured_channels(
                         "WhatsApp Cloud API backend requires 'channel-whatsapp-cloud' feature. Build/run with --features channel-whatsapp-cloud"
                     );
                 }
+            }
+            #[cfg(not(feature = "channel-whatsapp-cloud"))]
+            "cloud" => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "WhatsApp Cloud API is configured but this build was compiled without `channel-whatsapp-cloud`; skipping WhatsApp Cloud."
+                );
             }
             "web" => {
                 // Web mode: requires session_path
