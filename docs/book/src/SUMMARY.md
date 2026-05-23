@@ -31,6 +31,7 @@
 - [CLI](./reference/cli.md)
 - [Config](./reference/config.md)
 - [Environment variables](./reference/env-vars.md)
+- [Feature support matrix](./reference/feature-support.md)
 - [API (rustdoc)](./api.md)
 - [Gateway HTTP API](./gateway/api.md)
 
