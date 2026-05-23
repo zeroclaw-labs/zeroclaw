@@ -33,13 +33,6 @@ enum RecipientTarget {
 /// `(targetAuthor, targetTimestamp_ms)` recovered by `add_reaction` /
 /// `remove_reaction` from an opaque inbound id. Held in `recent_targets`.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fields consumed by add_reaction/remove_reaction in the follow-up commit"
-    )
-)]
 struct ReactionTarget {
     author: String,
     timestamp_ms: u64,
@@ -214,6 +207,50 @@ impl SignalChannel {
         } else {
             RecipientTarget::Group(recipient.to_string())
         }
+    }
+
+    /// Build the JSON-RPC params for signal-cli's `sendReaction` method.
+    ///
+    /// `targetAuthor` and `targetTimestamp` are recovered from
+    /// `recent_targets` rather than parsed out of `message_id`, so the
+    /// generic id stays opaque and the Signal sender never leaks into
+    /// the surfaces that consume `ChannelMessage.id`.
+    ///
+    /// Extracted from `add_reaction` / `remove_reaction` so the wire
+    /// shape is unit-testable without a live daemon.
+    fn build_reaction_params(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        remove: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let target = self.recent_targets.lock().get(message_id).cloned().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "no recent inbound Signal message matches id {message_id} — may have been evicted from the lookup cache or never received"
+            ))
+        })?;
+
+        let params = match Self::parse_recipient_target(channel_id) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "emoji": emoji,
+                "targetAuthor": target.author,
+                "targetTimestamp": target.timestamp_ms,
+                "remove": remove,
+                "account": &self.account,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "emoji": emoji,
+                "targetAuthor": target.author,
+                "targetTimestamp": target.timestamp_ms,
+                "remove": remove,
+                "account": &self.account,
+            }),
+        };
+
+        Ok(params)
     }
 
     /// Check whether the message passes the group/DM filter.
@@ -642,6 +679,28 @@ impl Channel for SignalChannel {
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         // signal-cli doesn't have a stop-typing RPC; typing indicators
         // auto-expire after ~15s on the client side.
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let params = self.build_reaction_params(channel_id, message_id, emoji, false)?;
+        self.rpc_request("sendReaction", params).await?;
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let params = self.build_reaction_params(channel_id, message_id, emoji, true)?;
+        self.rpc_request("sendReaction", params).await?;
         Ok(())
     }
 
@@ -1515,5 +1574,123 @@ mod tests {
         let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
         sender.send(ChannelApprovalResponse::Approve).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    fn make_reaction_channel() -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            false,
+        )
+    }
+
+    fn seed_reaction_target(ch: &SignalChannel, id: &str, author: &str, ts_ms: u64) {
+        ch.recent_targets.lock().put(
+            id.to_string(),
+            ReactionTarget {
+                author: author.to_string(),
+                timestamp_ms: ts_ms,
+            },
+        );
+    }
+
+    #[test]
+    fn build_reaction_params_dm_includes_recipient() {
+        let ch = make_reaction_channel();
+        seed_reaction_target(
+            &ch,
+            "sig_1700000000000_abcdef",
+            "+2222222222",
+            1_700_000_000_000,
+        );
+        let params = ch
+            .build_reaction_params(
+                "+1111111111",
+                "sig_1700000000000_abcdef",
+                "\u{1F44D}",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            params["recipient"],
+            serde_json::json!(["+1111111111".to_string()])
+        );
+        assert!(params.get("groupId").is_none());
+        assert_eq!(params["emoji"], "\u{1F44D}");
+        assert_eq!(params["targetAuthor"], "+2222222222");
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+        assert_eq!(params["remove"], false);
+        assert_eq!(params["account"], "+1234567890");
+    }
+
+    #[test]
+    fn build_reaction_params_group_includes_group_id_and_remove() {
+        let ch = make_reaction_channel();
+        seed_reaction_target(
+            &ch,
+            "sig_1700000000000_abcdef",
+            "+2222222222",
+            1_700_000_000_000,
+        );
+        let params = ch
+            .build_reaction_params(
+                "group:abc",
+                "sig_1700000000000_abcdef",
+                "\u{2764}\u{FE0F}",
+                true,
+            )
+            .unwrap();
+        assert_eq!(params["groupId"], "abc");
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["emoji"], "\u{2764}\u{FE0F}");
+        assert_eq!(params["targetAuthor"], "+2222222222");
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+        assert_eq!(params["remove"], true);
+        assert_eq!(params["account"], "+1234567890");
+    }
+
+    #[test]
+    fn build_reaction_params_round_trips_uuid_sender_via_lookup() {
+        // The opaque id reveals nothing about the sender, so the
+        // round-trip property — that `sendReaction` ultimately sends the
+        // correct `targetAuthor` — has to come from `process_envelope`
+        // seeding the lookup, not from id parsing.
+        let ch = make_reaction_channel();
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let env = Envelope {
+            source: Some(uuid.to_string()),
+            source_number: None,
+            data_message: Some(DataMessage {
+                message: Some("hi".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        let params = ch
+            .build_reaction_params(&msg.reply_target, &msg.id, "\u{1F44D}", false)
+            .unwrap();
+        assert_eq!(params["targetAuthor"], uuid);
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+    }
+
+    #[test]
+    fn build_reaction_params_rejects_unknown_id() {
+        let ch = make_reaction_channel();
+        let err = ch
+            .build_reaction_params("+1111111111", "sig_unknown_id", "\u{1F44D}", false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no recent inbound Signal message"),
+            "unexpected error: {err}"
+        );
     }
 }
