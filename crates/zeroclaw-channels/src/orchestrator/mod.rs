@@ -145,7 +145,10 @@ struct ChannelNotifyObserver {
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        if let ObserverEvent::ToolCallStart { tool, arguments } = event {
+        if let ObserverEvent::ToolCallStart {
+            tool, arguments, ..
+        } = event
+        {
             self.tools_used.store(true, Ordering::Relaxed);
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
@@ -2981,6 +2984,23 @@ fn spawn_supervised_listener_with_health_interval(
                         backoff = initial_backoff_secs.max(1);
                     }
                     Err(e) => {
+                        if is_non_retryable_channel_listener_error(ch.name(), &e) {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "channel listener hit non-retryable error; waiting for config change or shutdown"
+                            );
+                            zeroclaw_runtime::health::mark_component_error(&component, e.to_string());
+                            tokio::select! {
+                                () = cancel.cancelled() => return,
+                                () = std::future::pending::<()>() => unreachable!(),
+                            }
+                        }
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -3005,6 +3025,18 @@ fn spawn_supervised_listener_with_health_interval(
         }
         .instrument(span),
     )
+}
+
+fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::Error) -> bool {
+    match channel_name {
+        name if name == "discord" || name.starts_with("discord-") => {
+            error
+                .downcast_ref::<crate::discord::DiscordListenerFatalError>()
+                .is_some()
+                || zeroclaw_providers::reliable::is_non_retryable(error)
+        }
+        _ => false,
+    }
 }
 
 fn compute_max_in_flight_messages(channel_count: usize) -> usize {
@@ -7751,6 +7783,56 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        #[cfg(feature = "channel-lark")]
+        "lark" | "feishu" => {
+            // [channels.lark.<alias>] is the single source of truth for both
+            // names (AGENTS.md). from_config selects the endpoint via
+            // use_feishu. Error text names the real config table, not the
+            // cron alias the user wrote.
+            let lk = config.channels.lark.get(alias).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!(
+                        "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                    )
+                );
+                anyhow::Error::msg(format!(
+                    "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                ))
+            })?;
+            // Asymmetric by design: "feishu"+use_feishu=false is a typo
+            // (hard fail). "lark"+use_feishu=true is a soft compat path
+            // (warn but still deliver via fallback construction).
+            if channel_type == "feishu" && !lk.use_feishu {
+                anyhow::bail!(
+                    "[channels.lark.{alias}] has use_feishu=false but cron channel=\"feishu.{alias}\"; \
+                     use channel=\"lark.{alias}\" or set use_feishu=true"
+                );
+            }
+            if channel_type == "lark" && lk.use_feishu {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "cron channel=\"lark.{alias}\" with [channels.lark.{alias}] use_feishu=true \
+                         falls back to one-shot channel construction; prefer channel=\"feishu.{alias}\" \
+                         to reuse the live Feishu handle from start_channels"
+                    )
+                );
+            }
+            let peers = config.channel_external_peers("lark", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-lark"))]
+        "lark" | "feishu" => {
+            anyhow::bail!("Lark channel requires the `channel-lark` feature");
         }
         #[cfg(feature = "channel-webhook")]
         "webhook" => {
@@ -12698,6 +12780,7 @@ BTC is currently around $65,000 based on latest tool output."#
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
                 tool: "file_write".to_string(),
+                tool_call_id: None,
                 arguments: Some(payload),
             },
         );
@@ -14097,6 +14180,12 @@ This is an example JSON object for profile settings."#;
         calls: Arc<AtomicUsize>,
     }
 
+    struct FailOnceChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        err: Mutex<Option<anyhow::Error>>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -14138,6 +14227,18 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for FailOnceChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Discord,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for BlockUntilClosedChannel {
         fn name(&self) -> &str {
@@ -14154,6 +14255,28 @@ This is an example JSON object for profile settings."#;
         ) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for FailOnceChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(err) = self.err.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(err);
+            }
             Ok(())
         }
     }
@@ -14235,6 +14358,174 @@ This is an example JSON object for profile settings."#;
         assert!(join.is_ok(), "listener should stop on cancel");
         assert!(calls.load(Ordering::SeqCst) >= 1);
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_restart_on_non_retryable_discord_http_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(anyhow::Error::msg("401 Unauthorized"))),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert_eq!(component["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("401 Unauthorized")
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_restart_on_fatal_discord_rate_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(anyhow::Error::new(
+                crate::discord::DiscordListenerFatalError::new(
+                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                ),
+            ))),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert_eq!(component["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
+        let discord_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let discord_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let healthy_name = format!("test-supervised-sibling-{}", uuid::Uuid::new_v4());
+        let discord_component = format!("channel:{discord_name}");
+        let healthy_component = format!("channel:{healthy_name}");
+
+        let discord_channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: discord_name,
+            calls: Arc::clone(&discord_calls),
+            err: Mutex::new(Some(anyhow::Error::new(
+                crate::discord::DiscordListenerFatalError::new(
+                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                ),
+            ))),
+        });
+        let healthy_channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: healthy_name,
+            calls: Arc::clone(&healthy_calls),
+        });
+
+        let (discord_tx, discord_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (healthy_tx, healthy_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let discord_handle =
+            spawn_supervised_listener(discord_channel, None, discord_tx, 1, 1, cancel.clone());
+        let healthy_handle = spawn_supervised_listener_with_health_interval(
+            healthy_channel,
+            None,
+            healthy_tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let first_last_ok = zeroclaw_runtime::health::snapshot_json()["components"]
+            [&healthy_component]["last_ok"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !first_last_ok.is_empty(),
+            "healthy sibling should report health"
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let discord = &snapshot["components"][&discord_component];
+        let healthy = &snapshot["components"][&healthy_component];
+        let second_last_ok = healthy["last_ok"].as_str().unwrap_or("").to_string();
+        let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+        let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+
+        assert_eq!(discord_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(discord["status"], "error");
+        assert_eq!(discord["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            discord["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+        assert_eq!(healthy["status"], "ok");
+        assert!(
+            second > first,
+            "healthy sibling should keep refreshing health"
+        );
+        assert!(healthy_calls.load(Ordering::SeqCst) >= 1);
+
+        drop(discord_rx);
+        drop(healthy_rx);
+        cancel.cancel();
+        let discord_join = tokio::time::timeout(Duration::from_millis(500), discord_handle).await;
+        let healthy_join = tokio::time::timeout(Duration::from_millis(500), healthy_handle).await;
+        assert!(
+            discord_join.is_ok(),
+            "fatal discord listener should stop on cancel"
+        );
+        assert!(
+            healthy_join.is_ok(),
+            "healthy sibling listener should stop on cancel"
+        );
     }
 
     #[test]
@@ -16181,6 +16472,64 @@ Done."#;
         assert!(
             !prompt.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_routes_lark_to_lark_arm() {
+        // Both names must enter the merged lark|feishu arm. Falling through
+        // to `unsupported delivery channel` would mean the schema enum and
+        // the match arm have drifted apart.
+        let config = zeroclaw_config::schema::Config::default();
+
+        for channel in ["lark.default", "feishu.default"] {
+            let err = deliver_announcement(&config, channel, "oc_test_chat", None, "hi")
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("expected {channel} to bail because channel is not configured")
+                });
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("unsupported delivery channel"),
+                "{channel} must route to lark|feishu arm, not fall through; got: {msg}"
+            );
+            assert!(
+                msg.contains("[channels.lark.default] not configured"),
+                "{channel} must report the real config table [channels.lark.default]; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
+        // Reject (not warn): otherwise the message silently lands on the
+        // Lark endpoint despite the user explicitly naming Feishu.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                use_feishu: false,
+                app_id: "cli_test".to_string(),
+                app_secret: "secret".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "feishu.work", "oc_test_chat", None, "hi")
+            .await
+            .expect_err("expected bail when channel=feishu but use_feishu=false");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("use_feishu=false"),
+            "bail must explain the use_feishu mismatch; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.lark.work]"),
+            "bail must point at the real config table; got: {msg}"
         );
     }
 }

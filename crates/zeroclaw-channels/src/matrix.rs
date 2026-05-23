@@ -312,11 +312,36 @@ mod streaming {
         time::{Duration, Instant},
     };
 
+    use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 
     use super::markers;
 
-    pub(super) type DraftKey = OwnedRoomId;
+    const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(super) struct DraftKey {
+        room_id: OwnedRoomId,
+        draft_id: String,
+    }
+
+    pub(super) fn draft_key(room_id: OwnedRoomId, draft_id: &str) -> Result<DraftKey> {
+        let draft_id = draft_id.trim();
+        if draft_id.is_empty() {
+            bail!("matrix: draft message id is empty");
+        }
+        Ok(DraftKey {
+            room_id,
+            draft_id: draft_id.to_string(),
+        })
+    }
+
+    pub(super) fn new_multi_message_draft_id() -> String {
+        format!(
+            "{MULTI_MESSAGE_SYNTHETIC_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
 
     #[derive(Debug, Clone)]
     pub(super) struct PartialDraft {
@@ -348,6 +373,28 @@ mod streaming {
     pub(super) struct State {
         pub partial: HashMap<DraftKey, PartialDraft>,
         pub multi: HashMap<DraftKey, MultiDraft>,
+    }
+
+    pub(super) fn partial_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut PartialDraft> {
+        state.partial.get_mut(key)
+    }
+
+    pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
+        state.partial.remove(key)
+    }
+
+    pub(super) fn multi_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut MultiDraft> {
+        state.multi.get_mut(key)
+    }
+
+    pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
+        state.multi.remove(key)
     }
 
     pub(super) fn partial_should_edit(
@@ -3241,15 +3288,15 @@ impl MatrixChannel {
     }
 
     /// Edit-in-place draft update. Rate-limited per the configured interval.
-    async fn partial_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn partial_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let Some(visible_text) = streaming::partial_visible_text(text) else {
             return Ok(());
         };
         let event_id = {
             let mut state = self.streaming_state.write().await;
-            let Some(draft) = state.partial.get_mut(&key) else {
+            let Some(draft) = streaming::partial_for_update(&mut state, &key) else {
                 return Ok(());
             };
             let now = Instant::now();
@@ -3269,14 +3316,14 @@ impl MatrixChannel {
     /// `\n\n` boundary until the unsent buffer no longer contains a break,
     /// then returns to wait for more accumulated text. Each paragraph posts
     /// as an independent room message threaded under the captured anchor.
-    async fn multi_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn multi_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let delay = Duration::from_millis(self.config.multi_message_delay_ms);
         loop {
             let (paragraph, thread_anchor) = {
                 let mut state = self.streaming_state.write().await;
-                let Some(multi) = state.multi.get_mut(&key) else {
+                let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
                     return Ok(());
                 };
                 // Detect a buffer reset (e.g. DraftEvent::Clear) and re-anchor
@@ -3421,7 +3468,7 @@ impl Channel for MatrixChannel {
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(&message.recipient)?;
+        let room_id = streaming_room(&message.recipient)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(None),
             StreamMode::Partial => {
@@ -3430,6 +3477,7 @@ impl Channel for MatrixChannel {
                 let event_id = outbound::send(&self.outbox(client), message).await?;
                 let thread_anchor =
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
                 let mut state = self.streaming_state.write().await;
                 state.partial.insert(
                     key,
@@ -3451,6 +3499,8 @@ impl Channel for MatrixChannel {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .and_then(|s| s.parse::<OwnedEventId>().ok());
+                let draft_id = streaming::new_multi_message_draft_id();
+                let key = streaming::draft_key(room_id, &draft_id)?;
                 let mut state = self.streaming_state.write().await;
                 state.multi.insert(
                     key,
@@ -3459,16 +3509,16 @@ impl Channel for MatrixChannel {
                         sent_so_far: 0,
                     },
                 );
-                Ok(Some("multi_message_synthetic".to_string()))
+                Ok(Some(draft_id))
             }
         }
     }
 
-    async fn update_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
-            StreamMode::Partial => self.partial_update(recipient, text).await,
-            StreamMode::MultiMessage => self.multi_update(recipient, text).await,
+            StreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            StreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
 
@@ -3486,13 +3536,16 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
-                let draft = self.streaming_state.write().await.partial.remove(&key);
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
                 if let Some(draft) = draft {
                     let room =
                         outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
@@ -3601,7 +3654,10 @@ impl Channel for MatrixChannel {
             StreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
-                let multi = self.streaming_state.write().await.multi.remove(&key);
+                let multi = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_multi(&mut state, &key)
+                };
                 let Some(state) = multi else {
                     return Ok(());
                 };
@@ -3620,13 +3676,17 @@ impl Channel for MatrixChannel {
         }
     }
 
-    async fn cancel_draft(&self, recipient: &str, _message_id: &str) -> Result<()> {
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
-                if let Some(d) = self.streaming_state.write().await.partial.remove(&key) {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
+                if let Some(d) = draft {
                     let _ = outbound::redact(
                         client,
                         recipient,
@@ -3641,7 +3701,8 @@ impl Channel for MatrixChannel {
                 // Already-sent paragraphs are independent room messages and
                 // are not redacted on cancel — partial output is preferable
                 // to silent disappearance. Just drop our state.
-                self.streaming_state.write().await.multi.remove(&key);
+                let mut state = self.streaming_state.write().await;
+                streaming::take_multi(&mut state, &key);
                 Ok(())
             }
         }
@@ -3715,10 +3776,14 @@ impl Channel for MatrixChannel {
     }
 }
 
-fn streaming_key(recipient: &str) -> Result<streaming::DraftKey> {
+fn streaming_room(recipient: &str) -> Result<OwnedRoomId> {
     recipient
         .parse::<OwnedRoomId>()
         .with_context(|| format!("parse recipient room id {recipient}"))
+}
+
+fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKey> {
+    streaming::draft_key(streaming_room(recipient)?, message_id)
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────
@@ -4036,11 +4101,12 @@ mod tests {
     }
 
     mod streaming {
+        use super::super::streaming;
         use super::super::streaming::{
-            PartialDraft, PartialFinalizeAction, decide_partial_finalize_action,
+            MultiDraft, PartialDraft, PartialFinalizeAction, State, decide_partial_finalize_action,
             partial_should_edit, partial_visible_text,
         };
-        use matrix_sdk::ruma::owned_event_id;
+        use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
         use std::time::{Duration, Instant};
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
@@ -4049,6 +4115,15 @@ mod tests {
                 thread_anchor: None,
                 last_text: text.to_string(),
                 last_edit,
+            }
+        }
+
+        fn partial_draft(event_id: OwnedEventId, text: &str) -> PartialDraft {
+            PartialDraft {
+                event_id,
+                thread_anchor: None,
+                last_text: text.to_string(),
+                last_edit: Instant::now(),
             }
         }
 
@@ -4131,6 +4206,288 @@ mod tests {
                 decide_partial_finalize_action(true, false),
                 PartialFinalizeAction::EmptyError
             );
+        }
+
+        #[test]
+        fn draft_keys_include_message_id_for_same_room_concurrency() {
+            let room = owned_room_id!("!room:server");
+            let first = streaming::draft_key(room.clone(), "$draft-a:server").unwrap();
+            let second = streaming::draft_key(room.clone(), "$draft-b:server").unwrap();
+
+            assert_ne!(first, second);
+
+            let mut state = streaming::State::default();
+            state.partial.insert(
+                first.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-a:server"),
+                    thread_anchor: None,
+                    last_text: "first".to_string(),
+                    last_edit: Instant::now(),
+                },
+            );
+            state.partial.insert(
+                second.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-b:server"),
+                    thread_anchor: None,
+                    last_text: "second".to_string(),
+                    last_edit: Instant::now(),
+                },
+            );
+
+            assert_eq!(state.partial.len(), 2);
+            assert_eq!(
+                state.partial.remove(&second).map(|draft| draft.event_id),
+                Some(owned_event_id!("$draft-b:server"))
+            );
+            assert!(state.partial.contains_key(&first));
+        }
+
+        #[test]
+        fn partial_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::default();
+            state.partial.insert(
+                first.clone(),
+                partial_draft(owned_event_id!("$draft-a:server"), "first"),
+            );
+            state.partial.insert(
+                second.clone(),
+                partial_draft(owned_event_id!("$draft-b:server"), "second"),
+            );
+
+            streaming::partial_for_update(&mut state, &second)
+                .expect("second draft remains addressable")
+                .last_text = "second updated".to_string();
+
+            assert_eq!(
+                streaming::partial_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .last_text,
+                "first"
+            );
+
+            let finalized = streaming::take_partial(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(state.partial.contains_key(&first));
+            assert!(!state.partial.contains_key(&second));
+
+            state.partial.insert(
+                canceled.clone(),
+                partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
+            );
+            let canceled_draft = streaming::take_partial(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(state.partial.contains_key(&first));
+            assert!(!state.partial.contains_key(&canceled));
+        }
+
+        #[test]
+        fn multi_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first =
+                super::super::streaming_key(recipient, "multi_message_synthetic:first").unwrap();
+            let second =
+                super::super::streaming_key(recipient, "multi_message_synthetic:second").unwrap();
+            let canceled =
+                super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
+
+            let mut state = State::default();
+            state.multi.insert(
+                first.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 5,
+                },
+            );
+            state.multi.insert(
+                second.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 0,
+                },
+            );
+
+            streaming::multi_for_update(&mut state, &second)
+                .expect("second multi-message draft remains addressable")
+                .sent_so_far = 12;
+
+            assert_eq!(
+                streaming::multi_for_update(&mut state, &first)
+                    .expect("first multi-message draft remains isolated")
+                    .sent_so_far,
+                5
+            );
+
+            let finalized = streaming::take_multi(&mut state, &second)
+                .expect("finalize removes only the addressed multi-message draft");
+            assert_eq!(finalized.sent_so_far, 12);
+            assert!(state.multi.contains_key(&first));
+            assert!(!state.multi.contains_key(&second));
+
+            state.multi.insert(
+                canceled.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 3,
+                },
+            );
+            let canceled_draft = streaming::take_multi(&mut state, &canceled)
+                .expect("cancel removes only the addressed multi-message draft");
+            assert_eq!(canceled_draft.sent_so_far, 3);
+            assert!(state.multi.contains_key(&first));
+            assert!(!state.multi.contains_key(&canceled));
+        }
+
+        #[test]
+        fn multi_message_synthetic_draft_ids_are_unique() {
+            let first = streaming::new_multi_message_draft_id();
+            let second = streaming::new_multi_message_draft_id();
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("multi_message_synthetic:"));
+            assert!(second.starts_with("multi_message_synthetic:"));
+        }
+    }
+
+    mod live_smoke {
+        use std::{
+            env,
+            sync::Arc,
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
+
+        use matrix_sdk::config::SyncSettings;
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+
+        use super::super::{MatrixChannel, streaming_key};
+
+        fn env_first(primary: &str, fallback: &str) -> String {
+            env::var(primary)
+                .or_else(|_| env::var(fallback))
+                .unwrap_or_else(|_| panic!("set {primary} or {fallback} to run Matrix live smoke"))
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_partial_draft_lifecycle_uses_real_draft_ids() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: StreamMode::Partial,
+                draft_update_interval_ms: 50,
+                multi_message_delay_ms: 0,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("initial Matrix sync");
+
+            let first = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} first"),
+                    &room_id,
+                ))
+                .await
+                .expect("send first draft")
+                .expect("partial mode returns first draft event id");
+            let second = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} second"),
+                    &room_id,
+                ))
+                .await
+                .expect("send second draft")
+                .expect("partial mode returns second draft event id");
+            assert_ne!(first, second);
+
+            let first_key = streaming_key(&room_id, &first).expect("first draft key");
+            let second_key = streaming_key(&room_id, &second).expect("second draft key");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.contains_key(&first_key));
+                assert!(state.partial.contains_key(&second_key));
+            }
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let first_update = format!("zeroclaw draft lifecycle smoke {stamp} first update");
+            channel
+                .update_draft(&room_id, &first, &first_update)
+                .await
+                .expect("update first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert_eq!(
+                    state
+                        .partial
+                        .get(&first_key)
+                        .map(|draft| draft.last_text.as_str()),
+                    Some(first_update.as_str())
+                );
+                assert!(state.partial.contains_key(&second_key));
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &second,
+                    &format!("zeroclaw draft lifecycle smoke {stamp} second final"),
+                )
+                .await
+                .expect("finalize second draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.contains_key(&first_key));
+                assert!(!state.partial.contains_key(&second_key));
+            }
+
+            channel
+                .cancel_draft(&room_id, &first)
+                .await
+                .expect("cancel first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.is_empty());
+            }
         }
     }
 
