@@ -28,7 +28,9 @@ The script:
 1. Checks for `rustup`; downloads `rustup-init.exe` and installs stable toolchain if missing
 2. Builds (or downloads) the binary
 3. Installs to `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`
-4. Runs `zeroclaw onboard` automatically
+4. Prints mode-specific next steps:
+   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw onboard`
+   - `--minimal`: onboarding is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
 
 For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
 
@@ -124,7 +126,10 @@ zeroclaw service uninstall
 Remove the binary:
 
 ```cmd
-:: setup.bat / cargo install
+:: setup.bat
+del "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
+
+:: cargo install
 del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
 
 :: Scoop

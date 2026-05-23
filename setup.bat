@@ -294,8 +294,14 @@ echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
+if /I "%MODE%"=="minimal" (
+echo     2. Minimal build excludes onboarding ^(zeroclaw onboard is unavailable^)
+echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
+) else (
 echo     2. Run: zeroclaw onboard
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
+)
 echo.
 echo   Alternative install via Scoop:
 echo     scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
