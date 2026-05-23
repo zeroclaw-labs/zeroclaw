@@ -31,11 +31,25 @@ instance:
 
   services.zeroclaw.instances.me = {
     environmentFile = config.age.secrets.zeroclaw-bot-token.path;
+    # `settings` mirrors `~/.zeroclaw/config.toml` as a Nix attrset. The
+    # config schema (section headers, type/alias convention, required
+    # fields) is documented at
+    # https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/book/src/providers/configuration.md
     settings = {
-      default_provider = "anthropic";
-      default_model = "claude-sonnet-4-6";
+      providers.models.anthropic.home = {           # type = anthropic; alias = home (you choose)
+        model = "claude-sonnet-4-6";
+        api_key = "sk-ant-...";                     # or inject via env (see "Secrets pattern" below)
+      };
 
-      channels.telegram = {
+      agents.assistant = {                          # alias = assistant (you choose)
+        model_provider = "anthropic.home";          # <type>.<alias> reference
+        risk_profile = "assistant";
+        channels = [ "telegram.home" ];             # <type>.<alias> reference
+      };
+
+      risk_profiles.assistant = { };                # must match agents.assistant.risk_profile
+
+      channels.telegram.home = {                    # type = telegram; alias = home (you choose)
         enabled = true;
         # The unit's ExecStartPre runs `envsubst` over the rendered
         # TOML. `$BOT_TOKEN` is read from the EnvironmentFile= and

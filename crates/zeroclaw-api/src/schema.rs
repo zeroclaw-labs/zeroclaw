@@ -1,12 +1,12 @@
 //! JSON Schema cleaning and validation for LLM tool-calling compatibility.
 //!
-//! Different providers support different subsets of JSON Schema. This module
+//! Different model_providers support different subsets of JSON Schema. This module
 //! normalizes tool schemas to improve cross-provider compatibility while
 //! preserving semantic intent.
 //!
 //! ## What this module does
 //!
-//! 1. Removes unsupported keywords per provider strategy
+//! 1. Removes unsupported keywords per model_provider strategy
 //! 2. Resolves local `$ref` entries from `$defs` and `definitions`
 //! 3. Flattens literal `anyOf` / `oneOf` unions into `enum`
 //! 4. Strips nullable variants from unions and `type` arrays
@@ -88,7 +88,7 @@ pub const GEMINI_UNSUPPORTED_KEYWORDS: &[&str] = &[
 /// Keywords that should be preserved during cleaning (metadata).
 const SCHEMA_META_KEYS: &[&str] = &["description", "title", "default"];
 
-/// Schema cleaning strategies for different LLM providers.
+/// Schema cleaning strategies for different LLM model_providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleaningStrategy {
     /// Gemini (Google AI / Vertex AI) - Most restrictive
@@ -153,7 +153,7 @@ impl SchemaCleanr {
     pub fn validate(schema: &Value) -> anyhow::Result<()> {
         let obj = schema
             .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Schema must be an object"))?;
+            .ok_or_else(|| anyhow::Error::msg("Schema must be an object"))?;
 
         // Must have 'type' field
         if !obj.contains_key("type") {
@@ -165,7 +165,7 @@ impl SchemaCleanr {
             && t == "object"
             && !obj.contains_key("properties")
         {
-            tracing::warn!("Object schema without 'properties' field may cause issues");
+            eprintln!("warn: Object schema without 'properties' field may cause issues");
         }
 
         Ok(())
@@ -298,7 +298,7 @@ impl SchemaCleanr {
     ) -> Value {
         // Prevent circular references
         if ref_stack.contains(ref_value) {
-            tracing::warn!("Circular $ref detected: {}", ref_value);
+            eprintln!("warn: Circular $ref detected: {}", ref_value);
             return Self::preserve_meta(obj, Value::Object(Map::new()));
         }
 
@@ -313,7 +313,7 @@ impl SchemaCleanr {
         }
 
         // Can't resolve: return empty object with metadata
-        tracing::warn!("Cannot resolve $ref: {}", ref_value);
+        eprintln!("warn: Cannot resolve $ref: {}", ref_value);
         Self::preserve_meta(obj, Value::Object(Map::new()))
     }
 

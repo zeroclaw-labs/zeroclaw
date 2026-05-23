@@ -56,7 +56,17 @@ impl Tool for ReadSkillTool {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "name"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing 'name' parameter")
+            })?;
 
         let skills = crate::skills::load_skills_with_open_skills_settings(
             &self.workspace_dir,

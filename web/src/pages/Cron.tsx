@@ -2,6 +2,7 @@ import type { CronSettings } from '@/lib/api';
 import {
   addCronJob,
   deleteCronJob,
+  getAgentOptions,
   getCronJobs,
   getCronRuns,
   getCronSettings,
@@ -9,6 +10,7 @@ import {
   patchCronSettings,
   triggerCronJob,
 } from '@/lib/api';
+import { agentBoundChannels, type AgentBoundChannel } from '@/lib/agentChannels';
 import { t } from '@/lib/i18n';
 import type { CronJob, CronRun } from '@/types/api';
 import {
@@ -187,6 +189,13 @@ export default function Cron() {
   const [formModel, setFormModel] = useState('');
   const [formSessionTarget, setFormSessionTarget] = useState<'isolated' | 'main'>('isolated');
   const [formAllowedTools, setFormAllowedTools] = useState('');
+  const [formAgent, setFormAgent] = useState('');
+  const [formDeliveryMode, setFormDeliveryMode] = useState<'none' | 'announce'>('none');
+  const [formDeliveryChannel, setFormDeliveryChannel] = useState('');
+  const [formDeliveryTo, setFormDeliveryTo] = useState('');
+  const [formDeliveryBestEffort, setFormDeliveryBestEffort] = useState(true);
+  const [agentOptions, setAgentOptions] = useState<string[]>([]);
+  const [boundChannels, setBoundChannels] = useState<AgentBoundChannel[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -202,6 +211,11 @@ export default function Cron() {
     setFormModel('');
     setFormSessionTarget('isolated');
     setFormAllowedTools('');
+    setFormAgent(agentOptions[0] ?? '');
+    setFormDeliveryMode('none');
+    setFormDeliveryChannel('');
+    setFormDeliveryTo('');
+    setFormDeliveryBestEffort(true);
     setFormError(null);
     setModalJob('add');
   };
@@ -212,6 +226,19 @@ export default function Cron() {
     setFormSchedule(job.expression);
     setFormTimezone(scheduleTimezone(job) ?? '');
     setFormJobType(jobType);
+    setFormAgent((job as CronJob & { agent_alias?: string }).agent_alias ?? 'default');
+    const delivery = job.delivery;
+    if (delivery && (delivery.mode === 'announce' || delivery.mode === 'none')) {
+      setFormDeliveryMode(delivery.mode);
+      setFormDeliveryChannel(delivery.channel ?? '');
+      setFormDeliveryTo(delivery.to ?? '');
+      setFormDeliveryBestEffort(delivery.best_effort ?? true);
+    } else {
+      setFormDeliveryMode('none');
+      setFormDeliveryChannel('');
+      setFormDeliveryTo('');
+      setFormDeliveryBestEffort(true);
+    }
     if (jobType === 'agent') {
       setFormPrompt(job.prompt ?? '');
       setFormCommand('');
@@ -265,7 +292,37 @@ export default function Cron() {
   useEffect(() => {
     fetchJobs();
     fetchSettings();
+    void getAgentOptions()
+      .then((opts) => {
+        setAgentOptions(opts.agents);
+        // Pre-seed the agent field with the first option so the
+        // Add modal doesn't open with an empty required dropdown.
+        setFormAgent((current) => current || opts.agents[0] || '');
+      })
+      .catch(() => {
+        /* swallow: form will show an empty agent list */
+      });
   }, []);
+
+  // When the picked agent changes, refresh the bound-channels list so the
+  // delivery-channel picker stays scoped to channels that agent owns.
+  useEffect(() => {
+    if (!formAgent) {
+      setBoundChannels([]);
+      return;
+    }
+    let cancelled = false;
+    void agentBoundChannels(formAgent)
+      .then((list) => {
+        if (!cancelled) setBoundChannels(list);
+      })
+      .catch(() => {
+        if (!cancelled) setBoundChannels([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [formAgent]);
 
   const handleSubmit = async () => {
     const isAgent = formJobType === 'agent';
@@ -283,6 +340,24 @@ export default function Cron() {
     }
     setSubmitting(true);
     setFormError(null);
+
+    if (!isEditing && !formAgent.trim()) {
+      setFormError(t('cron.agent_required_error') || 'Pick an agent for this cron job');
+      setSubmitting(false);
+      return;
+    }
+    if (formDeliveryMode === 'announce') {
+      if (!formDeliveryChannel.trim()) {
+        setFormError('Delivery channel is required when announce mode is selected');
+        setSubmitting(false);
+        return;
+      }
+      if (!formDeliveryTo.trim()) {
+        setFormError('Delivery target (room id / user id / address) is required for announce mode');
+        setSubmitting(false);
+        return;
+      }
+    }
 
     try {
       if (isEditing) {
@@ -309,6 +384,7 @@ export default function Cron() {
         setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
       } else {
         const body: Parameters<typeof addCronJob>[0] = {
+          agent: formAgent.trim(),
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
           job_type: formJobType,
@@ -326,6 +402,14 @@ export default function Cron() {
           if (parsedTools.length > 0) body.allowed_tools = parsedTools;
         } else {
           body.command = formCommand.trim();
+        }
+        if (formDeliveryMode === 'announce') {
+          body.delivery = {
+            mode: 'announce',
+            channel: formDeliveryChannel.trim(),
+            to: formDeliveryTo.trim(),
+            best_effort: formDeliveryBestEffort,
+          };
         }
         const job = await addCronJob(body);
         setJobs((prev) => [...prev, job]);
@@ -463,7 +547,7 @@ export default function Cron() {
       {/* Unified Add / Edit Modal */}
       {modalJob !== null && (
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
-          <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale mt-15">
+          <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale mt-15 max-h-9/10 overflow-auto">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
                 {isEditing ? t('cron.edit_modal_title') : t('cron.add_modal_title')}
@@ -522,6 +606,31 @@ export default function Cron() {
                   </div>
                 )}
               </div>
+              {!isEditing && (
+                <div>
+                  <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                    Agent <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                  </label>
+                  <select
+                    value={formAgent}
+                    onChange={(e) => setFormAgent(e.target.value)}
+                    className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
+                  >
+                    {agentOptions.length === 0 ? (
+                      <option value="">no configured agents</option>
+                    ) : (
+                      agentOptions.map((alias) => (
+                        <option key={alias} value={alias}>
+                          agents.{alias}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <p className="text-xs mt-1" style={{ color: 'var(--pc-text-faint)' }}>
+                    Runs under this agent's risk profile, model provider, and channel bindings.
+                  </p>
+                </div>
+              )}
               <div>
                 <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
                   {t('cron.name_optional')}
@@ -627,6 +736,86 @@ export default function Cron() {
                     </>
                   )}
                 </>
+              )}
+
+              {/* Delivery section — scoped to the picked agent's channel
+                  bindings. The channel composite + identity field
+                  (matrix user_id, discord guild_ids, ...) come from the
+                  agentBoundChannels helper so the operator sees exactly
+                  which channel goes where. Dangling channel refs are
+                  accepted on add; the scheduler logs loudly when a
+                  dangling delivery fires. */}
+              {!isEditing && (
+                <div className="border-t pt-4" style={{ borderColor: 'var(--pc-border)' }}>
+                  <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                    Delivery
+                  </label>
+                  <div className="flex gap-2 mb-2">
+                    <button
+                      type="button"
+                      onClick={() => setFormDeliveryMode('none')}
+                      className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'none'
+                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                        }`}
+                      style={formDeliveryMode === 'none' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                    >
+                      none
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFormDeliveryMode('announce')}
+                      className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${formDeliveryMode === 'announce'
+                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                        }`}
+                      style={formDeliveryMode === 'announce' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                    >
+                      announce
+                    </button>
+                  </div>
+                  {formDeliveryMode === 'announce' && (
+                    <div className="space-y-2">
+                      <select
+                        value={formDeliveryChannel}
+                        onChange={(e) => setFormDeliveryChannel(e.target.value)}
+                        className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
+                      >
+                        <option value="">
+                          {boundChannels.length === 0
+                            ? 'no channels bound on this agent'
+                            : 'select a channel...'}
+                        </option>
+                        {boundChannels.map((ch) => (
+                          <option key={ch.composite} value={ch.composite}>
+                            {ch.composite}
+                            {ch.identity ? ` — ${ch.identity}` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        value={formDeliveryTo}
+                        onChange={(e) => setFormDeliveryTo(e.target.value)}
+                        placeholder="target (room id, user id, channel id, address...)"
+                        className="input-electric w-full px-3 py-2 text-sm font-mono"
+                      />
+                      <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                        <input
+                          type="checkbox"
+                          checked={formDeliveryBestEffort}
+                          onChange={(e) => setFormDeliveryBestEffort(e.target.checked)}
+                        />
+                        best-effort: log on failure, don't mark the job as errored
+                      </label>
+                      <p className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+                        Channels from <code className="font-mono">agents.{formAgent || '<agent>'}.channels</code>.
+                        Picking one that isn't configured yet is allowed; the scheduler will warn
+                        loudly when the job fires.
+                      </p>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             <div className="flex justify-end gap-3 mt-6">

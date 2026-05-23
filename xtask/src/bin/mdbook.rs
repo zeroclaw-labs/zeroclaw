@@ -27,9 +27,9 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider name from [providers.models.<name>] in config.toml
+        /// ModelProvider name from [providers.models.<name>] in config.toml
         #[arg(long)]
-        provider: Option<String>,
+        model_provider: Option<String>,
         /// Entries per API call (default: 50)
         #[arg(long)]
         batch: Option<usize>,
@@ -51,9 +51,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Sync {
             locale,
             force,
-            provider,
+            model_provider,
             batch,
-        } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref(), batch),
+        } => cmd::mdbook::sync::run(locale.as_deref(), force, model_provider.as_deref(), batch),
         Cmd::Stats => cmd::mdbook::stats::run(),
         Cmd::Check => cmd::mdbook::check::run(),
         Cmd::Locales => {

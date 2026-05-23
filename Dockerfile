@@ -115,10 +115,8 @@ RUN size=$(stat -c%s /app/zeroclaw) && \
 # Prepare runtime directory structure and default config inline (no extra stage).
 # Dashboard assets live at /usr/share/zeroclawlabs/web/dist (outside the documented
 # /zeroclaw-data mount point) so a bind mount on /zeroclaw-data cannot shadow them.
-RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'workspace_dir = "/zeroclaw-data/workspace"' \
-        'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
         'api_key = ""' \
         'default_provider = "openrouter"' \
         'default_model = "anthropic/claude-sonnet-4-20250514"' \
@@ -131,7 +129,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'require_pairing = false' \
         'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
         '' \
-        '[autonomy]' \
+        '[risk_profiles.default]' \
         'level = "supervised"' \
         'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
@@ -159,16 +157,16 @@ RUN chown 65534:65534 /zeroclaw-data/.zeroclaw/config.toml
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
-# Use consistent workspace path
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+# Bootstrap (uppercase tail) — pre-load: decides where the config file lives.
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
-# Defaults for local dev (Ollama) - matches config.template.toml
-ENV PROVIDER="ollama"
-ENV ZEROCLAW_MODEL="llama3.2"
-ENV ZEROCLAW_GATEWAY_PORT=42617
-
-# Note: API_KEY is intentionally NOT set here to avoid confusion.
-# It is set in config.toml as the Ollama URL.
+# V0.8.0 env-var grammar: `ZEROCLAW_<dotted_path_with_double_underscores>=<value>`
+# mirrors the TOML config 1:1; `__` is the path separator. Operators inject
+# credentials and runtime knobs at `docker run -e ...` (or via docker-compose
+# `environment:`). Legacy `PROVIDER`, `ZEROCLAW_MODEL`, `ANTHROPIC_API_KEY`,
+# `API_KEY`, etc. fallbacks were eradicated. Example:
+#   docker run -e ZEROCLAW_providers__models__anthropic__default__api_key=sk-ant-... ...
+ENV ZEROCLAW_gateway__port=42617
 
 WORKDIR /zeroclaw-data
 USER 65534:65534
@@ -190,7 +188,7 @@ COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 # Default provider and model are set in config.toml, not here,
 # so config file edits are not silently overridden

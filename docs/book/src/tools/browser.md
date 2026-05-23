@@ -34,12 +34,14 @@ zeroclaw config set browser.allowed-domains '["example.com", "docs.example.com"]
 zeroclaw config set browser.enabled false
 ```
 
+For the `agent_browser` backend, set `browser.headed = true` to launch the browser in headed mode for debugging or first-time login setup, or `browser.headed = false` to force headless mode. When `browser.headed` is unset, Zeroclaw preserves the inherited `AGENT_BROWSER_HEADED` environment behavior. The rust-native backend continues to use `browser.native_headless`.
+
 See the [Config reference](../reference/config.md) for all browser fields and defaults.
 
 ### 3. Test
 
 ```bash
-echo "Open https://example.com and tell me what it says" | zeroclaw agent
+echo "Open https://example.com and tell me what it says" | zeroclaw agent -a assistant
 ```
 
 ## VNC Setup (GUI Access)
@@ -148,13 +150,13 @@ agent-browser close
 
 ```bash
 # Content extraction
-echo "Open https://example.com and summarize it" | zeroclaw agent
+echo "Open https://example.com and summarize it" | zeroclaw agent -a assistant
 
 # Navigation
-echo "Go to https://github.com/trending and list the top 3 repos" | zeroclaw agent
+echo "Go to https://github.com/trending and list the top 3 repos" | zeroclaw agent -a assistant
 
 # Form interaction
-echo "Go to Wikipedia, search for 'Rust programming language', and summarize" | zeroclaw agent
+echo "Go to Wikipedia, search for 'Rust programming language', and summarize" | zeroclaw agent -a assistant
 ```
 
 ## Troubleshooting

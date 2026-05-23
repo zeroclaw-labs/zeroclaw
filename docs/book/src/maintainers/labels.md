@@ -18,7 +18,7 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 |---|---|
 | `docs` | `docs/**`, `**/*.md`, `**/*.mdx`, `LICENSE`, `.markdownlint-cli2.yaml` |
 | `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
-| `ci` | `.github/**`, `.githooks/**` |
+| `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
 | `agent` | `src/agent/**` |
 | `channel` | `src/channels/**` |
@@ -45,6 +45,8 @@ Applied automatically by `pr-path-labeler.yml` (the only labeling automation cur
 | `scripts` | `scripts/**` |
 | `dev` | `dev/**` |
 
+`ci` is scoped to GitHub automation/config files, not all `.github/**` paths. The root `.github/*.json` matcher is intentional for automation metadata (for example `.github/label-policy.json`), so files like `.github/assets/**`, `.github/ISSUE_TEMPLATE/**`, `.github/CODEOWNERS`, and `.github/pull_request_template.md` do not match `ci`.
+
 ### Per-channel labels
 
 Each channel gets a `channel:<name>` label in addition to the base `channel` label.
@@ -55,7 +57,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
 | `channel:dingtalk` | `dingtalk.rs` |
-| `channel:discord` | `discord.rs`, `discord_history.rs` |
+| `channel:discord` | `discord.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |
@@ -86,7 +88,6 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `provider:anthropic` | `anthropic.rs` |
 | `provider:azure-openai` | `azure_openai.rs` |
 | `provider:bedrock` | `bedrock.rs` |
-| `provider:claude-code` | `claude_code.rs` |
 | `provider:compatible` | `compatible.rs` |
 | `provider:copilot` | `copilot.rs` |
 | `provider:gemini` | `gemini.rs`, `gemini_cli.rs` |

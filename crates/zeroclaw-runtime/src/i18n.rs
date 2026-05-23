@@ -63,9 +63,11 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
 }
 
 fn missing_cli_string(key: &str) -> String {
-    tracing::warn!(
-        error_key = "i18n.missing_cli_string",
-        key,
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"error_key": "i18n.missing_cli_string", "key": key})),
         "missing CLI Fluent string"
     );
     format!("{{{key}}}")
@@ -193,7 +195,12 @@ fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
     let search_paths = [workspace_path];
     for path in search_paths.into_iter().flatten() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            tracing::debug!(path = %path.display(), "loaded locale FTL from disk");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path.display().to_string()})),
+                "loaded locale FTL from disk"
+            );
             return Some(content);
         }
     }
@@ -506,150 +513,6 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn channel_runtime_cli_strings_format_from_fluent() {
-        let keys = [
-            (
-                "channel-runtime-current-route",
-                &[("provider", "openrouter"), ("model", "gpt-test")][..],
-                ["openrouter", "gpt-test"].as_slice(),
-            ),
-            (
-                "channel-runtime-switch-model-help",
-                &[][..],
-                ["/model <model-id>"].as_slice(),
-            ),
-            (
-                "channel-runtime-configured-model-routes",
-                &[][..],
-                [].as_slice(),
-            ),
-            (
-                "channel-runtime-no-cached-models",
-                &[("provider", "openrouter")][..],
-                ["openrouter", "zeroclaw models refresh"].as_slice(),
-            ),
-            (
-                "channel-runtime-cached-models",
-                &[("count", "10")][..],
-                ["10"].as_slice(),
-            ),
-            (
-                "channel-runtime-switch-provider-help",
-                &[][..],
-                ["/models <provider>"].as_slice(),
-            ),
-            (
-                "channel-runtime-switch-model-command-help",
-                &[][..],
-                ["/model <model-id>"].as_slice(),
-            ),
-            (
-                "channel-runtime-available-providers",
-                &[][..],
-                [].as_slice(),
-            ),
-            (
-                "channel-runtime-provider-aliases",
-                &[("aliases", "anthropic, claude")][..],
-                ["anthropic, claude"].as_slice(),
-            ),
-            (
-                "channel-runtime-use-models-and-model",
-                &[][..],
-                ["/models <provider>", "/model <model-id>"].as_slice(),
-            ),
-            (
-                "channel-runtime-provider-switched",
-                &[("provider", "openrouter"), ("model", "gpt-test")][..],
-                ["openrouter", "gpt-test", "/model <model-id>"].as_slice(),
-            ),
-            (
-                "channel-runtime-provider-init-failed",
-                &[("provider", "openrouter"), ("details", "401 unauthorized")][..],
-                ["openrouter", "401 unauthorized"].as_slice(),
-            ),
-            (
-                "channel-runtime-provider-unavailable",
-                &[("provider", "openrouter"), ("details", "401 unauthorized")][..],
-                ["openrouter", "401 unauthorized", "/models"].as_slice(),
-            ),
-            (
-                "channel-runtime-unknown-provider",
-                &[("provider", "unknown")][..],
-                ["unknown", "/models"].as_slice(),
-            ),
-            (
-                "channel-runtime-model-id-empty",
-                &[][..],
-                ["/model <model-id>"].as_slice(),
-            ),
-            (
-                "channel-runtime-model-switched",
-                &[("provider", "openrouter"), ("model", "gpt-test")][..],
-                ["openrouter", "gpt-test"].as_slice(),
-            ),
-            ("channel-runtime-new-session", &[][..], [].as_slice()),
-            ("channel-runtime-stop-sent", &[][..], [].as_slice()),
-            ("channel-runtime-stop-none", &[][..], [].as_slice()),
-            (
-                "channel-runtime-malformed-tool-output",
-                &[][..],
-                [].as_slice(),
-            ),
-            (
-                "channel-runtime-fallback-footer",
-                &[
-                    ("requested_provider", "openai"),
-                    ("actual_provider", "anthropic"),
-                    ("actual_model", "claude-test"),
-                ][..],
-                ["openai", "anthropic", "claude-test", "/models"].as_slice(),
-            ),
-            (
-                "channel-runtime-tool-receipts-header",
-                &[][..],
-                [].as_slice(),
-            ),
-            (
-                "channel-runtime-context-window-exceeded-compacted",
-                &[][..],
-                [].as_slice(),
-            ),
-            (
-                "channel-runtime-context-window-exceeded",
-                &[][..],
-                [].as_slice(),
-            ),
-            ("channel-runtime-request-timed-out", &[][..], [].as_slice()),
-            (
-                "channel-runtime-config-block-title",
-                &[("provider", "openrouter"), ("model", "gpt-test")][..],
-                ["openrouter", "gpt-test"].as_slice(),
-            ),
-            ("channel-runtime-select-provider", &[][..], [].as_slice()),
-            ("channel-runtime-select-model", &[][..], [].as_slice()),
-            ("channel-runtime-provider-label", &[][..], [].as_slice()),
-            ("channel-runtime-model-label", &[][..], [].as_slice()),
-        ];
-        for source in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
-            for (key, args, expected_parts) in keys {
-                let value = format_ftl_message(source.0, source.1, key, args)
-                    .unwrap_or_else(|| panic!("{key} should format in {}", source.1));
-                for expected in expected_parts {
-                    assert!(
-                        value.contains(expected),
-                        "{key} in {} should preserve {expected}",
-                        source.1
                     );
                 }
             }

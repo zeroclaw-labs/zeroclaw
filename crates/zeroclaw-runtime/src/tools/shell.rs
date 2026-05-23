@@ -79,6 +79,60 @@ impl ShellTool {
     }
 }
 
+/// Decode raw process output bytes to a UTF-8 String.
+///
+/// On Windows, cmd.exe emits bytes in the active console output code page
+/// (e.g. CP936/GBK on Simplified Chinese systems). We query the code page at
+/// runtime and transcode via `encoding_rs` so non-ASCII characters survive
+/// intact instead of being replaced by U+FFFD.
+///
+/// On all other platforms the shell runs under the user's locale (usually
+/// UTF-8 already), so `from_utf8_lossy` is sufficient.
+#[cfg(target_os = "windows")]
+fn decode_output(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::GetACP;
+    use windows::Win32::System::Console::GetConsoleOutputCP;
+
+    let cp = unsafe { GetConsoleOutputCP() };
+    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
+
+    let encoding = windows_code_page_to_encoding(cp);
+    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
+        cow.into_owned()
+    }
+}
+
+/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
+/// Falls back to UTF-8 (lossy) for unknown code pages.
+#[cfg(target_os = "windows")]
+fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
+    match cp {
+        932 => encoding_rs::SHIFT_JIS,
+        936 | 54936 => encoding_rs::GBK,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1252 => encoding_rs::WINDOWS_1252,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        20127 | 65001 => encoding_rs::UTF_8,
+        _ => encoding_rs::UTF_8,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -139,7 +193,17 @@ impl Tool for ShellTool {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "command"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing 'command' parameter")
+            })?;
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
@@ -176,9 +240,16 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut()
         // to get a mutable reference to the underlying command.
-        self.sandbox
-            .wrap_command(cmd.as_std_mut())
-            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "shell tool: sandbox wrap_command failed"
+            );
+            anyhow::Error::msg(format!("Sandbox error: {e}"))
+        })?;
 
         cmd.env_clear();
 
@@ -193,8 +264,8 @@ impl Tool for ShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let mut stdout = decode_output(&output.stdout);
+                let mut stderr = decode_output(&output.stderr);
 
                 // Truncate output to prevent OOM
                 if stdout.len() > MAX_OUTPUT_BYTES {
@@ -652,6 +723,64 @@ mod tests {
     }
 
     // ── Non-UTF8 binary output tests ────────────────────
+
+    #[test]
+    fn decode_output_valid_utf8_roundtrips() {
+        let input = "hello 世界 🌍".as_bytes();
+        assert_eq!(super::decode_output(input), "hello 世界 🌍");
+    }
+
+    #[test]
+    fn decode_output_invalid_utf8_uses_replacement_chars() {
+        // 0xFF is not valid UTF-8
+        let input = b"hello\xFF world";
+        let result = super::decode_output(input);
+        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+    }
+
+    #[test]
+    fn decode_output_empty_bytes_returns_empty_string() {
+        assert_eq!(super::decode_output(b""), "");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_covers_cjk() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
+        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
+        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
+        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_utf8_variants() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
+        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decode_output_gbk_bytes_transcode_to_utf8() {
+        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
+        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
+        // When the console code page is GBK (936), windows_code_page_to_encoding
+        // returns GBK and decodes correctly.  We test the transcoding function
+        // directly since we cannot control GetConsoleOutputCP in unit tests.
+        let (cow, _enc, _errors) = encoding_rs::GBK.decode(gbk_bytes);
+        assert_eq!(cow.as_ref(), "你好");
+    }
 
     #[test]
     fn shell_safe_env_vars_excludes_secrets() {

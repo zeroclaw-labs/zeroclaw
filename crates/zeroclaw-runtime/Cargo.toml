@@ -10,6 +10,7 @@ publish = false
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
@@ -63,7 +64,6 @@ tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
-tracing = { version = "0.1", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
@@ -87,7 +87,8 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_Globalization"] }
+encoding_rs = "0.8"
 
 [features]
 default = ["observability-prometheus", "schema-export"]

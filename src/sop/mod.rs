@@ -4,7 +4,7 @@ pub use zeroclaw_runtime::sop::*;
 use anyhow::Result;
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.workspace_dir;
+    let workspace_dir = &config.data_dir;
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
     let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
 
@@ -75,10 +75,16 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             Ok(())
         }
         crate::SopCommands::Show { name } => {
-            let sop = sops
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| anyhow::anyhow!("SOP not found: {name}"))?;
+            let sop = sops.iter().find(|s| s.name == name).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sop": name})),
+                    "sop show: name not found in loaded SOPs"
+                );
+                anyhow::Error::msg(format!("SOP not found: {name}"))
+            })?;
 
             println!(
                 "{} v{}",

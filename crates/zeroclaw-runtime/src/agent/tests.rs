@@ -1,6 +1,6 @@
 //! Comprehensive agent-loop test suite.
 //!
-//! Tests exercise the full `Agent.turn()` cycle with mock providers and tools,
+//! Tests exercise the full `Agent.turn()` cycle with mock model_providers and tools,
 //! covering every edge case an agentic tool loop must handle:
 //!
 //!   1. Simple text response (no tools)
@@ -33,26 +33,28 @@ use crate::tools::{Tool, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use zeroclaw_config::schema::{AgentConfig, MemoryConfig};
+use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig};
 use zeroclaw_memory::{self, Memory};
+
+zeroclaw_api::mock_tool_attribution!(CountingTool, EchoTool, FailingTool, PanickingTool);
 use zeroclaw_providers::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider, ToolCall,
     ToolResultMessage,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test Helpers — Mock Provider, Mock Tool, Mock Memory
+// Test Helpers — Mock ModelProvider, Mock Tool, Mock Memory
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A mock LLM provider that returns pre-scripted responses in order.
+/// A mock LLM model_provider that returns pre-scripted responses in order.
 /// When the queue is exhausted it returns a simple "done" text response.
-struct ScriptedProvider {
+struct ScriptedModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
     /// Records every request for assertion.
     requests: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
-impl ScriptedProvider {
+impl ScriptedModelProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
@@ -67,7 +69,7 @@ impl ScriptedProvider {
 }
 
 #[async_trait]
-impl Provider for ScriptedProvider {
+impl ModelProvider for ScriptedModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -101,12 +103,24 @@ impl Provider for ScriptedProvider {
         Ok(guard.remove(0))
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for ScriptedModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ScriptedModelProvider"
+    }
+}
 
-/// A mock provider that always returns an error.
-struct FailingProvider;
+/// A mock model_provider that always returns an error.
+struct FailingModelProvider;
 
 #[async_trait]
-impl Provider for FailingProvider {
+impl ModelProvider for FailingModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -114,7 +128,7 @@ impl Provider for FailingProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<String> {
-        anyhow::bail!("provider error")
+        anyhow::bail!("model_provider error")
     }
 
     async fn chat(
@@ -123,7 +137,19 @@ impl Provider for FailingProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        anyhow::bail!("provider error")
+        anyhow::bail!("model_provider error")
+    }
+}
+impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "FailingModelProvider"
     }
 }
 
@@ -253,12 +279,12 @@ impl Tool for CountingTool {
     }
 }
 
-struct ToolSpecCaptureProvider {
+struct ToolSpecCaptureModelProvider {
     tools_received: Arc<Mutex<Vec<bool>>>,
     responses: Mutex<Vec<ChatResponse>>,
 }
 
-impl ToolSpecCaptureProvider {
+impl ToolSpecCaptureModelProvider {
     fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<bool>>>) {
         let tools_received = Arc::new(Mutex::new(Vec::new()));
         (
@@ -272,7 +298,7 @@ impl ToolSpecCaptureProvider {
 }
 
 #[async_trait]
-impl Provider for ToolSpecCaptureProvider {
+impl ModelProvider for ToolSpecCaptureModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -304,6 +330,18 @@ impl Provider for ToolSpecCaptureProvider {
         true
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for ToolSpecCaptureModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ToolSpecCaptureModelProvider"
+    }
+}
 
 fn make_memory() -> Arc<dyn Memory> {
     let cfg = MemoryConfig {
@@ -328,12 +366,12 @@ fn make_observer() -> Arc<dyn Observer> {
 }
 
 fn build_agent_with(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     dispatcher: Box<dyn ToolDispatcher>,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -344,13 +382,13 @@ fn build_agent_with(
 }
 
 fn build_agent_with_memory(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     mem: Arc<dyn Memory>,
     auto_save: bool,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(mem)
         .observer(make_observer())
@@ -362,12 +400,12 @@ fn build_agent_with_memory(
 }
 
 fn build_agent_with_config(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    config: AgentConfig,
+    config: AliasedAgentConfig,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -416,9 +454,11 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "Hello world",
+    )]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -426,13 +466,13 @@ async fn turn_returns_text_when_no_tools_called() {
     let response = agent.turn("hi").await.unwrap();
     assert!(
         !response.is_empty(),
-        "Expected non-empty text response from provider"
+        "Expected non-empty text response from model_provider"
     );
 }
 
 #[tokio::test]
 async fn turn_with_no_effective_tools_treats_xml_tool_call_as_text() {
-    let provider = Box::new(ScriptedProvider::new(vec![xml_tool_response(
+    let provider = Box::new(ScriptedModelProvider::new(vec![xml_tool_response(
         "echo",
         r#"{"message":"hi"}"#,
     )]));
@@ -452,7 +492,7 @@ async fn turn_with_no_effective_tools_treats_xml_tool_call_as_text() {
 
 #[tokio::test]
 async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response(
+    let provider = Box::new(ScriptedModelProvider::new(vec![text_response(
         "<think>hidden scratchpad</think>visible answer",
     )]));
     let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
@@ -465,7 +505,7 @@ async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
 #[tokio::test]
 async fn turn_with_no_effective_tools_does_not_send_empty_native_tool_specs() {
     let (provider, tools_received) =
-        ToolSpecCaptureProvider::new(vec![text_response("plain response")]);
+        ToolSpecCaptureModelProvider::new(vec![text_response("plain response")]);
     let mut agent = build_agent_with(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
 
     let response = agent.turn("hi").await.unwrap();
@@ -484,7 +524,7 @@ async fn turn_with_no_effective_tools_does_not_send_empty_native_tool_specs() {
 
 #[tokio::test]
 async fn turn_executes_single_tool_then_returns() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -495,7 +535,7 @@ async fn turn_executes_single_tool_then_returns() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -515,7 +555,7 @@ async fn turn_executes_single_tool_then_returns() {
 async fn turn_handles_multi_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -538,7 +578,7 @@ async fn turn_handles_multi_step_tool_chain() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(counting_tool)],
         Box::new(NativeToolDispatcher),
     );
@@ -569,14 +609,14 @@ async fn turn_bails_out_at_max_iterations() {
         }]));
     }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
+    let model_provider = Box::new(ScriptedModelProvider::new(responses));
 
-    let config = AgentConfig {
+    let config = AliasedAgentConfig {
         max_tool_iterations: max_iters,
-        ..AgentConfig::default()
+        ..AliasedAgentConfig::default()
     };
 
-    let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
+    let mut agent = build_agent_with_config(model_provider, vec![Box::new(EchoTool)], config);
 
     let result = agent.turn("infinite loop").await;
     assert!(result.is_err());
@@ -593,7 +633,7 @@ async fn turn_bails_out_at_max_iterations() {
 
 #[tokio::test]
 async fn turn_handles_unknown_tool_gracefully() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
@@ -604,7 +644,7 @@ async fn turn_handles_unknown_tool_gracefully() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -634,7 +674,7 @@ async fn turn_handles_unknown_tool_gracefully() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_failure() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "fail".into(),
@@ -645,7 +685,7 @@ async fn turn_recovers_from_tool_failure() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(FailingTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -659,7 +699,7 @@ async fn turn_recovers_from_tool_failure() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_error() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "panicker".into(),
@@ -670,7 +710,7 @@ async fn turn_recovers_from_tool_error() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(PanickingTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -683,19 +723,22 @@ async fn turn_recovers_from_tool_error() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. Provider error propagation
+// 7. ModelProvider error propagation
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn turn_propagates_provider_error() {
     let mut agent = build_agent_with(
-        Box::new(FailingProvider),
+        Box::new(FailingModelProvider),
         vec![],
         Box::new(NativeToolDispatcher),
     );
 
     let result = agent.turn("hello").await;
-    assert!(result.is_err(), "Expected provider error to propagate");
+    assert!(
+        result.is_err(),
+        "Expected model_provider error to propagate"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -710,13 +753,13 @@ async fn history_trims_after_max_messages() {
         responses.push(text_response("ok"));
     }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
-    let config = AgentConfig {
+    let model_provider = Box::new(ScriptedModelProvider::new(responses));
+    let config = AliasedAgentConfig {
         max_history_messages: max_history,
-        ..AgentConfig::default()
+        ..AliasedAgentConfig::default()
     };
 
-    let mut agent = build_agent_with_config(provider, vec![], config);
+    let mut agent = build_agent_with_config(model_provider, vec![], config);
 
     for i in 0..max_history + 5 {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
@@ -743,12 +786,12 @@ async fn history_trims_after_max_messages() {
 #[tokio::test]
 async fn auto_save_stores_only_user_messages_in_memory() {
     let (mem, _tmp) = make_sqlite_memory();
-    let provider = Box::new(ScriptedProvider::new(vec![text_response(
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
         "I remember everything",
     )]));
 
     let mut agent = build_agent_with_memory(
-        provider,
+        model_provider,
         vec![],
         mem.clone(),
         true, // auto_save enabled
@@ -781,10 +824,10 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 #[tokio::test]
 async fn auto_save_disabled_does_not_store() {
     let (mem, _tmp) = make_sqlite_memory();
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("hello")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("hello")]));
 
     let mut agent = build_agent_with_memory(
-        provider,
+        model_provider,
         vec![],
         mem.clone(),
         false, // auto_save disabled
@@ -802,13 +845,13 @@ async fn auto_save_disabled_does_not_store() {
 
 #[tokio::test]
 async fn xml_dispatcher_parses_and_loops() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         xml_tool_response("echo", r#"{"message": "xml-test"}"#),
         text_response("XML tool completed"),
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(XmlToolDispatcher),
     );
@@ -822,9 +865,9 @@ async fn xml_dispatcher_parses_and_loops() {
 
 #[tokio::test]
 async fn native_dispatcher_sends_tool_specs() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -848,14 +891,14 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 
 #[tokio::test]
 async fn turn_handles_empty_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let response = agent.turn("hi").await.unwrap();
     assert!(response.is_empty());
@@ -863,14 +906,14 @@ async fn turn_handles_empty_text_response() {
 
 #[tokio::test]
 async fn turn_handles_none_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     // Should not panic — falls back to empty string
     let response = agent.turn("hi").await.unwrap();
@@ -883,7 +926,7 @@ async fn turn_handles_none_text_response() {
 
 #[tokio::test]
 async fn turn_preserves_text_alongside_tool_calls() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         ChatResponse {
             text: Some("Let me check...".into()),
             tool_calls: vec![ToolCall {
@@ -899,7 +942,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -929,7 +972,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
 async fn turn_handles_multiple_tools_in_one_response() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -954,7 +997,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(counting_tool)],
         Box::new(NativeToolDispatcher),
     );
@@ -977,9 +1020,9 @@ async fn turn_handles_multiple_tools_in_one_response() {
 
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -998,12 +1041,12 @@ async fn system_prompt_injected_on_first_turn() {
 
 #[tokio::test]
 async fn system_prompt_not_duplicated_on_second_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("first"),
         text_response("second"),
     ]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -1025,7 +1068,7 @@ async fn system_prompt_not_duplicated_on_second_turn() {
 
 #[tokio::test]
 async fn history_contains_all_expected_entries_after_tool_loop() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -1036,7 +1079,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -1082,7 +1125,10 @@ async fn builder_fails_without_provider() {
         .workspace_dir(std::path::PathBuf::from("/tmp"))
         .build();
 
-    assert!(result.is_err(), "Building without provider should fail");
+    assert!(
+        result.is_err(),
+        "Building without model_provider should fail"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1091,13 +1137,13 @@ async fn builder_fails_without_provider() {
 
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("response 1"),
         text_response("response 2"),
         text_response("response 3"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let r1 = agent.turn("msg 1").await.unwrap();
     let len_after_1 = agent.history().len();
@@ -1318,7 +1364,7 @@ fn native_format_results_maps_tool_call_ids() {
     let results = vec![
         ToolExecutionResult {
             name: "a".into(),
-            output: format!("File: {}", image_path.display()),
+            output: format!("File: {}", image_path.display().to_string()),
             success: true,
             tool_call_id: Some("tc-001".into()),
         },
@@ -1357,7 +1403,7 @@ fn xml_format_results_wraps_local_image_paths() {
     let dispatcher = XmlToolDispatcher;
     let results = vec![ToolExecutionResult {
         name: "shell".into(),
-        output: format!("Saved image to {}", image_path.display()),
+        output: format!("Saved image to {}", image_path.display().to_string()),
         success: true,
         tool_call_id: None,
     }];
@@ -1421,7 +1467,7 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
             tool_call_id: "tc1".into(),
-            content: format!("Saved image to {}", image_path.display()),
+            content: format!("Saved image to {}", image_path.display().to_string()),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
@@ -1484,12 +1530,12 @@ fn native_dispatcher_returns_empty_instructions() {
 
 #[tokio::test]
 async fn clear_history_resets_conversation() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("first"),
         text_response("second"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let _ = agent.turn("hi").await.unwrap();
     assert!(!agent.history().is_empty());
@@ -1511,8 +1557,10 @@ async fn clear_history_resets_conversation() {
 
 #[tokio::test]
 async fn run_single_delegates_to_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("via run_single")]));
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "via run_single",
+    )]));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let response = agent.run_single("test").await.unwrap();
     assert!(

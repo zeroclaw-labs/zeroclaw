@@ -75,7 +75,7 @@ tool-memory-store = Store a fact, preference, or note in long-term memory. Use c
 
 tool-microsoft365 = Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API
 
-tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles
+tool-model-routing-config = Manage default model settings, scenario-based provider/model routes, classification rules, and aliased agent profiles
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
@@ -104,8 +104,6 @@ tool-sop-execute = Manually trigger a Standard Operating Procedure (SOP) by name
 tool-sop-list = List all loaded Standard Operating Procedures (SOPs) with their triggers, priority, step count, and active run count. Optionally filter by name or priority.
 
 tool-sop-status = Query SOP execution status. Provide run_id for a specific run, or sop_name to list runs for that SOP. With no arguments, shows all active runs.
-
-tool-swarm = Orchestrate a swarm of agents to collaboratively handle a task. Supports sequential (pipeline), parallel (fan-out/fan-in), and router (LLM-selected) strategies.
 
 tool-tool-search = Fetch full schema definitions for deferred MCP tools so they can be called. Use "select:name1,name2" for exact match or keywords to search.
 

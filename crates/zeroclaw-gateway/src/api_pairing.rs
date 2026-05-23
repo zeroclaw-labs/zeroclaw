@@ -231,11 +231,9 @@ impl DeviceRegistry {
 }
 
 /// Store for pending pairing requests.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PairingStore {
     pending: Mutex<Vec<PendingPairing>>,
-    #[allow(dead_code)] // WIP: will be used to cap pending pairing requests
-    max_pending: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,11 +246,8 @@ struct PendingPairing {
 }
 
 impl PairingStore {
-    pub fn new(max_pending: usize) -> Self {
-        Self {
-            pending: Mutex::new(Vec::new()),
-            max_pending,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn pending_count(&self) -> usize {

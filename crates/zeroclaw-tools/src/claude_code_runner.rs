@@ -121,10 +121,16 @@ impl Tool for ClaudeCodeRunnerTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "claude_code_runner: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
@@ -282,8 +288,10 @@ impl Tool for ClaudeCodeRunnerTool {
                 .args(["kill-session", "-t", &cleanup_session])
                 .output()
                 .await;
-            tracing::info!(
-                session = cleanup_session,
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session": cleanup_session})),
                 "Claude Code runner session TTL expired, cleaned up"
             );
         });

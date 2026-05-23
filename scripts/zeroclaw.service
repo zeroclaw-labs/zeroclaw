@@ -6,17 +6,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+User=@@RPI_USER@@
 SupplementaryGroups=gpio spi i2c
-WorkingDirectory=/home/pi/zeroclaw
-ExecStart=/home/pi/zeroclaw/zeroclaw gateway start
+WorkingDirectory=/home/@@RPI_USER@@/zeroclaw
+ExecStart=/home/@@RPI_USER@@/zeroclaw/zeroclaw gateway start
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/home/pi/zeroclaw/.env
+EnvironmentFile=/home/@@RPI_USER@@/zeroclaw/.env
 Environment=RUST_LOG=info
 
 # Expand ~ in config path
-Environment=HOME=/home/pi
+Environment=HOME=/home/@@RPI_USER@@
 
 [Install]
 WantedBy=multi-user.target

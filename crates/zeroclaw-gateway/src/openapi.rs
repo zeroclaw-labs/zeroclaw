@@ -10,7 +10,7 @@
 //!
 //! Cached behind a `OnceCell` because the spec is static per build.
 //!
-//! See #6175.
+//!
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -63,7 +63,7 @@ pub async fn handle_openapi_json() -> Response {
 pub fn build_spec() -> serde_json::Value {
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
-        PatchResponse, PropPutBody, PropResponse, SecretResponse,
+        PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
     };
     use zeroclaw_config::api_error::ConfigApiError;
 
@@ -85,6 +85,7 @@ pub fn build_spec() -> serde_json::Value {
             "MigrateResponse":  schema_value::<MigrateResponse>(),
             "DriftEntry":       schema_value::<DriftEntry>(),
             "DriftResponse":    schema_value::<DriftResponse>(),
+            "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
         },
         "securitySchemes": {
@@ -101,7 +102,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": true,
         "schema": { "type": "string" },
-        "description": "Dotted property path, e.g. `providers.fallback`."
+        "description": "Dotted property path, e.g. `agents.researcher.model_provider`."
     });
 
     let prefix_param = serde_json::json!({
@@ -117,7 +118,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": false,
         "schema": { "type": "string" },
-        "description": "Section prefix to scope the init pass (e.g. `providers`)."
+        "description": "Section prefix to scope the init pass (e.g. `model_providers`)."
     });
 
     let error_responses = serde_json::json!({
@@ -253,6 +254,19 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "Drift summary.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriftResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/config/reload-status": {
+            "get": {
+                "tags": ["config"],
+                "summary": "Pending-reload flag for the running daemon",
+                "description": "Returns `{pending_reload: true}` when one or more config writes have landed since the last `/admin/reload`. Distinct from `/api/config/drift`, which compares disk to in-memory; this flag fires on in-process PATCHes that hot-swap memory but still need subsystem re-init (channels, providers, scheduler) to take effect.",
+                "responses": {
+                    "200": {
+                        "description": "Pending-reload flag.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReloadStatusResponse" } } }
                     }
                 }
             }
@@ -408,6 +422,8 @@ mod tests {
         assert!(paths.get("/api/config").is_some());
         assert!(paths.get("/api/config/init").is_some());
         assert!(paths.get("/api/config/migrate").is_some());
+        assert!(paths.get("/api/config/drift").is_some());
+        assert!(paths.get("/api/config/reload-status").is_some());
     }
 
     #[cfg(feature = "schema-export")]

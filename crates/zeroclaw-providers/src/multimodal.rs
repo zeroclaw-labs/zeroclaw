@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::collections::HashSet;
 use std::path::Path;
-use zeroclaw_api::provider::ChatMessage;
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -358,8 +358,18 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    // When image count exceeds the limit, strip markers from oldest messages
+    // first so that the most recent (most relevant) images survive. This
+    // prevents conversations from becoming permanently stuck once the
+    // cumulative image count crosses the threshold.
+    let trimmed = if total_images > max_images {
+        trim_old_images(messages, max_images)
+    } else {
+        messages.to_vec()
+    };
+
+    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
+    let latest_tool_indices = latest_tool_result_indices(&trimmed);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
@@ -529,10 +539,15 @@ async fn normalize_image_references(
             Err(error) => {
                 skipped_count += 1;
                 let error_reason = multimodal_error_reason(&error);
-                tracing::warn!(
-                    source_kind = image_reference_kind(reference),
-                    error_kind = multimodal_error_kind(&error),
-                    reason = error_reason.as_deref().unwrap_or(""),
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "source_kind": image_reference_kind(reference),
+                            "error_kind": multimodal_error_kind(&error),
+                            "reason": error_reason.as_deref().unwrap_or(""),
+                        })),
                     "skipping multimodal image that could not be loaded"
                 );
             }
@@ -1067,7 +1082,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("see attached [IMAGE:{}]", image_path.display()),
+            "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
 
@@ -1202,7 +1217,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", image_path.display()),
+            "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
 
@@ -1290,7 +1305,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display()),
+            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
         })
         .to_string();
 
@@ -1300,7 +1315,10 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
             },
-            ChatMessage::user(format!("Now inspect this [IMAGE:{}]", fresh_path.display())),
+            ChatMessage::user(format!(
+                "Now inspect this [IMAGE:{}]",
+                fresh_path.display().to_string()
+            )),
         ];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
@@ -1567,9 +1585,9 @@ mod tests {
         }
 
         let messages = vec![
-            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
-            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display().to_string())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display().to_string())),
         ];
 
         let config = MultimodalConfig {
@@ -1749,7 +1767,7 @@ mod tests {
     }
 
     /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision providers (#3674).
+    /// portion, which is the behaviour needed for non-vision model_providers.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";

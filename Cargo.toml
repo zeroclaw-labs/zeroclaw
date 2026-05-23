@@ -1,30 +1,31 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.7.5"
+version = "0.8.0-beta-1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.5" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.5" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.5", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.5" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.5" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.5", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.5" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.5", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.5" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.5" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.5" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.5" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.5" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.5" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-1" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-1" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-1" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-1" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-1" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-1" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.8.0-beta-1" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-1" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-1" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-1" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-1" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-1" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -74,6 +75,7 @@ path = "src/lib.rs"
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
@@ -112,8 +114,6 @@ shellexpand = "3.1"
 schemars = "1.2"
 
 # Logging - minimal
-tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
@@ -232,7 +232,7 @@ mime_guess = { version = "2", optional = true }
 
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
-# Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
+# Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
@@ -309,7 +309,6 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
-channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
@@ -399,6 +398,14 @@ path = "tests/test_system.rs"
 [[test]]
 name = "live"
 path = "tests/test_live.rs"
+
+# Architecture invariant gates. Fail-on-detect for patterns that
+# violate the workspace's ABSOLUTE RULE (AGENTS.md §1) — duplicate
+# state across the codebase. Run with `cargo test --test architecture`
+# during development; the workspace `cargo test` already includes it.
+[[test]]
+name = "architecture"
+path = "tests/test_architecture.rs"
 
 [[bench]]
 name = "agent_benchmarks"
