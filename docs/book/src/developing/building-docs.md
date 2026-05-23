@@ -9,7 +9,7 @@ cargo mdbook serve                       # serve all locales at http://localhost
 cargo mdbook serve --locale ja           # live-reload against Japanese source
 cargo mdbook build                       # static build of every locale into docs/book/book/
 cargo mdbook refs                        # regenerate the auto-generated reference pages
-cargo mdbook sync                        # after editing English source: re-extract + AI-fill delta
+cargo mdbook sync                        # translation-cache pass: re-extract + merge .po files
 cargo mdbook sync --locale ja            # sync one locale only
 cargo mdbook sync --force                # force-retranslate everything (quality pass)
 cargo mdbook sync --locale ja --force    # force-retranslate one locale
@@ -66,6 +66,15 @@ Quick stability check after a small docs edit:
 cargo mdbook sync
 git diff --numstat -- docs/book/po
 ```
+Routine English docs PRs do not need to include generated `.po` churn when the sync output is broad and hard to review. Keep the prose PR focused, leave the generated catalog refresh for a dedicated translation-cache PR, and say so in the PR body:
+
+> Skipped committing generated `.po` updates: this is an English docs-only change, and `cargo mdbook sync` would produce broad gettext catalog churn. Translation-cache updates are deferred to a dedicated follow-up PR.
+
+Include `.po` updates only when one of these is true:
+
+- The PR is specifically a translation-cache or release-translation pass.
+- The PR adds a new locale.
+- `cargo mdbook sync` produces a small, reviewable diff limited to the strings changed by the PR.
 
 ## Adding a new locale
 
