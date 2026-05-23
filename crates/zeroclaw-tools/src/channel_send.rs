@@ -18,7 +18,8 @@ pub type ChannelMapHandle =
 /// Tool that sends a message through a configured channel.
 ///
 /// Parameters:
-/// - `channel`: Channel name as registered (`telegram`, `slack`, `discord`, etc.)
+/// - `channel`: Composite channel key (`telegram.default`, `telegram.prod`, etc.) or bare
+///   type name (`telegram`, `slack`). Bare names resolve to `<type>.default`.
 /// - `to`: Recipient/target ID (chat ID, channel name, etc.)
 /// - `body`: Message content to send
 pub struct ChannelSendTool {
@@ -51,7 +52,7 @@ impl Tool for ChannelSendTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Channel name (e.g. telegram, slack, discord, mattermost, signal, matrix, irc)"
+                    "description": "Composite channel key (e.g. telegram.default, telegram.prod, slack.prod) or bare type name (telegram, slack, discord, mattermost, signal, matrix, irc). Bare names resolve to <type>.default."
                 },
                 "to": {
                     "type": "string",
@@ -109,10 +110,40 @@ impl Tool for ChannelSendTool {
 
         let channel = {
             let channel_map = self.channel_map.read();
-            channel_map.get(&channel_name).cloned().ok_or_else(|| {
+
+            // 1. exact composite key
+            let channel = channel_map.get(&channel_name).cloned();
+
+            // 2. bare type → <type>.default
+            let channel = channel.or_else(|| {
+                if !channel_name.contains('.') {
+                    let default_key = format!("{channel_name}.default");
+                    channel_map.get(&default_key).cloned()
+                } else {
+                    None
+                }
+            });
+
+            // 3. aliased → fallback to <type>.default
+            let channel = channel.or_else(|| {
+                if let Some(bare) = channel_name.split('.').next() {
+                    if bare != channel_name {
+                        let default_key = format!("{bare}.default");
+                        channel_map.get(&default_key).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+
+            channel.ok_or_else(|| {
+                // Build a helpful list of available channels
+                let available: Vec<String> = channel_map.keys().cloned().collect();
                 anyhow::Error::msg(format!(
-                    "Channel '{}' not found. Check the configured channel name.",
-                    channel_name
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel_name, available
                 ))
             })?
         };
@@ -131,7 +162,7 @@ impl Tool for ChannelSendTool {
             success: true,
             output: format!(
                 "Message sent successfully to channel '{}', recipient '{}'",
-                channel.name(),
+                channel_name,
                 to
             ),
             error: None,
