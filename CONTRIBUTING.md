@@ -31,7 +31,7 @@ All PRs target **`master`**. PRs targeting `main` will be rejected.
 3. **Fork → branch → change → test → PR.** PRs target `master`. Use `feat/*` or `fix/*` branch names.
 4. **Open a draft PR early** if you get stuck and ask questions in the description.
 
-For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**.
+For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**. For non-trivial architecture, workflow, config, security, or agent-assisted changes, use the **[Architecture and contribution map](docs/book/src/contributing/architecture-map.md)** to find the right foundation and architecture context before implementing.
 
 ## Development setup
 
@@ -114,6 +114,7 @@ The book is the source of truth for everything contributor-facing. Quick links:
 | Topic | Page |
 |---|---|
 | The full contribution flow | [How to contribute](docs/book/src/contributing/how-to.md) |
+| What to read before architecture-sensitive changes | [Architecture and contribution map](docs/book/src/contributing/architecture-map.md) |
 | Communication channels | [Communication](docs/book/src/contributing/communication.md) |
 | Filing an RFC | [RFC process](docs/book/src/contributing/rfcs.md) |
 | Privacy & PII rules | [Privacy](docs/book/src/contributing/privacy.md) |

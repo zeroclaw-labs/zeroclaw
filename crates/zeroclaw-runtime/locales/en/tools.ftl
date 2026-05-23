@@ -59,7 +59,7 @@ tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
 
-tool-jira = Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support.
+tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 
 tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
 

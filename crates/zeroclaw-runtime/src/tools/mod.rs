@@ -269,6 +269,11 @@ pub fn register_skill_tools(
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
 ) {
+    if skills.is_empty() {
+        return;
+    }
+
+    let before = tools_registry.len();
     let skill_tools = crate::skills::skills_to_tools(skills, security);
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
@@ -289,6 +294,27 @@ pub fn register_skill_tools(
             tools_registry.push(tool);
         }
     }
+    let registered = tools_registry.len() - before;
+
+    // Positive-path log — matches how the rest of zeroclaw reports
+    // successful initialization (open-skills clone, daemon startup,
+    // gateway bind, etc.). Without this, a skill that audited clean,
+    // parsed cleanly, and registered N tools leaves zero signal in the
+    // log, which makes SKILL.toml / SKILL.md authoring painful to debug.
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "Registered {} skill tool(s) from {} skill(s): {}",
+            registered,
+            skills.len(),
+            skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    );
 }
 
 /// Always-on built-in tools that surface in the integrations panel as
@@ -548,6 +574,7 @@ pub fn all_tools_with_runtime(
                 browser_config.allowed_domains.clone(),
                 browser_config.session_name.clone(),
                 browser_config.backend.clone(),
+                browser_config.headed,
                 browser_config.native_headless,
                 browser_config.native_webdriver_url.clone(),
                 browser_config.native_chrome_path.clone(),
