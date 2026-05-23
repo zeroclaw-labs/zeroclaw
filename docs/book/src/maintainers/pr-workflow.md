@@ -27,6 +27,8 @@ The Project board is an automated planning board, not the authoritative PR revie
 
 Use the board for issue readiness, active ownership, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
 
+A draft JSON summary of this planning split lives in [`project-board-contract.json`](./project-board-contract.json). Treat it as design input for future board refresh automation, not as an active GitHub Project integration yet.
+
 Do not mirror native PR review state into manual board lanes. GitHub PR state owns review decision, required checks, mergeability, conflicts, stale approvals, and merge readiness. If the board later displays derived PR routing such as `DIRTY`, `BEHIND`, or `APPROVED`, treat it as a dashboard view of GitHub state, not a separate source of truth.
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
