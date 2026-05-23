@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use lru::LruCache;
+use parking_lot::Mutex as SyncMutex;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -13,10 +16,33 @@ use zeroclaw_api::channel::{
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
+/// How many recent inbound messages we remember for the purpose of
+/// addressing outbound reactions back at them. signal-cli's `sendReaction`
+/// is keyed on `(targetAuthor, targetTimestamp)`, but we don't want those
+/// values to leak into the generic `ChannelMessage.id` (which flows into
+/// logs, memory keys, thread roots, and tool args). Instead we mint an
+/// opaque id and remember the mapping channel-locally.
+const RECENT_TARGETS_CAPACITY: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
     Direct(String),
     Group(String),
+}
+
+/// `(targetAuthor, targetTimestamp_ms)` recovered by `add_reaction` /
+/// `remove_reaction` from an opaque inbound id. Held in `recent_targets`.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "fields consumed by add_reaction/remove_reaction in the follow-up commit"
+    )
+)]
+struct ReactionTarget {
+    author: String,
+    timestamp_ms: u64,
 }
 
 /// Signal channel using signal-cli daemon's native JSON-RPC + SSE API.
@@ -46,6 +72,11 @@ pub struct SignalChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
+    /// Opaque inbound message id → `(targetAuthor, targetTimestamp)` so
+    /// outbound reactions can be addressed without embedding the Signal
+    /// sender (E.164 phone number or UUID) in `ChannelMessage.id`. Bounded
+    /// LRU; once a message ages out, reactions against it fail cleanly.
+    recent_targets: Arc<SyncMutex<LruCache<String, ReactionTarget>>>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -112,6 +143,10 @@ impl SignalChannel {
             proxy_url: None,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout_secs: 300,
+            recent_targets: Arc::new(SyncMutex::new(LruCache::new(
+                NonZeroUsize::new(RECENT_TARGETS_CAPACITY)
+                    .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
+            ))),
         }
     }
 
@@ -311,8 +346,22 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
+        // Opaque id: timestamp is convenient for debugging, the random
+        // suffix disambiguates two senders that happen to post at the same
+        // millisecond in a group. Crucially, neither component reveals the
+        // sender — that lives only in the channel-local `recent_targets`
+        // map and the `sender` field on `ChannelMessage`.
+        let id = format!("sig_{timestamp}_{}", Self::random_id_suffix());
+        self.recent_targets.lock().put(
+            id.clone(),
+            ReactionTarget {
+                author: sender.clone(),
+                timestamp_ms: timestamp,
+            },
+        );
+
         Some(ChannelMessage {
-            id: format!("sig_{timestamp}"),
+            id,
             sender: sender.clone(),
             reply_target: target,
             content: text.to_string(),
@@ -323,6 +372,15 @@ impl SignalChannel {
             interruption_scope_id: None,
             attachments: vec![],
         })
+    }
+
+    fn random_id_suffix() -> String {
+        use rand::RngExt;
+        const CHARSET: &[u8] = b"0123456789abcdef";
+        let mut rng = rand::rng();
+        (0..6)
+            .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+            .collect()
     }
 }
 
@@ -1033,7 +1091,19 @@ mod tests {
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
         assert_eq!(msg.content, "Hello from privacy user");
-        assert_eq!(msg.id, "sig_1700000000000");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the routing identity must not appear in the
+        // generic message id, which flows into logs, memory keys, and the
+        // LLM-facing tool context.
+        assert!(
+            !msg.id.contains(uuid),
+            "UUID sender must not leak into msg.id: {}",
+            msg.id
+        );
         assert_eq!(msg.timestamp, 1_700_000_000);
         assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
 
@@ -1113,7 +1183,19 @@ mod tests {
         assert_eq!(msg.content, "Hello!");
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
-        assert_eq!(msg.id, "sig_1700000000000");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the E.164 phone number must not appear in
+        // the generic message id, which flows into logs, memory keys, and
+        // the LLM-facing tool context.
+        assert!(
+            !msg.id.contains("+1111111111"),
+            "E.164 sender must not leak into msg.id: {}",
+            msg.id
+        );
         assert_eq!(msg.timestamp, 1_700_000_000);
         assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
     }
@@ -1259,9 +1341,62 @@ mod tests {
         assert_eq!(msg.reply_target, "group:group_xyz");
         assert_eq!(msg.content, "group hello");
         assert_eq!(msg.channel, "signal");
-        assert_eq!(msg.id, "sig_1700000000000");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the in-group sender must not appear in the
+        // generic message id, even though the group id itself is in
+        // `reply_target` and not sensitive.
+        assert!(
+            !msg.id.contains("+1111111111"),
+            "E.164 sender must not leak into group msg.id: {}",
+            msg.id
+        );
         assert_eq!(msg.timestamp, 1_700_000_000);
         assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
+    }
+
+    #[test]
+    fn process_envelope_populates_recent_targets() {
+        // The opaque `msg.id` is unusable for `sendReaction` on its own —
+        // signal-cli needs `(targetAuthor, targetTimestamp)`. Confirm the
+        // channel-local lookup is seeded so a later reaction can recover
+        // those values without the id leaking the sender.
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            vec!["group_xyz".to_string()],
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1111111111".into()]),
+            false,
+            false,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("group hello".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group_xyz".to_string()),
+                }),
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        let target = ch
+            .recent_targets
+            .lock()
+            .peek(&msg.id)
+            .cloned()
+            .expect("recent_targets should contain the just-emitted id");
+        assert_eq!(target.author, "+1111111111");
+        assert_eq!(target.timestamp_ms, 1_700_000_000_000);
     }
 
     #[test]
