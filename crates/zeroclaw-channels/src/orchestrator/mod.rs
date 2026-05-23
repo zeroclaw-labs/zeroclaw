@@ -5795,62 +5795,7 @@ pub fn register_channels_for_tools(
     channel_send_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-
-    // --- diagnostic: dump config view ---
-    let agent_summary: Vec<_> = config
-        .agents
-        .iter()
-        .map(|(k, v)| {
-            format!(
-                "{} (enabled={}, channels={:?})",
-                k,
-                v.enabled,
-                v.channels.iter().map(|c| c.as_str()).collect::<Vec<_>>()
-            )
-        })
-        .collect();
-    let tg_keys: Vec<_> = config.channels.telegram.keys().cloned().collect();
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"agents": agent_summary, "telegram_aliases": tg_keys})),
-        "register_channels_for_tools: config agents"
-    );
-    #[cfg(feature = "channel-telegram")]
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "register_channels_for_tools: channel-telegram feature IS enabled"
-    );
-    #[cfg(not(feature = "channel-telegram"))]
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "register_channels_for_tools: channel-telegram feature is NOT enabled — telegram will be skipped"
-    );
-    // --- end diagnostic ---
-
     let configured = collect_configured_channels(&config_arc, "", &[]);
-    let configured_names: Vec<_> = configured
-        .iter()
-        .map(|ch| {
-            format!(
-                "{}.{}",
-                ch.display_name,
-                ch.alias.as_deref().unwrap_or("<default>")
-            )
-        })
-        .collect();
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"channels": configured_names, "count": configured.len()})),
-        "collect_configured_channels result"
-    );
 
     let handles = [
         ask_user_handle.as_ref(),
