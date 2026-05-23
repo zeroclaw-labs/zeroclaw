@@ -7601,8 +7601,45 @@ pub async fn deliver_announcement(
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
         #[cfg(feature = "channel-lark")]
-        "lark" => {
-            let lk = config.channels.lark.get(alias).ok_or_else(not_configured)?;
+        "lark" | "feishu" => {
+            // [channels.lark.<alias>] is the single source of truth for both
+            // names (AGENTS.md). from_config selects the endpoint via
+            // use_feishu. Error text names the real config table, not the
+            // cron alias the user wrote.
+            let lk = config.channels.lark.get(alias).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!(
+                        "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                    )
+                );
+                anyhow::Error::msg(format!(
+                    "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                ))
+            })?;
+            // Asymmetric by design: "feishu"+use_feishu=false is a typo
+            // (hard fail). "lark"+use_feishu=true is a soft compat path
+            // (warn but still deliver via fallback construction).
+            if channel_type == "feishu" && !lk.use_feishu {
+                anyhow::bail!(
+                    "[channels.lark.{alias}] has use_feishu=false but cron channel=\"feishu.{alias}\"; \
+                     use channel=\"lark.{alias}\" or set use_feishu=true"
+                );
+            }
+            if channel_type == "lark" && lk.use_feishu {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "cron channel=\"lark.{alias}\" with [channels.lark.{alias}] use_feishu=true \
+                         falls back to one-shot channel construction; prefer channel=\"feishu.{alias}\" \
+                         to reuse the live Feishu handle from start_channels"
+                    )
+                );
+            }
             let peers = config.channel_external_peers("lark", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
@@ -7610,7 +7647,7 @@ pub async fn deliver_announcement(
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
-        "lark" => {
+        "lark" | "feishu" => {
             anyhow::bail!("Lark channel requires the `channel-lark` feature");
         }
         "webhook" => {
@@ -15936,22 +15973,58 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_routes_lark_to_lark_arm() {
-        // Verify that the "lark.<alias>" channel string is routed to the
-        // lark match arm and bails with "[channels.lark.<alias>] not
-        // configured" when no entry exists, rather than falling through
-        // to `other => bail!("unsupported delivery channel: ...")`.
+        // Both names must enter the merged lark|feishu arm. Falling through
+        // to `unsupported delivery channel` would mean the schema enum and
+        // the match arm have drifted apart.
         let config = zeroclaw_config::schema::Config::default();
-        let err = deliver_announcement(&config, "lark.default", "oc_test_chat", None, "hi")
+
+        for channel in ["lark.default", "feishu.default"] {
+            let err = deliver_announcement(&config, channel, "oc_test_chat", None, "hi")
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("expected {channel} to bail because channel is not configured")
+                });
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("unsupported delivery channel"),
+                "{channel} must route to lark|feishu arm, not fall through; got: {msg}"
+            );
+            assert!(
+                msg.contains("[channels.lark.default] not configured"),
+                "{channel} must report the real config table [channels.lark.default]; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
+        // Reject (not warn): otherwise the message silently lands on the
+        // Lark endpoint despite the user explicitly naming Feishu.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                use_feishu: false,
+                app_id: "cli_test".to_string(),
+                app_secret: "secret".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "feishu.work", "oc_test_chat", None, "hi")
             .await
-            .expect_err("expected lark arm to bail because channel is not configured");
+            .expect_err("expected bail when channel=feishu but use_feishu=false");
         let msg = format!("{err:#}");
         assert!(
-            !msg.contains("unsupported delivery channel"),
-            "lark must route to lark arm, not fall through; got: {msg}"
+            msg.contains("use_feishu=false"),
+            "bail must explain the use_feishu mismatch; got: {msg}"
         );
         assert!(
-            msg.contains("[channels.lark.default] not configured"),
-            "expected '[channels.lark.default] not configured' bail; got: {msg}"
+            msg.contains("[channels.lark.work]"),
+            "bail must point at the real config table; got: {msg}"
         );
     }
 }
