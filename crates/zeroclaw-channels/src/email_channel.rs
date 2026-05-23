@@ -615,8 +615,24 @@ impl EmailChannel {
         Ok(())
     }
 
+    fn smtp_credentials(&self) -> Credentials {
+        let user = self
+            .config
+            .smtp_username
+            .as_deref()
+            .unwrap_or(&self.config.username)
+            .to_owned();
+        let pass = self
+            .config
+            .smtp_password
+            .as_deref()
+            .unwrap_or(&self.config.password)
+            .to_owned();
+        Credentials::new(user, pass)
+    }
+
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
-        let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
+        let creds = self.smtp_credentials();
         let transport = if self.config.smtp_tls {
             SmtpTransport::relay(&self.config.smtp_host)?
                 .port(self.config.smtp_port)
@@ -881,6 +897,60 @@ mod tests {
         Arc::new(move || peers.clone())
     }
 
+    #[test]
+    fn email_config_custom() {
+        let config = EmailConfig {
+            enabled: true,
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            imap_folder: "Archive".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 465,
+            smtp_tls: true,
+            username: "user@example.com".to_string(),
+            password: "pass123".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "bot@example.com".to_string(),
+            idle_timeout_secs: 1200,
+            poll_interval_secs: 60,
+            default_subject: "Custom Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
+        };
+        assert_eq!(config.imap_host, "imap.example.com");
+        assert_eq!(config.imap_folder, "Archive");
+        assert_eq!(config.idle_timeout_secs, 1200);
+        assert_eq!(config.default_subject, "Custom Subject");
+    }
+
+    #[test]
+    fn email_config_clone() {
+        let config = EmailConfig {
+            enabled: true,
+            imap_host: "imap.test.com".to_string(),
+            imap_port: 993,
+            imap_folder: "INBOX".to_string(),
+            smtp_host: "smtp.test.com".to_string(),
+            smtp_port: 587,
+            smtp_tls: true,
+            username: "user@test.com".to_string(),
+            password: "secret".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "bot@test.com".to_string(),
+            idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
+            default_subject: "Test Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.imap_host, config.imap_host);
+        assert_eq!(cloned.smtp_port, config.smtp_port);
+        assert_eq!(cloned.default_subject, config.default_subject);
+    }
+
     #[tokio::test]
     async fn email_channel_new() {
         let config = EmailConfig::default();
@@ -1113,6 +1183,8 @@ mod tests {
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
+            smtp_username: None,
+            smtp_password: None,
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
@@ -1213,5 +1285,45 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("imap.debug.com"));
+    }
+
+    #[test]
+    fn email_config_smtp_credentials_default_to_none() {
+        let config = EmailConfig::default();
+        assert!(config.smtp_username.is_none());
+        assert!(config.smtp_password.is_none());
+    }
+
+    #[test]
+    fn smtp_credentials_fallback_to_shared() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        // Credentials doesn't expose fields directly, so round-trip via a
+        // fresh construction for comparison
+        let expected =
+            Credentials::new("shared@example.com".to_string(), "shared_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_uses_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("smtp@example.com".to_string()),
+            smtp_password: Some("smtp_pass".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
+        assert_eq!(creds, expected);
     }
 }

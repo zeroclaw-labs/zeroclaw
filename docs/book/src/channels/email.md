@@ -10,23 +10,27 @@ The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. 
 [channels.email]
 enabled = true
 
-[channels.email.imap]
-host = "imap.example.com"
-port = 993
+# IMAP (inbound)
+imap_host = "imap.example.com"
+imap_port = 993                  # default: 993
+imap_folder = "INBOX"            # default: INBOX
+poll_interval_secs = 60          # fallback when IDLE not supported
+
+# SMTP (outbound)
+smtp_host = "smtp.example.com"
+smtp_port = 587                  # default: 465
+smtp_tls = true                  # default: true
+
+# Shared credentials (used by both IMAP and SMTP when no smtp_* override is set)
 username = "you@example.com"
 password = "..."                 # or app-password for Gmail/iCloud
-mailbox = "INBOX"
-poll_interval_secs = 60
 
-[channels.email.smtp]
-host = "smtp.example.com"
-port = 587
-username = "you@example.com"
-password = "..."
+# Optional: use separate credentials for SMTP only (e.g. a relay service)
+# smtp_username = "relay-user@sendgrid.net"
+# smtp_password = "..."
 
-[channels.email.filter]
+from_address = "you@example.com"
 allowed_senders = ["boss@example.com", "alerts@example.com"]
-subject_prefix = "[agent]"       # only respond to subjects starting with this
 ```
 
 ### Gmail gotchas
@@ -40,9 +44,9 @@ subject_prefix = "[agent]"       # only respond to subjects starting with this
 OAuth 2.0 is recommended over password auth:
 
 ```toml
-[channels.email.imap]
-host = "outlook.office365.com"
-port = 993
+[channels.email]
+imap_host = "outlook.office365.com"
+imap_port = 993
 username = "you@example.com"
 oauth_token = "..."              # managed via `zeroclaw channel auth email`
 ```
