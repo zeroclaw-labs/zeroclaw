@@ -435,6 +435,29 @@ async fn handle_socket(
         .channel_handles()
         .register_channel("ws", approval_channel.clone());
 
+    // Seed agent's channel handles with configured channels (telegram,
+    // etc.) so the dashboard agent can deliver to external channels.
+    // The agent creates its own fresh handles in
+    // from_config_with_session_cwd_and_mcp_backchannel, so they need
+    // to be populated here — separate from the gateway boot-time seeding.
+    let ch = agent.channel_handles();
+    let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
+        &config,
+        &ch.ask_user,
+        &Some(ch.reaction.clone()),
+        &ch.poll,
+        &ch.escalate,
+        &ch.channel_send,
+    );
+    if !channel_names.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"channels": channel_names, "session": session_key})),
+            "Seeded {} channel(s) into dashboard agent session",
+        );
+    }
+
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
