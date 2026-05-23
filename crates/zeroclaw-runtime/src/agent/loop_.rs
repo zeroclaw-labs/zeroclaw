@@ -3474,6 +3474,12 @@ pub async fn run(
             system_prompt.push_str(&deferred_section);
         }
 
+        // Inject configured channel targets so the agent knows where to deliver outbound messages
+        if let Some(channel_targets) = crate::agent::agent::build_channel_targets(&config) {
+            system_prompt.push('\n');
+            system_prompt.push_str(&channel_targets);
+        }
+
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager = if interactive {
             Some(ApprovalManager::from_risk_profile(&risk_profile))
@@ -4667,6 +4673,12 @@ pub async fn process_message(
         if !deferred_section.is_empty() {
             system_prompt.push('\n');
             system_prompt.push_str(&deferred_section);
+        }
+
+        // Inject configured channel targets so the agent knows where to deliver outbound messages
+        if let Some(channel_targets) = crate::agent::agent::build_channel_targets(&config) {
+            system_prompt.push('\n');
+            system_prompt.push_str(&channel_targets);
         }
 
         // ── Parse thinking directive from user message ─────────────

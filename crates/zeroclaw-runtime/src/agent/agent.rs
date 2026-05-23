@@ -27,7 +27,7 @@ pub use zeroclaw_api::agent::TurnEvent;
 
 /// Build the configured channel targets section for system prompt injection.
 /// Returns `Some(string)` if any channels have `default_target` set, `None` otherwise.
-fn build_channel_targets(config: &Config) -> Option<String> {
+pub(crate) fn build_channel_targets(config: &Config) -> Option<String> {
     let mut entries: Vec<(String, String)> = Vec::new();
 
     for (alias, cfg) in &config.channels.telegram {
@@ -91,8 +91,9 @@ fn build_channel_targets(config: &Config) -> Option<String> {
         return None;
     }
 
-    let mut out = String::from("## Configured Channel Targets\n\n");
-    out.push_str("Use these recipients when sending messages:\n\n");
+    let mut out = String::new();
+    out.push_str("## Configured Channel Targets\n\n");
+    out.push_str("Use these recipients when sending messages via the `channel_send` tool. For each entry, use the composite key (e.g. `telegram.default`) as the `channel` parameter and the target as the `to` parameter.\n\n");
     for (channel, target) in &entries {
         out.push_str(&format!("- {channel}: {target}\n"));
     }
