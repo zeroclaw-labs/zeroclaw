@@ -162,8 +162,7 @@ impl Tool for ChannelSendTool {
             success: true,
             output: format!(
                 "Message sent successfully to channel '{}', recipient '{}'",
-                channel_name,
-                to
+                channel_name, to
             ),
             error: None,
         })
