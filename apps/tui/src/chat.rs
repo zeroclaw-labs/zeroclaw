@@ -691,6 +691,19 @@ fn render(f: &mut Frame, state: &ChatState, area: Rect) {
         let cx = (ia.x + 1 + visual).min(ia.x + ia.width.saturating_sub(2));
         f.set_cursor_position((cx, ia.y + 1));
     }
+
+    match &state.session_overlay {
+        SessionOverlay::List {
+            sessions,
+            list_state,
+        } => {
+            render_session_list_overlay(f, area, sessions, list_state);
+        }
+        SessionOverlay::Rename { buf } => {
+            render_rename_overlay(f, area, buf);
+        }
+        SessionOverlay::None => {}
+    }
 }
 
 /// Extract the file extension from the `"path"` field of a tool's input JSON.
@@ -761,19 +774,6 @@ fn render_tool_entry<'a>(
             format!("  → {truncated}"),
             Style::default().fg(RESULT_FG),
         )));
-    }
-
-    match &state.session_overlay {
-        SessionOverlay::List {
-            sessions,
-            list_state,
-        } => {
-            render_session_list_overlay(f, area, sessions, list_state);
-        }
-        SessionOverlay::Rename { buf } => {
-            render_rename_overlay(f, area, buf);
-        }
-        SessionOverlay::None => {}
     }
 }
 
