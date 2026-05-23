@@ -10121,15 +10121,6 @@ impl ChannelsConfig {
             },
         ]
     }
-
-    #[doc(hidden)]
-    #[deprecated(note = "use channels(); webhook is now included")]
-    pub fn channels_except_webhook(&self) -> Vec<super::traits::ChannelInfo> {
-        self.channels()
-            .into_iter()
-            .filter(|c| c.name != "Webhook")
-            .collect()
-    }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
