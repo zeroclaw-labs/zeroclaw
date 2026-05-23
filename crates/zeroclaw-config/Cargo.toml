@@ -49,11 +49,8 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-# schema-export and clap are the only defaults; all channel features
-# are opt-in via individual `channel-*` flags or the workspace
-# `default-channels` bundle. Consumers that need `channel-nostr` or
-# `voice-wake` (e.g. the regression test suite) must enable them
-# explicitly.
+# schema-export and clap are the only defaults. All channel schema types
+# compile unconditionally; channel feature flags live in zeroclaw-channels only.
 default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
 clap = ["dep:clap"]

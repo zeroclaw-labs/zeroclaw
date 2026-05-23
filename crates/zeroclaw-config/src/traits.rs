@@ -343,13 +343,6 @@ pub trait ChannelConfig {
     fn desc() -> &'static str;
 }
 
-// Maybe there should be a `&self` as parameter for custom channel/info or what...
-
-pub trait ConfigHandle {
-    fn name(&self) -> &'static str;
-    fn desc(&self) -> &'static str;
-}
-
 /// A menu item for `OnboardUi::select`, with an optional status badge
 /// (e.g. `[configured]` / `[not set]`) that backends render next to the label.
 #[derive(Debug, Clone)]
