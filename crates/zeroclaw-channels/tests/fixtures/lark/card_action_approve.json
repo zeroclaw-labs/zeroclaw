@@ -1,0 +1,13 @@
+{
+  "_fixture_note": "PLACEHOLDER — to be replaced with a real captured `card.action.trigger` payload. Capture procedure: set `RUST_LOG=zeroclaw_channels::lark=debug` in production, click an Approve button on a live Lark/Feishu approval card, then grep the log for `card.action.trigger raw payload` and copy the JSON from the `raw_payload` field. Sanitize `app_id`/`open_id`/`message_id`/timestamps before committing.",
+  "_captured_at": "PLACEHOLDER",
+  "_decision_label": "Approve",
+  "_approval_id_label": "aa012cfc-f512-4dfd-b962-bcb0bc74ee37 (from logs 2026-05-23T10:54:02Z)",
+  "action": {
+    "tag": "button",
+    "value": {
+      "approval_id": "aa012cfc-f512-4dfd-b962-bcb0bc74ee37",
+      "decision": "approve"
+    }
+  }
+}

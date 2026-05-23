@@ -2449,10 +2449,29 @@ impl LarkChannel {
     ) -> anyhow::Result<()> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
+        // Diagnostic: log the raw inbound payload at DEBUG so operators can
+        // capture real Lark/Feishu `card.action.trigger` JSON for fixture
+        // collection. Default production RUST_LOG (=info) leaves this off,
+        // so it costs nothing at runtime; flip the channel to debug to record
+        // shape evidence:
+        //
+        //   RUST_LOG=zeroclaw_channels::lark=debug
+        //
+        // Captured payloads should land in
+        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed by
+        // the integration test in `tests/lark_approval_live_evidence.rs`.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+                .with_attrs(::serde_json::json!({"raw_payload": event_payload})),
+            "card.action.trigger raw payload"
+        );
+
         // Feishu Card 2.0 button click events MAY round-trip the button value at
-        // `event.action.behaviors[0].value` instead of `event.action.value` (the
-        // Card 1.0 path). Production click samples for Card 2.0 are unavailable
-        // at PR-cut time, so we accept either pointer to remain forward-compatible.
+        // `event.action.behaviors[0].value` instead of `event.action.value`
+        // (the Card 1.0 path). Both pointers are accepted for forward-compat;
+        // captured fixtures under `tests/fixtures/lark/` lock the shape that
+        // production currently emits.
         let value = event_payload
             .pointer("/action/value")
             .or_else(|| event_payload.pointer("/action/behaviors/0/value"))

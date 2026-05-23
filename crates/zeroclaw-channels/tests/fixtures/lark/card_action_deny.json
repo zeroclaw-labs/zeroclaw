@@ -1,0 +1,13 @@
+{
+  "_fixture_note": "PLACEHOLDER — to be replaced with a real captured `card.action.trigger` payload. See card_action_approve.json for the capture procedure.",
+  "_captured_at": "PLACEHOLDER",
+  "_decision_label": "Deny",
+  "_approval_id_label": "5738bfac-5db7-42c6-b0bb-5a52a07d9228 (from logs 2026-05-23T10:57:51Z; the same Deny path was observed 3 consecutive times in production logs that day, all parsed correctly)",
+  "action": {
+    "tag": "button",
+    "value": {
+      "approval_id": "5738bfac-5db7-42c6-b0bb-5a52a07d9228",
+      "decision": "deny"
+    }
+  }
+}

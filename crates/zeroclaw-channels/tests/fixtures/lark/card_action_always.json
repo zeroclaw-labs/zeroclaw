@@ -1,0 +1,13 @@
+{
+  "_fixture_note": "PLACEHOLDER — to be replaced with a real captured `card.action.trigger` payload. See card_action_approve.json for the capture procedure.",
+  "_captured_at": "PLACEHOLDER",
+  "_decision_label": "AlwaysApprove",
+  "_approval_id_label": "7514adbf-6ef7-4e9b-9e52-4a6639157ab9 (from logs 2026-05-23T10:59:28Z; subsequent tool calls in that trace_id correctly skipped further approval prompts, confirming the AlwaysApprove path also wires through to the agent loop)",
+  "action": {
+    "tag": "button",
+    "value": {
+      "approval_id": "7514adbf-6ef7-4e9b-9e52-4a6639157ab9",
+      "decision": "always"
+    }
+  }
+}
