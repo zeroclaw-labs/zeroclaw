@@ -68,7 +68,10 @@ pub struct DiscordChannel {
     /// inbound message from a channel via `GET /channels/{id}`. Thread type
     /// is stable for the channel's lifetime so the cache lives as long as
     /// the channel instance.
-    thread_channels: Arc<AsyncMutex<HashMap<String, bool>>>,
+    ///
+    /// Value is `Some(parent_id)` when the channel is a thread, `None`
+    /// when it is a regular (non-thread) channel.
+    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
 }
 
 #[derive(Debug)]
@@ -226,22 +229,23 @@ impl DiscordChannel {
     }
 
     /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
-    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Results are
-    /// cached for the channel instance's lifetime: thread-ness is stable
-    /// for a given channel ID, so one lookup per ID per process. Failures
-    /// (network, 429, missing `type` field) fall through to `false` so a
-    /// transient API hiccup never blocks inbound delivery.
-    async fn is_thread_channel(&self, client: &reqwest::Client, channel_id: &str) -> bool {
+    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Returns
+    /// `Some(parent_id)` when the channel is a thread, `None` otherwise.
+    /// Results are cached for the channel instance's lifetime: thread-ness
+    /// is stable for a given channel ID, so one lookup per ID per process.
+    /// Failures (network, 429, missing fields) return `None` without
+    /// caching so the next message retries.
+    async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
         {
             let cache = self.thread_channels.lock().await;
-            if let Some(&value) = cache.get(channel_id) {
-                return value;
+            if let Some(value) = cache.get(channel_id) {
+                return value.clone();
             }
         }
 
         // Only a successful API response is cached. A transient network blip
         // or 429 must not poison the cache for the channel's lifetime; the
-        // next message should retry the lookup. Failure paths return `false`
+        // next message should retry the lookup. Failure paths return `None`
         // (the safe default) without writing to the cache. The whole request
         // is wrapped in an explicit timeout so a hung Discord API call can
         // never stall the listener; the shared channel HTTP client may not
@@ -276,14 +280,20 @@ impl DiscordChannel {
                 );
                 anyhow::Error::msg(format!("body parse failed: {e}"))
             })?;
-            Ok::<bool, anyhow::Error>(
-                body.get("type")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(is_thread_channel_type)
-                    .unwrap_or(false),
-            )
+            let is_thread = body
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .map(is_thread_channel_type)
+                .unwrap_or(false);
+            Ok::<Option<String>, anyhow::Error>(if is_thread {
+                body.get("parent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            })
         };
-        let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -294,19 +304,19 @@ impl DiscordChannel {
                         ),
                     "channel lookup failed"
                 );
-                return false;
+                return None;
             }
             Err(_) => {
                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
-                return false;
+                return None;
             }
         };
 
         self.thread_channels
             .lock()
             .await
-            .insert(channel_id.to_string(), is_thread);
-        is_thread
+            .insert(channel_id.to_string(), result.clone());
+        result
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -348,6 +358,30 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// channel is a thread. Discord normally responds in under 200 ms; this
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pure channel-filter decision: does `msg_channel` pass the allowlist?
+///
+/// A channel passes when:
+/// 1. `channel_filter` is empty (accept all), OR
+/// 2. `msg_channel` is directly in `channel_filter`, OR
+/// 3. `thread_parent_id` is `Some(parent)` and `parent` is in `channel_filter`
+///    (thread whose parent forum/channel is allowed).
+fn channel_passes_filter(
+    channel_filter: &[String],
+    msg_channel: &str,
+    thread_parent_id: Option<&str>,
+) -> bool {
+    if channel_filter.is_empty() {
+        return true;
+    }
+    if channel_filter.iter().any(|c| c == msg_channel) {
+        return true;
+    }
+    if let Some(parent) = thread_parent_id {
+        return channel_filter.iter().any(|c| c == parent);
+    }
+    false
+}
 
 /// Process Discord message attachments in a single pass.
 ///
@@ -1755,12 +1789,26 @@ impl Channel for DiscordChannel {
                     }
 
                     // Channel allowlist. Empty = watch every channel.
+                    // Thread messages carry the thread's own channel_id, not the
+                    // parent's. When the direct match fails, look up the thread's
+                    // parent_id and accept if *that* is in the allowlist.
                     if !channel_filter.is_empty() {
                         let msg_channel = d
                             .get("channel_id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        if !channel_filter.iter().any(|c| c == msg_channel) {
+                        let parent_id = if !msg_channel.is_empty()
+                            && !channel_filter.iter().any(|c| c == msg_channel)
+                        {
+                            self.thread_parent(&self.http_client(), msg_channel).await
+                        } else {
+                            None
+                        };
+                        if !channel_passes_filter(
+                            &channel_filter,
+                            msg_channel,
+                            parent_id.as_deref(),
+                        ) {
                             continue;
                         }
                     }
@@ -1918,7 +1966,8 @@ impl Channel for DiscordChannel {
                     // is worse.
                     let thread_ts = if channel_id.is_empty() {
                         None
-                    } else if self.is_thread_channel(&client, &channel_id).await {
+                    } else if self.thread_parent(&client, &channel_id).await.is_some()
+                    {
                         Some(channel_id.clone())
                     } else {
                         None
@@ -3229,6 +3278,40 @@ mod tests {
                 "type {non_thread} must not classify as thread"
             );
         }
+    }
+
+    #[test]
+    fn channel_filter_empty_accepts_everything() {
+        let filter: Vec<String> = vec![];
+        assert!(channel_passes_filter(&filter, "12345", None));
+        assert!(channel_passes_filter(&filter, "99999", Some("12345")));
+        assert!(channel_passes_filter(&filter, "", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match() {
+        let filter = vec!["111".to_string(), "222".to_string()];
+        assert!(channel_passes_filter(&filter, "111", None));
+        assert!(channel_passes_filter(&filter, "222", None));
+        assert!(!channel_passes_filter(&filter, "333", None));
+    }
+
+    #[test]
+    fn channel_filter_thread_parent_fallback() {
+        let filter = vec!["111".to_string()];
+        // Thread whose parent is in the allowlist — accepted.
+        assert!(channel_passes_filter(&filter, "999", Some("111")));
+        // Thread whose parent is NOT in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", Some("888")));
+        // Non-thread channel not in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match_skips_parent_check() {
+        let filter = vec!["111".to_string()];
+        // Direct match with a parent_id present — parent is irrelevant.
+        assert!(channel_passes_filter(&filter, "111", Some("999")));
     }
 
     #[test]

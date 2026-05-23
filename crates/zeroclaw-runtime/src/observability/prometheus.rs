@@ -349,6 +349,7 @@ impl Observer for PrometheusObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.tool_calls
@@ -485,13 +486,19 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(5),
             success: false,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -523,8 +530,11 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(100),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -554,18 +564,27 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: false,
+            arguments: None,
+            result: None,
         });
 
         let output = obs.encode();

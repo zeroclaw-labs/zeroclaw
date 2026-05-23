@@ -44,6 +44,9 @@ them from the beginning gives you the full arc: from the shape of the architectu
 how we record and coordinate and ship and collaborate, to what it means to write the
 code well at the sentence level.
 
+If you are trying to decide which foundation applies to a specific change, start with
+the [Architecture and contribution map](../contributing/architecture-map.md).
+
 | # | Document | What It Answers | Discussion Thread |
 |---|----------|-----------------|-------------------|
 | 1 | [Intentional Architecture — Microkernel Transition](./fnd-001-intentional-architecture.md) | What are we building, and what shape should it take? | [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) |
