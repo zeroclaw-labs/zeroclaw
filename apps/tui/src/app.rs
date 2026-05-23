@@ -239,8 +239,12 @@ pub async fn run(
                         Mode::Logs => {
                             logs_pane.handle_mouse(mouse, content_area);
                         }
-                        Mode::ACP => {}
-                        Mode::Chat => {}
+                        Mode::ACP => {
+                            acp_pane.handle_mouse(mouse, content_area);
+                        }
+                        Mode::Chat => {
+                            chat_pane.handle_mouse(mouse, content_area);
+                        }
                     }
                 }
             }
