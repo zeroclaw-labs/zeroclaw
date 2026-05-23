@@ -1,13 +1,25 @@
 {
-  "_fixture_note": "PLACEHOLDER — to be replaced with a real captured `card.action.trigger` payload. See card_action_approve.json for the capture procedure.",
-  "_captured_at": "PLACEHOLDER",
+  "_fixture_note": "Sanitized capture from a live Feishu tenant on 2026-05-23. Captured via `RUST_LOG=info,zeroclaw_log_event=debug` from `card.action.trigger raw payload` DEBUG events emitted by `LarkChannel::handle_card_action_event`. open_chat_id / open_message_id / operator.* / token were replaced with REDACTED_* placeholders. approval_id is a UUID v4 generated server-side and carries no tenant information.",
+  "_captured_at": "2026-05-23T12:16:38.373110Z",
   "_decision_label": "Deny",
-  "_approval_id_label": "5738bfac-5db7-42c6-b0bb-5a52a07d9228 (from logs 2026-05-23T10:57:51Z; the same Deny path was observed 3 consecutive times in production logs that day, all parsed correctly)",
+  "_approval_id_label": "ba0d4258-f3ca-4ea2-bfe4-5c065698b61b",
   "action": {
     "tag": "button",
     "value": {
-      "approval_id": "5738bfac-5db7-42c6-b0bb-5a52a07d9228",
+      "approval_id": "ba0d4258-f3ca-4ea2-bfe4-5c065698b61b",
       "decision": "deny"
     }
-  }
+  },
+  "context": {
+    "open_chat_id": "oc_REDACTED_CHAT_ID",
+    "open_message_id": "om_REDACTED_MSG_ID_2"
+  },
+  "host": "im_message",
+  "operator": {
+    "open_id": "ou_REDACTED_USER_ID",
+    "tenant_key": "REDACTED_TENANT_KEY",
+    "union_id": "on_REDACTED_UNION_ID",
+    "user_id": "REDACTED_USER_ID"
+  },
+  "token": "c-REDACTED_CALLBACK_TOKEN"
 }

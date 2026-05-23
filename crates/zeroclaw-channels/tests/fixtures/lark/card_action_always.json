@@ -1,13 +1,25 @@
 {
-  "_fixture_note": "PLACEHOLDER — to be replaced with a real captured `card.action.trigger` payload. See card_action_approve.json for the capture procedure.",
-  "_captured_at": "PLACEHOLDER",
+  "_fixture_note": "Sanitized capture from a live Feishu tenant on 2026-05-23. Captured via `RUST_LOG=info,zeroclaw_log_event=debug` from `card.action.trigger raw payload` DEBUG events emitted by `LarkChannel::handle_card_action_event`. open_chat_id / open_message_id / operator.* / token were replaced with REDACTED_* placeholders. approval_id is a UUID v4 generated server-side and carries no tenant information.",
+  "_captured_at": "2026-05-23T12:19:15.016478Z",
   "_decision_label": "AlwaysApprove",
-  "_approval_id_label": "7514adbf-6ef7-4e9b-9e52-4a6639157ab9 (from logs 2026-05-23T10:59:28Z; subsequent tool calls in that trace_id correctly skipped further approval prompts, confirming the AlwaysApprove path also wires through to the agent loop)",
+  "_approval_id_label": "ca8e43b6-d64d-4678-a50e-60b5374329dd",
   "action": {
     "tag": "button",
     "value": {
-      "approval_id": "7514adbf-6ef7-4e9b-9e52-4a6639157ab9",
+      "approval_id": "ca8e43b6-d64d-4678-a50e-60b5374329dd",
       "decision": "always"
     }
-  }
+  },
+  "context": {
+    "open_chat_id": "oc_REDACTED_CHAT_ID",
+    "open_message_id": "om_REDACTED_MSG_ID_3"
+  },
+  "host": "im_message",
+  "operator": {
+    "open_id": "ou_REDACTED_USER_ID",
+    "tenant_key": "REDACTED_TENANT_KEY",
+    "union_id": "on_REDACTED_UNION_ID",
+    "user_id": "REDACTED_USER_ID"
+  },
+  "token": "c-REDACTED_CALLBACK_TOKEN"
 }
