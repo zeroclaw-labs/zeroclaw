@@ -4043,4 +4043,138 @@ mod tests {
         assert_eq!(bytes.len(), 64);
         assert_eq!(filename, "voice.m4a");
     }
+
+    async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": { "message_id": "om_test_message_id" }
+            })))
+            .expect(1)
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn assert_send_body_matches_recipient_and_text(
+        mock_server: &wiremock::MockServer,
+        expected_recipient: &str,
+        expected_text: &str,
+    ) {
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should record requests");
+        let send_request = requests
+            .iter()
+            .find(|r| r.url.path() == "/im/v1/messages")
+            .expect("expected at least one POST /im/v1/messages");
+        assert_eq!(
+            send_request.url.query(),
+            Some("receive_id_type=chat_id"),
+            "send URL must carry receive_id_type=chat_id query param"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&send_request.body).expect("send body should be valid JSON");
+        assert_eq!(
+            body["receive_id"].as_str(),
+            Some(expected_recipient),
+            "receive_id must match the SendMessage recipient; full body: {body}"
+        );
+        assert_eq!(
+            body["msg_type"].as_str(),
+            Some("interactive"),
+            "msg_type must be 'interactive'; full body: {body}"
+        );
+        let content_str = body["content"]
+            .as_str()
+            .expect("content must be a JSON string per Lark interactive-card spec");
+        assert!(
+            content_str.contains(expected_text),
+            "card content should embed the message text {expected_text:?}; got: {content_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_send_via_from_config_emits_post_to_messages_endpoint() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server).await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: false,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        assert_eq!(
+            ch.name(),
+            "lark",
+            "use_feishu=false must keep the channel identity as 'lark'"
+        );
+
+        let message = SendMessage::new("hi from cron", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed against mocked Lark endpoint");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn feishu_send_via_from_config_emits_post_to_messages_endpoint() {
+        let mock_server = wiremock::MockServer::start().await;
+        mount_lark_token_and_send_mocks(&mock_server).await;
+
+        let config = zeroclaw_config::schema::LarkConfig {
+            enabled: true,
+            use_feishu: true,
+            app_id: "cli_test_app_id".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            ..Default::default()
+        };
+        let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
+        ch.api_base_override = Some(mock_server.uri());
+
+        assert_eq!(
+            ch.name(),
+            "feishu",
+            "use_feishu=true must surface the channel identity as 'feishu' \
+             (registry key alignment — see orchestrator::deliver_announcement)"
+        );
+
+        let message = SendMessage::new("hi from cron", "oc_test_chat_id");
+        Channel::send(&ch, &message)
+            .await
+            .expect("Channel::send should succeed against mocked Feishu endpoint");
+
+        assert_send_body_matches_recipient_and_text(
+            &mock_server,
+            "oc_test_chat_id",
+            "hi from cron",
+        )
+        .await;
+    }
 }
