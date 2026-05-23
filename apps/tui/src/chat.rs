@@ -883,11 +883,11 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-fn render_tool_entry<'a>(
-    lines: &mut Vec<Line<'a>>,
-    name: &'a str,
-    input: &'a serde_json::Value,
-    result: Option<&'a str>,
+fn render_tool_entry(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    input: &serde_json::Value,
+    result: Option<&str>,
 ) {
     const TOOL_FG: Color = Color::Rgb(180, 140, 255);
     const RESULT_FG: Color = Color::Rgb(130, 130, 130);
