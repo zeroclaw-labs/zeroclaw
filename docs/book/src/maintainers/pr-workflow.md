@@ -21,6 +21,16 @@ The control loop that delivers this is layered on purpose:
 
 Automation handles intake labels and CI gating. Final merge accountability stays with human maintainers and PR authors.
 
+## Project board contract
+
+The Project board is an automated planning board, not the authoritative PR review queue.
+
+Use the board for issue readiness, active ownership, roadmap grouping, dependencies, blocker state, and stale-exemption reasons. Those signals move slowly enough that a board field or planning lane can stay useful.
+
+Do not mirror native PR review state into manual board lanes. GitHub PR state owns review decision, required checks, mergeability, conflicts, stale approvals, and merge readiness. If the board later displays derived PR routing such as `DIRTY`, `BEHIND`, or `APPROVED`, treat it as a dashboard view of GitHub state, not a separate source of truth.
+
+This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
+
 ## PR lanes
 
 PR lanes are routing expectations, not another required label family. Use them to decide how much review depth, sequencing, and maintainer attention a PR needs. CODEOWNERS, native GitHub review state, CI, labels, linked issues, and explicit relationship keywords still carry the actual routing data.

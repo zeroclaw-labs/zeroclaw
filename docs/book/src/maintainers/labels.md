@@ -12,7 +12,13 @@ When definitions conflict, update the source file first, then sync this page.
 
 Labels are portable metadata. They should answer what kind of work this is, what code area it touches, how risky it is to review, and whether stale policy or triage policy needs special handling.
 
-When Project board automation is added, keep the split based on update frequency:
+When Project board automation is added, use it as an automated planning board,
+not as a second PR review queue. The board should answer slower-moving planning
+questions: what is ready to pick up, who owns it, what tracker or milestone it
+belongs to, and what is blocked. Native GitHub PR state should continue to
+answer fast-moving review and merge questions.
+
+Keep the split based on update frequency:
 
 - Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
 - Project board fields are appropriate for issue planning stage, active owner, dependency state, and roadmap grouping when those fields are actively maintained.
