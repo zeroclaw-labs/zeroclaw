@@ -4411,7 +4411,7 @@ mod tests {
             let channel = MatrixChannel::new(
                 config,
                 "matrix",
-                Arc::new(|| Vec::<String>::new()),
+                Arc::new(Vec::<String>::new),
                 state_dir.path().to_path_buf(),
             )
             .expect("matrix channel");
