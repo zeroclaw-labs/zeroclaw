@@ -117,12 +117,16 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
         }),
         "tool_call_start" => Some(ObserverEvent::ToolCallStart {
             tool,
+            tool_call_id: None,
             arguments: None,
         }),
         "tool_call" | "tool_call_result" => Some(ObserverEvent::ToolCall {
             tool,
+            tool_call_id: None,
             duration,
             success,
+            arguments: None,
+            result: None,
         }),
         "channel_message_inbound" => Some(ObserverEvent::ChannelMessage {
             channel,
@@ -228,6 +232,7 @@ mod tests {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 assert_eq!(tool, "shell");
                 assert_eq!(*duration, Duration::from_millis(120));
