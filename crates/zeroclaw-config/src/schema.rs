@@ -2802,6 +2802,11 @@ pub struct AliasedAgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// When true, only native provider tool calls are executable. Text fallback
+    /// parsing remains disabled, so XML/markdown/GLM-looking text is treated as
+    /// final assistant text.
+    #[serde(default)]
+    pub strict_tool_parsing: bool,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
@@ -2910,6 +2915,7 @@ impl Default for AliasedAgentConfig {
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -5622,6 +5628,9 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
+    #[serde(default)]
+    pub headed: Option<bool>,
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
@@ -5656,6 +5665,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
@@ -16363,6 +16373,7 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(!cfg.strict_tool_parsing);
     }
 
     #[test]
@@ -16375,6 +16386,7 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -16386,6 +16398,7 @@ tool_dispatcher = "xml"
         assert_eq!(agent.max_history_messages, 80);
         assert!(agent.parallel_tools);
         assert_eq!(agent.tool_dispatcher, "xml");
+        assert!(agent.strict_tool_parsing);
     }
 
     #[test]
@@ -17850,6 +17863,7 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
@@ -17868,6 +17882,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
@@ -17887,6 +17902,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
@@ -17903,6 +17919,21 @@ default_temperature = 0.7
         assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
+    }
+
+    #[test]
+    async fn browser_config_parses_headed_true() {
+        let parsed: BrowserConfig = toml::from_str(
+            r#"
+backend = "agent_browser"
+headed = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.backend, "agent_browser");
+        assert_eq!(parsed.headed, Some(true));
+        assert!(parsed.native_headless);
     }
 
     #[test]

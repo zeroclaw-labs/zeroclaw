@@ -102,6 +102,8 @@ impl LeakDetector {
                     Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
                     "Anthropic API key",
                 ),
+                // Groq
+                (Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(), "Groq API key"),
                 // Google
                 (
                     Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
@@ -410,6 +412,21 @@ mod tests {
                 assert!(patterns.iter().any(|p| p.contains("AWS")));
             }
             LeakResult::Clean => panic!("Should detect AWS key"),
+        }
+    }
+
+    #[test]
+    fn detects_groq_api_keys() {
+        let detector = LeakDetector::new();
+        let content = "Groq key: gsk_abcdefghijklmnopqrstuvwxyz123456";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Groq")));
+                assert!(redacted.contains("[REDACTED"));
+                assert!(!redacted.contains("gsk_abcdefghijklmnopqrstuvwxyz123456"));
+            }
+            LeakResult::Clean => panic!("Should detect Groq API key"),
         }
     }
 

@@ -198,7 +198,8 @@ impl WebSearchTool {
         }
 
         let html = response.text().await?;
-        let html_contains_block = contains_ascii_case_insensitive(&html, "/wr.do?");
+        let html_contains_block = contains_ascii_case_insensitive(&html, "/wr.do?")
+            || contains_ascii_case_insensitive(&html, "anomaly-modal");
         if let Some(message) =
             duckduckgo_block_message(status, final_url_is_block, html_contains_block)
         {
@@ -940,6 +941,35 @@ mod tests {
             .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
             .await
             .expect_err("verification HTML should be reported as a DuckDuckGo block");
+
+        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains("SearXNG"));
+    }
+
+    #[tokio::test]
+    async fn test_duckduckgo_request_reports_anomaly_modal_block() {
+        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
+        // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
+        // no verification form), and the old detector slid past it,
+        // returning a misleading "No results found" message to the agent.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .and(query_param("q", "test"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(
+                r#"<html><body><div class="anomaly-modal__title">Unusual Traffic Detected</div></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let err = tool
+            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect_err("anomaly-modal page should be reported as a DuckDuckGo block");
 
         assert!(err.to_string().contains("DuckDuckGo blocked"));
         assert!(err.to_string().contains("SearXNG"));
