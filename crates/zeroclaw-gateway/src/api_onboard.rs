@@ -862,7 +862,7 @@ fn provider_type_badge(
         }
     }
     if has_usable_alias {
-        Some("set".to_string())
+        Some("configured".to_string())
     } else if has_alias {
         Some("needs setup".to_string())
     } else {
@@ -1787,8 +1787,8 @@ mod tests {
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
         assert_eq!(
             anthropic.badge.as_deref(),
-            Some("set"),
-            "anthropic should be marked set once required chat fields are present"
+            Some("configured"),
+            "anthropic should be marked configured once required chat fields are present"
         );
     }
 
