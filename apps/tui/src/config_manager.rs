@@ -3,8 +3,8 @@ use std::io::{self, Stdout};
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -28,7 +28,12 @@ pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
@@ -36,6 +41,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         term.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;

@@ -7,11 +7,15 @@ use clap::Parser;
 
 mod acp;
 mod app;
+mod attachment;
 mod chat;
-mod diff;
 mod client;
+mod clipboard;
 mod config_manager;
 mod dashboard;
+mod diff;
+mod file_explorer;
+mod input_bar;
 mod logs;
 mod mouse;
 mod theme;
@@ -97,6 +101,7 @@ fn force_restore_terminal() {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
+            crossterm::event::DisableBracketedPaste,
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );

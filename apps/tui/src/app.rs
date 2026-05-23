@@ -99,7 +99,7 @@ pub async fn run(
                 let help = match mode {
                     Mode::Dashboard => dashboard_pane.help_lines(),
                     Mode::Config => config_app.help_lines(),
-                    Mode::ACP => vec![("?", "This help")],
+                    Mode::ACP => acp_pane.help_lines(),
                     Mode::Chat => chat_pane.help_lines(),
                     Mode::Logs => logs_pane.help_lines(),
                 };
@@ -241,6 +241,15 @@ pub async fn run(
                         }
                         Mode::ACP => {}
                         Mode::Chat => {}
+                    }
+                }
+            }
+            Event::Paste(text) => {
+                if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    match mode {
+                        Mode::Chat => chat_pane.handle_paste(&text),
+                        Mode::ACP => acp_pane.handle_paste(&text),
+                        _ => {}
                     }
                 }
             }

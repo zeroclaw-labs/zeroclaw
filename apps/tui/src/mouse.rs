@@ -167,7 +167,7 @@ pub(crate) fn copy_osc52(text: &str) {
 }
 
 /// Minimal base64 encoder. Standard alphabet, with padding.
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);

@@ -30,4 +30,12 @@ impl<'a> Acp<'a> {
     pub(crate) fn wants_text_input(&self) -> bool {
         self.inner.wants_text_input()
     }
+
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        self.inner.handle_paste(text);
+    }
+
+    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+        self.inner.help_lines()
+    }
 }

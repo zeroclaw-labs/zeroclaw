@@ -135,14 +135,22 @@ pub async fn process_file_entry(
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot write upload: {e}")))?;
 
-    let workspace_path = dest.to_string_lossy().to_string();
+    // Canonicalize so the marker always contains an absolute path —
+    // workspace_dir may be relative (e.g. ".") when no cwd was provided.
+    let canonical = tokio::fs::canonicalize(&dest)
+        .await
+        .unwrap_or_else(|_| dest.clone());
+    let workspace_path = canonical.to_string_lossy().to_string();
 
     // 6. Build marker.
     let kind = attachment_kind(&mime_type);
     let marker = match entry.source {
         FileSource::Clipboard => format!("[{kind} from clipboard]"),
         FileSource::File => {
-            let display_path = original_path.as_deref().unwrap_or(&sanitized);
+            // Prefer original local path (Unix transport), fall back to
+            // workspace path (WSS/base64 transport) so the multimodal
+            // processor can find the file on the server's filesystem.
+            let display_path = original_path.as_deref().unwrap_or(&workspace_path);
             format!("[{kind}:{display_path}]")
         }
     };
@@ -409,7 +417,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(r.marker, "[DOCUMENT:report.pdf]");
+        // data_b64 mode: marker uses the absolute workspace path (not the filename).
+        assert!(r.marker.starts_with("[DOCUMENT:"), "marker = {}", r.marker);
+        assert!(r.marker.ends_with(".pdf]"), "marker = {}", r.marker);
+        assert!(
+            r.marker.contains("/uploads/"),
+            "marker should use workspace uploads path: {}",
+            r.marker
+        );
         assert!(!r.deduplicated);
     }
 

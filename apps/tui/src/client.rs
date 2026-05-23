@@ -195,6 +195,15 @@ pub fn spawn_notification_router(
     })
 }
 
+// ── Transport ────────────────────────────────────────────────────
+
+/// Transport protocol of the established RPC connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    Unix,
+    Wss,
+}
+
 // ── Connection state ──────────────────────────────────────────────
 
 /// Observable connection state, written by the socket read task.
@@ -219,6 +228,8 @@ pub struct RpcClient {
     pub tui_id: Option<String>,
     /// HMAC signature for reconnection. Pass back in next initialize.
     pub tui_sig: Option<String>,
+    /// Transport protocol of this connection.
+    transport: Transport,
 }
 
 impl RpcClient {
@@ -337,6 +348,7 @@ impl RpcClient {
             connection_state: conn_state,
             tui_id,
             tui_sig,
+            transport: Transport::Unix,
         })
     }
 
@@ -479,6 +491,7 @@ impl RpcClient {
             connection_state: conn_state,
             tui_id,
             tui_sig,
+            transport: Transport::Wss,
         })
     }
 
@@ -922,7 +935,13 @@ impl RpcClient {
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
+            transport: Transport::Unix,
         }
+    }
+
+    /// Transport protocol of this connection.
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 }
 

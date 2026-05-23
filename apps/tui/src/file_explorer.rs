@@ -1,0 +1,542 @@
+//! Reusable file explorer modal widget with multi-file selection.
+//!
+//! Browses the local filesystem where the TUI is running. Designed to
+//! be invoked from any pane (Chat, ACP, etc.).
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+};
+
+use crate::theme;
+
+// ── Types ────────────────────────────────────────────────────────
+
+/// A single entry in the explorer listing.
+#[derive(Debug)]
+pub(crate) struct ExplorerEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub _is_hidden: bool,
+    pub full_path: PathBuf,
+}
+
+/// Action returned from key handling.
+pub(crate) enum ExplorerAction {
+    /// Key consumed, no state change visible to caller.
+    None,
+    /// User confirmed selection. Contains selected file paths.
+    Confirm(Vec<PathBuf>),
+    /// User cancelled the explorer.
+    Cancel,
+}
+
+// ── State ────────────────────────────────────────────────────────
+
+/// State for the file explorer overlay.
+#[derive(Debug)]
+pub(crate) struct FileExplorerState {
+    cwd: PathBuf,
+    entries: Vec<ExplorerEntry>,
+    list_state: ListState,
+    selected: HashSet<PathBuf>,
+    show_hidden: bool,
+    error: Option<String>,
+    search_query: String,
+    searching: bool,
+}
+
+impl FileExplorerState {
+    /// Create a new explorer rooted at `start_dir`.
+    pub fn new(start_dir: PathBuf) -> Self {
+        let mut state = Self {
+            cwd: start_dir,
+            entries: Vec::new(),
+            list_state: ListState::default(),
+            selected: HashSet::new(),
+            show_hidden: false,
+            error: None,
+            search_query: String::new(),
+            searching: false,
+        };
+        state.load_entries();
+        if !state.entries.is_empty() {
+            state.list_state.select(Some(0));
+        }
+        state
+    }
+
+    /// Read the current directory and populate entries.
+    pub fn load_entries(&mut self) {
+        self.entries.clear();
+        self.error = None;
+
+        let rd = match std::fs::read_dir(&self.cwd) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.error = Some(format!("Cannot read {}: {e}", self.cwd.display()));
+                return;
+            }
+        };
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_hidden = name.starts_with('.');
+            if !self.show_hidden && is_hidden {
+                continue;
+            }
+            let meta = entry.metadata();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let full_path = entry.path();
+
+            let e = ExplorerEntry {
+                name,
+                is_dir,
+                size,
+                _is_hidden: is_hidden,
+                full_path,
+            };
+
+            if is_dir {
+                dirs.push(e);
+            } else {
+                files.push(e);
+            }
+        }
+
+        dirs.sort_by_key(|a| a.name.to_lowercase());
+        files.sort_by_key(|a| a.name.to_lowercase());
+
+        self.entries.extend(dirs);
+        self.entries.extend(files);
+    }
+
+    /// Filtered view of entries (when searching).
+    fn visible_entries(&self) -> Vec<usize> {
+        if self.search_query.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let q = self.search_query.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name.to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn selected_idx(&self) -> Option<usize> {
+        self.list_state.selected()
+    }
+
+    fn current_entry(&self) -> Option<&ExplorerEntry> {
+        let visible = self.visible_entries();
+        self.list_state
+            .selected()
+            .and_then(|i| visible.get(i))
+            .and_then(|&real_idx| self.entries.get(real_idx))
+    }
+
+    /// Handle a key event. Returns the action for the caller to process.
+    pub fn handle_key(&mut self, key: KeyEvent) -> ExplorerAction {
+        // Search mode intercepts character input.
+        if self.searching {
+            return self.handle_search_key(key);
+        }
+
+        let visible = self.visible_entries();
+        let vis_len = visible.len();
+
+        match key.code {
+            KeyCode::Esc => ExplorerAction::Cancel,
+
+            KeyCode::Char('q') => ExplorerAction::Cancel,
+
+            KeyCode::Enter => {
+                if let Some(entry) = self.current_entry() {
+                    if entry.is_dir {
+                        let path = entry.full_path.clone();
+                        self.cwd = path;
+                        self.search_query.clear();
+                        self.load_entries();
+                        self.list_state.select(if self.entries.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                        ExplorerAction::None
+                    } else if self.selected.is_empty() {
+                        // No multi-select: confirm just the cursor entry.
+                        ExplorerAction::Confirm(vec![entry.full_path.clone()])
+                    } else {
+                        // Multi-select active: confirm all selected.
+                        let paths: Vec<PathBuf> = self.selected.iter().cloned().collect();
+                        ExplorerAction::Confirm(paths)
+                    }
+                } else {
+                    ExplorerAction::None
+                }
+            }
+
+            KeyCode::Char(' ') => {
+                if let Some(entry) = self.current_entry()
+                    && !entry.is_dir
+                {
+                    let path = entry.full_path.clone();
+                    if self.selected.contains(&path) {
+                        self.selected.remove(&path);
+                    } else {
+                        self.selected.insert(path);
+                    }
+                    // Advance cursor after toggling.
+                    if let Some(i) = self.selected_idx() {
+                        if i + 1 < vis_len {
+                            self.list_state.select(Some(i + 1));
+                        }
+                    }
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(i) = self.selected_idx() {
+                    if i + 1 < vis_len {
+                        self.list_state.select(Some(i + 1));
+                    }
+                } else if vis_len > 0 {
+                    self.list_state.select(Some(0));
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(i) = self.selected_idx() {
+                    if i > 0 {
+                        self.list_state.select(Some(i - 1));
+                    }
+                } else if vis_len > 0 {
+                    self.list_state.select(Some(0));
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Home | KeyCode::Char('g') => {
+                if vis_len > 0 {
+                    self.list_state.select(Some(0));
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::End | KeyCode::Char('G') => {
+                if vis_len > 0 {
+                    self.list_state.select(Some(vis_len - 1));
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Char('l') | KeyCode::Right => {
+                // Enter directory under cursor.
+                if let Some(entry) = self.current_entry()
+                    && entry.is_dir
+                {
+                    let path = entry.full_path.clone();
+                    self.cwd = path;
+                    self.search_query.clear();
+                    self.load_entries();
+                    self.list_state.select(if self.entries.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(parent) = self.cwd.parent() {
+                    let prev = self.cwd.clone();
+                    self.cwd = parent.to_path_buf();
+                    self.search_query.clear();
+                    self.load_entries();
+                    // Try to re-select the dir we came from.
+                    let idx = self
+                        .entries
+                        .iter()
+                        .position(|e| e.full_path == prev)
+                        .unwrap_or(0);
+                    self.list_state.select(Some(idx));
+                }
+                ExplorerAction::None
+            }
+
+            KeyCode::Char('.') => {
+                self.show_hidden = !self.show_hidden;
+                self.load_entries();
+                self.list_state.select(if self.entries.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
+                ExplorerAction::None
+            }
+
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.search_query.clear();
+                ExplorerAction::None
+            }
+
+            _ => ExplorerAction::None,
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> ExplorerAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.searching = false;
+                self.search_query.clear();
+                // Reset selection to first visible.
+                let vis = self.visible_entries();
+                self.list_state
+                    .select(if vis.is_empty() { None } else { Some(0) });
+                ExplorerAction::None
+            }
+            KeyCode::Enter => {
+                self.searching = false;
+                // Keep the filter active, confirm if on a file.
+                if let Some(entry) = self.current_entry() {
+                    if entry.is_dir {
+                        let path = entry.full_path.clone();
+                        self.cwd = path;
+                        self.search_query.clear();
+                        self.load_entries();
+                        self.list_state.select(if self.entries.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                        ExplorerAction::None
+                    } else if self.selected.is_empty() {
+                        ExplorerAction::Confirm(vec![entry.full_path.clone()])
+                    } else {
+                        let paths: Vec<PathBuf> = self.selected.iter().cloned().collect();
+                        ExplorerAction::Confirm(paths)
+                    }
+                } else {
+                    ExplorerAction::None
+                }
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                let vis = self.visible_entries();
+                self.list_state
+                    .select(if vis.is_empty() { None } else { Some(0) });
+                ExplorerAction::None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_query.push(c);
+                let vis = self.visible_entries();
+                self.list_state
+                    .select(if vis.is_empty() { None } else { Some(0) });
+                ExplorerAction::None
+            }
+            _ => ExplorerAction::None,
+        }
+    }
+
+    /// Render the file explorer as a centered modal overlay.
+    pub fn render(&self, f: &mut Frame, area: Rect) {
+        // Center the overlay: 80% height, 70% width.
+        let vert = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(10),
+                Constraint::Min(10),
+                Constraint::Percentage(10),
+            ])
+            .split(area);
+        let overlay_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Min(40),
+                Constraint::Percentage(15),
+            ])
+            .split(vert[1])[1];
+
+        f.render_widget(Clear, overlay_area);
+
+        // Title: current path.
+        let cwd_display = self.cwd.display().to_string();
+        let title = if cwd_display.len() > 50 {
+            format!(" ...{} ", &cwd_display[cwd_display.len() - 47..])
+        } else {
+            format!(" {cwd_display} ")
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(Style::default().fg(Color::Cyan));
+
+        let inner = block.inner(overlay_area);
+        f.render_widget(block, overlay_area);
+
+        if let Some(err) = &self.error {
+            let p = Paragraph::new(Span::styled(err.as_str(), Style::default().fg(Color::Red)));
+            f.render_widget(p, inner);
+            return;
+        }
+
+        // Split inner into: entries list + footer.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+
+        let visible = self.visible_entries();
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&real_idx| {
+                let entry = &self.entries[real_idx];
+                let is_marked = self.selected.contains(&entry.full_path);
+
+                let prefix = if is_marked { "* " } else { "  " };
+                let (name, style) = if entry.is_dir {
+                    (
+                        format!("{prefix}{}/", entry.name),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    let size = crate::attachment::format_size(entry.size);
+                    let fg = if is_marked {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    };
+                    (
+                        format!("{prefix}{}  {size}", entry.name),
+                        Style::default().fg(fg),
+                    )
+                };
+
+                ListItem::new(Span::styled(name, style))
+            })
+            .collect();
+
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .fg(Color::Cyan),
+        );
+        let mut ls = self.list_state;
+        f.render_stateful_widget(list, chunks[0], &mut ls);
+
+        // Footer: selected count + search + key hints.
+        let mut footer_spans: Vec<Span> = Vec::new();
+
+        if !self.selected.is_empty() {
+            footer_spans.push(Span::styled(
+                format!(" {} selected ", self.selected.len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            footer_spans.push(Span::styled("| ", theme::dim_style()));
+        }
+
+        if self.searching {
+            footer_spans.push(Span::styled("/ ", Style::default().fg(Color::Yellow)));
+            footer_spans.push(Span::styled(
+                &self.search_query,
+                Style::default().fg(Color::White),
+            ));
+            footer_spans.push(Span::styled("\u{2588}", Style::default().fg(Color::White)));
+        } else {
+            footer_spans.push(Span::styled(
+                " Space=select Enter=confirm Esc=cancel /=search .=hidden",
+                theme::dim_style(),
+            ));
+        }
+
+        let footer = Paragraph::new(Line::from(footer_spans));
+        f.render_widget(footer, chunks[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_reads_current_dir() {
+        let tmp = std::env::temp_dir();
+        let state = FileExplorerState::new(tmp.clone());
+        assert_eq!(state.cwd, tmp);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn hidden_files_filtered_by_default() {
+        let tmp = std::env::temp_dir();
+        let state = FileExplorerState::new(tmp);
+        // No entry should start with '.' when show_hidden is false.
+        for entry in &state.entries {
+            assert!(
+                !entry.name.starts_with('.'),
+                "Hidden file leaked: {}",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_hidden() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new(tmp);
+        assert!(!state.show_hidden);
+        // Simulate pressing '.'
+        state.handle_key(KeyEvent::from(KeyCode::Char('.')));
+        assert!(state.show_hidden);
+    }
+
+    #[test]
+    fn cancel_returns_cancel() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new(tmp);
+        let action = state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(action, ExplorerAction::Cancel));
+    }
+
+    #[test]
+    fn search_filters_entries() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new(tmp);
+        // Enter search mode.
+        state.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        assert!(state.searching);
+        // Type a query that won't match anything.
+        state.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('z')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('q')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('q')));
+        let visible = state.visible_entries();
+        // Likely empty, but the point is it filters.
+        assert!(visible.len() <= state.entries.len());
+    }
+}

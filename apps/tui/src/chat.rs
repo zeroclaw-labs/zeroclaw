@@ -11,11 +11,13 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+use crate::attachment::build_attachments_json;
 use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionPromptResult, SessionUpdate,
     method, parse_session_update,
 };
 use crate::diff;
+use crate::input_bar::{InputBarAction, InputBarState};
 use crate::theme;
 use zeroclaw_api::jsonrpc::RpcOutbound;
 
@@ -257,7 +259,10 @@ impl<'a> Chat<'a> {
                                 for m in msgs.messages {
                                     match m.role.as_str() {
                                         "user" => {
-                                            state.entries.push(ChatEntry::UserMessage(m.content));
+                                            state.entries.push(ChatEntry::UserMessage {
+                                                text: Some(m.content),
+                                                attachments: vec![],
+                                            });
                                         }
                                         "assistant" => {
                                             state.entries.push(ChatEntry::AgentMessage(m.content));
@@ -306,7 +311,58 @@ impl<'a> Chat<'a> {
             SessionOverlay::None => { /* handled below */ }
         }
 
-        // ── Normal active-chat key handling ──────────────────────
+        // ── Delegate to input bar first ─────────────────────────
+        // The input bar handles: file explorer, Ctrl+A, Ctrl+V,
+        // Enter (slash commands + submit), text input, cursor, backspace.
+        // It does NOT handle approval, selection, session management, etc.
+        if state.pending_approval().is_none() && state.selected_entry.is_none() {
+            let action = state.input_bar.handle_key(key, state.turn_in_flight);
+            match action {
+                InputBarAction::Submit { text, attachments } => {
+                    let prompt = text.clone().unwrap_or_default();
+                    let att_names: Vec<String> =
+                        attachments.iter().map(|a| a.filename.clone()).collect();
+                    state.push_user_message(text, att_names);
+                    let sid = state.session_id.clone();
+                    let rpc_arc = self.rpc_out.clone();
+                    let tx = self.turn_result_tx.clone();
+                    let transport = self.rpc.transport();
+                    tokio::spawn(async move {
+                        let mut params = serde_json::json!({
+                            "session_id": sid,
+                            "prompt": prompt,
+                        });
+                        if !attachments.is_empty() {
+                            match build_attachments_json(&attachments, transport) {
+                                Ok(att_json) => {
+                                    params["attachments"] = serde_json::Value::Array(att_json);
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+                        let result = RpcClient::call_static::<SessionPromptResult>(
+                            &rpc_arc,
+                            method::SESSION_PROMPT,
+                            params,
+                        )
+                        .await;
+                        let _ = tx.send(result).await;
+                    });
+                    return false;
+                }
+                InputBarAction::StatusMessage(msg) => {
+                    state.entries.push(ChatEntry::AgentMessage(msg));
+                    return false;
+                }
+                InputBarAction::Consumed => return false,
+                InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
+            }
+        }
+
+        // ── Chat-specific key handling ───────────────────────────
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if state.turn_in_flight {
@@ -326,7 +382,7 @@ impl<'a> Chat<'a> {
                     return true;
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -336,23 +392,6 @@ impl<'a> Chat<'a> {
                             ApprovalDecision::AllowOnce,
                         )
                         .await;
-                } else if !state.turn_in_flight {
-                    let msg = state.take_input();
-                    if !msg.is_empty() {
-                        state.push_user_message(msg.clone());
-                        let sid = state.session_id.clone();
-                        let rpc_arc = self.rpc_out.clone();
-                        let tx = self.turn_result_tx.clone();
-                        tokio::spawn(async move {
-                            let result = RpcClient::call_static::<SessionPromptResult>(
-                                &rpc_arc,
-                                method::SESSION_PROMPT,
-                                serde_json::json!({"session_id": sid, "prompt": msg}),
-                            )
-                            .await;
-                            let _ = tx.send(result).await;
-                        });
-                    }
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -379,17 +418,10 @@ impl<'a> Chat<'a> {
                         .await;
                 }
             }
-            KeyCode::Left => {
-                state.move_cursor_left();
-            }
-            KeyCode::Right => {
-                state.move_cursor_right();
-            }
             // ── Session management ───────────────────────────────
             KeyCode::Char('n')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
             {
-                // silently ignore errors — stays on current session
                 if let Ok(s) = self.rpc.session_new(&state.agent_alias, None).await {
                     state.reset_for_session(s.session_id, None);
                 }
@@ -398,7 +430,6 @@ impl<'a> Chat<'a> {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
             {
                 if let Ok(list) = self.rpc.session_list(None).await {
-                    // Only show non-channel sessions (raw agent chats).
                     let chat_sessions: Vec<_> = list
                         .sessions
                         .into_iter()
@@ -420,9 +451,8 @@ impl<'a> Chat<'a> {
                 state.session_overlay = SessionOverlay::Rename { buf: String::new() };
             }
             // ── Thought toggle ───────────────────────────────────
-            // Only fires in command mode (empty input, no selection, no approval).
             KeyCode::Char('t')
-                if state.input.is_empty()
+                if state.input_bar.input().is_empty()
                     && state.pending_approval().is_none()
                     && state.selected_entry.is_none() =>
             {
@@ -436,9 +466,8 @@ impl<'a> Chat<'a> {
                     crate::mouse::copy_osc52(&clipboard_text(entry));
                 }
             }
-            // j/k only enter selection mode when input is empty (command mode).
             KeyCode::Char('k')
-                if state.input.is_empty()
+                if state.input_bar.input().is_empty()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
@@ -460,7 +489,7 @@ impl<'a> Chat<'a> {
                 }
             }
             KeyCode::Char('j')
-                if state.input.is_empty()
+                if state.input_bar.input().is_empty()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
@@ -483,16 +512,23 @@ impl<'a> Chat<'a> {
                     });
                 }
             }
-            // ── Text input ───────────────────────────────────────
-            KeyCode::Char(c) if !state.turn_in_flight && state.selected_entry.is_none() => {
-                state.push_input_char(c);
-            }
-            KeyCode::Backspace if state.selected_entry.is_none() => {
-                state.pop_input_char();
-            }
             _ => {}
         }
         false
+    }
+
+    /// Handle a bracketed paste event.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
+        };
+        if state.turn_in_flight {
+            return;
+        }
+        let action = state.input_bar.handle_paste(text);
+        if let InputBarAction::StatusMessage(msg) = action {
+            state.entries.push(ChatEntry::AgentMessage(msg));
+        }
     }
 
     /// Returns true when the pane is accepting text input (blocks `?` help).
@@ -516,7 +552,7 @@ impl<'a> Chat<'a> {
                     return false;
                 }
                 // Command mode when input is empty; text mode when typing.
-                !s.input.is_empty()
+                s.input_bar.wants_text_input()
             }
             _ => false,
         }
@@ -550,6 +586,11 @@ impl<'a> Chat<'a> {
                     }
                     SessionOverlay::None => {}
                 }
+                // Input bar may have context-sensitive help (file explorer, etc.)
+                let bar_help = state.input_bar.help_entries();
+                if !bar_help.is_empty() {
+                    return bar_help;
+                }
                 if state.pending_approval().is_some() {
                     vec![
                         ("Enter", "Approve"),
@@ -568,6 +609,9 @@ impl<'a> Chat<'a> {
                 } else {
                     vec![
                         ("Enter", "Send message"),
+                        ("/attach", "Attach file"),
+                        ("Ctrl+A", "File browser"),
+                        ("Ctrl+V", "Paste"),
                         ("j / k", "Select entry"),
                         ("t", "Toggle thoughts"),
                         ("Ctrl+N", "New session"),
@@ -673,23 +717,15 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 // ── Active chat rendering ────────────────────────────────────────
 
 fn render(f: &mut Frame, state: &ChatState, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(area);
+    let show_cursor = state.pending_approval().is_none();
+    let conv_area = state
+        .input_bar
+        .render(f, area, state.turn_in_flight, show_cursor);
 
-    render_conversation(f, state, chunks[0]);
-    render_input(f, state, chunks[1]);
+    render_conversation(f, state, conv_area);
 
     if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
-    } else {
-        // Place the terminal cursor at the editing position.
-        // Visual column = char count of the text before the cursor byte offset.
-        let ia = chunks[1];
-        let visual = state.input()[..state.cursor()].chars().count() as u16;
-        let cx = (ia.x + 1 + visual).min(ia.x + ia.width.saturating_sub(2));
-        f.set_cursor_position((cx, ia.y + 1));
     }
 
     match &state.session_overlay {
@@ -704,6 +740,8 @@ fn render(f: &mut Frame, state: &ChatState, area: Rect) {
         }
         SessionOverlay::None => {}
     }
+
+    state.input_bar.render_explorer_overlay(f, area);
 }
 
 /// Extract the file extension from the `"path"` field of a tool's input JSON.
@@ -790,16 +828,29 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         };
 
         match entry {
-            ChatEntry::UserMessage(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "You: ",
+            ChatEntry::UserMessage { text, attachments } => {
+                let mut spans = vec![Span::styled(
+                    "You: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD | sel_mod),
+                )];
+                if let Some(t) = text {
+                    spans.push(Span::styled(
+                        t.as_str(),
+                        Style::default().add_modifier(sel_mod),
+                    ));
+                }
+                if !attachments.is_empty() {
+                    let label = attachments.join(", ");
+                    spans.push(Span::styled(
+                        format!(" [{label}]"),
                         Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD | sel_mod),
-                    ),
-                    Span::styled(text.as_str(), Style::default().add_modifier(sel_mod)),
-                ]));
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::ITALIC | sel_mod),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
             ChatEntry::AgentMessage(text) => {
                 let prefix = Line::from(vec![Span::styled(
@@ -902,39 +953,6 @@ fn render_conversation(f: &mut Frame, state: &ChatState, area: Rect) {
         )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    f.render_widget(p, area);
-}
-
-fn render_input(f: &mut Frame, state: &ChatState, area: Rect) {
-    let label = if state.turn_in_flight {
-        " (thinking\u{2026}) "
-    } else {
-        " > "
-    };
-    let block = Block::default().borders(Borders::ALL).title(label);
-
-    // When input is empty and idle, show hint text so keybindings are discoverable.
-    let content: Line = if state.input.is_empty()
-        && !state.turn_in_flight
-        && state.pending_approval().is_none()
-        && state.selected_entry.is_none()
-    {
-        Line::from(vec![
-            Span::styled("Type to chat", Style::default().fg(Color::DarkGray)),
-            Span::styled("  ?", Style::default().fg(Color::Yellow)),
-            Span::styled("=help ", Style::default().fg(Color::DarkGray)),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::styled("=select ", Style::default().fg(Color::DarkGray)),
-            Span::styled("^N", Style::default().fg(Color::Yellow)),
-            Span::styled("=new ", Style::default().fg(Color::DarkGray)),
-            Span::styled("^S", Style::default().fg(Color::Yellow)),
-            Span::styled("=sessions", Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(Span::raw(state.input()))
-    };
-
-    let p = Paragraph::new(content).block(block);
     f.render_widget(p, area);
 }
 
@@ -1216,7 +1234,10 @@ pub struct PendingApproval {
 pub enum ChatEntry {
     AgentMessage(String),
     AgentThought(String),
-    UserMessage(String),
+    UserMessage {
+        text: Option<String>,
+        attachments: Vec<String>,
+    },
     Tool {
         tool_call_id: String,
         name: String,
@@ -1242,9 +1263,7 @@ pub struct ChatState {
     pub session_id: String,
     pub agent_alias: String,
     session_name: Option<String>,
-    input: String,
-    /// Byte offset of the editing cursor within `input`. Always on a char boundary.
-    cursor: usize,
+    pub input_bar: InputBarState,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
@@ -1261,8 +1280,7 @@ impl ChatState {
             session_id,
             agent_alias,
             session_name: None,
-            input: String::new(),
-            cursor: 0,
+            input_bar: InputBarState::new(),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -1280,55 +1298,6 @@ impl ChatState {
             Some(name) => format!("{} — {}", self.agent_alias, name),
             None => self.agent_alias.clone(),
         }
-    }
-
-    pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    /// Insert `c` at the cursor position and advance the cursor.
-    pub fn push_input_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    /// Delete the character immediately before the cursor (backspace).
-    pub fn pop_input_char(&mut self) {
-        if self.cursor > 0 {
-            let prev = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.input.remove(prev);
-            self.cursor = prev;
-        }
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        if self.cursor < self.input.len() {
-            let c = self.input[self.cursor..].chars().next().unwrap();
-            self.cursor += c.len_utf8();
-        }
-    }
-
-    pub fn take_input(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.input)
     }
 
     pub fn entries(&self) -> &[ChatEntry] {
@@ -1445,10 +1414,12 @@ impl ChatState {
             self.entries.push(ChatEntry::AgentMessage(full_text));
         }
         self.turn_in_flight = false;
+        self.input_bar.cleanup_temps();
     }
 
-    pub fn push_user_message(&mut self, msg: String) {
-        self.entries.push(ChatEntry::UserMessage(msg));
+    pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        self.entries
+            .push(ChatEntry::UserMessage { text, attachments });
         self.turn_in_flight = true;
     }
 
@@ -1456,7 +1427,7 @@ impl ChatState {
     pub fn reset_for_session(&mut self, session_id: String, name: Option<String>) {
         self.session_id = session_id;
         self.session_name = name;
-        self.input.clear();
+        self.input_bar.reset();
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
@@ -1468,7 +1439,14 @@ impl ChatState {
 
 fn clipboard_text(entry: &ChatEntry) -> String {
     match entry {
-        ChatEntry::UserMessage(t) => format!("You: {t}"),
+        ChatEntry::UserMessage { text, attachments } => {
+            let base = text.as_deref().unwrap_or("");
+            if attachments.is_empty() {
+                format!("You: {base}")
+            } else {
+                format!("You: {base} [{}]", attachments.join(", "))
+            }
+        }
         ChatEntry::AgentMessage(t) => format!("Agent: {t}"),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::Tool {
@@ -1491,7 +1469,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
 use std::io::Stdout;
 
 use crossterm::{
-    event::{Event, KeyEventKind},
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -1515,13 +1493,17 @@ pub async fn run(rpc: &mut RpcClient, agent_alias: &str) -> anyhow::Result<()> {
 fn init_terminal() -> anyhow::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal(term: &mut Term) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -1552,6 +1534,55 @@ async fn chat_loop(
             } => {
                 match maybe_event? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Let the input bar handle keys first (file explorer,
+                        // text input, slash commands, Ctrl+A, Ctrl+V, etc.)
+                        if state.pending_approval().is_none() {
+                            let action = state.input_bar.handle_key(key, state.turn_in_flight);
+                            match action {
+                                InputBarAction::Submit { text, attachments } => {
+                                    let prompt = text.as_deref().unwrap_or("").to_string();
+                                    let att_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+                                    state.push_user_message(text, att_names);
+                                    let sid = session_id.clone();
+                                    let rpc_arc = rpc.rpc.clone();
+                                    let tx = turn_result_tx.clone();
+                                    let transport = rpc.transport();
+                                    tokio::spawn(async move {
+                                        let mut params = serde_json::json!({
+                                            "session_id": sid,
+                                            "prompt": prompt,
+                                        });
+                                        if !attachments.is_empty() {
+                                            match build_attachments_json(&attachments, transport) {
+                                                Ok(att_json) => {
+                                                    params["attachments"] = serde_json::Value::Array(att_json);
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(Err(e)).await;
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        let result = RpcClient::call_static::<SessionPromptResult>(
+                                            &rpc_arc,
+                                            method::SESSION_PROMPT,
+                                            params,
+                                        )
+                                        .await;
+                                        let _ = tx.send(result).await;
+                                    });
+                                    continue;
+                                }
+                                InputBarAction::StatusMessage(msg) => {
+                                    state.entries.push(ChatEntry::AgentMessage(msg));
+                                    continue;
+                                }
+                                InputBarAction::Consumed => continue,
+                                InputBarAction::NotHandled => {} // fall through
+                            }
+                        }
+
+                        // Keys not handled by the input bar.
                         match key.code {
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if state.turn_in_flight {
@@ -1568,23 +1599,6 @@ async fn chat_loop(
                                             ApprovalDecision::AllowOnce,
                                         )
                                         .await;
-                                } else if !state.turn_in_flight {
-                                    let msg = state.take_input();
-                                    if !msg.is_empty() {
-                                        state.push_user_message(msg.clone());
-                                        let sid = session_id.clone();
-                                        let rpc_arc = rpc.rpc.clone();
-                                        let tx = turn_result_tx.clone();
-                                        tokio::spawn(async move {
-                                            let result = RpcClient::call_static::<SessionPromptResult>(
-                                                &rpc_arc,
-                                                method::SESSION_PROMPT,
-                                                serde_json::json!({"session_id": sid, "prompt": msg}),
-                                            )
-                                            .await;
-                                            let _ = tx.send(result).await;
-                                        });
-                                    }
                                 }
                             }
                             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1607,8 +1621,6 @@ async fn chat_loop(
                                             ApprovalDecision::AllowAlways,
                                         )
                                         .await;
-                                } else if state.pending_approval().is_none() && !state.turn_in_flight {
-                                    state.push_input_char('a');
                                 }
                             }
                             KeyCode::Char('e') => {
@@ -1636,23 +1648,17 @@ async fn chat_loop(
                                             )
                                             .await;
                                     }
-                                } else if state.pending_approval().is_none()
-                                    && !state.turn_in_flight
-                                {
-                                    state.push_input_char('e');
                                 }
-                            }
-                            KeyCode::Char(c) => {
-                                if state.pending_approval().is_none() && !state.turn_in_flight {
-                                    state.push_input_char(c);
-                                }
-                            }
-                            KeyCode::Backspace
-                                if state.pending_approval().is_none() =>
-                            {
-                                state.pop_input_char();
                             }
                             _ => {}
+                        }
+                    }
+                    Event::Paste(text) => {
+                        if !state.turn_in_flight {
+                            let action = state.input_bar.handle_paste(&text);
+                            if let InputBarAction::StatusMessage(msg) = action {
+                                state.entries.push(ChatEntry::AgentMessage(msg));
+                            }
                         }
                     }
                     Event::Resize(_, _) => {
@@ -1736,12 +1742,12 @@ mod tests {
     #[test]
     fn input_append_and_clear() {
         let mut s = state();
-        s.push_input_char('h');
-        s.push_input_char('i');
-        assert_eq!(s.input(), "hi");
-        let taken = s.take_input();
+        s.input_bar.push_input_char('h');
+        s.input_bar.push_input_char('i');
+        assert_eq!(s.input_bar.input(), "hi");
+        let taken = s.input_bar.take_input();
         assert_eq!(taken, "hi");
-        assert_eq!(s.input(), "");
+        assert_eq!(s.input_bar.input(), "");
     }
 
     #[test]

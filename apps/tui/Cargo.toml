@@ -31,6 +31,8 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 pulldown-cmark = { version = "0.13", default-features = false }
+mime_guess = "2"
+shellexpand = "3.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
