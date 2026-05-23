@@ -12,11 +12,9 @@
 
 use serde_json::Value;
 
-const APPROVE_FIXTURE: &str =
-    include_str!("fixtures/lark/card_action_approve.json");
+const APPROVE_FIXTURE: &str = include_str!("fixtures/lark/card_action_approve.json");
 const DENY_FIXTURE: &str = include_str!("fixtures/lark/card_action_deny.json");
-const ALWAYS_FIXTURE: &str =
-    include_str!("fixtures/lark/card_action_always.json");
+const ALWAYS_FIXTURE: &str = include_str!("fixtures/lark/card_action_always.json");
 
 fn extract_decision(payload: &Value) -> (String, String) {
     let value = payload
@@ -45,8 +43,8 @@ fn extract_decision(payload: &Value) -> (String, String) {
 
 #[test]
 fn approve_fixture_round_trips_through_production_pointer_logic() {
-    let payload: Value = serde_json::from_str(APPROVE_FIXTURE)
-        .expect("approve fixture must be valid JSON");
+    let payload: Value =
+        serde_json::from_str(APPROVE_FIXTURE).expect("approve fixture must be valid JSON");
     let (approval_id, decision) = extract_decision(&payload);
     assert!(!approval_id.is_empty(), "approval_id must be non-empty");
     assert_eq!(decision, "approve");
@@ -54,8 +52,8 @@ fn approve_fixture_round_trips_through_production_pointer_logic() {
 
 #[test]
 fn deny_fixture_round_trips_through_production_pointer_logic() {
-    let payload: Value = serde_json::from_str(DENY_FIXTURE)
-        .expect("deny fixture must be valid JSON");
+    let payload: Value =
+        serde_json::from_str(DENY_FIXTURE).expect("deny fixture must be valid JSON");
     let (approval_id, decision) = extract_decision(&payload);
     assert!(!approval_id.is_empty(), "approval_id must be non-empty");
     assert_eq!(decision, "deny");
@@ -63,8 +61,8 @@ fn deny_fixture_round_trips_through_production_pointer_logic() {
 
 #[test]
 fn always_fixture_round_trips_through_production_pointer_logic() {
-    let payload: Value = serde_json::from_str(ALWAYS_FIXTURE)
-        .expect("always fixture must be valid JSON");
+    let payload: Value =
+        serde_json::from_str(ALWAYS_FIXTURE).expect("always fixture must be valid JSON");
     let (approval_id, decision) = extract_decision(&payload);
     assert!(!approval_id.is_empty(), "approval_id must be non-empty");
     assert_eq!(decision, "always");
