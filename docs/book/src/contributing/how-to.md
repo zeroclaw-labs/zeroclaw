@@ -12,7 +12,8 @@ For anything larger than a typo fix:
 
 1. **Check the issue tracker.** Someone may already be working on it or have filed a related discussion.
 2. **Read `AGENTS.md`.** The repo's root `AGENTS.md` is the canonical source of convention — risk tiers, PR discipline, anti-patterns, and review standards live there.
-3. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
+3. **Use the [Architecture and contribution map](./architecture-map.md)** for anything that touches architecture, config, security, workflow, governance, CI, release behavior, or AI-assisted contribution policy.
+4. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
 
 ## The flow
 
@@ -121,5 +122,6 @@ Don't be a jerk. Disagree on ideas; not people. Accept that maintainers will clo
 ## See also
 
 - [RFC process](./rfcs.md) — for anything bigger than a patch
+- [Architecture and contribution map](./architecture-map.md) — which architecture, foundation, and workflow docs to read first
 - [Communication](./communication.md) — how to reach the team
 - [Maintainers → Overview](../maintainers/index.md) — what maintainers do day-to-day
