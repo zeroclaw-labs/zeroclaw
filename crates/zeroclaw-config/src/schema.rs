@@ -2802,6 +2802,11 @@ pub struct AliasedAgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// When true, only native provider tool calls are executable. Text fallback
+    /// parsing remains disabled, so XML/markdown/GLM-looking text is treated as
+    /// final assistant text.
+    #[serde(default)]
+    pub strict_tool_parsing: bool,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
@@ -2910,6 +2915,7 @@ impl Default for AliasedAgentConfig {
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -5622,6 +5628,9 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
+    #[serde(default)]
+    pub headed: Option<bool>,
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
@@ -5656,6 +5665,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
@@ -12861,6 +12871,7 @@ enum ConfigResolutionSource {
     EnvDataDir,
     EnvWorkspaceLegacy,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -12870,6 +12881,7 @@ impl ConfigResolutionSource {
             Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
             Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -12904,6 +12916,59 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
+async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
+    let parts = exe.iter().collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [prefix @ .., cellar, formula, _version, bin, exe_name]
+            if *cellar == std::ffi::OsStr::new("Cellar")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            prefix.iter().collect::<PathBuf>()
+        }
+        [prefix @ .., opt, formula, bin, exe_name]
+            if *opt == std::ffi::OsStr::new("opt")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        [prefix @ .., bin, exe_name]
+            if *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(prefix.join("var").join("zeroclaw"))
 }
 
 async fn resolve_runtime_config_dirs(
@@ -12991,6 +13056,17 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             data_dir,
             ConfigResolutionSource::EnvWorkspaceLegacy,
+        ));
+    }
+
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
+    {
+        return Ok((
+            homebrew_config_dir.clone(),
+            homebrew_config_dir.join("workspace"),
+            ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
 
@@ -16374,6 +16450,7 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(!cfg.strict_tool_parsing);
     }
 
     #[test]
@@ -16386,6 +16463,7 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -16397,6 +16475,7 @@ tool_dispatcher = "xml"
         assert_eq!(agent.max_history_messages, 80);
         assert!(agent.parallel_tools);
         assert_eq!(agent.tool_dispatcher, "xml");
+        assert!(agent.strict_tool_parsing);
     }
 
     #[test]
@@ -17861,6 +17940,7 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
@@ -17879,6 +17959,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
@@ -17898,6 +17979,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
@@ -17914,6 +17996,21 @@ default_temperature = 0.7
         assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
+    }
+
+    #[test]
+    async fn browser_config_parses_headed_true() {
+        let parsed: BrowserConfig = toml::from_str(
+            r#"
+backend = "agent_browser"
+headed = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.backend, "agent_browser");
+        assert_eq!(parsed.headed, Some(true));
+        assert!(parsed.native_headless);
     }
 
     #[test]
@@ -18304,6 +18401,69 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    async fn create_homebrew_prefix() -> TempDir {
+        let prefix = TempDir::new().expect("homebrew prefix temp dir");
+        fs::create_dir_all(prefix.path().join("Cellar"))
+            .await
+            .expect("create Cellar marker");
+        prefix
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_cellar_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("Cellar")
+            .join("zeroclaw")
+            .join("0.7.0")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_prefix_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_opt_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("opt")
+            .join("zeroclaw")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_rejects_non_homebrew_layout() {
+        let prefix = TempDir::new().expect("non-homebrew temp dir");
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        assert!(try_resolve_macos_homebrew_config_dir(&exe).await.is_none());
     }
 
     #[test]
