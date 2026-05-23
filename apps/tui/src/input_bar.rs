@@ -824,27 +824,58 @@ impl InputBarState {
 
     // ── Selection rendering helper ───────────────────────────
 
-    /// Build styled spans for the input text, highlighting any selection.
-    fn build_input_spans(&self) -> Vec<Span<'_>> {
-        match self.selection {
-            None => vec![Span::raw(&self.input)],
-            Some((start, end)) => {
-                let mut spans = Vec::new();
-                if start > 0 {
-                    spans.push(Span::raw(&self.input[..start]));
+    /// Build styled lines for the input text, splitting on `\n` and
+    /// highlighting any selection range.
+    fn build_input_lines(&self) -> Vec<Line<'_>> {
+        let sel_style = Style::default()
+            .bg(theme::SELECTION_BG)
+            .fg(theme::ICY_WHITE);
+
+        // Split input into physical lines and build spans per line,
+        // applying selection highlighting across line boundaries.
+        let mut lines = Vec::new();
+        let mut byte_pos: usize = 0;
+
+        for segment in self.input.split('\n') {
+            let seg_start = byte_pos;
+            let seg_end = byte_pos + segment.len();
+
+            let mut spans: Vec<Span<'_>> = Vec::new();
+
+            if let Some((sel_start, sel_end)) = self.selection {
+                // Compute overlap of selection with this segment.
+                let overlap_start = sel_start.max(seg_start);
+                let overlap_end = sel_end.min(seg_end);
+
+                if overlap_start < overlap_end {
+                    // There is selection overlap in this segment.
+                    if overlap_start > seg_start {
+                        spans.push(Span::raw(&self.input[seg_start..overlap_start]));
+                    }
+                    spans.push(Span::styled(
+                        &self.input[overlap_start..overlap_end],
+                        sel_style,
+                    ));
+                    if overlap_end < seg_end {
+                        spans.push(Span::raw(&self.input[overlap_end..seg_end]));
+                    }
+                } else {
+                    // No selection in this segment.
+                    spans.push(Span::raw(&self.input[seg_start..seg_end]));
                 }
-                spans.push(Span::styled(
-                    &self.input[start..end],
-                    Style::default()
-                        .bg(theme::SELECTION_BG)
-                        .fg(theme::ICY_WHITE),
-                ));
-                if end < self.input.len() {
-                    spans.push(Span::raw(&self.input[end..]));
-                }
-                spans
+            } else {
+                spans.push(Span::raw(&self.input[seg_start..seg_end]));
             }
+
+            lines.push(Line::from(spans));
+            byte_pos = seg_end + 1; // +1 for the '\n'
         }
+
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        lines
     }
 
     // ── Rendering ────────────────────────────────────────────
@@ -939,8 +970,9 @@ impl InputBarState {
             f.render_widget(p, input_area);
         } else {
             // Wrapped input content with optional selection highlighting.
-            let input_spans = self.build_input_spans();
-            let p = Paragraph::new(Line::from(input_spans))
+            // Each \n in the input becomes a separate Line for proper rendering.
+            let input_lines = self.build_input_lines();
+            let p = Paragraph::new(input_lines)
                 .block(block)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll_offset, 0));
@@ -971,6 +1003,28 @@ impl InputBarState {
                 let cx = input_area.x + 1 + cursor_col;
                 let cy = input_area.y + 1 + screen_row;
                 f.set_cursor_position((cx, cy));
+            }
+        }
+
+        // Scroll indicators on the right border when content overflows.
+        if content_rows > MAX_INPUT_ROWS && input_area.width > 2 {
+            let indicator_x = input_area.x + input_area.width - 1;
+            let indicator_style = Style::default().fg(Color::Yellow);
+
+            if self.scroll_offset > 0 {
+                // Content above — show up arrow on top border.
+                let buf = f.buffer_mut();
+                buf[(indicator_x, input_area.y)]
+                    .set_char('\u{25b2}')
+                    .set_style(indicator_style);
+            }
+            let max_scroll = content_rows.saturating_sub(MAX_INPUT_ROWS);
+            if self.scroll_offset < max_scroll {
+                // Content below — show down arrow on bottom border.
+                let buf = f.buffer_mut();
+                buf[(indicator_x, input_area.y + input_area.height - 1)]
+                    .set_char('\u{25bc}')
+                    .set_style(indicator_style);
             }
         }
 
@@ -1368,21 +1422,30 @@ mod tests {
     // ── Selection tests ──────────────────────────────────────
 
     #[test]
-    fn build_input_spans_no_selection() {
+    fn build_input_lines_no_selection() {
         let mut bar = InputBarState::new();
         bar.insert_text("hello");
-        let spans = bar.build_input_spans();
-        assert_eq!(spans.len(), 1);
+        let lines = bar.build_input_lines();
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
-    fn build_input_spans_with_selection() {
+    fn build_input_lines_with_newlines() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello\nworld\nfoo");
+        let lines = bar.build_input_lines();
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn build_input_lines_with_selection() {
         let mut bar = InputBarState::new();
         bar.insert_text("hello world");
         bar.selection = Some((2, 7));
-        let spans = bar.build_input_spans();
-        // before "he" + selected "llo w" + after "orld"
-        assert_eq!(spans.len(), 3);
+        let lines = bar.build_input_lines();
+        // Single line, 3 spans: "he" + "llo w" (selected) + "orld"
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 3);
     }
 
     #[test]

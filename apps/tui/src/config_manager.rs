@@ -4,7 +4,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -32,7 +33,8 @@ pub(crate) fn init_terminal() -> Result<Term> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
     )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
@@ -41,6 +43,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         term.backend_mut(),
+        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
@@ -2977,7 +2980,11 @@ fn edit_in_external_editor(
 
     // Suspend TUI: leave alternate screen + disable raw mode so the
     // child process gets a normal terminal.
-    let _ = execute!(term.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 
     // Launch via `sh -c` so $EDITOR values with flags (e.g. "vim -u NONE",
@@ -2989,7 +2996,11 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+    );
     // Force a full redraw so ratatui repaints everything.
     let _ = term.clear();
 

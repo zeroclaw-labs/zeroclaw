@@ -143,16 +143,22 @@ pub async fn process_file_entry(
     let workspace_path = canonical.to_string_lossy().to_string();
 
     // 6. Build marker.
+    //
+    // Images use `[IMAGE:path]` so the multimodal processor can inline them
+    // as data URIs for vision models. Non-image files use a prose format
+    // matching the channel attachment style (`[Document: name] path`) so the
+    // LLM sees a readable path it can access with file-reading tools.
     let kind = attachment_kind(&mime_type);
-    let marker = match entry.source {
-        FileSource::Clipboard => format!("[{kind} from clipboard]"),
-        FileSource::File => {
-            // Prefer original local path (Unix transport), fall back to
-            // workspace path (WSS/base64 transport) so the multimodal
-            // processor can find the file on the server's filesystem.
-            let display_path = original_path.as_deref().unwrap_or(&workspace_path);
-            format!("[{kind}:{display_path}]")
+    let display_path = original_path.as_deref().unwrap_or(&workspace_path);
+    let marker = if kind == "IMAGE" {
+        match entry.source {
+            FileSource::Clipboard => format!("[IMAGE from clipboard]"),
+            FileSource::File => format!("[IMAGE:{display_path}]"),
         }
+    } else {
+        // Non-image: prose format with workspace path so the agent can
+        // read the file with its tools regardless of transport.
+        format!("[Document: {filename}] {workspace_path}")
     };
 
     let size_bytes = bytes.len() as u64;
@@ -417,12 +423,15 @@ mod tests {
             .await
             .unwrap();
 
-        // data_b64 mode: marker uses the absolute workspace path (not the filename).
-        assert!(r.marker.starts_with("[DOCUMENT:"), "marker = {}", r.marker);
-        assert!(r.marker.ends_with(".pdf]"), "marker = {}", r.marker);
+        // data_b64 mode: non-image uses prose format with workspace path.
+        assert!(
+            r.marker.starts_with("[Document: report.pdf]"),
+            "marker = {}",
+            r.marker
+        );
         assert!(
             r.marker.contains("/uploads/"),
-            "marker should use workspace uploads path: {}",
+            "marker should include workspace uploads path: {}",
             r.marker
         );
         assert!(!r.deduplicated);
@@ -551,9 +560,16 @@ mod tests {
             .unwrap();
 
         assert!(r.ref_id.starts_with("sha256:"));
-        assert_eq!(
-            r.marker,
-            format!("[DOCUMENT:{}]", file_path.to_string_lossy())
+        // Non-image path mode: prose format with original filename and workspace path.
+        assert!(
+            r.marker.starts_with("[Document: testfile.pdf]"),
+            "marker = {}",
+            r.marker
+        );
+        assert!(
+            r.marker.contains("/uploads/"),
+            "marker should include workspace path: {}",
+            r.marker
         );
         assert!(!r.deduplicated);
         assert!(std::path::Path::new(&r.workspace_path).exists());

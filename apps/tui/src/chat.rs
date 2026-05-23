@@ -362,7 +362,7 @@ impl<'a> Chat<'a> {
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
-                    state.entries.push(ChatEntry::AgentMessage(msg));
+                    state.entries.push(ChatEntry::SystemMessage(msg));
                     return false;
                 }
                 InputBarAction::Consumed => return false,
@@ -571,7 +571,7 @@ impl<'a> Chat<'a> {
         }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
-            state.entries.push(ChatEntry::AgentMessage(msg));
+            state.entries.push(ChatEntry::SystemMessage(msg));
         }
     }
 
@@ -936,6 +936,16 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
                     ]));
                 }
             }
+            ChatEntry::SystemMessage(text) => {
+                for line_text in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line_text.to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::ITALIC | sel_mod),
+                    )));
+                }
+            }
             ChatEntry::Tool {
                 name,
                 input,
@@ -1298,6 +1308,8 @@ pub struct PendingApproval {
 pub enum ChatEntry {
     AgentMessage(String),
     AgentThought(String),
+    /// Local system/info message (e.g. "Attached: photo.png").
+    SystemMessage(String),
     UserMessage {
         text: Option<String>,
         attachments: Vec<String>,
@@ -1535,6 +1547,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
         }
         ChatEntry::AgentMessage(t) => format!("Agent: {t}"),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
+        ChatEntry::SystemMessage(t) => t.clone(),
         ChatEntry::Tool {
             name,
             input,
@@ -1567,7 +1580,11 @@ pub async fn open_editor_for_content(content: &str) -> String {
     }
 
     crossterm::terminal::disable_raw_mode().ok();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::terminal::LeaveAlternateScreen
+    );
 
     let path = tmp.path().to_owned();
     let status = tokio::process::Command::new(&editor)
@@ -1576,7 +1593,13 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    );
 
     if status.map(|s| s.success()).unwrap_or(false) {
         std::fs::read_to_string(&path).unwrap_or_else(|_| content.to_string())
