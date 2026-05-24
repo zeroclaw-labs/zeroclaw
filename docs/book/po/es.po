@@ -46708,8 +46708,8 @@ msgid ""
 msgstr "Los PR bloqueados reciben un único comentario con una lista de tareas accionable, no una serie de revisiones parciales."
 
 #: src/maintainers/pr-workflow.md:102
-msgid "`no-stale` reserved for accepted-but-blocked work."
-msgstr "`no-stale` reservado para el trabajo aceptado pero bloqueado."
+msgid "`status:no-stale` reserved for accepted-but-blocked work."
+msgstr "`status:no-stale` reservado para el trabajo aceptado pero bloqueado."
 
 #: src/maintainers/pr-workflow.md:104
 msgid ""
@@ -47199,8 +47199,8 @@ msgid "Non-actionable noise. Close with a polite pointer."
 msgstr "Ruido no accionable. Cierra con un indicio amable."
 
 #: src/maintainers/reviewer-playbook.md:86 src/maintainers/labels.md:179
-msgid "`no-stale`"
-msgstr "`no-stale`"
+msgid "`status:no-stale`"
+msgstr "`status:no-stale`"
 
 #: src/maintainers/reviewer-playbook.md:86
 msgid ""
@@ -47318,8 +47318,8 @@ msgstr "Limpieza semanal de la cola"
 
 #: src/maintainers/reviewer-playbook.md:122
 msgid ""
-"Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work."
-msgstr "Recorre la cola de elementos obsoletos. Aplica `no-stale` únicamente al trabajo aceptado pero bloqueado."
+"Walk the stale queue. Apply `status:no-stale` only to accepted-but-blocked work."
+msgstr "Recorre la cola de elementos obsoletos. Aplica `status:no-stale` únicamente al trabajo aceptado pero bloqueado."
 
 #: src/maintainers/reviewer-playbook.md:123
 msgid "Prioritize `size: XS/S` bug and security PRs first."
