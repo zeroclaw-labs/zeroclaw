@@ -452,8 +452,9 @@ async fn handle_socket(
     if !channel_names.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"channels": channel_names, "session": session_key})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"channels": channel_names, "session": session_key})
+            ),
             "Seeded {} channel(s) into dashboard agent session",
         );
     }

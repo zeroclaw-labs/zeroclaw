@@ -3475,7 +3475,7 @@ pub async fn run(
         }
 
         // Inject configured channel targets so the agent knows where to deliver outbound messages
-        if let Some(channel_targets) = crate::agent::agent::build_channel_targets(&config) {
+        if let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config) {
             system_prompt.push('\n');
             system_prompt.push_str(&channel_targets);
         }
@@ -4676,7 +4676,7 @@ pub async fn process_message(
         }
 
         // Inject configured channel targets so the agent knows where to deliver outbound messages
-        if let Some(channel_targets) = crate::agent::agent::build_channel_targets(&config) {
+        if let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config) {
             system_prompt.push('\n');
             system_prompt.push_str(&channel_targets);
         }
