@@ -846,7 +846,7 @@ impl Agent {
         };
 
         let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(config);
+            zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias);
 
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
