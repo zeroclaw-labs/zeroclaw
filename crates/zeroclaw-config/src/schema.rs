@@ -12402,7 +12402,9 @@ pub struct JiraConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`,
+    /// `"list_projects"`, `"myself"`, `"list_transitions"`,
+    /// `"transition_ticket"`, `"create_ticket"`.
     /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
@@ -12869,6 +12871,7 @@ enum ConfigResolutionSource {
     EnvDataDir,
     EnvWorkspaceLegacy,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -12878,6 +12881,7 @@ impl ConfigResolutionSource {
             Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
             Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -12912,6 +12916,59 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
+async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
+    let parts = exe.iter().collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [prefix @ .., cellar, formula, _version, bin, exe_name]
+            if *cellar == std::ffi::OsStr::new("Cellar")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            prefix.iter().collect::<PathBuf>()
+        }
+        [prefix @ .., opt, formula, bin, exe_name]
+            if *opt == std::ffi::OsStr::new("opt")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        [prefix @ .., bin, exe_name]
+            if *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(prefix.join("var").join("zeroclaw"))
 }
 
 async fn resolve_runtime_config_dirs(
@@ -12999,6 +13056,17 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             data_dir,
             ConfigResolutionSource::EnvWorkspaceLegacy,
+        ));
+    }
+
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
+    {
+        return Ok((
+            homebrew_config_dir.clone(),
+            homebrew_config_dir.join("workspace"),
+            ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
 
@@ -14356,12 +14424,21 @@ impl Config {
                     "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
                 );
             }
-            let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
+            let valid_actions = [
+                "get_ticket",
+                "search_tickets",
+                "comment_ticket",
+                "list_projects",
+                "myself",
+                "list_transitions",
+                "transition_ticket",
+                "create_ticket",
+            ];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket",
+                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
                         action
                     );
                 }
@@ -18326,6 +18403,69 @@ wire_api = "ws"
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
+    async fn create_homebrew_prefix() -> TempDir {
+        let prefix = TempDir::new().expect("homebrew prefix temp dir");
+        fs::create_dir_all(prefix.path().join("Cellar"))
+            .await
+            .expect("create Cellar marker");
+        prefix
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_cellar_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("Cellar")
+            .join("zeroclaw")
+            .join("0.7.0")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_prefix_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_opt_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("opt")
+            .join("zeroclaw")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_rejects_non_homebrew_layout() {
+        let prefix = TempDir::new().expect("non-homebrew temp dir");
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        assert!(try_resolve_macos_homebrew_config_dir(&exe).await.is_none());
+    }
+
     #[test]
     async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
         let _env_guard = env_override_lock().await;
@@ -18646,14 +18786,8 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn validate_rejects_unpublished_jira_actions() {
-        // Restored from upstream's #6116 (Jira API v2 server mode). The
-        // validation logic at `Config::validate -> jira.allowed_actions`
-        // exists unchanged; this test was dropped during the
-        // upstream/master merge resolution alongside the env_override
-        // tests that were intentionally deleted with `apply_env_overrides()`.
-        // Restoring it here.
-        for action in ["list_projects", "myself"] {
+    async fn validate_rejects_unknown_jira_actions() {
+        for action in ["delete_ticket", "drop_database", ""] {
             let mut config = Config::default();
             config.jira.enabled = true;
             config.jira.base_url = "https://jira.example.test".into();
@@ -18662,11 +18796,36 @@ default_model = "persisted-profile"
 
             let err = config
                 .validate()
-                .expect_err("unpublished Jira action should be rejected")
+                .expect_err("unknown Jira action should be rejected")
                 .to_string();
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
-                "expected Jira allowed action error for {action}, got: {err}"
+                "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_all_published_jira_actions() {
+        for action in [
+            "get_ticket",
+            "search_tickets",
+            "comment_ticket",
+            "list_projects",
+            "myself",
+            "list_transitions",
+            "transition_ticket",
+            "create_ticket",
+        ] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            assert!(
+                config.validate().is_ok(),
+                "published Jira action {action:?} should validate"
             );
         }
     }
