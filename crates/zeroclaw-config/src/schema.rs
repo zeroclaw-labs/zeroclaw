@@ -10,7 +10,6 @@ use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9789,23 +9788,6 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
-struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
-
-impl<T: ChannelConfig> ConfigWrapper<T> {
-    fn new(_: Option<&T>) -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
-    fn name(&self) -> &'static str {
-        T::name()
-    }
-    fn desc(&self) -> &'static str {
-        T::desc()
-    }
-}
-
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -9915,7 +9897,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mochat: HashMap<String, MochatConfig>,
-    #[cfg(feature = "channel-nostr")]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub nostr: HashMap<String, NostrConfig>,
@@ -9936,7 +9917,6 @@ pub struct ChannelsConfig {
     #[nested]
     pub voice_call: HashMap<String, crate::scattered_types::VoiceCallConfig>,
     /// Voice wake word detection channel instances (`[channels.voice_wake.<alias>]`).
-    #[cfg(feature = "voice-wake")]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_wake: HashMap<String, VoiceWakeConfig>,
@@ -9983,126 +9963,177 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
-    /// get channels' metadata and whether the default alias is configured, except webhook
-    #[rustfmt::skip]
-    pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+    /// Returns metadata and configuration status for every known channel type.
+    ///
+    /// Always returns the full set of channel types regardless of compile-time
+    /// feature flags — the `configured` flag reflects whether the operator has
+    /// populated that channel's config section.  For a list restricted to only
+    /// the channels compiled into this binary use
+    /// `zeroclaw_channels::listing::compiled_channels` instead.
+    pub fn channels(&self) -> Vec<super::traits::ChannelInfo> {
+        use super::traits::ChannelInfo;
         vec![
-            (
-                Box::new(ConfigWrapper::new(self.telegram.get("default"))),
-                !self.telegram.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.discord.get("default"))),
-                !self.discord.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.slack.get("default"))),
-                !self.slack.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.mattermost.get("default"))),
-                !self.mattermost.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.imessage.get("default"))),
-                !self.imessage.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.matrix.get("default"))),
-                !self.matrix.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.signal.get("default"))),
-                !self.signal.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.whatsapp.get("default"))),
-                !self.whatsapp.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.linq.get("default"))),
-                !self.linq.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wati.get("default"))),
-                !self.wati.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.nextcloud_talk.get("default"))),
-                !self.nextcloud_talk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.email.get("default"))),
-                !self.email.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.gmail_push.get("default"))),
-                !self.gmail_push.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.irc.get("default"))),
-                !self.irc.is_empty()
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.lark.get("default"))),
-                !self.lark.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.dingtalk.get("default"))),
-                !self.dingtalk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wecom.get("default"))),
-                !self.wecom.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wecom_ws.get("default"))),
-                !self.wecom_ws.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wechat.get("default"))),
-                !self.wechat.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.qq.get("default"))),
-                !self.qq.is_empty()
-            ),
-            #[cfg(feature = "channel-nostr")]
-            (
-                Box::new(ConfigWrapper::new(self.nostr.get("default"))),
-                !self.nostr.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.clawdtalk.get("default"))),
-                !self.clawdtalk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.reddit.get("default"))),
-                !self.reddit.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.bluesky.get("default"))),
-                !self.bluesky.is_empty(),
-            ),
-            #[cfg(feature = "voice-wake")]
-            (
-                Box::new(ConfigWrapper::new(self.voice_wake.get("default"))),
-                !self.voice_wake.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.mqtt.get("default"))),
-                !self.mqtt.is_empty(),
-            ),
+            ChannelInfo {
+                name: "Telegram",
+                desc: "connect your bot",
+                configured: !self.telegram.is_empty(),
+            },
+            ChannelInfo {
+                name: "Discord",
+                desc: "connect your bot",
+                configured: !self.discord.is_empty(),
+            },
+            ChannelInfo {
+                name: "Slack",
+                desc: "connect your bot",
+                configured: !self.slack.is_empty(),
+            },
+            ChannelInfo {
+                name: "Mattermost",
+                desc: "connect to your bot",
+                configured: !self.mattermost.is_empty(),
+            },
+            ChannelInfo {
+                name: "iMessage",
+                desc: "macOS only",
+                configured: !self.imessage.is_empty(),
+            },
+            ChannelInfo {
+                name: "Matrix",
+                desc: "self-hosted chat",
+                configured: !self.matrix.is_empty(),
+            },
+            ChannelInfo {
+                name: "Signal",
+                desc: "An open-source, encrypted messaging service",
+                configured: !self.signal.is_empty(),
+            },
+            ChannelInfo {
+                name: "WhatsApp",
+                desc: "Business Cloud API",
+                configured: !self.whatsapp.is_empty(),
+            },
+            ChannelInfo {
+                name: "WhatsApp Web",
+                desc: "native WhatsApp Web (wa-rs)",
+                configured: self.whatsapp.values().any(|c| c.is_web_config()),
+            },
+            ChannelInfo {
+                name: "Linq",
+                desc: "iMessage/RCS/SMS via Linq API",
+                configured: !self.linq.is_empty(),
+            },
+            ChannelInfo {
+                name: "WATI",
+                desc: "WhatsApp via WATI Business API",
+                configured: !self.wati.is_empty(),
+            },
+            ChannelInfo {
+                name: "NextCloud Talk",
+                desc: "NextCloud Talk platform",
+                configured: !self.nextcloud_talk.is_empty(),
+            },
+            ChannelInfo {
+                name: "Email",
+                desc: "Email over IMAP/SMTP",
+                configured: !self.email.is_empty(),
+            },
+            ChannelInfo {
+                name: "Gmail Push",
+                desc: "Gmail Pub/Sub push notifications",
+                configured: !self.gmail_push.is_empty(),
+            },
+            ChannelInfo {
+                name: "IRC",
+                desc: "IRC over TLS",
+                configured: !self.irc.is_empty(),
+            },
+            ChannelInfo {
+                name: "Lark",
+                desc: "Lark Bot",
+                configured: !self.lark.is_empty(),
+            },
+            ChannelInfo {
+                name: "DingTalk",
+                desc: "DingTalk Stream Mode",
+                configured: !self.dingtalk.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeCom",
+                desc: "WeCom Bot Webhook",
+                configured: !self.wecom.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeCom WebSocket",
+                desc: "WeCom AI Bot long connection",
+                configured: !self.wecom_ws.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeChat",
+                desc: "WeChat iLink Bot",
+                configured: !self.wechat.is_empty(),
+            },
+            ChannelInfo {
+                name: "QQ Official",
+                desc: "Tencent QQ Bot",
+                configured: !self.qq.is_empty(),
+            },
+            ChannelInfo {
+                name: "Nostr",
+                desc: "Nostr DMs",
+                configured: !self.nostr.is_empty(),
+            },
+            ChannelInfo {
+                name: "ClawdTalk",
+                desc: "ClawdTalk Channel",
+                configured: !self.clawdtalk.is_empty(),
+            },
+            ChannelInfo {
+                name: "Reddit",
+                desc: "Reddit bot (OAuth2)",
+                configured: !self.reddit.is_empty(),
+            },
+            ChannelInfo {
+                name: "Bluesky",
+                desc: "AT Protocol",
+                configured: !self.bluesky.is_empty(),
+            },
+            ChannelInfo {
+                name: "X/Twitter",
+                desc: "X/Twitter Bot via API v2",
+                configured: !self.twitter.is_empty(),
+            },
+            ChannelInfo {
+                name: "Mochat",
+                desc: "Mochat Customer Service",
+                configured: !self.mochat.is_empty(),
+            },
+            ChannelInfo {
+                name: "LINE",
+                desc: "connect your LINE bot",
+                configured: !self.line.is_empty(),
+            },
+            ChannelInfo {
+                name: "Voice Call",
+                desc: "outbound voice call channel",
+                configured: !self.voice_call.is_empty(),
+            },
+            ChannelInfo {
+                name: "VoiceWake",
+                desc: "voice wake word detection",
+                configured: !self.voice_wake.is_empty(),
+            },
+            ChannelInfo {
+                name: "MQTT",
+                desc: "MQTT SOP Listener",
+                configured: !self.mqtt.is_empty(),
+            },
+            ChannelInfo {
+                name: "Webhook",
+                desc: "HTTP endpoint",
+                configured: !self.webhook.is_empty(),
+            },
         ]
-    }
-
-    pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
-        let mut ret = self.channels_except_webhook();
-        ret.push((
-            Box::new(ConfigWrapper::new(self.webhook.get("default"))),
-            !self.webhook.is_empty(),
-        ));
-        ret
     }
 }
 
@@ -10142,13 +10173,11 @@ impl Default for ChannelsConfig {
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
@@ -12263,7 +12292,6 @@ pub struct VoiceDuplexConfig {
 /// Listens on the default microphone for a configurable wake word,
 /// then captures the following utterance and transcribes it via the
 /// existing transcription API.
-#[cfg(feature = "voice-wake")]
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "voice-wake"]
@@ -12297,27 +12325,22 @@ pub struct VoiceWakeConfig {
     pub excluded_tools: Vec<String>,
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_word() -> String {
     "hey zeroclaw".into()
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_silence_timeout_ms() -> u32 {
     2000
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_energy_threshold() -> f32 {
     0.01
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_max_capture_secs() -> u32 {
     30
 }
 
-#[cfg(feature = "voice-wake")]
 impl Default for VoiceWakeConfig {
     fn default() -> Self {
         Self {
@@ -12331,7 +12354,6 @@ impl Default for VoiceWakeConfig {
     }
 }
 
-#[cfg(feature = "voice-wake")]
 impl ChannelConfig for VoiceWakeConfig {
     fn name() -> &'static str {
         "VoiceWake"
@@ -12342,7 +12364,6 @@ impl ChannelConfig for VoiceWakeConfig {
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
-#[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nostr"]
@@ -12367,7 +12388,6 @@ pub struct NostrConfig {
     pub excluded_tools: Vec<String>,
 }
 
-#[cfg(feature = "channel-nostr")]
 impl ChannelConfig for NostrConfig {
     fn name() -> &'static str {
         "Nostr"
@@ -12377,7 +12397,6 @@ impl ChannelConfig for NostrConfig {
     }
 }
 
-#[cfg(feature = "channel-nostr")]
 pub fn default_nostr_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
@@ -16222,14 +16241,12 @@ auto_save = true
                 qq: HashMap::new(),
                 twitter: HashMap::new(),
                 mochat: HashMap::new(),
-                #[cfg(feature = "channel-nostr")]
                 nostr: HashMap::new(),
                 clawdtalk: HashMap::new(),
                 reddit: HashMap::new(),
                 bluesky: HashMap::new(),
                 voice_call: HashMap::new(),
                 voice_duplex: HashMap::new(),
-                #[cfg(feature = "voice-wake")]
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
                 message_timeout_secs: 300,
@@ -17456,14 +17473,12 @@ allowed_users = ["@u:matrix.org"]
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             message_timeout_secs: 300,
@@ -17842,14 +17857,12 @@ allowed_numbers = ["+1", "+2"]
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             message_timeout_secs: 300,
