@@ -16,7 +16,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud-talk` | [Nextcloud Talk](./nextcloud-talk.md) |
-| Discord, Slack, Telegram, Signal, iMessage, WeCom, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Discord, Slack, Telegram, Signal, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
