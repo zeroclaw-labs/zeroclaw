@@ -7,8 +7,8 @@ description = "Channel infrastructure: session backends, debouncing, stall watch
 publish = false
 
 [features]
-## PostgreSQL session backend (adds `postgres`, `r2d2`, `r2d2-postgres`).
-backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2-postgres"]
+## PostgreSQL session backend (adds `postgres`, `r2d2`, `r2d2_postgres`).
+backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
 ## Oracle 23ai session backend (adds `oracle`, `r2d2`).
 ## Requires Oracle Instant Client at runtime; set LD_LIBRARY_PATH accordingly.
 backend-oracle = ["dep:oracle", "dep:r2d2"]
@@ -34,7 +34,7 @@ tokio = { version = "1.50", default-features = false, features = ["sync", "time"
 # Optional: PostgreSQL backend
 postgres     = { version = "0.19", optional = true }
 r2d2         = { version = "0.8",  optional = true }
-r2d2-postgres = { version = "0.18", optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
 
 # Optional: Oracle 23ai backend
 oracle = { version = "0.5", optional = true, features = ["chrono"] }
