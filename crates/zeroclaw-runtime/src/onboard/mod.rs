@@ -2535,6 +2535,7 @@ mod tests {
             // are None. An empty-string answer lets prompt_field's
             // is-set-guard skip the persist, leaving the field None.
             .with("proxy-url", "")
+            .with("default-target", "")
             // Vec<String> with #[serde(default)]; empty answer keeps the
             // default empty list. Same shape as proxy-url above.
             .with("excluded-tools", "")
