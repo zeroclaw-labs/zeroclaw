@@ -253,6 +253,16 @@ fn response_message_item(role: &str, content: Vec<Value>) -> Value {
     })
 }
 
+fn legacy_tool_output_message(content: &str) -> Value {
+    response_message_item(
+        "user",
+        vec![serde_json::json!({
+            "type": "input_text",
+            "text": format!("Legacy tool output without call_id:\n{content}"),
+        })],
+    )
+}
+
 fn response_item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
@@ -412,7 +422,11 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
             }
             "tool" => {
                 if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
-                    if let Some(call_id) = value.get("tool_call_id").and_then(Value::as_str) {
+                    if let Some(call_id) = value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| first_nonempty(Some(id)))
+                    {
                         let output = value
                             .get("content")
                             .and_then(Value::as_str)
@@ -423,20 +437,10 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                             "output": output,
                         }));
                     } else if !msg.content.trim().is_empty() {
-                        input.push(response_message_item(
-                            "tool",
-                            vec![serde_json::json!({
-                                "type": "output_text",
-                                "text": msg.content,
-                            })],
-                        ));
+                        input.push(legacy_tool_output_message(&msg.content));
                     }
                 } else if !msg.content.trim().is_empty() {
-                    input.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": uuid::Uuid::new_v4().to_string(),
-                        "output": msg.content,
-                    }));
+                    input.push(legacy_tool_output_message(&msg.content));
                 }
             }
             _ => {}
@@ -1342,6 +1346,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -1685,6 +1690,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1721,6 +1727,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1753,6 +1760,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1785,6 +1793,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -2030,6 +2039,75 @@ data: [DONE]
         assert_eq!(input[0]["call_id"], "call_123");
         assert_eq!(input[0]["output"], "result");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn build_responses_input_replays_plain_tool_text_without_synthetic_call_id() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: "legacy plain text result".into(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            "Legacy tool output without call_id:\nlegacy plain text result"
+        );
+        assert!(input[0].get("call_id").is_none());
+    }
+
+    #[test]
+    fn build_responses_input_replays_tool_json_without_call_id_as_text() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: r#"{"content":"legacy result","status":"ok"}"#.into(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            r#"Legacy tool output without call_id:
+{"content":"legacy result","status":"ok"}"#
+        );
+        assert!(input[0].get("call_id").is_none());
+    }
+
+    #[test]
+    fn build_responses_input_replays_blank_tool_call_id_as_legacy_text() {
+        for raw_id in ["", "   "] {
+            let messages = vec![ChatMessage {
+                role: "tool".into(),
+                content: serde_json::json!({
+                    "tool_call_id": raw_id,
+                    "content": "legacy result"
+                })
+                .to_string(),
+            }];
+
+            let (_, input) = build_responses_input(&messages);
+
+            assert_eq!(input.len(), 1);
+            assert_eq!(input[0]["type"], "message");
+            assert_eq!(input[0]["role"], "user");
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert!(input[0].get("call_id").is_none());
+            assert!(
+                input[0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"legacy result\"")
+            );
+        }
     }
 
     #[test]

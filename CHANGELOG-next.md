@@ -54,6 +54,21 @@ The multi-agent epic (#6272) is the spine of this release:
 - MiniMax split into Global and China picker entries (#6758); llama.cpp promoted to a dedicated provider kind (#6417).
 - OpenRouter prompt caching (#6008); Codex native Responses tool calls (#6117); Ollama `num_ctx`/`num_predict`/`temperature` tuning (#6178).
 - Trait-driven provider dispatch with OAuth refresh on the per-alias schema; Azure rewired to typed config (and `AZURE_OPENAI_*` env vars retired); `models.dev` keys pre-populate the model picker.
+- **Anthropic / Bedrock:** opt-in native extended thinking with `budget_tokens`
+  and signed thinking-block round-trip across multi-turn tool use (#5652).
+  Disabled by default — set `agent.thinking.native_thinking = true` to enable.
+  When on, preserves the signed block bytes returned by the model (no trimming)
+  so subsequent tool-use turns validate on the provider side; streaming with
+  native thinking transparently falls back to a non-streaming request and
+  carries the signed block through to conversation history via the stream's
+  `reasoning` channel. Fixed-budget native thinking is gated off for Opus 4.7
+  on both providers (which only supports adaptive thinking and rejects fixed
+  `budget_tokens` with 400) — those models stay on prompt-based reasoning
+  until adaptive thinking lands as a follow-up. Custom `budget_tokens`
+  overrides are clamped to the provider's documented `[MIN, MAX]` range with
+  a WARN, avoiding a 400 when a config value dips below the provider minimum.
+  Full `thinking_delta` / `signature_delta` SSE handling remains a follow-up
+  for token-by-token streaming of thinking text.
 
 ### Channels
 
