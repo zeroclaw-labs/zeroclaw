@@ -20,6 +20,7 @@
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
+#[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
@@ -3057,10 +3058,14 @@ fn spawn_supervised_listener_with_health_interval(
 fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::Error) -> bool {
     match channel_name {
         name if name == "discord" || name.starts_with("discord-") => {
-            error
+            #[cfg(feature = "channel-discord")]
+            if error
                 .downcast_ref::<crate::discord::DiscordListenerFatalError>()
                 .is_some()
-                || zeroclaw_providers::reliable::is_non_retryable(error)
+            {
+                return true;
+            }
+            zeroclaw_providers::reliable::is_non_retryable(error)
         }
         _ => false,
     }
@@ -5002,6 +5007,10 @@ fn build_channel_by_id(
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-telegram"))]
+        "telegram" => {
+            anyhow::bail!("Telegram channel requires the `channel-telegram` feature");
+        }
         #[cfg(feature = "channel-discord")]
         "discord" => {
             let dc = config
@@ -5473,6 +5482,10 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
         #[cfg(feature = "channel-email")]
         "gmail_push" | "gmail-push" => {
             let gp = config
@@ -5491,6 +5504,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-email"))]
+        "gmail_push" | "gmail-push" => {
+            anyhow::bail!("Gmail Push channel requires the `channel-email` feature");
         }
         #[cfg(feature = "channel-irc")]
         "irc" => {
@@ -5782,6 +5799,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-telegram"))]
+    if !config.channels.telegram.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Telegram channel is configured but this build was compiled without \
+             `channel-telegram`; skipping Telegram."
+        );
+    }
+
     #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
         if !active_channel_aliases.contains(&format!("discord.{alias}")) {
@@ -5837,6 +5865,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-discord"))]
+    if !config.channels.discord.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Discord channel is configured but this build was compiled without \
+             `channel-discord`; skipping Discord."
+        );
+    }
+
     #[cfg(feature = "channel-slack")]
     for (alias, sl) in &config.channels.slack {
         if !active_channel_aliases.contains(&format!("slack.{alias}")) {
@@ -5875,6 +5914,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-slack"))]
+    if !config.channels.slack.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Slack channel is configured but this build was compiled without \
+             `channel-slack`; skipping Slack."
+        );
+    }
+
     #[cfg(feature = "channel-mattermost")]
     for (alias, mm) in &config.channels.mattermost {
         if !active_channel_aliases.contains(&format!("mattermost.{alias}")) {
@@ -5911,6 +5961,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-mattermost"))]
+    if !config.channels.mattermost.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Mattermost channel is configured but this build was compiled without \
+             `channel-mattermost`; skipping Mattermost."
+        );
+    }
+
     #[cfg(feature = "channel-imessage")]
     for (alias, im) in &config.channels.imessage {
         if !active_channel_aliases.contains(&format!("imessage.{alias}")) {
@@ -5930,6 +5991,17 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
         });
+    }
+
+    #[cfg(not(feature = "channel-imessage"))]
+    if !config.channels.imessage.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "iMessage channel is configured but this build was compiled without \
+             `channel-imessage`; skipping iMessage."
+        );
     }
 
     #[cfg(feature = "channel-matrix")]
@@ -6021,6 +6093,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-signal"))]
+    if !config.channels.signal.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Signal channel is configured but this build was compiled without \
+             `channel-signal`; skipping Signal."
+        );
+    }
+
     #[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
     for (alias, wa) in &config.channels.whatsapp {
         if !active_channel_aliases.contains(&format!("whatsapp.{alias}")) {
@@ -6039,9 +6122,9 @@ fn collect_configured_channels(
         }
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
+            #[cfg(feature = "channel-whatsapp-cloud")]
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
-                #[cfg(feature = "channel-whatsapp-cloud")]
                 if wa.is_cloud_config() {
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
@@ -6082,6 +6165,15 @@ fn collect_configured_channels(
                         "WhatsApp Cloud API backend requires 'channel-whatsapp-cloud' feature. Build/run with --features channel-whatsapp-cloud"
                     );
                 }
+            }
+            #[cfg(not(feature = "channel-whatsapp-cloud"))]
+            "cloud" => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "WhatsApp Cloud API is configured but this build was compiled without `channel-whatsapp-cloud`; skipping WhatsApp Cloud."
+                );
             }
             "web" => {
                 // Web mode: requires session_path
@@ -6161,6 +6253,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-linq"))]
+    if !config.channels.linq.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Linq channel is configured but this build was compiled without \
+             `channel-linq`; skipping Linq."
+        );
+    }
+
     #[cfg(feature = "channel-wati")]
     for (alias, wati_cfg) in &config.channels.wati {
         if !active_channel_aliases.contains(&format!("wati.{alias}")) {
@@ -6188,6 +6291,17 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(wati_channel),
         });
+    }
+
+    #[cfg(not(feature = "channel-wati"))]
+    if !config.channels.wati.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "WATI channel is configured but this build was compiled without \
+             `channel-wati`; skipping WATI."
+        );
     }
 
     #[cfg(feature = "channel-nextcloud")]
@@ -6219,6 +6333,17 @@ fn collect_configured_channels(
                 nc.proxy_url.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-nextcloud"))]
+    if !config.channels.nextcloud_talk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Nextcloud Talk channel is configured but this build was compiled without \
+             `channel-nextcloud`; skipping Nextcloud Talk."
+        );
     }
 
     #[cfg(feature = "channel-email")]
@@ -6269,6 +6394,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-email"))]
+    if !config.channels.email.is_empty() || !config.channels.gmail_push.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Email/Gmail Push channel is configured but this build was compiled without \
+             `channel-email`; skipping Email and Gmail Push."
+        );
+    }
+
     #[cfg(feature = "channel-irc")]
     for (alias, irc) in &config.channels.irc {
         if !active_channel_aliases.contains(&format!("irc.{alias}")) {
@@ -6300,6 +6436,17 @@ fn collect_configured_channels(
                 mention_only: irc.mention_only,
             })),
         });
+    }
+
+    #[cfg(not(feature = "channel-irc"))]
+    if !config.channels.irc.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "IRC channel is configured but this build was compiled without \
+             `channel-irc`; skipping IRC."
+        );
     }
 
     #[cfg(feature = "channel-lark")]
@@ -6398,6 +6545,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-dingtalk"))]
+    if !config.channels.dingtalk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "DingTalk channel is configured but this build was compiled without \
+             `channel-dingtalk`; skipping DingTalk."
+        );
+    }
+
     #[cfg(feature = "channel-qq")]
     for (alias, qq) in &config.channels.qq {
         if !active_channel_aliases.contains(&format!("qq.{alias}")) {
@@ -6427,6 +6585,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-qq"))]
+    if !config.channels.qq.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "QQ channel is configured but this build was compiled without \
+             `channel-qq`; skipping QQ."
+        );
+    }
+
     #[cfg(feature = "channel-twitter")]
     for (alias, tw) in &config.channels.twitter {
         if !active_channel_aliases.contains(&format!("twitter.{alias}")) {
@@ -6449,6 +6618,17 @@ fn collect_configured_channels(
                 peer_resolver,
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-twitter"))]
+    if !config.channels.twitter.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "X/Twitter channel is configured but this build was compiled without \
+             `channel-twitter`; skipping X/Twitter."
+        );
     }
 
     #[cfg(feature = "channel-mochat")]
@@ -6477,6 +6657,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-mochat"))]
+    if !config.channels.mochat.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Mochat channel is configured but this build was compiled without \
+             `channel-mochat`; skipping Mochat."
+        );
+    }
+
     #[cfg(feature = "channel-wecom")]
     for (alias, wc) in &config.channels.wecom {
         if !active_channel_aliases.contains(&format!("wecom.{alias}")) {
@@ -6499,6 +6690,17 @@ fn collect_configured_channels(
                 peer_resolver,
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-wecom"))]
+    if !config.channels.wecom.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "WeCom channel is configured but this build was compiled without \
+             `channel-wecom`; skipping WeCom."
+        );
     }
 
     #[cfg(feature = "channel-wecom-ws")]
@@ -6635,6 +6837,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-clawdtalk"))]
+    if !config.channels.clawdtalk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "ClawdTalk channel is configured but this build was compiled without \
+             `channel-clawdtalk`; skipping ClawdTalk."
+        );
+    }
+
     // Notion database poller channel
     #[cfg(feature = "channel-notion")]
     if config.notion.enabled && !config.notion.database_id.trim().is_empty() {
@@ -6666,6 +6879,17 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(not(feature = "channel-notion"))]
+    if config.notion.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Notion channel is enabled but this build was compiled without \
+             `channel-notion`; skipping Notion."
+        );
+    }
+
     #[cfg(feature = "channel-reddit")]
     for (alias, rd) in &config.channels.reddit {
         if !active_channel_aliases.contains(&format!("reddit.{alias}")) {
@@ -6688,6 +6912,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-reddit"))]
+    if !config.channels.reddit.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Reddit channel is configured but this build was compiled without \
+             `channel-reddit`; skipping Reddit."
+        );
+    }
+
     #[cfg(feature = "channel-bluesky")]
     for (alias, bs) in &config.channels.bluesky {
         if !active_channel_aliases.contains(&format!("bluesky.{alias}")) {
@@ -6705,6 +6940,17 @@ fn collect_configured_channels(
                 bs.app_password.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-bluesky"))]
+    if !config.channels.bluesky.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Bluesky channel is configured but this build was compiled without \
+             `channel-bluesky`; skipping Bluesky."
+        );
     }
 
     #[cfg(feature = "voice-wake")]
@@ -6726,6 +6972,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "voice-wake"))]
+    if !config.channels.voice_wake.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "VoiceWake channel is configured but this build was compiled without \
+             `voice-wake`; skipping VoiceWake."
+        );
+    }
+
     #[cfg(feature = "channel-voice-call")]
     for (alias, vc) in &config.channels.voice_call {
         if !active_channel_aliases.contains(&format!("voice_call.{alias}")) {
@@ -6739,6 +6996,17 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(VoiceCallChannel::new(alias.clone(), vc.clone())),
         });
+    }
+
+    #[cfg(not(feature = "channel-voice-call"))]
+    if !config.channels.voice_call.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Voice Call channel is configured but this build was compiled without \
+             `channel-voice-call`; skipping Voice Call."
+        );
     }
 
     #[cfg(feature = "channel-webhook")]
@@ -6762,6 +7030,17 @@ fn collect_configured_channels(
                 wh.secret.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-webhook"))]
+    if !config.channels.webhook.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Webhook channel is configured but this build was compiled without \
+             `channel-webhook`; skipping Webhook."
+        );
     }
 
     channels
@@ -6807,6 +7086,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
                 ),
             });
+        }
+    }
+
+    #[cfg(not(feature = "channel-nostr"))]
+    {
+        let config = config_arc.read();
+        if !config.channels.nostr.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Nostr channel is configured but this build was compiled without \
+                 `channel-nostr`; skipping Nostr health check."
+            );
         }
     }
 
@@ -7370,6 +7663,16 @@ pub async fn start_channels(
                     ),
                 });
             }
+            #[cfg(not(feature = "channel-nostr"))]
+            if !config.channels.nostr.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Nostr channel is configured but this build was compiled without \
+                     `channel-nostr`; skipping Nostr."
+                );
+            }
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
@@ -7835,6 +8138,10 @@ pub async fn deliver_announcement(
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-telegram"))]
+        "telegram" => {
+            anyhow::bail!("Telegram channel requires the `channel-telegram` feature");
         }
         #[cfg(feature = "channel-discord")]
         "discord" => {
@@ -14605,6 +14912,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn supervised_listener_does_not_restart_on_fatal_discord_rate_limit() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -14644,6 +14952,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
         let discord_calls = Arc::new(AtomicUsize::new(0));
@@ -16740,6 +17049,35 @@ Done."#;
         assert!(
             msg.contains("[channels.lark.work]"),
             "bail must point at the real config table; got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod omitted_feature_tests {
+    /// When `channel-telegram` is not compiled, a configured Telegram entry must
+    /// produce no channel in `collect_configured_channels`. This pins the behaviour
+    /// that selective builds never silently include a channel whose feature was
+    /// omitted, and ensures the `#[cfg(not(feature = "channel-telegram"))]` warn
+    /// path compiles correctly.
+    #[cfg(not(feature = "channel-telegram"))]
+    #[test]
+    fn collect_configured_channels_omits_telegram_when_compiled_out() {
+        use super::*;
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        assert!(
+            channels.iter().all(|c| c.display_name != "Telegram"),
+            "Telegram must be absent from collect_configured_channels when \
+             channel-telegram feature is not compiled in"
         );
     }
 }
