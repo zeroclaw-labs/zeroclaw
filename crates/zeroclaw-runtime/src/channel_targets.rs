@@ -70,7 +70,7 @@ pub fn build_channel_targets(config: &Config) -> Option<String> {
 
     let mut out = String::new();
     out.push_str("## Configured Channel Targets\n\n");
-    out.push_str("Use these recipients when sending messages via the `channel_send` tool. For each entry, use the composite key (e.g. `telegram.default`) as the `channel` parameter and the target as the `to` parameter.\n\n");
+    out.push_str("When responding to the user, ALWAYS use the `channel_send` tool to deliver your final response to their configured channel. Do NOT just reply in text — invoke the tool with the composite key (e.g. `telegram.default`) as the `channel` parameter and the recipient below as the `to` parameter.\n\n");
     for (channel, target) in &entries {
         out.push_str(&format!("- {channel}: {target}\n"));
     }
