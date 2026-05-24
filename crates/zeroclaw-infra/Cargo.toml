@@ -12,6 +12,9 @@ backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2-postgres"]
 ## Oracle 23ai session backend (adds `oracle`, `r2d2`).
 ## Requires Oracle Instant Client at runtime; set LD_LIBRARY_PATH accordingly.
 backend-oracle = ["dep:oracle", "dep:r2d2"]
+## IBM Db2 12.1.5 session backend in Oracle compatibility mode (adds `odbc-api`, `r2d2`).
+## Requires IBM Db2 CLI / ODBC driver at runtime; set LD_LIBRARY_PATH to the Db2 lib64 dir.
+backend-db2 = ["dep:odbc-api", "dep:r2d2"]
 
 [dependencies]
 zeroclaw-log.workspace = true
@@ -32,6 +35,9 @@ r2d2-postgres = { version = "0.18", optional = true }
 
 # Optional: Oracle 23ai backend
 oracle = { version = "0.5", optional = true, features = ["chrono"] }
+
+# Optional: IBM Db2 backend (ODBC)
+odbc-api = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.26"

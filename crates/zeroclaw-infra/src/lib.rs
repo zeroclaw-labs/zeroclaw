@@ -5,6 +5,8 @@
 pub mod acp_session_store;
 pub mod debounce;
 pub mod session_backend;
+#[cfg(feature = "backend-db2")]
+pub mod session_db2;
 #[cfg(feature = "backend-oracle")]
 pub mod session_oracle;
 #[cfg(feature = "backend-postgres")]
@@ -35,6 +37,10 @@ use crate::session_backend::SessionBackend;
 /// Only fields relevant to the chosen `backend` need to be populated.
 #[derive(Default)]
 pub struct RemoteSessionConfig<'a> {
+    /// ODBC connection string for `backend = "db2"`, e.g.
+    /// `"DSN=ZEROCLAW;UID=zeroclaw;PWD=secret;"`.
+    /// Db2 must be started with `DB2_COMPATIBILITY_VECTOR=ORA`.
+    pub db2_conn_str: Option<&'a str>,
     /// libpq DSN for `backend = "postgres"`, e.g.
     /// `"postgresql://zeroclaw:secret@primary/zeroclaw"`.
     pub postgres_url: Option<&'a str>,
@@ -91,6 +97,19 @@ pub fn make_session_backend_with_config(
             Ok(Arc::new(store))
         }
 
+        #[cfg(feature = "backend-db2")]
+        "db2" => {
+            let conn_str = cfg.db2_conn_str.ok_or_else(|| {
+                std::io::Error::other(
+                    "session_backend=db2 requires db2_conn_str in config",
+                )
+            })?;
+            let pool_size = cfg.pool_size.unwrap_or(5);
+            let store = session_db2::Db2SessionBackend::new(conn_str, pool_size)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(Arc::new(store))
+        }
+
         #[cfg(feature = "backend-oracle")]
         "oracle" => {
             let user = cfg.oracle_user.ok_or_else(|| {
@@ -118,7 +137,7 @@ pub fn make_session_backend_with_config(
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"other": other})),
                 "Unknown session_backend ''; falling back to sqlite. \
-                 Valid values: 'sqlite' (default), 'jsonl', 'postgres', 'oracle'."
+                 Valid values: 'sqlite' (default), 'jsonl', 'postgres', 'oracle', 'db2'."
             );
             Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
         }
