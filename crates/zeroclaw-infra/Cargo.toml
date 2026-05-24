@@ -32,8 +32,8 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 
 # Optional: PostgreSQL backend
-postgres     = { version = "0.19", optional = true }
-r2d2         = { version = "0.8",  optional = true }
+postgres      = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
+r2d2          = { version = "0.8",  optional = true }
 r2d2_postgres = { version = "0.18", optional = true }
 
 # Optional: Oracle 23ai backend

@@ -78,8 +78,16 @@ impl PostgresSessionBackend {
                 name            TEXT,
                 state           TEXT        NOT NULL DEFAULT 'idle',
                 turn_id         TEXT,
-                turn_started_at TIMESTAMPTZ
-             );",
+                turn_started_at TIMESTAMPTZ,
+                agent_alias     TEXT,
+                channel_id      TEXT,
+                room_id         TEXT,
+                sender_id       TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_smeta_agent_alias ON session_metadata(agent_alias);
+             CREATE INDEX IF NOT EXISTS idx_smeta_channel_id  ON session_metadata(channel_id);
+             CREATE INDEX IF NOT EXISTS idx_smeta_room_id     ON session_metadata(room_id);
+             CREATE INDEX IF NOT EXISTS idx_smeta_sender_id   ON session_metadata(sender_id);",
         )
         .context("failed to initialise postgres session schema")?;
 
@@ -178,7 +186,8 @@ impl SessionBackend for PostgresSessionBackend {
             return Vec::new();
         };
         let Ok(rows) = conn.query(
-            "SELECT session_key, name, created_at, last_activity, message_count
+            "SELECT session_key, name, created_at, last_activity, message_count,
+                    agent_alias, channel_id, room_id, sender_id
              FROM session_metadata ORDER BY last_activity DESC",
             &[],
         ) else {
@@ -193,6 +202,10 @@ impl SessionBackend for PostgresSessionBackend {
                     created_at: row.get(2),
                     last_activity: row.get(3),
                     message_count: count as usize,
+                    agent_alias: row.get(5),
+                    channel_id: row.get(6),
+                    room_id: row.get(7),
+                    sender_id: row.get(8),
                 }
             })
             .collect()
@@ -236,7 +249,8 @@ impl SessionBackend for PostgresSessionBackend {
         let pattern = format!("%{kw}%");
         let Ok(rows) = conn.query(
             "SELECT DISTINCT s.session_key, m.name, m.created_at,
-                    m.last_activity, m.message_count
+                    m.last_activity, m.message_count,
+                    m.agent_alias, m.channel_id, m.room_id, m.sender_id
              FROM sessions s
              JOIN session_metadata m USING (session_key)
              WHERE s.content ILIKE $1
@@ -255,6 +269,10 @@ impl SessionBackend for PostgresSessionBackend {
                     created_at: row.get(2),
                     last_activity: row.get(3),
                     message_count: count as usize,
+                    agent_alias: row.get(5),
+                    channel_id: row.get(6),
+                    room_id: row.get(7),
+                    sender_id: row.get(8),
                 }
             })
             .collect()
@@ -340,7 +358,8 @@ impl SessionBackend for PostgresSessionBackend {
             return Vec::new();
         };
         let Ok(rows) = conn.query(
-            "SELECT session_key, name, created_at, last_activity, message_count
+            "SELECT session_key, name, created_at, last_activity, message_count,
+                    agent_alias, channel_id, room_id, sender_id
              FROM session_metadata WHERE state = 'running'
              ORDER BY turn_started_at ASC NULLS LAST",
             &[],
@@ -356,6 +375,10 @@ impl SessionBackend for PostgresSessionBackend {
                     created_at: row.get(2),
                     last_activity: row.get(3),
                     message_count: count as usize,
+                    agent_alias: row.get(5),
+                    channel_id: row.get(6),
+                    room_id: row.get(7),
+                    sender_id: row.get(8),
                 }
             })
             .collect()
@@ -367,7 +390,8 @@ impl SessionBackend for PostgresSessionBackend {
         };
         let cutoff = Utc::now() - chrono::Duration::seconds(threshold_secs as i64);
         let Ok(rows) = conn.query(
-            "SELECT session_key, name, created_at, last_activity, message_count
+            "SELECT session_key, name, created_at, last_activity, message_count,
+                    agent_alias, channel_id, room_id, sender_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < $1
              ORDER BY turn_started_at ASC",
@@ -384,6 +408,10 @@ impl SessionBackend for PostgresSessionBackend {
                     created_at: row.get(2),
                     last_activity: row.get(3),
                     message_count: count as usize,
+                    agent_alias: row.get(5),
+                    channel_id: row.get(6),
+                    room_id: row.get(7),
+                    sender_id: row.get(8),
                 }
             })
             .collect()
@@ -393,7 +421,8 @@ impl SessionBackend for PostgresSessionBackend {
         let mut conn = self.pool.get().ok()?;
         let row = conn
             .query_opt(
-                "SELECT session_key, name, created_at, last_activity, message_count
+                "SELECT session_key, name, created_at, last_activity, message_count,
+                        agent_alias, channel_id, room_id, sender_id
                  FROM session_metadata WHERE session_key = $1",
                 &[&session_key],
             )
@@ -405,6 +434,10 @@ impl SessionBackend for PostgresSessionBackend {
             created_at: row.get(2),
             last_activity: row.get(3),
             message_count: count as usize,
+            agent_alias: row.get(5),
+            channel_id: row.get(6),
+            room_id: row.get(7),
+            sender_id: row.get(8),
         })
     }
 }
