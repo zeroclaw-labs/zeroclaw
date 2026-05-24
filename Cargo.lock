@@ -274,13 +274,15 @@ checksum = "9dbc3a507a82b17ba0d98f6ce8fd6954ea0c8152e98009d36a40d8dcc8ce078a"
 
 [[package]]
 name = "aspect-core"
-version = "0.1.0"
-source = "git+https://github.com/yijunyu/aspect-rs?rev=c31f453#c31f453509057cdef97f880daea3c3aed5d23bb0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fd3e7f9100f7ae656584c40356ef60e2794da98b45acae5a51b6427ce20f60c"
 
 [[package]]
 name = "aspect-std"
-version = "0.1.0"
-source = "git+https://github.com/yijunyu/aspect-rs?rev=c31f453#c31f453509057cdef97f880daea3c3aed5d23bb0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1abc65dfa3766d751105bc9a4ee8af5cfa0d4edf56a925f57eb9edeac4e58c"
 dependencies = [
  "aspect-core",
  "log",
