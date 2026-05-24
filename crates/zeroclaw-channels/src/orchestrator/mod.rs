@@ -6937,6 +6937,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         }
     }
 
+    #[cfg(not(feature = "channel-nostr"))]
+    {
+        let config = config_arc.read();
+        if !config.channels.nostr.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Nostr channel is configured but this build was compiled without \
+                 `channel-nostr`; skipping Nostr health check."
+            );
+        }
+    }
+
     if channels.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
         return Ok(());
@@ -7497,6 +7511,16 @@ pub async fn start_channels(
                     ),
                 });
             }
+            #[cfg(not(feature = "channel-nostr"))]
+            if !config.channels.nostr.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Nostr channel is configured but this build was compiled without \
+                     `channel-nostr`; skipping Nostr."
+                );
+            }
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
@@ -7962,6 +7986,10 @@ pub async fn deliver_announcement(
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-telegram"))]
+        "telegram" => {
+            anyhow::bail!("Telegram channel requires the `channel-telegram` feature");
         }
         #[cfg(feature = "channel-discord")]
         "discord" => {
@@ -16815,8 +16843,6 @@ Done."#;
 
 #[cfg(test)]
 mod omitted_feature_tests {
-    use super::*;
-
     /// When `channel-telegram` is not compiled, a configured Telegram entry must
     /// produce no channel in `collect_configured_channels`. This pins the behaviour
     /// that selective builds never silently include a channel whose feature was
@@ -16825,10 +16851,11 @@ mod omitted_feature_tests {
     #[cfg(not(feature = "channel-telegram"))]
     #[test]
     fn collect_configured_channels_omits_telegram_when_compiled_out() {
+        use super::*;
         let mut config = Config::default();
         config.channels.telegram.insert(
             "default".to_string(),
-            zeroclaw_config::TelegramConfig {
+            zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 ..Default::default()
             },
