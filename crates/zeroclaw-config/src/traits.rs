@@ -327,19 +327,20 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
+/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub configured: bool,
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name
     fn name() -> &'static str;
     /// short description
     fn desc() -> &'static str;
-}
-
-// Maybe there should be a `&self` as parameter for custom channel/info or what...
-
-pub trait ConfigHandle {
-    fn name(&self) -> &'static str;
-    fn desc(&self) -> &'static str;
 }
 
 /// A menu item for `OnboardUi::select`, with an optional status badge

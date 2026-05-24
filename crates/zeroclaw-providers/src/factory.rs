@@ -718,6 +718,49 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
     }
 }
 
+fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {
+    let raw = api_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http://localhost:11434/v1");
+
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return raw.trim_end_matches('/').to_string();
+    };
+
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() || matches!(path, "/" | "/api" | "/api/chat") {
+        url.set_path("/v1");
+        return url.to_string().trim_end_matches('/').to_string();
+    }
+
+    raw.trim_end_matches('/').to_string()
+}
+
+fn build_ollama_compat_provider(
+    alias: &str,
+    key: Option<&str>,
+    api_url: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> OpenAiCompatibleModelProvider {
+    let base_url = normalize_ollama_compat_base_url(api_url);
+    let ollama_key = key.map(str::trim).filter(|value| !value.is_empty());
+    let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        alias,
+        "Ollama",
+        &base_url,
+        ollama_key,
+        AuthStyle::Bearer,
+        true,
+    )
+    .with_local_model_tool_sanitize()
+    .with_unauthenticated_model_listing();
+    if opts.merge_system_into_user {
+        p = p.with_merge_system_into_user();
+    }
+    p
+}
+
 impl FamilyProviderFactory for OllamaModelProviderConfig {
     fn create_provider(
         &self,
@@ -726,24 +769,10 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let base_url = api_url.unwrap_or("http://localhost:11434/v1");
-        let ollama_key = key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("ollama");
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            "Ollama",
-            base_url,
-            Some(ollama_key),
-            AuthStyle::Bearer,
-            true,
-        )
-        .with_local_model_tool_sanitize();
-        if opts.merge_system_into_user {
-            p = p.with_merge_system_into_user();
-        }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(
+            build_ollama_compat_provider(alias, key, api_url, opts),
+            opts,
+        ))
     }
 }
 
@@ -1142,5 +1171,60 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             p = p.with_merge_system_into_user();
         }
         Ok(apply_compat_options(p, opts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_factory_uses_no_credential_when_key_absent() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("http://192.168.1.100:11434/v1"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.name, "Ollama");
+        assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
+        assert!(provider.credential.is_none());
+    }
+
+    #[test]
+    fn ollama_factory_normalizes_host_root_to_openai_compat_base() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("http://192.168.1.100:11434"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
+    }
+
+    #[test]
+    fn ollama_factory_normalizes_legacy_api_path_to_openai_compat_base() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            None,
+            Some("https://ollama.com/api"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.base_url, "https://ollama.com/v1");
+    }
+
+    #[test]
+    fn ollama_factory_preserves_typed_api_key_for_official_cloud() {
+        let provider = build_ollama_compat_provider(
+            "default",
+            Some("  ollama-key  "),
+            Some("https://ollama.com/v1"),
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert_eq!(provider.credential.as_deref(), Some("ollama-key"));
     }
 }
