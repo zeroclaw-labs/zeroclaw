@@ -52,17 +52,20 @@ pub fn register_channel_map_fn(f: ChannelMapFn) {
 /// Returns the number of channels seeded.
 ///
 /// Parameter order matches the return tuple of `all_tools_with_runtime`:
-///   pos3 = `Option<PerToolChannelHandle>` (ask_user)
-///   pos4 = `PerToolChannelHandle` (NOT Option — reaction in loop_.rs named `channel_map_handle`)
-///   pos5 = `Option<PerToolChannelHandle>` (poll in loop_.rs named `reaction_handle`)
-///   pos6 = `Option<PerToolChannelHandle>` (escalate)
-///   pos7 = `Option<PerToolChannelHandle>` (channel_send)
+/// Seed all channel-driven tool handles from the registered channel map factory.
+/// Returns the number of channels seeded. Parameters match the return order of
+/// `all_tools_with_runtime`:
+///   ask_user_handle = `Option<PerToolChannelHandle>`
+///   reaction_handle = `PerToolChannelHandle` (NOT Option)
+///   poll_handle = `Option<PerToolChannelHandle>`
+///   escalate_handle = `Option<PerToolChannelHandle>`
+///   channel_send_handle = `Option<PerToolChannelHandle>`
 pub(crate) fn seed_channel_handles(
-    pos3: &Option<tools::PerToolChannelHandle>,
-    pos4: &tools::PerToolChannelHandle,
-    pos5: &Option<tools::PerToolChannelHandle>,
-    pos6: &Option<tools::PerToolChannelHandle>,
-    pos7: &Option<tools::PerToolChannelHandle>,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+    channel_send_handle: &Option<tools::PerToolChannelHandle>,
 ) -> usize {
     let Some(factory) = CHANNEL_MAP_FN.get() else {
         return 0;
@@ -73,11 +76,11 @@ pub(crate) fn seed_channel_handles(
     }
 
     let handles = [
-        pos3.as_ref(),
-        Some(pos4),
-        pos5.as_ref(),
-        pos6.as_ref(),
-        pos7.as_ref(),
+        ask_user_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+        channel_send_handle.as_ref(),
     ];
 
     let mut count = 0;
@@ -3029,9 +3032,9 @@ pub async fn run(
         let (
             mut tools_registry,
             delegate_handle,
-            reaction_handle,
-            channel_map_handle,
             ask_user_handle,
+            reaction_handle,
+            poll_handle,
             escalate_handle,
             channel_send_handle,
         ) = tools::all_tools_with_runtime(
@@ -3057,8 +3060,8 @@ pub async fn run(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle,
-            &channel_map_handle,
             &reaction_handle,
+            &poll_handle,
             &escalate_handle,
             &channel_send_handle,
         );
@@ -3067,7 +3070,7 @@ pub async fn run(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"count": count})),
-                "Registered channels for CLI agent",
+                &format!("Registered {} channel(s) for CLI agent", count),
             );
         }
 
@@ -4363,9 +4366,9 @@ pub async fn process_message(
         let (
             mut tools_registry,
             delegate_handle_pm,
-            reaction_handle_pm,
-            channel_map_handle_pm,
             ask_user_handle_pm,
+            reaction_handle_pm,
+            poll_handle_pm,
             escalate_handle_pm,
             channel_send_handle_pm,
         ) = tools::all_tools_with_runtime(
@@ -4393,8 +4396,8 @@ pub async fn process_message(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &ask_user_handle_pm,
-            &channel_map_handle_pm,
             &reaction_handle_pm,
+            &poll_handle_pm,
             &escalate_handle_pm,
             &channel_send_handle_pm,
         );
@@ -4403,7 +4406,7 @@ pub async fn process_message(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"count": count})),
-                "Registered channels for process_message agent",
+                &format!("Registered {} channel(s) for process_message agent", count),
             );
         }
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {

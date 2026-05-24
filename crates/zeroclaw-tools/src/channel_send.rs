@@ -168,3 +168,146 @@ impl Tool for ChannelSendTool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
+
+    /// Stub channel for tests — records send calls.
+    struct StubChannel {
+        name: String,
+    }
+
+    impl StubChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    impl Attributable for StubChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Webhook)
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StubChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_tool(handles: ChannelMapHandle) -> ChannelSendTool {
+        ChannelSendTool::new(Arc::new(SecurityPolicy::default()), handles)
+    }
+
+    #[test]
+    fn tool_name_and_description() {
+        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        assert_eq!(tool.name(), "channel_send");
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn parameter_schema_has_required_fields() {
+        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let schema = tool.parameters_schema();
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v.as_str() == Some("channel")));
+        assert!(required.iter().any(|v| v.as_str() == Some("to")));
+        assert!(required.iter().any(|v| v.as_str() == Some("body")));
+    }
+
+    #[test]
+    fn spec_matches_metadata() {
+        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let spec = tool.spec();
+        assert_eq!(spec.name, tool.name());
+        assert_eq!(spec.description, tool.description());
+    }
+
+    #[tokio::test]
+    async fn empty_channel_map_returns_error_with_available_list() {
+        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram.default",
+                "to": "chat_482910",
+                "body": "hello"
+            }))
+            .await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+        assert!(err.contains("Available channels"));
+    }
+
+    #[tokio::test]
+    async fn composite_key_resolves_exact_match() {
+        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.prod".to_string(),
+            Arc::new(StubChannel::new("telegram.prod")),
+        );
+        let tool = make_tool(map);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram.prod",
+                "to": "chat_482910",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn bare_type_key_resolves_to_default() {
+        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let tool = make_tool(map);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "to": "chat_482910",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn aliased_key_falls_back_to_default() {
+        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let tool = make_tool(map);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram.prod",
+                "to": "chat_482910",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
+    }
+}

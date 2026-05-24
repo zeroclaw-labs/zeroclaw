@@ -153,8 +153,10 @@ use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
 /// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
+///
 /// Each channel-driven tool owns its own handle so callers can populate it
-/// independently (late-bound registration).
+/// independently (late-bound registration). Shared alias of the same
+/// underlying type formerly known as `ChannelMapHandle`.
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
