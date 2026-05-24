@@ -1,14 +1,17 @@
 //! Replays captured `card.action.trigger` fixtures (collected from a live
-//! Lark/Feishu tenant via `RUST_LOG=zeroclaw_channels::lark=debug`) through
+//! Lark/Feishu tenant via `RUST_LOG=info,zeroclaw_log_event=debug`) through
 //! the exact JSON-pointer logic used by `LarkChannel::handle_card_action_event`,
 //! and asserts that `approval_id` + `decision` extract via the production
 //! parser path.
 //!
 //! This is the integration-style fixture coverage that
-//! `crates/zeroclaw-channels/src/lark.rs` (search: `card.action.trigger raw
-//! payload`) was designed to support. Replace the placeholder JSON files in
-//! `tests/fixtures/lark/` with sanitized captures from a real tenant to make
-//! these assertions evidence-backed.
+//! `crates/zeroclaw-channels/src/lark.rs` (search:
+//! `card.action.trigger sanitized payload`) was designed to support. The
+//! fixtures under `tests/fixtures/lark/` are real captures from a live
+//! Feishu tenant on 2026-05-23, sanitized at capture time (each fixture's
+//! `_fixture_note` documents the exact replacement policy applied to
+//! `token`, `operator.*`, and `context.open_*`). These assertions are
+//! evidence-backed.
 
 use serde_json::Value;
 

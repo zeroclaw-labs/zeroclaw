@@ -376,6 +376,74 @@ fn build_resolved_approval_card(
     })
 }
 
+/// Build a sanitized copy of a `card.action.trigger` event payload that is
+/// safe to emit to structured logs / dashboards / persisted JSONL.
+///
+/// The raw inbound payload from Lark/Feishu carries tenant-specific
+/// identifiers and a callback verification token. These values are
+/// classified as PII / callback secrets by the project's privacy policy
+/// (see each fixture's `_fixture_note` under `tests/fixtures/lark/` for the
+/// authoritative list of fields that must be redacted before any
+/// persistence).
+///
+/// This function replaces the following with deterministic `REDACTED_*`
+/// placeholder strings:
+///
+/// - top-level `token` (Lark callback verification token)
+/// - `operator.open_id` / `union_id` / `user_id` / `tenant_key`
+/// - `context.open_chat_id` / `context.open_message_id`
+///
+/// Non-sensitive business fields (`action.*`, `host`, etc.) are preserved
+/// verbatim so DEBUG operators can still capture production payload shape
+/// for fixture collection.
+///
+/// The input is borrowed read-only; a fresh owned `Value` is returned. The
+/// regression test `sanitize_card_action_payload_redacts_sensitive_fields`
+/// is the gate that fails if any of those raw values can leak through this
+/// path.
+fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut sanitized = event_payload.clone();
+
+    // Top-level callback verification token.
+    if let Some(token) = sanitized.get_mut("token")
+        && !token.is_null()
+    {
+        *token = Value::String("REDACTED_TOKEN".to_string());
+    }
+
+    // operator.* identifiers — only overwrite keys that are actually present
+    // so the sanitized payload still reflects production shape (don't
+    // invent fields that the real event didn't carry).
+    if let Some(Value::Object(operator)) = sanitized.get_mut("operator") {
+        for (key, placeholder) in [
+            ("open_id", "REDACTED_OPERATOR_OPEN_ID"),
+            ("union_id", "REDACTED_OPERATOR_UNION_ID"),
+            ("user_id", "REDACTED_OPERATOR_USER_ID"),
+            ("tenant_key", "REDACTED_OPERATOR_TENANT_KEY"),
+        ] {
+            if operator.contains_key(key) {
+                operator.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    // context.open_* identifiers.
+    if let Some(Value::Object(context)) = sanitized.get_mut("context") {
+        for (key, placeholder) in [
+            ("open_chat_id", "REDACTED_OPEN_CHAT_ID"),
+            ("open_message_id", "REDACTED_OPEN_MESSAGE_ID"),
+        ] {
+            if context.contains_key(key) {
+                context.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    sanitized
+}
+
 /// Build the full message body for sending an interactive card message.
 fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::Value {
     serde_json::json!({
@@ -2449,22 +2517,34 @@ impl LarkChannel {
     ) -> anyhow::Result<()> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Diagnostic: log the raw inbound payload at DEBUG so operators can
-        // capture real Lark/Feishu `card.action.trigger` JSON for fixture
-        // collection. Default production RUST_LOG (=info) leaves this off,
-        // so it costs nothing at runtime; flip the channel to debug to record
-        // shape evidence:
+        // Diagnostic: emit a SANITIZED copy of the inbound payload at DEBUG
+        // so operators can capture real Lark/Feishu `card.action.trigger`
+        // shape evidence for fixture collection WITHOUT leaking
+        // tenant-specific identifiers (token, operator.*, context.open_*)
+        // to runtime logs / dashboards / persisted JSONL.
         //
-        //   RUST_LOG=zeroclaw_channels::lark=debug
+        // `sanitize_card_action_payload` replaces those fields with
+        // deterministic `REDACTED_*` placeholders before the value reaches
+        // `record!`. The regression test
+        // `sanitize_card_action_payload_redacts_sensitive_fields` will fail
+        // if any of those raw values can leak through this path again.
+        //
+        // Default production RUST_LOG (=info) leaves this off, so it costs
+        // nothing at runtime; opt in with:
+        //
+        //   RUST_LOG=info,zeroclaw_log_event=debug
         //
         // Captured payloads should land in
-        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed by
-        // the integration test in `tests/lark_approval_live_evidence.rs`.
+        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed
+        // by the integration test in `tests/lark_approval_live_evidence.rs`.
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
-                .with_attrs(::serde_json::json!({"raw_payload": event_payload})),
-            "card.action.trigger raw payload"
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive).with_attrs(
+                ::serde_json::json!({
+                    "sanitized_payload": sanitize_card_action_payload(event_payload),
+                })
+            ),
+            "card.action.trigger sanitized payload"
         );
 
         // Feishu Card 2.0 button click events MAY round-trip the button value at
@@ -4701,6 +4781,133 @@ mod tests {
                 title.contains(expected_text_fragment),
                 "decision={decision:?} header title `{title}` should contain `{expected_text_fragment}`"
             );
+        }
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_sensitive_fields() {
+        let raw = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {
+                    "approval_id": "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7",
+                    "decision": "approve"
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_real_chat_id_LEAKED",
+                "open_message_id": "om_real_msg_id_LEAKED"
+            },
+            "host": "im_message",
+            "operator": {
+                "open_id": "ou_real_user_id_LEAKED",
+                "tenant_key": "real_tenant_key_LEAKED",
+                "union_id": "on_real_union_id_LEAKED",
+                "user_id": "real_user_id_LEAKED"
+            },
+            "token": "c-real_callback_token_LEAKED"
+        });
+
+        let sanitized = sanitize_card_action_payload(&raw);
+        let dumped = serde_json::to_string(&sanitized).expect("sanitized must serialize");
+
+        for forbidden in [
+            "oc_real_chat_id_LEAKED",
+            "om_real_msg_id_LEAKED",
+            "ou_real_user_id_LEAKED",
+            "real_tenant_key_LEAKED",
+            "on_real_union_id_LEAKED",
+            "real_user_id_LEAKED",
+            "c-real_callback_token_LEAKED",
+        ] {
+            assert!(
+                !dumped.contains(forbidden),
+                "sanitized payload must not contain raw value {forbidden:?}; got {dumped}"
+            );
+        }
+
+        assert_eq!(sanitized["token"], "REDACTED_TOKEN");
+        assert_eq!(
+            sanitized["operator"]["open_id"],
+            "REDACTED_OPERATOR_OPEN_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["union_id"],
+            "REDACTED_OPERATOR_UNION_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["user_id"],
+            "REDACTED_OPERATOR_USER_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["tenant_key"],
+            "REDACTED_OPERATOR_TENANT_KEY"
+        );
+        assert_eq!(
+            sanitized["context"]["open_chat_id"],
+            "REDACTED_OPEN_CHAT_ID"
+        );
+        assert_eq!(
+            sanitized["context"]["open_message_id"],
+            "REDACTED_OPEN_MESSAGE_ID"
+        );
+
+        assert_eq!(
+            sanitized["action"]["value"]["approval_id"],
+            "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7"
+        );
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+        assert_eq!(sanitized["action"]["tag"], "button");
+        assert_eq!(sanitized["host"], "im_message");
+
+        assert_eq!(raw["token"], "c-real_callback_token_LEAKED");
+        assert_eq!(raw["operator"]["open_id"], "ou_real_user_id_LEAKED");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_handles_missing_optional_fields() {
+        let raw = serde_json::json!({
+            "action": { "value": { "approval_id": "x", "decision": "approve" } }
+        });
+        let sanitized = sanitize_card_action_payload(&raw);
+        assert!(sanitized.get("token").is_none());
+        assert!(sanitized.get("operator").is_none());
+        assert!(sanitized.get("context").is_none());
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_committed_fixtures() {
+        let fixtures: [(&str, &str); 3] = [
+            (
+                "card_action_approve.json",
+                include_str!("../tests/fixtures/lark/card_action_approve.json"),
+            ),
+            (
+                "card_action_deny.json",
+                include_str!("../tests/fixtures/lark/card_action_deny.json"),
+            ),
+            (
+                "card_action_always.json",
+                include_str!("../tests/fixtures/lark/card_action_always.json"),
+            ),
+        ];
+        for (name, raw_text) in fixtures {
+            let raw: serde_json::Value = serde_json::from_str(raw_text)
+                .unwrap_or_else(|e| panic!("parse fixture {name}: {e}"));
+            let sanitized = sanitize_card_action_payload(&raw);
+            let dumped =
+                serde_json::to_string(&sanitized).expect("sanitized fixture must serialize");
+            for placeholder_field in [
+                "REDACTED_TOKEN",
+                "REDACTED_OPERATOR_OPEN_ID",
+                "REDACTED_OPEN_CHAT_ID",
+            ] {
+                assert!(
+                    dumped.contains(placeholder_field),
+                    "sanitizer output for {name} must contain {placeholder_field}; got {dumped}"
+                );
+            }
         }
     }
 
