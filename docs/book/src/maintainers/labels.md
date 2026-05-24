@@ -162,8 +162,10 @@ Track lifecycle state of RFCs and tracked work items. Applied manually.
 
 | Label | Description |
 |---|---|
-| `status:in-progress` | An open PR is actively targeting this issue |
-| `status:accepted` | RFC or work item ratified by the team |
+| `status:accepted` | RFC or work item ratified by the team. This does not exempt the issue from stale handling by itself. |
+| `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded. |
+| `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
+| `status:no-stale` | Explicit stale exemption for accepted or blocked work. Use only when a maintainer comment, issue body, or tracker entry records why the issue should stay open. |
 
 ## Triage labels
 
@@ -177,7 +179,6 @@ Applied manually — the auto-response automation that used to handle these was 
 | `duplicate` | Duplicate of an existing issue |
 | `stale-candidate` | Dormant PR or issue; candidate for closing |
 | `superseded` | Replaced by a newer PR |
-| `status:no-stale` | Exempt from stale automation; accepted but blocked work |
 
 ## Maintenance triggers
 

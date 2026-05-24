@@ -99,7 +99,7 @@ For AI-heavy PRs, reviewers focus on:
 
 - First maintainer triage target: **within 48 hours**.
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
-- `status:no-stale` reserved for accepted-but-blocked work.
+- `status:no-stale` is reserved for accepted or blocked work with a recorded reason to stay open.
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 

@@ -130,7 +130,7 @@ Process two groups:
 
 2. **Apply labels** — apply the appropriate primary label (`bug`, `feature`, `r:support`) plus any module/channel/provider labels derivable from the title or body (e.g., `channel:telegram`, `provider:ollama`). Apply risk tier if determinable.
 
-3. **Link open PRs** — search for open PRs that reference this issue number or describe the same fix. If found, apply `status:in-progress` and comment linking the PR so the reporter knows work is in progress.
+3. **Link open PRs** — search for open PRs that reference this issue number or describe the same fix. If found, apply `status:in-progress` and comment linking the PR so the reporter knows work is in progress. Do not add `status:no-stale` only because a PR exists; the stale pass excludes issues with open linked PRs.
 
 4. **Evaluate for community labels** — after classifying and labeling, ask:
    - Is this a bug or feature that is well-scoped, clearly documented, and accessible to a new contributor? → apply `good first issue`
@@ -273,7 +273,10 @@ Activity is defined as: a follow-up comment or update from the **original author
 - `priority:critical`
 - `type:rfc`
 - `status:no-stale`
+- an open linked PR
 - 10 or more 👍 reactions on the opening post (community has signaled relevance regardless of author silence)
+
+`status:in-progress` is a routing signal, not a permanent stale exemption by itself. During stale passes, verify that an open linked PR still exists. If the PR has closed without resolving the issue, remove or replace `status:in-progress` only after presenting the exact label change to the user.
 
 ### Stale enforcement steps
 
@@ -389,10 +392,11 @@ Derived from RFC #5577. Apply these consistently:
 ### Status
 
 - `status:stale` — original author has not engaged for 45+ days; pending closure
-- `status:blocked` — waiting on external blocker; exempt from stale
-- `status:in-progress` — linked open PR exists
+- `status:accepted` — RFC or work item accepted by the team; not stale-exempt by itself
+- `status:blocked` — waiting on external blocker; exempt from stale while the blocker is recorded
+- `status:in-progress` — linked open PR exists; verify live PR state before stale decisions
 - `status:wont-do` — architectural won't-fix; permanent decision, not a deferral
-- `status:no-stale` — explicitly exempt from stale automation; maintainer-applied
+- `status:no-stale` — explicitly exempt from stale automation; maintainer-applied with a recorded reason
 
 ### Module labels (apply when issue is scoped to a specific subsystem)
 
