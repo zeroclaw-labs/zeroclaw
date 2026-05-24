@@ -2,7 +2,6 @@
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -693,6 +692,15 @@ pub struct VoiceCallConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+impl crate::traits::ChannelConfig for VoiceCallConfig {
+    fn name() -> &'static str {
+        "Voice Call"
+    }
+    fn desc() -> &'static str {
+        "outbound voice call channel"
+    }
 }
 
 impl Default for VoiceCallConfig {

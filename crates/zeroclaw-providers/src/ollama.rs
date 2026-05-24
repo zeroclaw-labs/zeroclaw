@@ -254,7 +254,21 @@ impl OllamaModelProvider {
         reqwest::Url::parse(&self.base_url)
             .ok()
             .and_then(|url| url.host_str().map(|host| host.to_string()))
-            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+            .is_some_and(|host| {
+                matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+            })
+    }
+
+    fn is_official_cloud_endpoint(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| {
+                    host.eq_ignore_ascii_case("ollama.com")
+                        || host.eq_ignore_ascii_case("api.ollama.com")
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn http_client(&self) -> Client {
@@ -267,23 +281,29 @@ impl OllamaModelProvider {
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
-        let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+        let official_cloud_endpoint = self.is_official_cloud_endpoint();
+        let local_endpoint = self.is_local_endpoint();
+        let normalized_model = if requests_cloud && official_cloud_endpoint {
+            model.strip_suffix(":cloud").unwrap_or(model).to_string()
+        } else {
+            model.to_string()
+        };
 
-        if requests_cloud && self.is_local_endpoint() {
+        if requests_cloud && local_endpoint {
             anyhow::bail!(
                 "Model '{}' requested cloud routing, but Ollama endpoint is local. Configure api_url with a remote Ollama endpoint.",
                 model
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
+        if requests_cloud && official_cloud_endpoint && self.api_key.is_none() {
             anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+                "Model '{}' requested cloud routing, but no API key is configured. Set api_key on [providers.models.ollama.<alias>] or via the schema-mirror grammar.",
                 model
             );
         }
 
-        let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
+        let should_auth = self.api_key.is_some() && !local_endpoint;
 
         Ok((normalized_model, should_auth))
     }
@@ -1143,6 +1163,19 @@ mod tests {
     }
 
     #[test]
+    fn cloud_suffix_with_unspecified_local_endpoint_errors() {
+        let p = OllamaModelProvider::new("test", Some("http://0.0.0.0:11434"), Some("ollama-key"));
+        let error = p
+            .resolve_request_details("qwen3:cloud")
+            .expect_err("cloud suffix should fail on unspecified local endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but Ollama endpoint is local")
+        );
+    }
+
+    #[test]
     fn cloud_suffix_without_api_key_errors() {
         let p = OllamaModelProvider::new("test", Some("https://ollama.com"), None);
         let error = p
@@ -1151,8 +1184,28 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("requested cloud routing, but no API key is configured")
+                .contains("Set api_key on [providers.models.ollama.<alias>]")
         );
+    }
+
+    #[test]
+    fn cloud_suffix_preserved_for_private_remote_without_api_key() {
+        let p = OllamaModelProvider::new("test", Some("http://192.168.1.100:11434"), None);
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(!should_auth);
+    }
+
+    #[test]
+    fn cloud_suffix_preserved_for_private_remote_with_api_key() {
+        let p = OllamaModelProvider::new(
+            "test",
+            Some("https://private-ollama.example.com"),
+            Some("ollama-key"),
+        );
+        let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
+        assert_eq!(model, "qwen3:cloud");
+        assert!(should_auth);
     }
 
     #[test]

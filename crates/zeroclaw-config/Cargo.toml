@@ -49,15 +49,9 @@ tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
-# `channel-nostr` and `voice-wake` gate optional schema fields
-# (`channels.nostr`, `channels.voice_wake`). They live in default so
-# the regression test suite (which migrates a comprehensive V1
-# fixture exercising every channel type) doesn't silently drop
-# those blocks on deserialize. Consumers that want a minimal
-# schema can opt out with `default-features = false`.
-default = ["schema-export", "clap", "channel-nostr", "voice-wake"]
+# schema-export and clap are the only defaults. All channel schema types
+# compile unconditionally; channel feature flags live in zeroclaw-channels only.
+default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
 clap = ["dep:clap"]
-channel-nostr = []
-voice-wake = []
 memory-postgres = ["dep:postgres"]
