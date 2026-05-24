@@ -21,6 +21,7 @@ use crate::client::{
 };
 use crate::diff;
 use crate::input_bar::{InputBarAction, InputBarState};
+use crate::mouse;
 use crate::theme;
 use zeroclaw_api::jsonrpc::RpcOutbound;
 
@@ -602,12 +603,53 @@ impl<'a> Chat<'a> {
         false
     }
 
-    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) {
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         if let ChatPhase::Active(ref mut state) = self.phase {
             // Let the file explorer handle mouse events first when open.
             if state.input_bar.handle_mouse(mouse) {
                 return;
             }
+
+            // Session list overlay intercepts all mouse events when open.
+            if let SessionOverlay::List {
+                sessions,
+                list_state,
+            } = &mut state.session_overlay
+            {
+                let col = mouse.column;
+                let row = mouse.row;
+                let overlay_area = session_list_overlay_area(area);
+
+                match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        if !mouse::in_rect(col, row, overlay_area) {
+                            // Click outside → close overlay.
+                            state.session_overlay = SessionOverlay::None;
+                        } else {
+                            let count = sessions.len();
+                            if let Some(idx) = mouse::list_click_index(
+                                row,
+                                overlay_area,
+                                list_state.offset(),
+                                count,
+                            ) {
+                                list_state.select(Some(idx));
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        if mouse::in_rect(col, row, overlay_area) {
+                            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                            let count = sessions.len();
+                            let i = list_state.selected().unwrap_or(0);
+                            list_state.select(Some(mouse::list_scroll(i, count, up, 1)));
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
             match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
@@ -1196,12 +1238,10 @@ fn strip_content_fields(summary: &str) -> String {
 
 // ── Session overlay rendering ─────────────────────────────────────
 
-fn render_session_list_overlay(
-    f: &mut Frame,
-    area: Rect,
-    sessions: &[SessionEntry],
-    list_state: &ListState,
-) {
+/// Compute the overlay rect for the session list picker.
+/// Kept in sync with `render_session_list_overlay` so mouse hit-testing
+/// can use the same geometry without storing extra state.
+fn session_list_overlay_area(area: Rect) -> Rect {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1210,14 +1250,23 @@ fn render_session_list_overlay(
             Constraint::Percentage(20),
         ])
         .split(area);
-    let overlay_area = Layout::default()
+    Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(15),
             Constraint::Min(40),
             Constraint::Percentage(15),
         ])
-        .split(vert[1])[1];
+        .split(vert[1])[1]
+}
+
+fn render_session_list_overlay(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[SessionEntry],
+    list_state: &ListState,
+) {
+    let overlay_area = session_list_overlay_area(area);
 
     f.render_widget(Clear, overlay_area);
 
