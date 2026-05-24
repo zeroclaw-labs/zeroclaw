@@ -3,6 +3,7 @@
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use zeroclaw_macros::Configurable;
 
@@ -38,7 +39,30 @@ impl ThinkingLevel {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn default_budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Off | Self::Minimal | Self::Low | Self::Medium => None,
+            Self::High => Some(10_000),
+            Self::Max => Some(50_000),
+        }
+    }
 }
+
+pub use zeroclaw_api::model_provider::{
+    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams,
+};
 
 /// Configuration for thinking/reasoning level control.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -47,12 +71,57 @@ impl ThinkingLevel {
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
+    /// Opt-in flag for provider-native extended thinking. When `true`, the
+    /// provider sends a dedicated `thinking` parameter with `budget_tokens`
+    /// instead of relying solely on prompt-based reasoning. Defaults to
+    /// `false` so existing High/Max users keep their prior prompt-based
+    /// behavior (cost, latency, transport path) until they explicitly migrate.
+    #[serde(default)]
+    pub native_thinking: bool,
+    #[serde(default)]
+    pub budget_tokens: HashMap<String, u32>,
 }
 
 impl Default for ThinkingConfig {
     fn default() -> Self {
         Self {
             default_level: ThinkingLevel::Medium,
+            native_thinking: false,
+            budget_tokens: HashMap::new(),
+        }
+    }
+}
+
+impl ThinkingConfig {
+    /// Resolve the effective `budget_tokens` for a given level.
+    ///
+    /// Only levels with a built-in default (`High`, `Max`) are eligible for
+    /// native thinking. Config overrides for levels Off–Medium are ignored
+    /// to prevent accidentally forcing `temperature = 1.0` on low levels.
+    pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
+        // Guard: only levels that have a built-in budget can use native thinking.
+        let default = level.default_budget_tokens()?;
+        Some(
+            self.budget_tokens
+                .get(level.as_str())
+                .copied()
+                .unwrap_or(default),
+        )
+    }
+
+    pub fn warn_unknown_budget_keys(&self) {
+        use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off};
+        const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, Max];
+        for key in self.budget_tokens.keys() {
+            if !ALL_LEVELS.iter().any(|l| l.as_str() == key) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"key": key})),
+                    "Unknown thinking level in budget_tokens config; \
+                     valid levels are: off, minimal, low, medium, high, max"
+                );
+            }
         }
     }
 }
