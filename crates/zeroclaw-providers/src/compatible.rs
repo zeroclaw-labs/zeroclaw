@@ -65,6 +65,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// non-string `default` quirks crash the tool-call parser). The check
     /// runs at tool conversion time against the runtime model id.
     local_model_tool_sanitize: bool,
+    /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
+    /// without authentication. Keep the default credential-gated for hosted
+    /// providers so missing credentials still fall through to catalog sources.
+    unauthenticated_model_listing: bool,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -279,6 +283,7 @@ impl OpenAiCompatibleModelProvider {
             models_dev_key: None,
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
+            unauthenticated_model_listing: false,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -289,6 +294,11 @@ impl OpenAiCompatibleModelProvider {
     /// happily serves llama, qwen, etc. without sanitization.
     pub fn with_local_model_tool_sanitize(mut self) -> Self {
         self.local_model_tool_sanitize = true;
+        self
+    }
+
+    pub fn with_unauthenticated_model_listing(mut self) -> Self {
+        self.unauthenticated_model_listing = true;
         self
     }
 
@@ -1985,16 +1995,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
-        // (OpenAI-compatible: GET {base_url}/models).
-        if let Some(credential) = self.credential.as_deref() {
+        // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
+        // servers that explicitly allow unauthenticated listing use the same
+        // path without an Authorization header.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.unauthenticated_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .apply_auth_header(self.http_client().get(&url), list_credential)
                 .send()
                 .await
                 .map_err(|e| {

@@ -2264,6 +2264,7 @@ mod tests {
         assert!(create_model_provider("lmstudio", Some("key")).is_ok());
         assert!(create_model_provider("lmstudio", None).is_ok());
     }
+
     #[test]
     fn factory_llamacpp() {
         assert!(create_model_provider("llamacpp", Some("key")).is_ok());
@@ -2603,6 +2604,125 @@ mod tests {
             Some("https://ollama.com"),
         );
         assert!(model_provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ollama_private_remote_cloud_request_omits_auth_and_preserves_model() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Option<(Option<String>, String)>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *capture.lock().expect("capture lock poisoned") = Some((auth, model));
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let model_provider = create_model_provider_with_url("ollama", None, Some(&base_url))
+            .expect("ollama provider should build");
+        let response = model_provider
+            .chat_with_system(None, "hello", "qwen3:cloud", Some(0.7))
+            .await
+            .expect("chat request should succeed");
+
+        assert_eq!(response, "ok");
+        let (auth, model) = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(auth, None);
+        assert_eq!(model, "qwen3:cloud");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_private_remote_lists_models_without_auth() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::get};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Option<Option<String>>>>;
+
+        async fn capture_models_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            *capture.lock().expect("capture lock poisoned") = Some(auth);
+            Json(json!({
+                "data": [{"id": "qwen3:cloud"}]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/models", get(capture_models_request))
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let model_provider = create_model_provider_with_url("ollama", None, Some(&base_url))
+            .expect("ollama provider should build");
+        let models = model_provider
+            .list_models()
+            .await
+            .expect("model list should succeed");
+
+        assert_eq!(models, vec!["qwen3:cloud".to_string()]);
+        let auth = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(auth, None);
+        server.abort();
     }
 
     #[test]
