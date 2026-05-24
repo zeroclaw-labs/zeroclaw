@@ -2866,6 +2866,7 @@ pub async fn run(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
+    crate::agent::thinking::validate_thinking_config(&agent.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {
@@ -4190,6 +4191,7 @@ pub async fn process_message(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
+    crate::agent::thinking::validate_thinking_config(&agent.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {

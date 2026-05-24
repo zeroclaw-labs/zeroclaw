@@ -558,4 +558,31 @@ mod tests {
             "NATIVE_THINKING_OVERRIDE outside a scope must read None, got: {read_back:?}"
         );
     }
+
+    /// Regression test: `validate_thinking_config` is called once at agent
+    /// initialization (from `loop_::run` and `loop_::process_message`) so a
+    /// typo such as an unknown `agent.thinking.budget_tokens.foo` key warns
+    /// once at startup instead of being silently ignored. The function must
+    /// accept arbitrary configs without panicking — including unknown keys,
+    /// empty configs, and configs with all valid keys — since it runs in
+    /// the request-processing hot path's startup section.
+    #[test]
+    fn validate_thinking_config_accepts_arbitrary_inputs_without_panicking() {
+        let mut cfg_with_unknown_key = ThinkingConfig::default();
+        cfg_with_unknown_key
+            .budget_tokens
+            .insert("turbo".to_string(), 5_000); // not a valid ThinkingLevel
+        validate_thinking_config(&cfg_with_unknown_key);
+
+        let cfg_default = ThinkingConfig::default();
+        validate_thinking_config(&cfg_default);
+
+        let mut cfg_all_valid = ThinkingConfig::default();
+        for level in ["off", "minimal", "low", "medium", "high", "max"] {
+            cfg_all_valid
+                .budget_tokens
+                .insert(level.to_string(), 10_000);
+        }
+        validate_thinking_config(&cfg_all_valid);
+    }
 }
