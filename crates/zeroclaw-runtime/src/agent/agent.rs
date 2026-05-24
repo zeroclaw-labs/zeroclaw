@@ -96,6 +96,17 @@ pub struct AgentChannelHandles {
 }
 
 impl AgentChannelHandles {
+    /// Return references to all populated per-tool channel handles.
+    fn populated_handles(&self) -> Vec<Option<&tools::PerToolChannelHandle>> {
+        vec![
+            self.ask_user.as_ref(),
+            Some(&self.reaction),
+            self.poll.as_ref(),
+            self.escalate.as_ref(),
+            self.channel_send.as_ref(),
+        ]
+    }
+
     /// Register a channel into every populated handle so all channel-driven
     /// tools can resolve it by name.
     pub fn register_channel(
@@ -104,42 +115,21 @@ impl AgentChannelHandles {
         channel: Arc<dyn zeroclaw_api::channel::Channel>,
     ) {
         let name = name.into();
-        let handles: Vec<_> = vec![
-            self.ask_user.as_ref(),
-            Some(&self.reaction),
-            self.poll.as_ref(),
-            self.escalate.as_ref(),
-            self.channel_send.as_ref(),
-        ];
-        for handle in handles.into_iter().flatten() {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().insert(name.clone(), Arc::clone(&channel));
         }
     }
 
     /// Remove a channel from every populated handle (used on session/stop).
     pub fn unregister_channel(&self, name: &str) {
-        let handles: Vec<_> = vec![
-            self.ask_user.as_ref(),
-            Some(&self.reaction),
-            self.poll.as_ref(),
-            self.escalate.as_ref(),
-            self.channel_send.as_ref(),
-        ];
-        for handle in handles.into_iter().flatten() {
+        for handle in self.populated_handles().into_iter().flatten() {
             handle.write().remove(name);
         }
     }
 
     /// Look up a registered channel by name from any populated channel map.
     pub fn get_channel(&self, name: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
-        let handles: Vec<_> = vec![
-            self.ask_user.as_ref(),
-            Some(&self.reaction),
-            self.poll.as_ref(),
-            self.escalate.as_ref(),
-            self.channel_send.as_ref(),
-        ];
-        for handle in handles.into_iter().flatten() {
+        for handle in self.populated_handles().into_iter().flatten() {
             if let Some(channel) = handle.read().get(name) {
                 return Some(Arc::clone(channel));
             }
