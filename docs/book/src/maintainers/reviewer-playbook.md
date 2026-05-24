@@ -85,7 +85,7 @@ The same risk-routing principle applies to issues, but the labels and signals ar
 | `r:needs-repro` | Bug report missing a deterministic repro. Block deeper triage on this. |
 | `r:support` | Usage or help question better routed outside the bug backlog. |
 | `duplicate` / `invalid` | Non-actionable noise. Close with a polite pointer. |
-| `no-stale` | Accepted work waiting on an external blocker. Keeps the issue out of stale automation. |
+| `status:no-stale` | Accepted work waiting on an external blocker. Keeps the issue out of stale automation. |
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
 
@@ -121,7 +121,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work.
+- Walk the stale queue. Apply `status:no-stale` only to accepted-but-blocked work.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 
