@@ -52,6 +52,20 @@ Then the command counts fuzzy + untranslated entries. If there's a delta and `--
 
 Without `--provider`, `cargo mdbook sync` still runs extract + merge and reports how many strings need translation. Strings without a `msgstr` fall back to English at render time — partial translations are valid.
 
+`cargo mdbook sync` normalizes generated gettext catalogs with stable output rules (`msgcat --sort-output --no-wrap --add-location=file`). That keeps diffs focused on real source changes and avoids global line-number churn from small edits.
+
+Expected unavoidable churn:
+
+- Header metadata updates (for example `POT-Creation-Date` / `PO-Revision-Date`)
+- Reference updates when a string moves to a different source file
+- Actual source-string additions, removals, and edits
+
+Quick stability check after a small docs edit:
+
+```bash
+cargo mdbook sync
+git diff --numstat -- docs/book/po
+```
 Routine English docs PRs do not need to include generated `.po` churn when the sync output is broad and hard to review. Keep the prose PR focused, leave the generated catalog refresh for a dedicated translation-cache PR, and say so in the PR body:
 
 > Skipped committing generated `.po` updates: this is an English docs-only change, and `cargo mdbook sync` would produce broad gettext catalog churn. Translation-cache updates are deferred to a dedicated follow-up PR.
