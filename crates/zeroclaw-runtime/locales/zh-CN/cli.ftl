@@ -22,3 +22,38 @@ cli-skills-install-tier-community =
     正在安装 {$name} v{$version} — 社区提交
     此技能未经 ZeroClaw 审计。请检查技能内容，
     并在授予任何权限或用于生产前运行 `zeroclaw skills audit {$name}`。
+
+channel-wecom-ws-stream-bootstrap = 正在处理中，请稍候。
+channel-wecom-ws-stop-ack = 已停止当前消息处理。
+channel-wecom-ws-voice-unavailable = 我现在无法处理语音消息 {$emoji}
+channel-wecom-ws-unsupported-message = 暂不支持该消息类型。
+channel-wecom-ws-welcome = 你好，欢迎来找我聊天 {$emoji}
+channel-wecom-ws-supplemental-message =
+    [补充消息]
+    {$extra}
+channel-wecom-ws-group-allowlist-missing =
+    管理员尚未配置 WeCom allowlist，当前机器人不接收任何群消息。
+
+    群 chatid: {$chatid}
+    发送者 userid: {$userid}
+
+    请在 {$allowed_groups_path} 或 {$allowed_users_path} 中加入允许项，也可以临时设置为 ["*"] 进行测试。
+channel-wecom-ws-group-access-denied =
+    当前群未被允许使用此机器人。
+
+    群 chatid: {$chatid}
+    发送者 userid: {$userid}
+
+    请管理员将该群加入 {$allowed_groups_path}，或将你的 userid 加入 {$allowed_users_path}。
+channel-wecom-ws-dm-allowlist-missing =
+    管理员尚未配置 WeCom allowlist，当前机器人不接收任何消息。
+
+    你的 userid: {$userid}
+
+    请在 {$allowed_users_path} 中加入允许项，也可以临时设置为 ["*"] 进行测试。
+channel-wecom-ws-dm-access-denied =
+    你没有权限使用此机器人。
+
+    你的 userid: {$userid}
+
+    请管理员将你的 userid 加入 {$allowed_users_path}。

@@ -2,7 +2,6 @@
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroclaw_macros::Configurable;
@@ -412,6 +411,11 @@ pub struct EmailConfig {
     pub smtp_port: u16,
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    #[secret]
+    #[serde(default)]
+    pub smtp_password: Option<String>,
     pub username: String,
     #[secret]
     pub password: String,
@@ -452,6 +456,8 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            smtp_username: None,
+            smtp_password: None,
             username: String::new(),
             password: String::new(),
             from_address: String::new(),
@@ -617,6 +623,15 @@ pub struct VoiceCallConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+impl crate::traits::ChannelConfig for VoiceCallConfig {
+    fn name() -> &'static str {
+        "Voice Call"
+    }
+    fn desc() -> &'static str {
+        "outbound voice call channel"
+    }
 }
 
 impl Default for VoiceCallConfig {

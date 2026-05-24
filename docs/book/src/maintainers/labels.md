@@ -177,7 +177,7 @@ Applied manually — the auto-response automation that used to handle these was 
 | `duplicate` | Duplicate of an existing issue |
 | `stale-candidate` | Dormant PR or issue; candidate for closing |
 | `superseded` | Replaced by a newer PR |
-| `no-stale` | Exempt from stale automation; accepted but blocked work |
+| `status:no-stale` | Exempt from stale automation; accepted but blocked work |
 
 ## Maintenance triggers
 
