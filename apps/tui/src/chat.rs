@@ -5,7 +5,7 @@ use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser,
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -782,11 +782,7 @@ fn draw_agent_picker(
         .iter()
         .map(|a| ListItem::new(Span::styled(a.as_str(), theme::body_style())))
         .collect();
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
 }
 
@@ -812,7 +808,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
     let p = Paragraph::new(Line::from(Span::styled(
         msg,
-        Style::default().fg(Color::Red),
+        theme::error_style(),
     )))
     .alignment(Alignment::Center);
     frame.render_widget(p, chunks[1]);
@@ -838,7 +834,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {} ", cwd),
-                    Style::default().fg(Color::DarkGray),
+                    theme::dim_style(),
                 ))),
                 cwd_row,
             );
@@ -903,12 +899,9 @@ fn render_tool_entry(
     input: &serde_json::Value,
     result: Option<&str>,
 ) {
-    const TOOL_FG: Color = Color::Rgb(180, 140, 255);
-    const RESULT_FG: Color = Color::Rgb(130, 130, 130);
-
     lines.push(Line::from(vec![Span::styled(
         format!("[tool: {name}] "),
-        Style::default().fg(TOOL_FG).add_modifier(Modifier::BOLD),
+        theme::tool_label_style(),
     )]));
 
     match name {
@@ -944,7 +937,7 @@ fn render_tool_entry(
             };
             lines.push(Line::from(Span::styled(
                 format!("  {truncated}"),
-                Style::default().fg(RESULT_FG),
+                theme::dim_style(),
             )));
         }
     }
@@ -957,7 +950,7 @@ fn render_tool_entry(
         };
         lines.push(Line::from(Span::styled(
             format!("  → {truncated}"),
-            Style::default().fg(RESULT_FG),
+            theme::dim_style(),
         )));
     }
 }
@@ -980,23 +973,19 @@ fn render_entry_into(
         ChatEntry::UserMessage { text, attachments } => {
             let mut spans = vec![Span::styled(
                 "You: ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | sel_mod),
+                theme::user_label_style().add_modifier(sel_mod),
             )];
             if let Some(t) = text {
                 spans.push(Span::styled(
                     t.clone(),
-                    Style::default().add_modifier(sel_mod),
+                    theme::body_style().add_modifier(sel_mod),
                 ));
             }
             if !attachments.is_empty() {
                 let label = attachments.join(", ");
                 spans.push(Span::styled(
                     format!(" [{label}]"),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::ITALIC | sel_mod),
+                    theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
                 ));
             }
             lines.push(Line::from(spans));
@@ -1004,9 +993,7 @@ fn render_entry_into(
         ChatEntry::AgentMessage(text) => {
             lines.push(Line::from(vec![Span::styled(
                 "Agent: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD | sel_mod),
+                theme::agent_label_style().add_modifier(sel_mod),
             )]));
             let md_lines = markdown_to_lines(text);
             for mut line in md_lines {
@@ -1028,13 +1015,11 @@ fn render_entry_into(
                 lines.push(Line::from(vec![
                     Span::styled(
                         "(thinking) ",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC | sel_mod),
+                        theme::thought_style().add_modifier(sel_mod),
                     ),
                     Span::styled(
                         text.clone(),
-                        Style::default().fg(Color::DarkGray).add_modifier(sel_mod),
+                        theme::dim_style().add_modifier(sel_mod),
                     ),
                 ]));
             }
@@ -1043,9 +1028,7 @@ fn render_entry_into(
             for line_text in text.lines() {
                 lines.push(Line::from(Span::styled(
                     line_text.to_string(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::ITALIC | sel_mod),
+                    theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
                 )));
             }
         }
@@ -1073,9 +1056,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     if !state.streaming_text.is_empty() {
         let prefix = Line::from(vec![Span::styled(
             "Agent: ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            theme::agent_label_style(),
         )]);
         lines.push(prefix);
         lines.extend(markdown_to_lines(&state.streaming_text));
@@ -1086,13 +1067,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 "(thinking) ",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
+                theme::thought_style(),
             ),
             Span::styled(
                 state.streaming_thought.clone(),
-                Style::default().fg(Color::DarkGray),
+                theme::dim_style(),
             ),
         ]));
     }
@@ -1193,7 +1172,7 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Approval Required ")
-                .style(Style::default().fg(Color::Yellow)),
+                .style(theme::approval_border_style()),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, overlay_area);
@@ -1245,7 +1224,7 @@ fn render_session_list_overlay(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Sessions (Enter=switch, Esc=close) ")
-        .style(Style::default().fg(Color::Cyan));
+        .style(theme::overlay_border_style());
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
@@ -1260,11 +1239,7 @@ fn render_session_list_overlay(
         })
         .collect();
 
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let list = List::new(items).highlight_style(theme::list_highlight_style());
     // Copy state to pass as mutable.
     let mut ls = *list_state;
     f.render_stateful_widget(list, inner, &mut ls);
@@ -1296,7 +1271,7 @@ fn render_rename_overlay(f: &mut Frame, area: Rect, buf: &str) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Rename Session ")
-                .style(Style::default().fg(Color::Cyan)),
+                .style(theme::overlay_border_style()),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, overlay_area);
@@ -1338,7 +1313,7 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                 }
                 current_spans.push(Span::styled(
                     "  \u{2022} ",
-                    Style::default().fg(Color::DarkGray),
+                    theme::dim_style(),
                 ));
             }
             MdEvent::End(TagEnd::Item) if !current_spans.is_empty() => {
@@ -1357,7 +1332,7 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                         }
                         current_spans.push(Span::styled(
                             format!("\u{2502} {code_line}"),
-                            Style::default().fg(Color::White),
+                            theme::code_block_style(),
                         ));
                     }
                 } else {
@@ -1374,7 +1349,7 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
             MdEvent::Code(t) => {
                 current_spans.push(Span::styled(
                     t.to_string(),
-                    Style::default().fg(Color::Yellow),
+                    theme::code_inline_style(),
                 ));
             }
             MdEvent::SoftBreak => {
