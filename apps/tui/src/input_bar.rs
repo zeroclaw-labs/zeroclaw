@@ -31,7 +31,7 @@ const MAX_INPUT_ROWS: u16 = 5;
 const CURSOR_BLINK_MS: u128 = 500;
 
 /// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &["/attach", "/attachments", "/detach"];
+const SLASH_COMMANDS: &[&str] = &["/attach", "/attachments", "/detach", "/toggle-thinking"];
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -46,6 +46,8 @@ pub(crate) enum InputBarAction {
     },
     /// Status message to show in conversation (e.g. "Attached: photo.png").
     StatusMessage(String),
+    /// User typed `/toggle-thinking` — parent should toggle thought visibility.
+    ToggleThinking,
     /// Key was not handled by the input bar — parent should handle it.
     NotHandled,
 }
@@ -56,6 +58,7 @@ enum SlashCommand<'a> {
     Attach(&'a str),
     Detach(Option<usize>),
     ListAttachments,
+    ToggleThinking,
     NotACommand,
 }
 
@@ -71,6 +74,8 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::Detach(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
+    } else if trimmed == "/toggle-thinking" {
+        SlashCommand::ToggleThinking
     } else {
         SlashCommand::NotACommand
     }
@@ -769,6 +774,7 @@ impl InputBarState {
                         InputBarAction::StatusMessage(format!("Pending attachments:\n{list}"))
                     }
                 }
+                SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
@@ -1226,6 +1232,10 @@ mod tests {
             SlashCommand::ListAttachments
         ));
         assert!(matches!(
+            parse_slash_command("/toggle-thinking"),
+            SlashCommand::ToggleThinking
+        ));
+        assert!(matches!(
             parse_slash_command("hello"),
             SlashCommand::NotACommand
         ));
@@ -1399,6 +1409,24 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("hello");
         assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn autocomplete_toggle_thinking_prefix() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/toggle");
+        assert!(bar.autocomplete_active);
+        assert!(bar.autocomplete_matches.contains(&"/toggle-thinking"));
+    }
+
+    #[test]
+    fn slash_toggle_thinking_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/toggle-thinking");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::ToggleThinking));
+        // Input should be cleared after submission.
+        assert_eq!(bar.input(), "");
     }
 
     // ── Selection tests ──────────────────────────────────────

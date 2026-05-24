@@ -406,6 +406,18 @@ impl<'a> Chat<'a> {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::ToggleThinking => {
+                    state.show_thoughts = !state.show_thoughts;
+                    state.mark_dirty_full();
+                    let status = if state.show_thoughts {
+                        "Thinking output: visible"
+                    } else {
+                        "Thinking output: hidden"
+                    };
+                    state.entries.push(ChatEntry::SystemMessage(status.to_string()));
+                    state.mark_dirty_append();
+                    return false;
+                }
                 InputBarAction::Consumed => return false,
                 InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
             }
@@ -700,6 +712,7 @@ impl<'a> Chat<'a> {
                         ("/attach", "Attach file"),
                         ("Ctrl+A", "File browser"),
                         ("Ctrl+V", "Paste"),
+                        ("/toggle-thinking", "Toggle thinking visibility"),
                         ("Shift+\u{2191}/\u{2193}", "Scroll conversation"),
                         ("j / k", "Select entry"),
                         ("y", "Yank selected entry"),
