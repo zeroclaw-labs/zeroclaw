@@ -163,9 +163,9 @@ Track lifecycle state of RFCs and tracked work items. Applied manually.
 | Label | Description |
 |---|---|
 | `status:accepted` | RFC or work item ratified by the team. This does not exempt the issue from stale handling by itself. |
-| `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded. |
+| `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
-| `status:no-stale` | Explicit stale exemption for accepted or blocked work. Use only when a maintainer comment, issue body, or tracker entry records why the issue should stay open. |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Use only when a maintainer comment, issue body, or tracker entry records why the issue should stay open. |
 
 ## Triage labels
 

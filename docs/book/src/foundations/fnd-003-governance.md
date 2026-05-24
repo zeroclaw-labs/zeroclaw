@@ -20,6 +20,7 @@
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
 | 2 | 2026-04-09 | Added §6.4 Architectural Compliance: Human Review, AI Support; added Discussion Question on AI automation of architecture reviews |
+| 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
 
 ---
 
@@ -866,10 +867,16 @@ Use `#f1f5f9` (light gray) for all component labels to distinguish them visually
 
 ### `status:` — Where is this in the process?
 
+This table records governance intent and historical taxonomy shape. For current live label semantics and automation behavior, use the maintainer label guide as the operational reference; maintainer docs carry later label-policy corrections from #6808.
+
 | Label | Color | Use |
 |---|---|---|
 | `status:needs-triage` | `#f8fafc` White | Newly opened, not yet reviewed |
-| `status:blocked` | `#dc2626` Red | Waiting on something external |
+| `status:accepted` | `#0e8a16` Green | RFC or work item ratified; not stale-exempt by itself |
+| `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
+| `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
+| `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
+| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption with a recorded reason, for accepted or otherwise long-lived work not already protected by another exclusion |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
 | `status:discussion` | `#a78bfa` Purple | Needs team discussion before work begins |
@@ -948,7 +955,7 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (`.github/workflows/stale.yml`):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `status:blocked`, `priority:critical`, and `type:rfc` from the stale process.
+Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, `status:no-stale`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The maintainer label guide and issue-triage protocol carry the current operational details.
 
 **PR size labeling (`.github/workflows/pr-size.yml`):**
 

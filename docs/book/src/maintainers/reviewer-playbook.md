@@ -86,9 +86,9 @@ The same risk-routing principle applies to issues, but the labels and signals ar
 | `r:support` | Usage or help question better routed outside the bug backlog. |
 | `duplicate` / `invalid` | Non-actionable noise. Close with a polite pointer. |
 | `status:accepted` | The team has accepted the RFC or work item. Add `status:no-stale` only when the issue also needs stale protection. |
-| `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker. |
+| `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
-| `status:no-stale` | Accepted or blocked work should stay open. Record the reason in a maintainer comment, issue body, or tracker entry. |
+| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason in a maintainer comment, issue body, or tracker entry. |
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
 
@@ -124,7 +124,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `status:no-stale` only when accepted or blocked work has a recorded reason to stay open.
+- Walk the stale queue. Apply `status:no-stale` only when accepted or otherwise long-lived work has a recorded reason to stay open and is not already protected by another stale exclusion.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 
