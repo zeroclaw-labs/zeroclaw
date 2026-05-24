@@ -54,6 +54,8 @@ pub fn compiled_channels(cfg: &ChannelsConfig) -> Vec<ChannelInfo> {
         "DingTalk",
         #[cfg(feature = "channel-wecom")]
         "WeCom",
+        #[cfg(feature = "channel-wecom-ws")]
+        "WeCom WebSocket",
         #[cfg(feature = "channel-wechat")]
         "WeChat",
         #[cfg(feature = "channel-qq")]

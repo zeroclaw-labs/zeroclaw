@@ -9877,6 +9877,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub wecom: HashMap<String, WeComConfig>,
+    /// WeCom AI Bot WebSocket channel instances (`[channels.wecom_ws.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub wecom_ws: HashMap<String, WeComWsConfig>,
     /// WeChat personal iLink Bot channel instances (`[channels.wechat.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10060,6 +10064,11 @@ impl ChannelsConfig {
                 configured: !self.wecom.is_empty(),
             },
             ChannelInfo {
+                name: "WeCom WebSocket",
+                desc: "WeCom AI Bot long connection",
+                configured: !self.wecom_ws.is_empty(),
+            },
+            ChannelInfo {
                 name: "WeChat",
                 desc: "WeChat iLink Bot",
                 configured: !self.wechat.is_empty(),
@@ -10159,6 +10168,7 @@ impl Default for ChannelsConfig {
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -11939,6 +11949,96 @@ impl ChannelConfig for WeComConfig {
     }
     fn desc() -> &'static str {
         "WeCom Bot Webhook"
+    }
+}
+
+fn default_wecom_ws_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_ws_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_ws_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+/// WeCom AI Bot WebSocket configuration.
+///
+/// This is distinct from webhook-based [`WeComConfig`] and uses the WeCom AI
+/// Bot long-connection API for inbound messages and active-session replies.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wecom_ws"]
+pub struct WeComWsConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// Display name or mention alias of the WeCom AI bot, for example `danya`.
+    ///
+    /// WeCom group text often arrives as plain text such as `@danya say hi`;
+    /// passing this name through lets the generic reply-intent precheck
+    /// recognize that a group message was addressed to the bot.
+    #[serde(default)]
+    pub bot_name: Option<String>,
+    /// File retention days for downloaded WeCom attachments under the workspace cache.
+    #[serde(default = "default_wecom_ws_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size in MiB for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_ws_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_ws_stream_mode")]
+    pub stream_mode: StreamMode,
+    /// Optional per-channel proxy override. Falls back to the global proxy config when empty.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for WeComWsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_id: String::new(),
+            secret: String::new(),
+            allowed_users: Vec::new(),
+            allowed_groups: Vec::new(),
+            bot_name: None,
+            file_retention_days: default_wecom_ws_file_retention_days(),
+            max_file_size_mb: default_wecom_ws_max_file_size_mb(),
+            stream_mode: default_wecom_ws_stream_mode(),
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for WeComWsConfig {
+    fn name() -> &'static str {
+        "WeCom WebSocket"
+    }
+    fn desc() -> &'static str {
+        "WeCom AI Bot long connection"
     }
 }
 
@@ -15946,7 +16046,65 @@ auto_save = true
         assert!(c.cli);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
+        assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+    }
+
+    #[test]
+    async fn wecom_ws_config_serde_defaults_and_secret_metadata() {
+        let toml = r#"
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+            allowed_groups = ["zeroclaw_group"]
+            bot_name = "danya"
+            proxy_url = "http://127.0.0.1:7890"
+        "#;
+        let parsed: WeComWsConfig = toml::from_str(toml).unwrap();
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.bot_id, "bot-123");
+        assert_eq!(parsed.secret, "sk-test");
+        assert_eq!(parsed.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
+        assert_eq!(parsed.bot_name.as_deref(), Some("danya"));
+        assert_eq!(parsed.file_retention_days, 7);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+        assert_eq!(parsed.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(parsed.excluded_tools.is_empty());
+        assert_eq!(WeComWsConfig::default().file_retention_days, 7);
+        assert_eq!(WeComWsConfig::default().max_file_size_mb, 20);
+        assert_eq!(WeComWsConfig::default().stream_mode, StreamMode::Partial);
+        assert!(WeComWsConfig::default().bot_name.is_none());
+        assert!(WeComWsConfig::default().proxy_url.is_none());
+        assert!(WeComWsConfig::prop_is_secret("channels.wecom_ws.secret"));
+    }
+
+    #[test]
+    async fn config_parses_wecom_ws_separate_from_wecom_webhook() {
+        let toml = r#"
+            [channels.wecom.default]
+            enabled = true
+            webhook_key = "webhook-key"
+
+            [channels.wecom_ws.default]
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+        "#;
+        let parsed: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            parsed.channels.wecom.get("default").unwrap().webhook_key,
+            "webhook-key"
+        );
+        let ws = parsed.channels.wecom_ws.get("default").unwrap();
+        assert_eq!(ws.bot_id, "bot-123");
+        assert_eq!(ws.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(ws.stream_mode, StreamMode::Partial);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -16063,6 +16221,7 @@ auto_save = true
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
                 wecom: HashMap::new(),
+                wecom_ws: HashMap::new(),
                 wechat: HashMap::new(),
                 qq: HashMap::new(),
                 twitter: HashMap::new(),
@@ -17294,6 +17453,7 @@ allowed_users = ["@u:matrix.org"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -17677,6 +17837,7 @@ allowed_numbers = ["+1", "+2"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),

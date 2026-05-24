@@ -80,6 +80,8 @@ pub use crate::webhook::WebhookChannel;
 pub use crate::wechat::WeChatChannel;
 #[cfg(feature = "channel-wecom")]
 pub use crate::wecom::WeComChannel;
+#[cfg(feature = "channel-wecom-ws")]
+pub use crate::wecom_ws::WeComWsChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -478,6 +480,9 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
     };
+    if msg.channel == "wecom_ws" {
+        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+    }
     // reply_target gives per-channel isolation (distinct Discord/Slack
     // channels) and thread_ts gives per-topic isolation in forum groups.
     // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
@@ -499,6 +504,14 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    if msg.channel == "wecom_ws" && msg.reply_target.starts_with("group--") {
+        let channel_scope = match &msg.channel_alias {
+            Some(alias) => format!("{}.{}", msg.channel, alias),
+            None => msg.channel.clone(),
+        };
+        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+    }
+
     match &msg.interruption_scope_id {
         Some(scope) => format!(
             "{}_{}_{}_{}",
@@ -688,6 +701,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use absolute local paths when sending generated files whenever possible.\n",
         ),
+        "wecom_ws" => Some(
+            "When responding on WeCom AI Bot WebSocket:\n\
+             - Be concise and direct\n\
+             - Use Markdown text; the channel sends progressive draft updates when enabled\n\
+             - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
+        ),
         _ => None,
     }
 }
@@ -874,7 +893,15 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "slack" | "wecom_ws"
+    )
+}
+
+fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
+    channel_name == "wecom_ws"
+        && content.contains("[WeCom group message addressed to this bot via @")
 }
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
@@ -3535,15 +3562,21 @@ async fn process_channel_message_body(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let classifier_intent = classify_channel_reply_intent(
-        active_model_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let explicit_channel_address =
+        is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
+    let classifier_intent = if explicit_channel_address {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        classify_channel_reply_intent(
+            active_model_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -5266,6 +5299,58 @@ fn build_channel_by_id(
         "wecom" => {
             anyhow::bail!("WeCom channel requires the `channel-wecom` feature");
         }
+        #[cfg(feature = "channel-wecom-ws")]
+        channel_id
+            if channel_id == "wecom_ws"
+                || channel_id == "wecom-ws"
+                || channel_id.starts_with("wecom_ws.")
+                || channel_id.starts_with("wecom-ws.") =>
+        {
+            let alias = channel_id
+                .split_once('.')
+                .map(|(_, alias)| alias)
+                .unwrap_or("default")
+                .to_string();
+            let wc =
+                config.channels.wecom_ws.get(&alias).with_context(|| {
+                    format!("WeCom WebSocket channel '{alias}' is not configured")
+                })?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                let configured_allowed_users = wc.allowed_users.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = configured_allowed_users.clone();
+                    for peer in config.channel_external_peers("wecom-ws", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    for peer in config.channel_external_peers("wecom_ws", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
+            Ok(Arc::new(WeComWsChannel::new_with_alias(
+                wc,
+                alias.clone(),
+                peer_resolver,
+                &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+            )?))
+        }
+        #[cfg(not(feature = "channel-wecom-ws"))]
+        channel_id
+            if channel_id == "wecom_ws"
+                || channel_id == "wecom-ws"
+                || channel_id.starts_with("wecom_ws.")
+                || channel_id.starts_with("wecom-ws.") =>
+        {
+            anyhow::bail!("WeCom WebSocket channel requires the `channel-wecom-ws` feature");
+        }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
             let wc = config
@@ -5563,7 +5648,7 @@ fn build_channel_by_id(
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
+            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
             email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
@@ -6615,6 +6700,73 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "WeCom channel is configured but this build was compiled without \
              `channel-wecom`; skipping WeCom."
+        );
+    }
+
+    #[cfg(feature = "channel-wecom-ws")]
+    for (alias, wc_ws) in &config.channels.wecom_ws {
+        if !active_channel_aliases.contains(&format!("wecom_ws.{alias}"))
+            && !active_channel_aliases.contains(&format!("wecom-ws.{alias}"))
+        {
+            continue;
+        }
+        if !wc_ws.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            let configured_allowed_users = wc_ws.allowed_users.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = configured_allowed_users.clone();
+                for peer in config.channel_external_peers("wecom-ws", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                for peer in config.channel_external_peers("wecom_ws", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
+        match WeComWsChannel::new_with_alias(
+            wc_ws,
+            alias.clone(),
+            peer_resolver,
+            &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+        ) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "WeCom WebSocket",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{err:#}")})),
+                    format!(
+                        "WeCom WebSocket channel configuration is invalid; skipping WeCom WebSocket {matrix_skip_context}"
+                    ),
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-wecom-ws"))]
+    if !config.channels.wecom_ws.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            format!(
+                "WeCom WebSocket channel is configured but this build was compiled without `channel-wecom-ws`; skipping WeCom WebSocket {matrix_skip_context}."
+            ),
         );
     }
 
@@ -8162,6 +8314,14 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-webhook"))]
         "webhook" => {
             anyhow::bail!("Webhook channel requires the `channel-webhook` feature");
+        }
+        "wecom_ws" | "wecom-ws" => {
+            let _ = config
+                .channels
+                .wecom_ws
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            anyhow::bail!("wecom_ws channel is not connected");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -13220,6 +13380,56 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn wecom_ws_conversation_history_key_uses_reply_target_scope() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_wecom_ws".into(),
+            sender: "zeroclaw_user".into(),
+            reply_target: "group--room-1".into(),
+            content: "hello".into(),
+            channel: "wecom_ws".into(),
+            channel_alias: Some("work".into()),
+            timestamp: 1,
+            thread_ts: Some("req-1".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg),
+            "wecom_ws_work_group--room-1"
+        );
+        assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_model_switch_for_wecom_ws() {
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/model qwen-max"),
+            Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
+        );
+    }
+
+    #[test]
+    fn explicit_wecom_group_address_bypasses_reply_intent_precheck() {
+        assert!(is_explicitly_addressed_channel_message(
+            "wecom_ws",
+            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
+        ));
+        assert!(!is_explicitly_addressed_channel_message(
+            "wecom_ws",
+            "@danya say hi"
+        ));
+        assert!(!is_explicitly_addressed_channel_message(
+            "telegram",
+            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
+        ));
+    }
+
+    #[test]
     fn conversation_memory_key_is_unique_per_message() {
         let msg1 = zeroclaw_api::channel::ChannelMessage {
             id: "msg_1".into(),
@@ -14702,6 +14912,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn supervised_listener_does_not_restart_on_fatal_discord_rate_limit() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -14741,6 +14952,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
         let discord_calls = Arc::new(AtomicUsize::new(0));

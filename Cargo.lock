@@ -13086,6 +13086,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "cbc 0.1.2",
  "chrono",
  "cpal",
  "directories",
