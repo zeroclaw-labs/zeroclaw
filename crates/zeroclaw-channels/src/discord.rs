@@ -74,6 +74,27 @@ pub struct DiscordChannel {
     thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DiscordListenerFatalError {
+    message: String,
+}
+
+impl DiscordListenerFatalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordListenerFatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DiscordListenerFatalError {}
+
 impl DiscordChannel {
     pub fn new(
         bot_token: String,
@@ -175,6 +196,10 @@ impl DiscordChannel {
     pub fn with_channel_ids(mut self, ids: Vec<String>) -> Self {
         self.channel_ids = ids;
         self
+    }
+
+    fn fatal_listener_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DiscordListenerFatalError::new(message))
     }
 
     pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
@@ -1518,19 +1543,35 @@ impl Channel for DiscordChannel {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let gw_resp = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+        if gw_resp.status().as_u16() == 429 {
+            return Err(Self::fatal_listener_error(
+                "discord gateway preflight rate-limited (429 Too Many Requests)",
+            ));
+        }
+        let gw_resp = gw_resp.error_for_status()?;
+        let gw_resp: serde_json::Value = gw_resp.json().await?;
+
+        if let Some(remaining) = gw_resp
+            .get("session_start_limit")
+            .and_then(|v| v.get("remaining"))
+            .and_then(serde_json::Value::as_u64)
+            && remaining == 0
+        {
+            return Err(Self::fatal_listener_error(
+                "discord gateway identify blocked: session_start_limit.remaining is 0",
+            ));
+        }
 
         let gw_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?;
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         ::zeroclaw_log::record!(
