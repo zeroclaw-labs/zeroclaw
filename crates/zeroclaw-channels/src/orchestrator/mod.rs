@@ -5638,6 +5638,23 @@ fn find_channel_for_message<'a>(
         .and_then(|(base, _)| channels.get(base))
 }
 
+/// Active `<type>.<alias>` channel references from enabled agents.
+///
+/// An empty set means no enabled agent declared channel bindings, so
+/// collection falls back to legacy behavior and accepts all enabled channels.
+struct ActiveChannelAliases {
+    /// Set of `<type>.<alias>` channel references from enabled agents.
+    aliases: HashSet<String>,
+}
+
+impl ActiveChannelAliases {
+    /// Returns true when `channel_ref` is explicitly bound, or when there are
+    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    fn contains(&self, channel_ref: &str) -> bool {
+        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+    }
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -5653,12 +5670,14 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases: std::collections::HashSet<String> = config
-        .agents
-        .values()
-        .filter(|a| a.enabled)
-        .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-        .collect();
+    let active_channel_aliases = ActiveChannelAliases {
+        aliases: config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect(),
+    };
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -14131,6 +14150,49 @@ This is an example JSON object for profile settings."#;
             channels
                 .iter()
                 .any(|entry| entry.channel.name() == "mattermost")
+        );
+    }
+
+    #[cfg(feature = "channel-mattermost")]
+    #[test]
+    fn collect_configured_channels_falls_back_when_agent_bindings_missing() {
+        let mut config = Config::default();
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                url: "https://mattermost.example.com".to_string(),
+                bot_token: Some("test-token".to_string()),
+                login_id: None,
+                password: None,
+                channel_ids: vec!["channel-1".to_string()],
+                team_ids: vec![],
+                discover_dms: None,
+                thread_replies: Some(true),
+                mention_only: Some(false),
+                interrupt_on_new_message: false,
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Mattermost"),
+            "enabled channels should still load when no enabled agent declares channel bindings"
         );
     }
 
