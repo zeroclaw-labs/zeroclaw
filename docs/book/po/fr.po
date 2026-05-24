@@ -55880,8 +55880,8 @@ msgstr ""
 "effectuer, et non une série de revues partielles."
 
 #: src/maintainers/pr-workflow.md:102
-msgid "`no-stale` reserved for accepted-but-blocked work."
-msgstr "`no-stale` réservé au travail accepté mais bloqué."
+msgid "`status:no-stale` reserved for accepted-but-blocked work."
+msgstr "`status:no-stale` réservé au travail accepté mais bloqué."
 
 #: src/maintainers/pr-workflow.md:104
 msgid ""
@@ -56481,8 +56481,8 @@ msgid "Non-actionable noise. Close with a polite pointer."
 msgstr "Bruit non exploitable. Fermez avec un pointeur poli."
 
 #: src/maintainers/reviewer-playbook.md:86 src/maintainers/labels.md:179
-msgid "`no-stale`"
-msgstr "`no-stale`"
+msgid "`status:no-stale`"
+msgstr "`status:no-stale`"
 
 #: src/maintainers/reviewer-playbook.md:86
 msgid ""
@@ -56629,9 +56629,9 @@ msgstr "Hygiène de la file d'attente hebdomadaire"
 
 #: src/maintainers/reviewer-playbook.md:122
 msgid ""
-"Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work."
+"Walk the stale queue. Apply `status:no-stale` only to accepted-but-blocked work."
 msgstr ""
-"Parcourez la file d'attente des éléments périmés. Appliquez `no-stale` "
+"Parcourez la file d'attente des éléments périmés. Appliquez `status:no-stale` "
 "uniquement au travail accepté mais bloqué."
 
 #: src/maintainers/reviewer-playbook.md:123

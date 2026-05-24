@@ -412,6 +412,11 @@ pub struct EmailConfig {
     pub smtp_port: u16,
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    #[secret]
+    #[serde(default)]
+    pub smtp_password: Option<String>,
     pub username: String,
     #[secret]
     pub password: String,
@@ -452,6 +457,8 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            smtp_username: None,
+            smtp_password: None,
             username: String::new(),
             password: String::new(),
             from_address: String::new(),

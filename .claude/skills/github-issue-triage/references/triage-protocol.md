@@ -24,6 +24,7 @@ If a required label is missing, create it before applying:
 
 ```bash
 gh label create "status:stale"       --color "E4E669" --repo zeroclaw-labs/zeroclaw
+gh label create "status:no-stale"    --color "E4E669" --repo zeroclaw-labs/zeroclaw
 gh label create "status:wont-do"     --color "B60205" --repo zeroclaw-labs/zeroclaw
 gh label create "status:in-progress" --color "0075CA" --repo zeroclaw-labs/zeroclaw
 gh label create "duplicate"          --color "CFD3D7" --repo zeroclaw-labs/zeroclaw
@@ -271,7 +272,7 @@ Activity is defined as: a follow-up comment or update from the **original author
 - `status:blocked`
 - `priority:critical`
 - `type:rfc`
-- `no-stale`
+- `status:no-stale`
 - 10 or more 👍 reactions on the opening post (community has signaled relevance regardless of author silence)
 
 ### Stale enforcement steps
@@ -391,7 +392,7 @@ Derived from RFC #5577. Apply these consistently:
 - `status:blocked` — waiting on external blocker; exempt from stale
 - `status:in-progress` — linked open PR exists
 - `status:wont-do` — architectural won't-fix; permanent decision, not a deferral
-- `no-stale` — explicitly exempt from stale automation; maintainer-applied
+- `status:no-stale` — explicitly exempt from stale automation; maintainer-applied
 
 ### Module labels (apply when issue is scoped to a specific subsystem)
 
@@ -418,7 +419,7 @@ Before closing any issue, verify:
 - [ ] Comment is welcoming and specific to this issue
 - [ ] Comment tells the reporter explicitly how to reopen ("you can reopen this by commenting here")
 - [ ] Comment does not contain personal identifiers or real names
-- [ ] Issue is not in the exclusion list: `type:rfc`, open linked PR, `no-stale`, `priority:critical`, `status:blocked`
+- [ ] Issue is not in the exclusion list: `type:rfc`, open linked PR, `status:no-stale`, `priority:critical`, `status:blocked`
 - [ ] Label has been applied matching the closure reason (e.g., `r:support`, `status:stale`)
 - [ ] Security issues have been redirected, not closed publicly
 

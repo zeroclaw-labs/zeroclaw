@@ -1389,7 +1389,22 @@ pub fn create_routed_model_provider_with_options(
                     (!trimmed_key.is_empty()).then_some(trimmed_key)
                 })
             });
-        let key = routed_credential.or(api_key);
+        let key = routed_credential
+            .or_else(|| {
+                name.split_once('.')
+                    .and_then(|(family, alias)| {
+                        config
+                            .providers
+                            .models
+                            .find(family, alias)
+                            .and_then(|cfg| cfg.api_key.as_deref())
+                    })
+                    .and_then(|raw_key| {
+                        let trimmed = raw_key.trim();
+                        (!trimmed.is_empty()).then_some(trimmed)
+                    })
+            })
+            .or(api_key);
         let url = if name == primary_name { api_url } else { None };
         let entry_options = if name == primary_name {
             options.clone()
@@ -3098,5 +3113,150 @@ mod tests {
         assert!(tuning.temperature_override.is_none());
         assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
         assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
+    }
+
+    fn config_with_openai_alias() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+        let mut config = Config::default();
+        let alias = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                api_key: Some("openai-alias-key".into()),
+                model: Some("gpt-4o".into()),
+                ..ModelProviderConfig::default()
+            },
+        };
+        config
+            .providers
+            .models
+            .openai
+            .insert("alias".to_string(), alias);
+        let agent = AliasedAgentConfig {
+            model_provider: "openai.alias".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("test_agent".to_string(), agent);
+        config
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_uses_route_key_first() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai.alias".into(),
+            model: "gpt-4o".into(),
+            api_key: Some("route-key".into()),
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "route-key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_uses_config_entry_key() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Route has no api_key — should fall back to config entry key "openai-alias-key"
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai.alias".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "config-entry key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_falls_back_to_api_key_param() {
+        let config = zeroclaw_config::schema::Config::default(); // no entry in config.models
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Neither route nor config entry has api_key — should use the param "fallback-key"
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "fallback-key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_skips_config_entry_for_non_dotted_name() {
+        let config = zeroclaw_config::schema::Config::default();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Non-dotted name "openai" — split_once('.') returns None, so config entry
+        // lookup is skipped entirely. Falls back to api_key param.
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai",
+            Some("direct-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "direct-key should succeed: {}",
+            result.err().unwrap()
+        );
     }
 }

@@ -9895,6 +9895,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub wecom: HashMap<String, WeComConfig>,
+    /// WeCom AI Bot WebSocket channel instances (`[channels.wecom_ws.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub wecom_ws: HashMap<String, WeComWsConfig>,
     /// WeChat personal iLink Bot channel instances (`[channels.wechat.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10052,6 +10056,10 @@ impl ChannelsConfig {
                 !self.wecom.is_empty(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wecom_ws.get("default"))),
+                !self.wecom_ws.is_empty(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.wechat.get("default"))),
                 !self.wechat.is_empty(),
             ),
@@ -10129,6 +10137,7 @@ impl Default for ChannelsConfig {
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -11914,6 +11923,96 @@ impl ChannelConfig for WeComConfig {
     }
 }
 
+fn default_wecom_ws_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_ws_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_ws_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+/// WeCom AI Bot WebSocket configuration.
+///
+/// This is distinct from webhook-based [`WeComConfig`] and uses the WeCom AI
+/// Bot long-connection API for inbound messages and active-session replies.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wecom_ws"]
+pub struct WeComWsConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// Display name or mention alias of the WeCom AI bot, for example `danya`.
+    ///
+    /// WeCom group text often arrives as plain text such as `@danya say hi`;
+    /// passing this name through lets the generic reply-intent precheck
+    /// recognize that a group message was addressed to the bot.
+    #[serde(default)]
+    pub bot_name: Option<String>,
+    /// File retention days for downloaded WeCom attachments under the workspace cache.
+    #[serde(default = "default_wecom_ws_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size in MiB for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_ws_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_ws_stream_mode")]
+    pub stream_mode: StreamMode,
+    /// Optional per-channel proxy override. Falls back to the global proxy config when empty.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for WeComWsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_id: String::new(),
+            secret: String::new(),
+            allowed_users: Vec::new(),
+            allowed_groups: Vec::new(),
+            bot_name: None,
+            file_retention_days: default_wecom_ws_file_retention_days(),
+            max_file_size_mb: default_wecom_ws_max_file_size_mb(),
+            stream_mode: default_wecom_ws_stream_mode(),
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for WeComWsConfig {
+    fn name() -> &'static str {
+        "WeCom WebSocket"
+    }
+    fn desc() -> &'static str {
+        "WeCom AI Bot long connection"
+    }
+}
+
 /// WeChat personal iLink Bot channel configuration.
 ///
 /// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
@@ -12402,7 +12501,9 @@ pub struct JiraConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`,
+    /// `"list_projects"`, `"myself"`, `"list_transitions"`,
+    /// `"transition_ticket"`, `"create_ticket"`.
     /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
@@ -12869,6 +12970,7 @@ enum ConfigResolutionSource {
     EnvDataDir,
     EnvWorkspaceLegacy,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -12878,6 +12980,7 @@ impl ConfigResolutionSource {
             Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
             Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -12912,6 +13015,59 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
+async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
+    let parts = exe.iter().collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [prefix @ .., cellar, formula, _version, bin, exe_name]
+            if *cellar == std::ffi::OsStr::new("Cellar")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            prefix.iter().collect::<PathBuf>()
+        }
+        [prefix @ .., opt, formula, bin, exe_name]
+            if *opt == std::ffi::OsStr::new("opt")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        [prefix @ .., bin, exe_name]
+            if *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(prefix.join("var").join("zeroclaw"))
 }
 
 async fn resolve_runtime_config_dirs(
@@ -12999,6 +13155,17 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             data_dir,
             ConfigResolutionSource::EnvWorkspaceLegacy,
+        ));
+    }
+
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
+    {
+        return Ok((
+            homebrew_config_dir.clone(),
+            homebrew_config_dir.join("workspace"),
+            ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
 
@@ -14371,12 +14538,21 @@ impl Config {
                     "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
                 );
             }
-            let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
+            let valid_actions = [
+                "get_ticket",
+                "search_tickets",
+                "comment_ticket",
+                "list_projects",
+                "myself",
+                "list_transitions",
+                "transition_ticket",
+                "create_ticket",
+            ];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket",
+                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
                         action
                     );
                 }
@@ -15866,7 +16042,65 @@ auto_save = true
         assert!(c.cli);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
+        assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+    }
+
+    #[test]
+    async fn wecom_ws_config_serde_defaults_and_secret_metadata() {
+        let toml = r#"
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+            allowed_groups = ["zeroclaw_group"]
+            bot_name = "danya"
+            proxy_url = "http://127.0.0.1:7890"
+        "#;
+        let parsed: WeComWsConfig = toml::from_str(toml).unwrap();
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.bot_id, "bot-123");
+        assert_eq!(parsed.secret, "sk-test");
+        assert_eq!(parsed.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
+        assert_eq!(parsed.bot_name.as_deref(), Some("danya"));
+        assert_eq!(parsed.file_retention_days, 7);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+        assert_eq!(parsed.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(parsed.excluded_tools.is_empty());
+        assert_eq!(WeComWsConfig::default().file_retention_days, 7);
+        assert_eq!(WeComWsConfig::default().max_file_size_mb, 20);
+        assert_eq!(WeComWsConfig::default().stream_mode, StreamMode::Partial);
+        assert!(WeComWsConfig::default().bot_name.is_none());
+        assert!(WeComWsConfig::default().proxy_url.is_none());
+        assert!(WeComWsConfig::prop_is_secret("channels.wecom_ws.secret"));
+    }
+
+    #[test]
+    async fn config_parses_wecom_ws_separate_from_wecom_webhook() {
+        let toml = r#"
+            [channels.wecom.default]
+            enabled = true
+            webhook_key = "webhook-key"
+
+            [channels.wecom_ws.default]
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+        "#;
+        let parsed: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            parsed.channels.wecom.get("default").unwrap().webhook_key,
+            "webhook-key"
+        );
+        let ws = parsed.channels.wecom_ws.get("default").unwrap();
+        assert_eq!(ws.bot_id, "bot-123");
+        assert_eq!(ws.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(ws.stream_mode, StreamMode::Partial);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -15983,6 +16217,7 @@ auto_save = true
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
                 wecom: HashMap::new(),
+                wecom_ws: HashMap::new(),
                 wechat: HashMap::new(),
                 qq: HashMap::new(),
                 twitter: HashMap::new(),
@@ -17216,6 +17451,7 @@ allowed_users = ["@u:matrix.org"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -17601,6 +17837,7 @@ allowed_numbers = ["+1", "+2"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
@@ -18419,6 +18656,69 @@ wire_api = "ws"
         let _ = fs::remove_dir_all(default_config_dir).await;
     }
 
+    async fn create_homebrew_prefix() -> TempDir {
+        let prefix = TempDir::new().expect("homebrew prefix temp dir");
+        fs::create_dir_all(prefix.path().join("Cellar"))
+            .await
+            .expect("create Cellar marker");
+        prefix
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_cellar_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("Cellar")
+            .join("zeroclaw")
+            .join("0.7.0")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_prefix_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_opt_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("opt")
+            .join("zeroclaw")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_rejects_non_homebrew_layout() {
+        let prefix = TempDir::new().expect("non-homebrew temp dir");
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        assert!(try_resolve_macos_homebrew_config_dir(&exe).await.is_none());
+    }
+
     #[test]
     async fn default_path_under_config_dir_respects_zeroclaw_config_dir() {
         let _env_guard = env_override_lock().await;
@@ -18739,14 +19039,8 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn validate_rejects_unpublished_jira_actions() {
-        // Restored from upstream's #6116 (Jira API v2 server mode). The
-        // validation logic at `Config::validate -> jira.allowed_actions`
-        // exists unchanged; this test was dropped during the
-        // upstream/master merge resolution alongside the env_override
-        // tests that were intentionally deleted with `apply_env_overrides()`.
-        // Restoring it here.
-        for action in ["list_projects", "myself"] {
+    async fn validate_rejects_unknown_jira_actions() {
+        for action in ["delete_ticket", "drop_database", ""] {
             let mut config = Config::default();
             config.jira.enabled = true;
             config.jira.base_url = "https://jira.example.test".into();
@@ -18755,11 +19049,36 @@ default_model = "persisted-profile"
 
             let err = config
                 .validate()
-                .expect_err("unpublished Jira action should be rejected")
+                .expect_err("unknown Jira action should be rejected")
                 .to_string();
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
-                "expected Jira allowed action error for {action}, got: {err}"
+                "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_all_published_jira_actions() {
+        for action in [
+            "get_ticket",
+            "search_tickets",
+            "comment_ticket",
+            "list_projects",
+            "myself",
+            "list_transitions",
+            "transition_ticket",
+            "create_ticket",
+        ] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            assert!(
+                config.validate().is_ok(),
+                "published Jira action {action:?} should validate"
             );
         }
     }

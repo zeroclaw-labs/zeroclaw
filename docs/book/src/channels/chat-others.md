@@ -69,17 +69,63 @@ api_key = "..."
 
 **macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
 
-## WeCom (企业微信)
+## WeCom Bot Webhook (企业微信群机器人)
 
 ```toml
-[channels.wecom]
+[channels.wecom.default]
 enabled = true
-corp_id = "..."
-corp_secret = "..."
-agent_id = 1000001
+webhook_key = "..."                 # key from the group bot webhook URL
 ```
 
-Chinese enterprise WeChat. Custom app required in the corp admin panel.
+WeCom Bot Webhook is send-only through the group bot webhook API. Use it for simple outbound delivery into a WeCom group when ZeroClaw does not need to receive messages from WeCom.
+
+## WeCom channel choices
+
+| Use case | Config block | Transport | Direction |
+|---|---|---|---|
+| Send simple messages into a WeCom group bot webhook | `[channels.wecom.<alias>]` | WeCom group bot webhook | Outbound only |
+| Receive and reply as a WeCom AI Bot | `[channels.wecom_ws.<alias>]` | WeCom AI Bot long connection over WebSocket | Bidirectional |
+
+`wecom_ws` uses WebSocket as the transport, but it is not a generic WebSocket-compatible channel. It implements WeCom's AI Bot long-connection protocol, including subscription, inbound callback frames, response commands, request acknowledgements, user/group allowlists, and encrypted attachment handling.
+
+## WeCom AI Bot Long Connection (企业微信智能机器人长连接)
+
+```toml
+[channels.wecom_ws.default]
+enabled = true
+bot_id = "..."
+secret = "..."
+allowed_users = ["zeroclaw_user"]    # empty denies all users
+allowed_groups = ["zeroclaw_group"]  # empty denies all groups
+bot_name = "danya"                   # optional group mention alias
+stream_mode = "partial"
+file_retention_days = 7
+max_file_size_mb = 20
+# proxy_url = "http://127.0.0.1:7890"  # optional per-channel override
+```
+
+This channel connects to WeCom's AI Bot long-connection API over WebSocket. Use it when ZeroClaw needs to receive WeCom messages and reply as the AI Bot. For simple outbound-only group webhook delivery, use `[channels.wecom.<alias>]` instead.
+
+The WebSocket is only the transport. The channel still implements WeCom-specific subscription/auth, `msg_callback` parsing, `aibot_respond_msg` / `aibot_send_msg` replies, request acknowledgement handling, allowlists, group addressing, and encrypted attachment handling. Enabling `wecom_ws` does not change existing webhook behavior.
+
+Access control is explicit. If both `allowed_users` and `allowed_groups` are empty, inbound messages are denied. Use `"*"` only for controlled test deployments.
+
+Set `bot_name` to the visible WeCom robot name when using the channel in groups. This lets ZeroClaw recognize messages such as `@danya say hi` as addressed to the bot during reply-intent prechecks.
+
+Attachments sent by WeCom can be downloaded into the workspace cache and represented to the model as local markers such as `[IMAGE:/absolute/path.png]` or `[Document: /absolute/path.bin]`.
+
+Outbound image payloads are not supported yet. `stream_mode` supports `"partial"` for progressive draft updates or `"off"` for final replies only.
+
+## WeChat personal iLink Bot (微信个人号 iLink)
+
+```toml
+[channels.wechat]
+enabled = true
+allowed_users = ["*"]
+# api_base_url, cdn_base_url, and state_dir are optional overrides.
+```
+
+WeChat personal iLink Bot is a different channel from WeCom. It uses QR-code login against the iLink Bot API for personal WeChat conversations and should not be used for WeCom enterprise bot traffic.
 
 ## DingTalk
 
