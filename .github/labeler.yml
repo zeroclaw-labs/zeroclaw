@@ -200,6 +200,8 @@
       - any-glob-to-any-file:
           - "src/channels/wecom.rs"
           - "crates/zeroclaw-channels/src/wecom.rs"
+          - "src/channels/wecom_ws.rs"
+          - "crates/zeroclaw-channels/src/wecom_ws.rs"
 
 "channel:whatsapp":
   - changed-files:

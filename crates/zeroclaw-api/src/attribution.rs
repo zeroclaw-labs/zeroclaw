@@ -104,6 +104,8 @@ pub enum ChannelKind {
     Wati,
     #[strum(serialize = "wecom")]
     WeCom,
+    #[strum(serialize = "wecom_ws")]
+    WeComWs,
     Webhook,
     Wechat,
     WhatsappBusiness,
