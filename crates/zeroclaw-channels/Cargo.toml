@@ -16,9 +16,8 @@ zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
 # AOP support: AllowlistAspect provides the per-channel "who is allowed to
 # talk to the bot" check, replacing 20+ near-identical hand-rolled
-# `fn is_user_allowed` implementations across channel modules. Pinned to a
-# specific commit until aspect-rs publishes a 0.1 release on crates.io.
-aspect-std = { git = "https://github.com/yijunyu/aspect-rs", rev = "239ba1d" }
+# `fn is_user_allowed` implementations across channel modules.
+aspect-std = "0.1.1"
 anyhow = "1.0"
 lru = "0.16"
 rumqttc = "0.25"
