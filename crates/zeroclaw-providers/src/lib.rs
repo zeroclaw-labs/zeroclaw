@@ -857,6 +857,18 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Format an error including its full source chain and sanitize the result.
+pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut formatted = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut formatted, format_args!("{error}"));
+    let mut current = error.source();
+    while let Some(source) = current {
+        let _ = std::fmt::Write::write_fmt(&mut formatted, format_args!(": {source}"));
+        current = source.source();
+    }
+    sanitize_api_error(&formatted)
+}
+
 /// Build a sanitized model_provider error from a failed HTTP response.
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
