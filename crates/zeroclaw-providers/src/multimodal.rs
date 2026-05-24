@@ -305,6 +305,7 @@ async fn normalize_native_tool_result_json(
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -320,7 +321,7 @@ async fn normalize_native_tool_result_json(
         return None;
     }
 
-    let normalized = normalize_image_references(&refs, config, max_bytes, remote_client).await;
+    let normalized = normalize_image_references(&refs, config, max_bytes, remote_client, ctx).await;
     let new_inner = compose_multimodal_content(
         &cleaned_text,
         &normalized.data_uris,
@@ -363,6 +364,17 @@ pub async fn prepare_messages_for_provider(
     // prevents conversations from becoming permanently stuck once the
     // cumulative image count crosses the threshold.
     let trimmed = if total_images > max_images {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "total_images": total_images,
+                    "max_images": max_images,
+                    "trimmed_to": max_images,
+                })),
+            "multimodal: trimming oldest images — conversation exceeds image limit"
+        );
         trim_old_images(messages, max_images)
     } else {
         messages.to_vec()
@@ -399,6 +411,7 @@ pub async fn prepare_messages_for_provider(
                 config,
                 max_bytes,
                 &remote_client,
+                &ImageNormalizeCtx { message_index: index, role: &message.role },
             )
             .await
         {
@@ -416,7 +429,14 @@ pub async fn prepare_messages_for_provider(
             continue;
         }
 
-        let normalized = normalize_image_references(&refs, config, max_bytes, &remote_client).await;
+        let normalized = normalize_image_references(
+            &refs,
+            config,
+            max_bytes,
+            &remote_client,
+            &ImageNormalizeCtx { message_index: index, role: &message.role },
+        )
+        .await;
         let content = compose_multimodal_content(
             &cleaned_text,
             &normalized.data_uris,
@@ -430,19 +450,103 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
+    // Apply age-based trimming when configured: strip images from user messages
+    // older than `max_image_turns` turns back from the end of history.
+    // `max_image_turns == 0` means disabled — no age trimming.
+    let age_trimmed = if config.max_image_turns > 0 {
+        let before = count_image_markers(&normalized_messages);
+        let trimmed = trim_images_by_age(&normalized_messages, config.max_image_turns);
+        let after = count_image_markers(&trimmed);
+        if after < before {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_image_turns": config.max_image_turns,
+                        "images_before": before,
+                        "images_after": after,
+                        "images_dropped": before - after,
+                    })),
+                "multimodal: age-trimmed old images from conversation history"
+            );
+        }
+        trimmed
+    } else {
+        normalized_messages
+    };
+
     // Apply the per-request image cap after normalization so failed image refs
     // do not consume budget and evict older images that could still be sent.
     let capped_messages =
-        if has_successful_images && count_image_markers(&normalized_messages) > max_images {
-            trim_old_images(&normalized_messages, max_images)
+        if has_successful_images && count_image_markers(&age_trimmed) > max_images {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "images_after_normalization": count_image_markers(&age_trimmed),
+                        "max_images": max_images,
+                    })),
+                "multimodal: post-normalization image cap exceeded — trimming oldest images"
+            );
+            trim_old_images(&age_trimmed, max_images)
         } else {
-            normalized_messages
+            age_trimmed
         };
 
     Ok(PreparedMessages {
         contains_images: count_image_markers(&capped_messages) > 0,
         messages: capped_messages,
     })
+}
+
+/// Strip images from user messages that are more than `max_turns` turns back
+/// from the end of `messages`.  A "turn" here is counted as a user-role
+/// message, so `max_turns = 2` keeps images in the two most recent user
+/// messages and strips them from all earlier ones.  Tool-result images are
+/// handled by the stale-tool-result mechanism and are left untouched.
+fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
+    // Count user messages from the end to find the cutoff index.
+    let mut user_turn_count = 0usize;
+    let mut cutoff = 0usize; // messages at index < cutoff are "too old"
+    for (i, m) in messages.iter().enumerate().rev() {
+        if m.role == "user" {
+            user_turn_count += 1;
+            if user_turn_count > max_turns {
+                // Everything up to and including this index is too old.
+                cutoff = i + 1;
+                break;
+            }
+        }
+    }
+
+    if cutoff == 0 {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if i < cutoff && m.role == "user" {
+                let (cleaned, refs) = parse_image_markers(&m.content);
+                if refs.is_empty() {
+                    return m.clone();
+                }
+                let text = if cleaned.trim().is_empty() {
+                    "[image removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 /// Strip image markers from older messages (oldest first) until total image
@@ -524,11 +628,20 @@ struct NormalizedImageReferences {
     skipped_count: usize,
 }
 
+/// Context attached to image-skip log events so callers can be identified.
+struct ImageNormalizeCtx<'a> {
+    /// Zero-based index of this message in the conversation history.
+    message_index: usize,
+    /// Role of the message containing the image reference.
+    role: &'a str,
+}
+
 async fn normalize_image_references(
     refs: &[String],
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
+    ctx: &ImageNormalizeCtx<'_>,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
@@ -539,14 +652,20 @@ async fn normalize_image_references(
             Err(error) => {
                 skipped_count += 1;
                 let error_reason = multimodal_error_reason(&error);
+                // Truncate the raw reference so we don't dump a full base64
+                // payload into the log, but keep enough to identify the source.
+                let marker_preview: String = reference.chars().take(120).collect();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
+                            "message_index": ctx.message_index,
+                            "message_role": ctx.role,
                             "source_kind": image_reference_kind(reference),
                             "error_kind": multimodal_error_kind(&error),
                             "reason": error_reason.as_deref().unwrap_or(""),
+                            "marker_preview": marker_preview,
                         })),
                     "skipping multimodal image that could not be loaded"
                 );
