@@ -2583,7 +2583,7 @@ mod tests {
             always_ask: vec!["echo".into()],
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
@@ -2598,6 +2598,9 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
@@ -2638,7 +2641,7 @@ mod tests {
             always_ask: vec!["echo".into()],
             ..zeroclaw_config::schema::RiskProfileConfig::default()
         };
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(model_provider)
             .tools(vec![Box::new(CountingTool {
                 calls: Arc::clone(&tool_calls),
@@ -2653,6 +2656,9 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
@@ -2691,7 +2697,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
@@ -2709,6 +2715,9 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
             requests: Arc::clone(&approval_requests),
@@ -2751,7 +2760,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
@@ -2769,6 +2778,9 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
             requests: Arc::clone(&approval_requests),
@@ -2816,7 +2828,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let captured_args = Arc::new(std::sync::Mutex::new(None));
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(provider)
             .tools(vec![Box::new(CapturingApprovalArgTool {
                 name: "shell",
@@ -2834,6 +2846,9 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
+        let handle: tools::PerToolChannelHandle =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
         let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
             response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
             requests: Arc::clone(&approval_requests),
