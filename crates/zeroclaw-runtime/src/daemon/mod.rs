@@ -1186,7 +1186,11 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config.channels.channels().iter().any(|(_, ok)| *ok)
+    config
+        .channels
+        .channels()
+        .iter()
+        .any(|info| info.configured)
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.

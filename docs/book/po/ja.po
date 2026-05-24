@@ -47116,8 +47116,8 @@ msgid ""
 msgstr "ブロックされたPRには、部分的なレビューのシリーズではなく、1つの実行可能なチェックリストコメントが表示されます。"
 
 #: src/maintainers/pr-workflow.md:102
-msgid "`no-stale` reserved for accepted-but-blocked work."
-msgstr "`no-stale` は、受け入れられたがブロックされた作業のために予約されています。"
+msgid "`status:no-stale` reserved for accepted-but-blocked work."
+msgstr "`status:no-stale` は、受け入れられたがブロックされた作業のために予約されています。"
 
 #: src/maintainers/pr-workflow.md:104
 msgid ""
@@ -47607,8 +47607,8 @@ msgid "Non-actionable noise. Close with a polite pointer."
 msgstr "対応できないノイズです。丁寧なポインターで閉じてください。"
 
 #: src/maintainers/reviewer-playbook.md:86 src/maintainers/labels.md:179
-msgid "`no-stale`"
-msgstr "`no-stale`"
+msgid "`status:no-stale`"
+msgstr "`status:no-stale`"
 
 #: src/maintainers/reviewer-playbook.md:86
 msgid ""
@@ -47726,8 +47726,8 @@ msgstr "週次キューの保守"
 
 #: src/maintainers/reviewer-playbook.md:122
 msgid ""
-"Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work."
-msgstr "古いキューを走査します。`no-stale` は、承認済みだがブロックされている作業にのみ適用してください。"
+"Walk the stale queue. Apply `status:no-stale` only to accepted-but-blocked work."
+msgstr "古いキューを走査します。`status:no-stale` は、承認済みだがブロックされている作業にのみ適用してください。"
 
 #: src/maintainers/reviewer-playbook.md:123
 msgid "Prioritize `size: XS/S` bug and security PRs first."
