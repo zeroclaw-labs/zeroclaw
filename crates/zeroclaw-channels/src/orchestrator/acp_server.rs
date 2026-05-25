@@ -67,6 +67,12 @@ struct Session {
     #[allow(dead_code)] // WIP: intended for session expiry logic
     created_at: Instant,
     last_active: Instant,
+    /// Agent alias (e.g. `"clamps"`) for attributable span logs.
+    agent_alias: String,
+    /// Model-provider ref (e.g. `"anthropic.default"`) for attributable span logs.
+    model_provider: String,
+    /// Model identifier (e.g. `"claude-sonnet-4-6"`) for attributable span logs.
+    model: String,
 }
 
 // ── ACP Server ───────────────────────────────────────────────────
@@ -206,7 +212,12 @@ impl AcpServer {
                                         module_path!(),
                                         ::zeroclaw_log::Action::Note
                                     )
-                                    .with_attrs(::serde_json::json!({"id": id})),
+                                    .with_attrs(::serde_json::json!({
+                                        "id": id,
+                                        "agent_alias": session.agent_alias,
+                                        "model_provider": session.model_provider,
+                                        "model": session.model,
+                                    })),
                                     "Session expired after inactivity"
                                 );
                             }
@@ -256,6 +267,11 @@ impl AcpServer {
     /// text messages are already complete JSON-RPC frames and outbound frames
     /// are supplied by the writer channel passed to [`new_with_writer`].
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "ACP server starting (WebSocket/framed mode)"
+        );
         while let Some(line) = input_rx.recv().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -334,18 +350,40 @@ impl AcpServer {
             "session/stop" => self.handle_session_stop(&request.params).await,
             "session/cancel" => self.handle_session_cancel(&request.params).await,
             "session/event" | "session/update" => self.handle_session_event(&request.params).await,
-            _ => Err(RpcError {
-                code: METHOD_NOT_FOUND,
-                message: format!("Method not found: {}", request.method),
-                data: None,
-            }),
+            _ => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"method": request.method})),
+                    "ACP method not found"
+                );
+                Err(RpcError {
+                    code: METHOD_NOT_FOUND,
+                    message: format!("Method not found: {}", request.method),
+                    data: None,
+                })
+            }
         };
 
         // Only send response for requests (with id), not notifications
         if !is_notification {
             match result {
                 Ok(value) => self.write_result(id, value).await,
-                Err(e) => self.write_error(id, e.code, &e.message).await,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "method": request.method,
+                                "error_code": e.code,
+                                "error": e.message,
+                            })),
+                        "ACP request failed"
+                    );
+                    self.write_error(id, e.code, &e.message).await;
+                }
             }
         }
     }
@@ -406,6 +444,17 @@ impl AcpServer {
 
         let loading_count = self.loading_sessions.lock().await.len();
         if sessions.len() + loading_count >= self.acp_config.max_sessions {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "active": sessions.len(),
+                        "loading": loading_count,
+                        "max": self.acp_config.max_sessions,
+                    })),
+                "ACP session/new rejected: session limit reached"
+            );
             return Err(RpcError {
                 code: SESSION_LIMIT_REACHED,
                 message: format!(
@@ -508,6 +557,17 @@ impl AcpServer {
                 agent,
                 created_at: now,
                 last_active: now,
+                agent_alias: agent_alias.clone(),
+                model_provider: self
+                    .config
+                    .agent(&agent_alias)
+                    .map(|a| a.model_provider.to_string())
+                    .unwrap_or_default(),
+                model: self
+                    .config
+                    .model_provider_for_agent(&agent_alias)
+                    .and_then(|mp| mp.model.clone())
+                    .unwrap_or_default(),
             })),
         );
 
@@ -523,12 +583,28 @@ impl AcpServer {
             });
         }
 
+        let mp = self
+            .config
+            .agent(&agent_alias)
+            .map(|a| a.model_provider.to_string())
+            .unwrap_or_default();
+        let model_name = self
+            .config
+            .model_provider_for_agent(&agent_alias)
+            .and_then(|mp| mp.model.clone())
+            .unwrap_or_default();
         ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"session_id": session_id, "workspace_dir": workspace_dir})
-            ),
-            "Created session (workspace: )"
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "workspace_dir": workspace_dir,
+                    "agent_alias": agent_alias,
+                    "model_provider": mp,
+                    "model": model_name,
+                })),
+            "ACP session created"
         );
 
         Ok(serde_json::json!({
@@ -560,6 +636,18 @@ impl AcpServer {
             let sessions = self.sessions.lock().await;
             let mut loading = self.loading_sessions.lock().await;
             if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "active": sessions.len(),
+                            "loading": loading.len(),
+                            "max": self.acp_config.max_sessions,
+                        })),
+                    "ACP session/load rejected: session limit reached"
+                );
                 return Err(RpcError {
                     code: SESSION_LIMIT_REACHED,
                     message: format!(
@@ -570,6 +658,13 @@ impl AcpServer {
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"session_id": session_id})),
+                    "ACP session/load rejected: session already active"
+                );
                 return Err(RpcError {
                     code: INVALID_PARAMS,
                     message: format!(
@@ -669,6 +764,17 @@ impl AcpServer {
                     agent,
                     created_at: now,
                     last_active: now,
+                    agent_alias: restore_alias.clone(),
+                    model_provider: self
+                        .config
+                        .agent(&restore_alias)
+                        .map(|a| a.model_provider.to_string())
+                        .unwrap_or_default(),
+                    model: self
+                        .config
+                        .model_provider_for_agent(&restore_alias)
+                        .and_then(|mp| mp.model.clone())
+                        .unwrap_or_default(),
                 })),
             );
         }
@@ -680,11 +786,28 @@ impl AcpServer {
             }
         }
 
+        let mp = self
+            .config
+            .agent(&restore_alias)
+            .map(|a| a.model_provider.to_string())
+            .unwrap_or_default();
+        let model_name = self
+            .config
+            .model_provider_for_agent(&restore_alias)
+            .and_then(|mp| mp.model.clone())
+            .unwrap_or_default();
         ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_id": session_id, "message_count": data.messages.len()})),
-            "Loaded session"
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "message_count": data.messages.len(),
+                    "agent_alias": restore_alias,
+                    "model_provider": mp,
+                    "model": model_name,
+                })),
+            "ACP session loaded"
         );
         Ok(serde_json::json!({}))
     }
@@ -712,6 +835,18 @@ impl AcpServer {
             let sessions = self.sessions.lock().await;
             let mut loading = self.loading_sessions.lock().await;
             if sessions.len() + loading.len() >= self.acp_config.max_sessions {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "active": sessions.len(),
+                            "loading": loading.len(),
+                            "max": self.acp_config.max_sessions,
+                        })),
+                    "ACP session/resume rejected: session limit reached"
+                );
                 return Err(RpcError {
                     code: SESSION_LIMIT_REACHED,
                     message: format!(
@@ -722,6 +857,13 @@ impl AcpServer {
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"session_id": session_id})),
+                    "ACP session/resume rejected: session already active"
+                );
                 return Err(RpcError {
                     code: INVALID_PARAMS,
                     message: format!(
@@ -818,15 +960,42 @@ impl AcpServer {
                     agent,
                     created_at: now,
                     last_active: now,
+                    agent_alias: restore_alias.clone(),
+                    model_provider: self
+                        .config
+                        .agent(&restore_alias)
+                        .map(|a| a.model_provider.to_string())
+                        .unwrap_or_default(),
+                    model: self
+                        .config
+                        .model_provider_for_agent(&restore_alias)
+                        .and_then(|mp| mp.model.clone())
+                        .unwrap_or_default(),
                 })),
             );
         }
 
+        let mp = self
+            .config
+            .agent(&restore_alias)
+            .map(|a| a.model_provider.to_string())
+            .unwrap_or_default();
+        let model_name = self
+            .config
+            .model_provider_for_agent(&restore_alias)
+            .and_then(|mp| mp.model.clone())
+            .unwrap_or_default();
         ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_id": session_id})),
-            "Resumed session"
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "agent_alias": restore_alias,
+                    "model_provider": mp,
+                    "model": model_name,
+                })),
+            "ACP session resumed"
         );
         Ok(serde_json::json!({}))
     }
@@ -860,10 +1029,10 @@ impl AcpServer {
         if let Some(token) = token {
             token.cancel();
             ::zeroclaw_log::record!(
-                DEBUG,
+                INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"session_id": session_id})),
-                "Cancelled active turn for closing session"
+                "ACP session/close: cancelled active turn"
             );
         }
 
@@ -878,12 +1047,21 @@ impl AcpServer {
 
         // Wait for any in-flight turn to finish (the cancel token may have already stopped it).
         let session = session_arc.lock().await;
+        let agent_alias = session.agent_alias.clone();
+        let model_provider = session.model_provider.clone();
+        let model = session.model.clone();
         session.agent.channel_handles().unregister_channel("acp");
         ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_id": session_id})),
-            "Closed session"
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "agent_alias": agent_alias,
+                    "model_provider": model_provider,
+                    "model": model,
+                })),
+            "ACP session closed"
         );
 
         Ok(serde_json::json!({}))
@@ -927,6 +1105,46 @@ impl AcpServer {
             })?
         };
 
+        // Snapshot attribution fields before releasing the outer lock.
+        let (agent_alias, model_provider, model) = {
+            // Try-lock: if the inner lock is held by an active turn, we'll
+            // reject below via register_cancel_token anyway. Use a brief
+            // non-blocking peek so we can log the alias even on the error path.
+            if let Ok(s) = session_arc.try_lock() {
+                (s.agent_alias.clone(), s.model_provider.clone(), s.model.clone())
+            } else {
+                (String::new(), String::new(), String::new())
+            }
+        };
+
+        // Instrument the rest of the turn so every record! inside lands in
+        // the Attribution section of the log viewer with agent_alias,
+        // model_provider, and session_key populated.
+        // scope! wraps the body with .instrument() internally — no EnteredSpan
+        // held across .await points, so the future stays Send.
+        // Clone before the macro so the owned values remain available inside
+        // the async move block.
+        let session_id_s = session_id.clone();
+        let agent_alias_s = agent_alias.clone();
+        let model_provider_s = model_provider.clone();
+        let model_s = model.clone();
+        ::zeroclaw_log::scope!(
+            agent_alias: agent_alias_s.as_str(),
+            model_provider: model_provider_s.as_str(),
+            model: model_s.as_str(),
+            session_key: session_id_s.as_str(),
+            channel: "acp",
+        => async move {
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_attrs(::serde_json::json!({
+                    "prompt_len": prompt.len(),
+                })),
+            "ACP session/prompt turn starting"
+        );
+
         // Create a cancellation token for this turn and register it so that a
         // concurrent `session/cancel` notification can fire it without waiting
         // for the inner session lock (which is held for the full turn duration).
@@ -958,6 +1176,7 @@ impl AcpServer {
         // proper pending→completed flow in ACP clients.
         // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
+        let mut tool_call_count: u32 = 0;
         while let Some(event) = event_rx.recv().await {
             // ACP has no `session/update` shape for token-usage events; the
             // task-local cost tracker records them out-of-band. Skip before
@@ -966,9 +1185,40 @@ impl AcpServer {
             if matches!(event, TurnEvent::Usage { .. }) {
                 continue;
             }
-            // Track streamed text so partial content survives cancellation.
-            if let TurnEvent::Chunk { ref delta } = event {
-                accumulated_text.push_str(delta);
+            // Emit attributable span logs for every tool call and result.
+            // Attribution (agent_alias, model_provider, session_key) flows
+            // from the enclosing spans — not repeated here in attrs.
+            match &event {
+                TurnEvent::ToolCall { id, name, args } => {
+                    tool_call_count += 1;
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                            .with_attrs(::serde_json::json!({
+                                "tool_call_id": id,
+                                "tool": name,
+                                "args_len": args.to_string().len(),
+                            })),
+                        "ACP tool call dispatched"
+                    );
+                }
+                TurnEvent::ToolResult { id, name, output } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "tool_call_id": id,
+                                "tool": name,
+                                "output_len": output.len(),
+                            })),
+                        "ACP tool call completed"
+                    );
+                }
+                TurnEvent::Chunk { delta } => {
+                    accumulated_text.push_str(delta);
+                }
+                _ => {}
             }
             if let Some(notification) = notification_for_turn_event(&session_id, &event) {
                 self.write_notification(&notification).await;
@@ -993,13 +1243,34 @@ impl AcpServer {
         };
 
         if was_cancelled {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool_calls": tool_call_count,
+                        "stop_reason": "cancelled",
+                    })),
+                "ACP session/prompt turn cancelled"
+            );
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let (result_text, new_turn_msgs) = turn_result.map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Agent turn failed: {e}"),
-            data: None,
+        let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": e.to_string(),
+                    })),
+                "ACP session/prompt turn failed"
+            );
+            RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Agent turn failed: {e}"),
+                data: None,
+            }
         })?;
 
         // Persist new messages on successful, non-cancelled turns.
@@ -1011,14 +1282,28 @@ impl AcpServer {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"session_id": session_id, "error": e.to_string()})
-                    ),
+                    .with_attrs(::serde_json::json!({
+                        "error": e.to_string(),
+                    })),
                 "Failed to persist turn; session continues in memory"
             );
         }
 
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "tool_calls": tool_call_count,
+                    "response_len": result_text.len(),
+                    "stop_reason": "end_turn",
+                })),
+            "ACP session/prompt turn complete"
+        );
+
         Ok(Self::prompt_result(session_id, "end_turn", result_text))
+
+        }).await
     }
 
     fn register_cancel_token(
@@ -1031,6 +1316,13 @@ impl AcpServer {
             .lock()
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops");
         if tokens.contains_key(session_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"session_id": session_id})),
+                "ACP session/prompt rejected: session already has an active turn"
+            );
             return Err(RpcError {
                 code: SESSION_BUSY,
                 message: format!("Session already has an active prompt turn: {session_id}"),
@@ -1132,14 +1424,23 @@ impl AcpServer {
         // Wait for any in-flight prompt turn to finish before cleaning up.
         // The inner lock is held by the turn task; this blocks until it drops.
         let session = session_arc.lock().await;
+        let agent_alias = session.agent_alias.clone();
+        let model_provider = session.model_provider.clone();
+        let model = session.model.clone();
         // Drop the ACP back-channel from each tool's channel map so the
         // session's RpcOutbound clone isn't kept alive by stale entries.
         session.agent.channel_handles().unregister_channel("acp");
         ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_id": session_id})),
-            "Stopped session"
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": session_id,
+                    "agent_alias": agent_alias,
+                    "model_provider": model_provider,
+                    "model": model,
+                })),
+            "ACP session stopped"
         );
         Ok(serde_json::json!({
             "sessionId": session_id,
@@ -1180,10 +1481,10 @@ impl AcpServer {
         if let Some(token) = token {
             token.cancel();
             ::zeroclaw_log::record!(
-                DEBUG,
+                INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"session_id": session_id})),
-                "Cancelled active turn for session"
+                "ACP session/cancel: fired cancel token for active turn"
             );
         }
 
