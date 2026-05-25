@@ -1873,7 +1873,7 @@ impl Agent {
                                 );
                             }
                             return Err(StreamedTurnError {
-                                error: anyhow::anyhow!(error.to_string()),
+                                error: anyhow::Error::msg(error.to_string()),
                                 committed_response,
                                 new_messages: new_msgs,
                             });
@@ -2103,10 +2103,10 @@ impl Agent {
         }
 
         Err(StreamedTurnError {
-            error: anyhow::anyhow!(
+            error: anyhow::Error::msg(format!(
                 "Agent exceeded maximum tool iterations ({})",
                 self.config.max_tool_iterations
-            ),
+            )),
             committed_response,
             new_messages: new_msgs,
         })
