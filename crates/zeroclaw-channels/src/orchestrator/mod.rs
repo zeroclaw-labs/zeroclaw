@@ -6874,6 +6874,66 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn build_owner_by_channel_key(
+    config: &Config,
+    enabled_agents: &[String],
+    collected_channel_keys: &[String],
+) -> HashMap<String, String> {
+    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
+    // backward-compat with cron callers / singleton channels) → agent_alias.
+    // Built from each enabled agent's `agents.<alias>.channels` list — the
+    // schema treats this as the source of truth for channel ownership.
+    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
+    for alias_str in enabled_agents {
+        let Some(agent_cfg) = config.agents.get(alias_str) else {
+            debug_assert!(
+                false,
+                "enabled agent alias missing from config.agents: {}",
+                alias_str
+            );
+            continue;
+        };
+        for ch in &agent_cfg.channels {
+            let ch_str: &str = ch.as_ref();
+            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
+            if let Some((bare, _)) = ch_str.split_once('.') {
+                owner_by_channel_key
+                    .entry(bare.to_string())
+                    .or_insert_with(|| alias_str.clone());
+            }
+        }
+    }
+
+    // Legacy fallback mode: when no enabled agent declares channel bindings,
+    // channel collection accepts all enabled channels. Those channels must
+    // also be routable, so bind collected channel keys to the runtime-active
+    // agent selection.
+    // `owner_by_channel_key.is_empty()` means every enabled agent had an
+    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
+    // signal used by `collect_configured_channels` to accept all enabled
+    // channel blocks.
+    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+        let fallback_owner = config
+            .resolved_runtime_agent_alias()
+            .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
+            .map(ToString::to_string)
+            .or_else(|| enabled_agents.first().cloned());
+
+        if let Some(owner_alias) = fallback_owner {
+            for channel_key in collected_channel_keys {
+                owner_by_channel_key.insert(channel_key.clone(), owner_alias.clone());
+                if let Some((bare, _)) = channel_key.split_once('.') {
+                    owner_by_channel_key
+                        .entry(bare.to_string())
+                        .or_insert_with(|| owner_alias.clone());
+                }
+            }
+        }
+    }
+
+    owner_by_channel_key
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -6982,6 +7042,7 @@ pub async fn start_channels(
     // Subsequent iterations reuse `channels_by_name_shared` to populate
     // their tool handles and to seed their `ChannelRuntimeContext`.
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
+    let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
@@ -7410,6 +7471,7 @@ pub async fn start_channels(
                 .iter()
                 .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
                 .collect();
+            collected_channel_keys = channel_labels.clone();
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
@@ -7665,25 +7727,8 @@ pub async fn start_channels(
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
-    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
-    // backward-compat with cron callers / singleton channels) → agent_alias.
-    // Built from each enabled agent's `agents.<alias>.channels` list — the
-    // schema treats this as the source of truth for channel ownership.
-    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
-    for (alias_str, agent_cfg) in &config.agents {
-        if !agent_cfg.enabled {
-            continue;
-        }
-        for ch in &agent_cfg.channels {
-            let ch_str: &str = ch.as_ref();
-            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
-            if let Some((bare, _)) = ch_str.split_once('.') {
-                owner_by_channel_key
-                    .entry(bare.to_string())
-                    .or_insert_with(|| alias_str.clone());
-            }
-        }
-    }
+    let owner_by_channel_key =
+        build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
 
     // Hydrate persisted session histories into the owning agent's
     // `conversation_histories` LRU. Sessions whose channel has no enabled
@@ -8441,6 +8486,32 @@ mod tests {
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
         assert!(Arc::ptr_eq(&resolved, &notion_agent_ctx));
+    }
+
+    #[test]
+    fn agent_router_multi_resolves_fallback_loaded_channel_to_legacy_agent() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        let enabled_agents = vec!["legacy".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        let legacy_ctx = router_test_ctx();
+        let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+        by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
+        let router = AgentRouter::multi(by_agent, owners);
+
+        let msg = channel_message("mattermost", Some("default"));
+        let resolved = router.resolve(&msg).expect("fallback owner resolves");
+        assert!(Arc::ptr_eq(&resolved, &legacy_ctx));
     }
 
     #[test]
