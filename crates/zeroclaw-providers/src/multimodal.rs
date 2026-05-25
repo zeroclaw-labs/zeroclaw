@@ -655,20 +655,50 @@ async fn normalize_image_references(
                 // Truncate the raw reference so we don't dump a full base64
                 // payload into the log, but keep enough to identify the source.
                 let marker_preview: String = reference.chars().take(120).collect();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "message_index": ctx.message_index,
-                            "message_role": ctx.role,
-                            "source_kind": image_reference_kind(reference),
-                            "error_kind": multimodal_error_kind(&error),
-                            "reason": error_reason.as_deref().unwrap_or(""),
-                            "marker_preview": marker_preview,
-                        })),
-                    "skipping multimodal image that could not be loaded"
+                let error_kind = multimodal_error_kind(&error);
+                let attrs = ::serde_json::json!({
+                    "message_index": ctx.message_index,
+                    "message_role": ctx.role,
+                    "source_kind": image_reference_kind(reference),
+                    "error_kind": error_kind,
+                    "reason": error_reason.as_deref().unwrap_or(""),
+                    "marker_preview": marker_preview,
+                });
+                // Severity rules:
+                //   - For inbound user attachments, any failure is a real
+                //     loss the operator cares about → WARN.
+                //   - For tool-result content, marker-looking strings often
+                //     come from tool output that just happened to contain
+                //     `[IMAGE:...]` patterns (e.g. an agent reading a test
+                //     fixture, a code search hitting an assertion, log
+                //     snippets). Treat best-effort recoverable failures as
+                //     DEBUG so they stop drowning real signal. Keep WARN
+                //     only for configuration/limit problems that the
+                //     operator can actually act on.
+                let is_tool_role = ctx.role == "tool";
+                let is_recoverable_load_failure = matches!(
+                    error_kind,
+                    "image_source_not_found"
+                        | "local_read_failed"
+                        | "remote_fetch_failed"
+                        | "invalid_marker"
                 );
+                if is_tool_role && is_recoverable_load_failure {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(attrs),
+                        "skipping multimodal marker in tool result (likely not a real attachment)"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(attrs),
+                        "skipping multimodal image that could not be loaded"
+                    );
+                }
             }
         }
     }
