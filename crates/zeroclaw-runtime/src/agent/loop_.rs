@@ -3077,16 +3077,28 @@ pub async fn run(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        // Build access policy from SecurityPolicy so blocked
+                        // MCP tools never surface anywhere in context.
+                        let mcp_policy =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                allowed_tools.as_deref(),
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search));
                     } else {
                         // Eager path: register all MCP tools directly
                         let names = registry.tool_names();
@@ -4346,16 +4358,26 @@ pub async fn process_message(
                                 registry.server_count()
                             )
                         );
-                        deferred_section =
-                            crate::tools::build_deferred_tools_section(&deferred_set);
+                        let mcp_policy_pm =
+                            zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                                security.allowed_tools.as_deref(),
+                                security.excluded_tools.as_deref(),
+                                None, // no caller-supplied allowlist in channel path
+                            );
+                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
+                            mcp_policy_pm.as_ref(),
+                        );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             crate::tools::ActivatedToolSet::new(),
                         ));
                         activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                        tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search_pm =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy_pm {
+                            tool_search_pm = tool_search_pm.with_access_policy(policy);
+                        }
+                        tools_registry.push(Box::new(tool_search_pm));
                     } else {
                         let names = registry.tool_names();
                         let mut registered = 0usize;

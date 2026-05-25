@@ -81,6 +81,7 @@ pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::McpRegistry;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
+    build_deferred_tools_section_filtered,
 };
 pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
