@@ -1029,7 +1029,7 @@ impl LarkChannel {
                         random_lark_ack_reaction(Some(&event_payload), &text).to_string();
                     let reaction_channel = self.clone();
                     let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
+                    zeroclaw_api::spawn!(async move {
                         reaction_channel
                             .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
                             .await;
@@ -2091,7 +2091,7 @@ impl LarkChannel {
                     random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
                 let reaction_channel = Arc::clone(&state.channel);
                 let reaction_message_id = message_id.to_string();
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     reaction_channel
                         .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
                         .await;

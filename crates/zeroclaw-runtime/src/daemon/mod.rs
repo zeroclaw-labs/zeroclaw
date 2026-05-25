@@ -568,7 +568,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -600,7 +600,7 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
@@ -674,7 +674,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let dm_metrics = Arc::clone(&metrics);
         let dm_config = config.clone();
         let dm_delivery = delivery.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let check_interval = Duration::from_secs(60);
             let timeout = chrono::Duration::minutes(i64::from(deadman_timeout));
             loop {
@@ -1742,7 +1742,7 @@ mod tests {
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, false, count));
+        let handle = zeroclaw_api::spawn!(wait_for_exit_signal(reload_rx, false, count));
 
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1766,7 +1766,7 @@ mod tests {
 
         let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, false, count));
+        let handle = zeroclaw_api::spawn!(wait_for_exit_signal(reload_rx, false, count));
         tokio::time::sleep(Duration::from_millis(50)).await;
         reload_tx.send(true).expect("send reload");
 
@@ -1784,7 +1784,7 @@ mod tests {
 
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count));
+        let handle = zeroclaw_api::spawn!(wait_for_exit_signal(reload_rx, true, count));
 
         // No clients ever connect — should NOT shut down.
         let result = timeout(Duration::from_millis(500), handle).await;
@@ -1802,7 +1802,7 @@ mod tests {
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count2 = count.clone();
-        let handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count2));
+        let handle = zeroclaw_api::spawn!(wait_for_exit_signal(reload_rx, true, count2));
 
         // Simulate client connect then disconnect.
         count.store(1, Ordering::Relaxed);
@@ -1826,7 +1826,7 @@ mod tests {
         let (_reload_tx, reload_rx) = tokio::sync::watch::channel(false);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count2 = count.clone();
-        let mut handle = tokio::spawn(wait_for_exit_signal(reload_rx, true, count2));
+        let mut handle = zeroclaw_api::spawn!(wait_for_exit_signal(reload_rx, true, count2));
 
         // Client connects, disconnects.
         count.store(1, Ordering::Relaxed);

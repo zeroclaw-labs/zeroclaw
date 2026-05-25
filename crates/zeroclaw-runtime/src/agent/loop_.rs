@@ -3955,7 +3955,7 @@ pub async fn run(
                 let content_streamed_flag = content_was_streamed.clone();
                 let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
-                let consumer_handle = tokio::spawn(async move {
+                let consumer_handle = zeroclaw_api::spawn!(async move {
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
@@ -3980,7 +3980,7 @@ pub async fn run(
                 // Ctrl+C cancels the in-flight turn instead of killing the process.
                 let cancel_token = CancellationToken::new();
                 let cancel_token_clone = cancel_token.clone();
-                let ctrlc_handle = tokio::spawn(async move {
+                let ctrlc_handle = zeroclaw_api::spawn!(async move {
                     if tokio::signal::ctrl_c().await.is_ok() {
                         cancel_token_clone.cancel();
                     }

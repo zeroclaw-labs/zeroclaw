@@ -2088,7 +2088,7 @@ impl Agent {
             .expect("CLI channel factory not registered — call register_cli_channel_fn at startup")(
         );
 
-        let listen_handle = tokio::spawn(async move {
+        let listen_handle = zeroclaw_api::spawn!(async move {
             let _ = zeroclaw_api::channel::Channel::listen(&*cli, tx).await;
         });
 
@@ -3173,7 +3173,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mock_addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
+        let server_handle = zeroclaw_api::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
 

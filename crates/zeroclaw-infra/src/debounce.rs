@@ -83,7 +83,7 @@ impl MessageDebouncer {
 
             // Spawn a new timer.
             let key_clone = key.clone();
-            entry.timer_handle = tokio::spawn(async move {
+            entry.timer_handle = zeroclaw_api::spawn!(async move {
                 tokio::time::sleep(window).await;
                 fire_debounced(&entries_ref, &key_clone).await;
             });
@@ -94,7 +94,7 @@ impl MessageDebouncer {
 
             let key_clone = key.clone();
             let entries_spawn = Arc::clone(&self.entries);
-            let handle = tokio::spawn(async move {
+            let handle = zeroclaw_api::spawn!(async move {
                 tokio::time::sleep(window).await;
                 fire_debounced(&entries_spawn, &key_clone).await;
             });

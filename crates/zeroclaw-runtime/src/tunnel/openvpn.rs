@@ -144,7 +144,7 @@ impl Tunnel for OpenVpnTunnel {
 
         // Drain stderr in background to prevent OS pipe buffer from filling and
         // blocking the openvpn process.
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 ::zeroclaw_log::record!(
                     TRACE,

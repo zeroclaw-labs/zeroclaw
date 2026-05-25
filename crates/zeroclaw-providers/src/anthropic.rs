@@ -2115,7 +2115,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
+        let server_handle = zeroclaw_api::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
 

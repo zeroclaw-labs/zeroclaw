@@ -282,7 +282,7 @@ impl Tool for ClaudeCodeRunnerTool {
         // Schedule session TTL cleanup
         let ttl = self.config.session_ttl;
         let cleanup_session = session_name.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &cleanup_session])

@@ -359,7 +359,7 @@ impl RpcDispatcher {
                     let handle = self.spawn_handle();
                     let id_clone = id;
                     let params_clone = req.params.clone();
-                    tokio::spawn(async move {
+                    zeroclaw_api::spawn!(async move {
                         let result = handle.handle_session_prompt(&params_clone).await;
                         match result {
                             Ok(v) => handle.send_result(id_clone, v).await,
@@ -1898,7 +1898,7 @@ impl RpcDispatcher {
         let mut rx = event_tx.subscribe();
         let rpc = self.rpc.clone();
         // Spawn a forwarding task that lives until the subscriber drops.
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             while let Ok(event) = rx.recv().await {
                 let notification = JsonRpcNotification::new(notification::LOGS_EVENT, event);
                 if let Ok(json) = serde_json::to_string(&notification)

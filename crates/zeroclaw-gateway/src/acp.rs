@@ -84,9 +84,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         Arc::new(AcpServer::new_with_writer(config, acp_config, output_tx))
     };
 
-    let server_task = tokio::spawn(Arc::clone(&server).run_messages(input_rx));
+    let server_task = zeroclaw_api::spawn!(Arc::clone(&server).run_messages(input_rx));
 
-    let output_task = tokio::spawn(async move {
+    let output_task = zeroclaw_api::spawn!(async move {
         while let Some(line) = output_rx.recv().await {
             if sender.send(Message::Text(line.into())).await.is_err() {
                 break;

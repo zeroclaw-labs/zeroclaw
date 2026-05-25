@@ -169,7 +169,7 @@ pub fn spawn_notification_router(
     mut bcast_rx: broadcast::Receiver<RpcNotification>,
     update_tx: mpsc::Sender<SessionUpdate>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         loop {
             match bcast_rx.recv().await {
                 Ok(notif) => {
@@ -241,7 +241,7 @@ impl RpcClient {
         let (read_half, write_half) = stream.into_split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let mut w = write_half;
             while let Some(mut line) = writer_rx.recv().await {
                 if !line.ends_with('\n') {
@@ -261,7 +261,7 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
-        let read_task = tokio::spawn(async move {
+        let read_task = zeroclaw_api::spawn!(async move {
             let mut reader = BufReader::new(read_half);
             let mut buf = String::new();
             loop {
@@ -384,7 +384,7 @@ impl RpcClient {
         let (mut sink, mut stream) = ws_stream.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             while let Some(line) = writer_rx.recv().await {
                 if sink.send(Message::Text(line.into())).await.is_err() {
                     break;
@@ -400,7 +400,7 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
-        let read_task = tokio::spawn(async move {
+        let read_task = zeroclaw_api::spawn!(async move {
             loop {
                 match stream.next().await {
                     Some(Ok(Message::Text(text))) => {
@@ -954,8 +954,8 @@ impl RpcClient {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             rpc,
-            _read_task: tokio::spawn(async {}),
-            _router_task: tokio::spawn(async {}),
+            _read_task: zeroclaw_api::spawn!(async {}),
+            _router_task: zeroclaw_api::spawn!(async {}),
             server_version: "test".to_string(),
             notifications_bcast: notif_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
@@ -1389,7 +1389,7 @@ mod session_method_tests {
         let client = RpcClient::with_rpc(rpc.clone());
 
         let task =
-            tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
+            zeroclaw_api::spawn!(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
         let line = write_rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1413,7 +1413,7 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = tokio::spawn(async move { client.session_cancel("s1").await });
+        let task = zeroclaw_api::spawn!(async move { client.session_cancel("s1").await });
 
         let line = write_rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1430,7 +1430,7 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = tokio::spawn(async move {
+        let task = zeroclaw_api::spawn!(async move {
             client
                 .session_approve("s1", "req-1", ApprovalDecision::AllowOnce)
                 .await

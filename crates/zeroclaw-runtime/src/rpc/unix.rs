@@ -39,7 +39,7 @@ impl UnixSocketTransport {
         let (read_half, write_half) = stream.into_split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let mut writer = write_half;
             while let Some(mut line) = writer_rx.recv().await {
                 if !line.ends_with('\n') {
@@ -170,7 +170,7 @@ pub async fn run_unix_socket(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     let mut transport = UnixSocketTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
@@ -286,7 +286,7 @@ mod tests {
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_api::spawn!(async move {
             run_unix_socket(server_ctx, server_cancel, test_client_count()).await
         });
 
@@ -340,7 +340,7 @@ mod tests {
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
@@ -378,7 +378,7 @@ mod tests {
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
@@ -409,7 +409,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
 
@@ -441,7 +441,7 @@ mod tests {
 
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
         });
         wait_for_socket(&sock_path).await;
@@ -487,7 +487,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let server_count = count.clone();
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let _ = run_unix_socket(server_ctx, server_cancel, server_count).await;
         });
 

@@ -48,7 +48,7 @@ where
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
 
-    let turn_handle = tokio::spawn(async move {
+    let turn_handle = zeroclaw_api::spawn!(async move {
         let mut guard = agent.lock().await;
         crate::agent::loop_::scope_session_key(session_key, async {
             guard

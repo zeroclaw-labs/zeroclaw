@@ -184,7 +184,7 @@ impl AcpServer {
                 );
                 anyhow::Error::msg("ACP server writer already started")
             })?;
-        tokio::spawn(writer_task(writer_rx));
+        zeroclaw_api::spawn!(writer_task(writer_rx));
 
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin);
@@ -193,7 +193,7 @@ impl AcpServer {
         // Spawn session reaper
         let sessions = Arc::clone(&self.sessions);
         let timeout = Duration::from_secs(self.acp_config.session_timeout_secs);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
@@ -317,10 +317,7 @@ impl AcpServer {
                 // Spawn so a long-running session/prompt doesn't block the
                 // read loop — outbound RPC responses (e.g. for
                 // session/request_permission) need to be processable
-                // while a prompt turn is in flight.
-                //
-                // Use `zeroclaw_api::spawn!` (not `tokio::spawn`) so the task
-                // inherits the current tracing span. Once `handle_request`
+                // while a prompt turn is in flight. Once `handle_request`
                 // resolves session/agent context and attaches an
                 // attribution scope, every log record emitted from this
                 // task lands attributed in the TUI instead of orphaning.
@@ -1166,7 +1163,7 @@ impl AcpServer {
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
         // map entry remains in place.
-        let turn_handle = tokio::spawn(async move {
+        let turn_handle = zeroclaw_api::spawn!(async move {
             let mut session = session_arc.lock().await;
             let result = session
                 .agent

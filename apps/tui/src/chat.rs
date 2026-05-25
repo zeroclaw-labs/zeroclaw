@@ -387,7 +387,7 @@ impl<'a> Chat<'a> {
                     let rpc_arc = self.rpc_out.clone();
                     let tx = self.turn_result_tx.clone();
                     let transport = self.rpc.transport();
-                    tokio::spawn(async move {
+                    zeroclaw_api::spawn!(async move {
                         let mut params = serde_json::json!({
                             "session_id": sid,
                             "prompt": prompt,

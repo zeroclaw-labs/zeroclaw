@@ -1580,7 +1580,7 @@ pub async fn run_gateway(
                     .await
                     .expect("infallible make_service");
 
-                    tokio::spawn(async move {
+                    zeroclaw_api::spawn!(async move {
                         let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -2851,7 +2851,7 @@ async fn handle_nextcloud_talk_webhook(
     for msg in messages {
         let state = state.clone();
         let nextcloud_talk = Arc::clone(nextcloud_talk);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
             let session_id = sender_session_id("nextcloud_talk", &msg);
 
@@ -2992,7 +2992,7 @@ async fn handle_gmail_push_webhook(
 
     // Process the notification asynchronously (non-blocking for the webhook response)
     let channel = Arc::clone(gmail_push);
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         if let Err(e) = channel.handle_notification(&envelope).await {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -3115,7 +3115,7 @@ async fn handle_admin_reload(
     // down + bring up = correct" but "/admin/reload = stale".
     let shutdown_tx = state.shutdown_tx.clone();
     // Brief delay so the HTTP response flushes before tear-down begins.
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         // Drain axum first so the listener releases.
         let _ = shutdown_tx.send(true);
@@ -3350,7 +3350,7 @@ mod tests {
         // immediately with that Err. We race a short delay against
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_api::spawn!(async move {
             run_gateway("127.0.0.1", 0, config, None, None, None, None).await
         });
 
@@ -3405,7 +3405,7 @@ mod tests {
         };
         config.agents.insert("fake123".to_string(), agent);
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_api::spawn!(async move {
             run_gateway("127.0.0.1", 0, config, None, None, None, None).await
         });
 

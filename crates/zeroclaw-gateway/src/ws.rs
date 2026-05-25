@@ -1032,7 +1032,7 @@ async fn process_chat_message(
                 let temperature = state.temperature;
                 let user_msg = content.to_string();
                 let assistant_resp = response.clone();
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                         model_provider.as_ref(),
                         &model,

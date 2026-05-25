@@ -55,7 +55,7 @@ async fn spawn_mock_provider() -> (SocketAddr, CapturedBodies) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    zeroclaw_api::spawn!(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
     (addr, captured)

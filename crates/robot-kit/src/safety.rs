@@ -16,6 +16,11 @@
 //! The AI can REQUEST movement, but the safety system ALLOWS it.
 //! Safety always wins.
 
+// robot-kit is an independent hardware crate that does not depend on
+// `zeroclaw-api`, so it cannot use `zeroclaw_api::spawn!`. Bump-recovery
+// tasks here run outside any orchestrator span. See clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use crate::config::{RobotConfig, SafetyConfig};
 use crate::traits::ToolResult;
 use anyhow::Result;

@@ -185,7 +185,7 @@ mod tests {
 
         // Queue one more (pending=2, will block waiting for permit)
         let queue_clone = queue.clone();
-        let handle = tokio::spawn(async move { queue_clone.acquire("s1").await });
+        let handle = zeroclaw_api::spawn!(async move { queue_clone.acquire("s1").await });
 
         // Give the spawned task time to register
         tokio::time::sleep(Duration::from_millis(50)).await;

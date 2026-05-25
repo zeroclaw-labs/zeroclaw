@@ -139,7 +139,7 @@ mod tests {
         };
 
         let pending_for_resolve = Arc::clone(&pending);
-        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let task = zeroclaw_api::spawn!(async move { ch.request_approval("", &request).await });
 
         let line = write_rx.recv().await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();

@@ -595,7 +595,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let a = audited.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_api::spawn!(async move {
                 a.store(
                     &format!("k{i}"),
                     &format!("v{i}"),

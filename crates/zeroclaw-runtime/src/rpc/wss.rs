@@ -35,7 +35,7 @@ impl WssTransport {
         let (sink, stream) = ws.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             let mut sink = sink;
             while let Some(line) = writer_rx.recv().await {
                 if sink.send(Message::Text(line.into())).await.is_err() {
@@ -158,7 +158,7 @@ pub async fn run_wss_listener(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     // TLS handshake.
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,

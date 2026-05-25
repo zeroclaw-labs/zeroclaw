@@ -2099,7 +2099,7 @@ mod tests {
                 }
             }),
         );
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://127.0.0.1:{port}")

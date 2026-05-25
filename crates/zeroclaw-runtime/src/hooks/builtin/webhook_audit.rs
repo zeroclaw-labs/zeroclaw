@@ -328,7 +328,7 @@ impl HookHandler for WebhookAuditHook {
         let url = self.config.url.clone();
 
         // Fire-and-forget — never block the agent loop.
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             match client.post(&url).json(&payload).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {

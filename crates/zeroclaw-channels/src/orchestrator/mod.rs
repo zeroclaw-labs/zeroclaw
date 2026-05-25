@@ -110,7 +110,6 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
-use zeroclaw_log::Instrument;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
@@ -2947,7 +2946,7 @@ fn spawn_supervised_listener_with_health_interval(
         _ => ch.name().to_string(),
     };
     let span = zeroclaw_log::attribution_span!(&*ch);
-    tokio::spawn(
+    zeroclaw_api::spawn!(
         async move {
             let component = format!("channel:{composite}");
             let mut backoff = initial_backoff_secs.max(1);
@@ -3012,7 +3011,7 @@ fn spawn_supervised_listener_with_health_interval(
                 backoff = backoff.saturating_mul(2).min(max_backoff);
             }
         }
-        .instrument(span),
+        .instrument(span)
     )
 }
 
@@ -4659,7 +4658,7 @@ async fn run_message_dispatch_loop(
             if let Some(channel) = channel {
                 let reply_target = msg.reply_target.clone();
                 let thread_ts = msg.thread_ts.clone();
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     let _ = channel
                         .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
                         .await;
@@ -11640,7 +11639,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
-        let send_task = tokio::spawn(async move {
+        let send_task = zeroclaw_api::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
@@ -11781,7 +11780,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
-        let send_task = tokio::spawn(async move {
+        let send_task = zeroclaw_api::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "U123".to_string(),
@@ -11919,7 +11918,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
-        let send_task = tokio::spawn(async move {
+        let send_task = zeroclaw_api::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-a".to_string(),
                 sender: "alice".to_string(),
@@ -15595,7 +15594,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
-        let send_task = tokio::spawn(async move {
+        let send_task = zeroclaw_api::spawn!(async move {
             // Two messages from same sender but in different Slack threads —
             // they must NOT cancel each other.
             tx.send(zeroclaw_api::channel::ChannelMessage {

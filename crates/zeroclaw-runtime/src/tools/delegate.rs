@@ -965,7 +965,7 @@ impl DelegateTool {
         // and channel-scoped tool calls would land unattributed.
         let parent_session_key = current_tool_loop_session_key();
 
-        tokio::spawn(async move {
+        zeroclaw_api::spawn!(async move {
             scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
                     agents,
@@ -1142,7 +1142,7 @@ impl DelegateTool {
         }
 
         // Capture the current receipt scope so each spawned sub-agent task
-        // re-enters it. `tokio::spawn` does not propagate task-locals, so
+        // re-enters it. Spawned tasks do not propagate task-locals, so
         // without this `execute_sync`'s `try_with` would resolve to `None`
         // inside the spawn and the parallel agents would run unsigned even
         // when the parent turn has receipts enabled. The collector is `Arc`'d
@@ -1181,7 +1181,7 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let session_key = parent_session_key.clone();
 
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_api::spawn!(async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -2628,7 +2628,7 @@ mod tests {
         let seen = TOOL_LOOP_SESSION_KEY
             .scope(Some("channel_session".to_string()), async {
                 let session_key = current_tool_loop_session_key();
-                tokio::spawn(async move {
+                zeroclaw_api::spawn!(async move {
                     scope_delegate_session_key(session_key, async {
                         current_tool_loop_session_key()
                     })

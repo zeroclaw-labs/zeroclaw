@@ -53,7 +53,9 @@ macro_rules! spawn {
     ($body:expr) => {{
         #[allow(unused_imports)]
         use $crate::__private::tracing::Instrument as _;
-        ::tokio::spawn(($body).in_current_span())
+        #[allow(clippy::disallowed_methods)]
+        let __zc_spawn_handle = ::tokio::spawn(($body).in_current_span());
+        __zc_spawn_handle
     }};
 }
 
