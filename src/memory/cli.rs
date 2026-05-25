@@ -214,10 +214,10 @@ async fn handle_stats(config: &Config) -> Result<()> {
 fn unsupported_clear_backend_message(backend: &str) -> String {
     #[cfg(feature = "agent-runtime")]
     {
-        return i18n::get_required_cli_string_with_args(
+        i18n::get_required_cli_string_with_args(
             "cli-memory-clear-unsupported-backend",
             &[("backend", backend)],
-        );
+        )
     }
 
     #[cfg(not(feature = "agent-runtime"))]
