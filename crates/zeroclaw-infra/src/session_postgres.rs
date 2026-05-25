@@ -23,8 +23,7 @@
 //! migrated between backends without transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
-    TimestampedMessage,
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -283,8 +282,11 @@ impl SessionBackend for PostgresSessionBackend {
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let mut conn = self.pool.get().map_err(std::io::Error::other)?;
-        conn.execute("DELETE FROM sessions WHERE session_key = $1", &[&session_key])
-            .map_err(std::io::Error::other)?;
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = $1",
+            &[&session_key],
+        )
+        .map_err(std::io::Error::other)?;
         let n = conn
             .execute(
                 "DELETE FROM session_metadata WHERE session_key = $1",
@@ -459,7 +461,10 @@ impl SessionBackend for PostgresSessionBackend {
             .map(|row| {
                 let ts: DateTime<Utc> = row.get(2);
                 TimestampedMessage {
-                    message: ChatMessage { role: row.get(0), content: row.get(1) },
+                    message: ChatMessage {
+                        role: row.get(0),
+                        content: row.get(1),
+                    },
                     created_at: Some(ts),
                 }
             })
@@ -469,7 +474,10 @@ impl SessionBackend for PostgresSessionBackend {
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let mut conn = self.pool.get().map_err(std::io::Error::other)?;
         let n = conn
-            .execute("DELETE FROM sessions WHERE session_key = $1", &[&session_key])
+            .execute(
+                "DELETE FROM sessions WHERE session_key = $1",
+                &[&session_key],
+            )
             .map_err(std::io::Error::other)? as usize;
         if n > 0 {
             conn.execute(
@@ -483,14 +491,13 @@ impl SessionBackend for PostgresSessionBackend {
         Ok(n)
     }
 
-    fn set_session_agent_alias(
-        &self,
-        session_key: &str,
-        agent_alias: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let mut conn = self.pool.get().map_err(std::io::Error::other)?;
-        let alias_val: Option<&str> =
-            if agent_alias.is_empty() { None } else { Some(agent_alias) };
+        let alias_val: Option<&str> = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
         let now = Utc::now();
         conn.execute(
             "INSERT INTO session_metadata
@@ -557,9 +564,7 @@ mod tests {
     #[test]
     fn postgres_backend_round_trip() {
         let Some(url) = test_url() else {
-            eprintln!(
-                "ZEROCLAW_TEST_POSTGRES_URL not set — skipping postgres backend test"
-            );
+            eprintln!("ZEROCLAW_TEST_POSTGRES_URL not set — skipping postgres backend test");
             return;
         };
         let backend = PostgresSessionBackend::new(&url, 2).expect("connect");
@@ -570,7 +575,10 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let msg = ChatMessage { role: "user".into(), content: "hello postgres".into() };
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello postgres".into(),
+        };
         backend.append(&key, &msg).expect("append");
 
         let loaded = backend.load(&key);

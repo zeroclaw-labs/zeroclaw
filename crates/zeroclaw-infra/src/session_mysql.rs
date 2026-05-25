@@ -27,12 +27,11 @@
 //! transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
-    TimestampedMessage,
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use mysql::{prelude::*, Pool};
+use mysql::{Pool, prelude::*};
 use zeroclaw_api::model_provider::ChatMessage;
 
 // ── Backend ───────────────────────────────────────────────────────────────
@@ -56,8 +55,8 @@ impl MysqlSessionBackend {
         let opts = mysql::Opts::from_url(database_url).context("invalid MySQL URL")?;
         // Pool::new_manual was removed in mysql 25; use Pool::new + PoolOpts for
         // size control. PoolConstraints::new(active_min, active_max).
-        let constraints = mysql::PoolConstraints::new(1, pool_size)
-            .context("invalid pool constraints")?;
+        let constraints =
+            mysql::PoolConstraints::new(1, pool_size).context("invalid pool constraints")?;
         let pool_opts = mysql::PoolOpts::new().with_constraints(constraints);
         let builder = mysql::OptsBuilder::from_opts(opts)
             // Enforce UTC for all connections so DATETIME(6) values round-trip
@@ -66,7 +65,9 @@ impl MysqlSessionBackend {
             .pool_opts(pool_opts);
         let pool = Pool::new(builder).context("failed to build MySQL connection pool")?;
 
-        let mut conn = pool.get_conn().context("failed to get initial MySQL connection")?;
+        let mut conn = pool
+            .get_conn()
+            .context("failed to get initial MySQL connection")?;
 
         // MySQL 9.0 supports CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS.
         conn.query_drop(
@@ -221,11 +222,8 @@ impl SessionBackend for MysqlSessionBackend {
         for key in &keys {
             conn.exec_drop("DELETE FROM sessions WHERE session_key = ?", (key,))
                 .map_err(std::io::Error::other)?;
-            conn.exec_drop(
-                "DELETE FROM session_metadata WHERE session_key = ?",
-                (key,),
-            )
-            .map_err(std::io::Error::other)?;
+            conn.exec_drop("DELETE FROM session_metadata WHERE session_key = ?", (key,))
+                .map_err(std::io::Error::other)?;
         }
         Ok(n)
     }
@@ -331,7 +329,11 @@ impl SessionBackend for MysqlSessionBackend {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
-        Ok(Some(SessionState { state, turn_id, turn_started_at }))
+        Ok(Some(SessionState {
+            state,
+            turn_id,
+            turn_started_at,
+        }))
     }
 
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
@@ -414,14 +416,13 @@ impl SessionBackend for MysqlSessionBackend {
         Ok(n)
     }
 
-    fn set_session_agent_alias(
-        &self,
-        session_key: &str,
-        agent_alias: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
-        let alias_val: Option<&str> =
-            if agent_alias.is_empty() { None } else { Some(agent_alias) };
+        let alias_val: Option<&str> = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
         conn.exec_drop(
             "INSERT INTO session_metadata
                  (session_key, created_at, last_activity, message_count, agent_alias)
@@ -453,7 +454,9 @@ impl SessionBackend for MysqlSessionBackend {
     ) -> std::io::Result<()> {
         let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
         fn norm(v: Option<&str>) -> Option<String> {
-            v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+            v.map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
         }
         let channel_id = norm(context.channel_id);
         let room_id = norm(context.room_id);
@@ -537,7 +540,10 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let msg = ChatMessage { role: "user".into(), content: "hello mysql".into() };
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello mysql".into(),
+        };
         backend.append(&key, &msg).expect("append");
 
         let loaded = backend.load(&key);

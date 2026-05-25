@@ -922,10 +922,7 @@ pub async fn run_gateway(
     // to SQLite while channel + tool reads went to JSONL — the original
     // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match zeroclaw_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels,
-        ) {
+        match zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels) {
             Ok(backend) => {
                 ::zeroclaw_log::record!(
                     INFO,

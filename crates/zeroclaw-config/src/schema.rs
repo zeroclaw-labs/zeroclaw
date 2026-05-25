@@ -9958,7 +9958,6 @@ pub struct ChannelsConfig {
 
     // ── Remote session backend credentials ───────────────────────────────
     // Only the fields for the selected `session_backend` are required.
-
     /// PostgreSQL DSN for `session_backend = "postgres"`, e.g.
     /// `"postgresql://zeroclaw:secret@primary/zeroclaw"`.
     #[secret]

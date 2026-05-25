@@ -33,8 +33,7 @@
 //! backends so data can be migrated between backends without transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
-    TimestampedMessage,
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -310,11 +309,8 @@ impl SessionBackend for OracleSessionBackend {
         for key in &keys {
             conn.execute("DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1", &[key])
                 .map_err(std::io::Error::other)?;
-            conn.execute(
-                "DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = :1",
-                &[key],
-            )
-            .map_err(std::io::Error::other)?;
+            conn.execute("DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = :1", &[key])
+                .map_err(std::io::Error::other)?;
         }
         if n > 0 {
             conn.commit().map_err(std::io::Error::other)?;
@@ -538,7 +534,10 @@ impl SessionBackend for OracleSessionBackend {
         let mut g = self.pool.get().map_err(std::io::Error::other)?;
         let conn = &mut g.0;
         let stmt = conn
-            .execute("DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1", &[&session_key])
+            .execute(
+                "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1",
+                &[&session_key],
+            )
             .map_err(std::io::Error::other)?;
         let n = stmt.row_count().map_err(std::io::Error::other)? as usize;
         if n > 0 {
@@ -554,15 +553,14 @@ impl SessionBackend for OracleSessionBackend {
         Ok(n)
     }
 
-    fn set_session_agent_alias(
-        &self,
-        session_key: &str,
-        agent_alias: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let mut g = self.pool.get().map_err(std::io::Error::other)?;
         let conn = &mut g.0;
-        let alias_val: Option<&str> =
-            if agent_alias.is_empty() { None } else { Some(agent_alias) };
+        let alias_val: Option<&str> = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
         conn.execute(
             "MERGE INTO ZC_SESSION_META m
              USING (SELECT :1 AS SK, :2 AS ALIAS FROM DUAL) src ON (m.SESSION_KEY = src.SK)
@@ -659,7 +657,7 @@ mod tests {
     fn test_creds() -> Option<(String, String, String)> {
         let user = std::env::var("ZEROCLAW_TEST_ORACLE_USER").ok()?;
         let pass = std::env::var("ZEROCLAW_TEST_ORACLE_PASS").ok()?;
-        let dsn  = std::env::var("ZEROCLAW_TEST_ORACLE_DSN").ok()?;
+        let dsn = std::env::var("ZEROCLAW_TEST_ORACLE_DSN").ok()?;
         Some((user, pass, dsn))
     }
 
@@ -679,7 +677,10 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let msg = ChatMessage { role: "user".into(), content: "hello oracle".into() };
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello oracle".into(),
+        };
         backend.append(&key, &msg).expect("append");
 
         let loaded = backend.load(&key);

@@ -52,7 +52,9 @@ pub fn make_session_backend(
         #[cfg(feature = "backend-postgres")]
         "postgres" => {
             let url = channels.postgres_url.as_deref().ok_or_else(|| {
-                std::io::Error::other("session_backend=postgres requires postgres_url in [channels]")
+                std::io::Error::other(
+                    "session_backend=postgres requires postgres_url in [channels]",
+                )
             })?;
             let store = session_postgres::PostgresSessionBackend::new(url, channels.pool_size)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -62,9 +64,7 @@ pub fn make_session_backend(
         #[cfg(feature = "backend-db2")]
         "db2" => {
             let conn_str = channels.db2_conn_str.as_deref().ok_or_else(|| {
-                std::io::Error::other(
-                    "session_backend=db2 requires db2_conn_str in [channels]",
-                )
+                std::io::Error::other("session_backend=db2 requires db2_conn_str in [channels]")
             })?;
             let store = session_db2::Db2SessionBackend::new(conn_str, channels.pool_size)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -95,9 +95,8 @@ pub fn make_session_backend(
             let url = channels.mysql_url.as_deref().ok_or_else(|| {
                 std::io::Error::other("session_backend=mysql requires mysql_url in [channels]")
             })?;
-            let store =
-                session_mysql::MysqlSessionBackend::new(url, channels.pool_size as usize)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let store = session_mysql::MysqlSessionBackend::new(url, channels.pool_size as usize)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(Arc::new(store))
         }
 
@@ -215,8 +214,7 @@ mod tests {
         // operator can roll back.
         let tmp = TempDir::new().unwrap();
         {
-            let jsonl =
-                make_session_backend(tmp.path(), &channels_with_backend("jsonl")).unwrap();
+            let jsonl = make_session_backend(tmp.path(), &channels_with_backend("jsonl")).unwrap();
             jsonl.append("legacy", &user_msg("from-jsonl")).unwrap();
         }
         let sqlite = make_session_backend(tmp.path(), &channels_with_backend("sqlite")).unwrap();

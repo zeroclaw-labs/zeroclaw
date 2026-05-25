@@ -46,15 +46,14 @@
 //! connection string at the correct endpoint.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
-    TimestampedMessage,
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use odbc_api::{
+    Connection, Cursor, Environment, ParameterCollectionRef, ResultSetMetadata,
     buffers::TextRowSet,
     parameter::{VarCharBox, VarCharSlice},
-    Connection, Cursor, Environment, ParameterCollectionRef, ResultSetMetadata,
 };
 use r2d2::ManageConnection;
 use r2d2::Pool;
@@ -131,15 +130,15 @@ impl Db2SessionBackend {
     /// `"DSN=ZEROCLAW;UID=zeroclaw;PWD=secret;"`.
     /// `pool_size` sets the maximum number of pooled ODBC connections.
     pub fn new(conn_str: &str, pool_size: u32) -> Result<Self> {
-        let manager = Db2Manager { conn_str: conn_str.to_owned() };
+        let manager = Db2Manager {
+            conn_str: conn_str.to_owned(),
+        };
         let pool = Pool::builder()
             .max_size(pool_size)
             .build(manager)
             .context("failed to build Db2 ODBC connection pool")?;
 
-        let mut guard = pool
-            .get()
-            .context("failed to get initial Db2 connection")?;
+        let mut guard = pool.get().context("failed to get initial Db2 connection")?;
         let conn = &mut guard.0;
 
         // CREATE TABLE IF NOT EXISTS is supported natively in Db2 12.1+.
@@ -263,7 +262,10 @@ fn select_rows(
 
 /// Extract column `idx` from a row as `String`.
 fn col_str(row: &[Option<String>], idx: usize) -> String {
-    row.get(idx).and_then(|v| v.as_deref()).unwrap_or("").to_owned()
+    row.get(idx)
+        .and_then(|v| v.as_deref())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// Extract column `idx` from a row as `Option<String>`.
@@ -309,7 +311,9 @@ fn row_to_meta(row: &[Option<String>]) -> SessionMetadata {
 
 impl SessionBackend for Db2SessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         select_rows(
             &g.0,
             "SELECT ROLE, CONTENT FROM ZC_SESSIONS
@@ -375,11 +379,8 @@ impl SessionBackend for Db2SessionBackend {
 
         let Some(id) = max_id else { return Ok(false) };
 
-        conn.execute(
-            "DELETE FROM ZC_SESSIONS WHERE ID = ?",
-            &id,
-        )
-        .map_err(std::io::Error::other)?;
+        conn.execute("DELETE FROM ZC_SESSIONS WHERE ID = ?", &id)
+            .map_err(std::io::Error::other)?;
 
         conn.execute(
             "UPDATE ZC_SESSION_META
@@ -394,7 +395,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn list_sessions(&self) -> Vec<String> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         select_rows(
             &g.0,
             "SELECT SESSION_KEY FROM ZC_SESSION_META ORDER BY LAST_ACTIVITY DESC",
@@ -406,7 +409,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         select_rows(
             &g.0,
             "SELECT SESSION_KEY, NAME, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
@@ -425,9 +430,7 @@ impl SessionBackend for Db2SessionBackend {
 
         // Compute the cutoff timestamp in Rust — Db2 does not support
         // NUMTODSINTERVAL even in Oracle compat mode.
-        let cutoff = fmt_ts(
-            &(Utc::now() - chrono::Duration::hours(i64::from(ttl_hours))),
-        );
+        let cutoff = fmt_ts(&(Utc::now() - chrono::Duration::hours(i64::from(ttl_hours))));
 
         let stale: Vec<String> = select_rows(
             conn,
@@ -457,7 +460,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn search(&self, query: &SessionQuery) -> Vec<SessionMetadata> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         let conn = &g.0;
         let Some(ref kw) = query.keyword else {
             return self.list_sessions_with_metadata();
@@ -527,7 +532,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
-        let Ok(g) = self.pool.get() else { return Ok(None) };
+        let Ok(g) = self.pool.get() else {
+            return Ok(None);
+        };
         let rows = select_rows(
             &g.0,
             "SELECT NAME FROM ZC_SESSION_META WHERE SESSION_KEY = ?",
@@ -560,7 +567,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
-        let Ok(g) = self.pool.get() else { return Ok(None) };
+        let Ok(g) = self.pool.get() else {
+            return Ok(None);
+        };
         let rows = select_rows(
             &g.0,
             "SELECT STATE, TURN_ID, TURN_STARTED_AT
@@ -585,7 +594,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         select_rows(
             &g.0,
             "SELECT SESSION_KEY, NAME, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
@@ -600,11 +611,11 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn list_stuck_sessions(&self, threshold_secs: u64) -> Vec<SessionMetadata> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         // Compute cutoff in Rust — Db2 does not support NUMTODSINTERVAL.
-        let cutoff = fmt_ts(
-            &(Utc::now() - chrono::Duration::seconds(threshold_secs as i64)),
-        );
+        let cutoff = fmt_ts(&(Utc::now() - chrono::Duration::seconds(threshold_secs as i64)));
         select_rows(
             &g.0,
             "SELECT SESSION_KEY, NAME, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
@@ -633,7 +644,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
-        let Ok(g) = self.pool.get() else { return Vec::new() };
+        let Ok(g) = self.pool.get() else {
+            return Vec::new();
+        };
         select_rows(
             &g.0,
             "SELECT ROLE, CONTENT, CREATED_AT FROM ZC_SESSIONS
@@ -646,9 +659,7 @@ impl SessionBackend for Db2SessionBackend {
             let ts = row
                 .get(2)
                 .and_then(|v| v.as_deref())
-                .and_then(|s| {
-                    DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok()
-                })
+                .and_then(|s| DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok())
                 .map(|dt| dt.with_timezone(&Utc));
             TimestampedMessage {
                 message: ChatMessage {
@@ -694,11 +705,7 @@ impl SessionBackend for Db2SessionBackend {
         Ok(n)
     }
 
-    fn set_session_agent_alias(
-        &self,
-        session_key: &str,
-        agent_alias: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let g = self.pool.get().map_err(std::io::Error::other)?;
         let alias_val = if agent_alias.is_empty() {
             VarCharBox::null()
@@ -723,7 +730,9 @@ impl SessionBackend for Db2SessionBackend {
     }
 
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
-        let Ok(g) = self.pool.get() else { return Ok(None) };
+        let Ok(g) = self.pool.get() else {
+            return Ok(None);
+        };
         let rows = select_rows(
             &g.0,
             "SELECT AGENT_ALIAS FROM ZC_SESSION_META WHERE SESSION_KEY = ?",
@@ -795,7 +804,10 @@ mod tests {
                 .unwrap()
                 .as_millis()
         );
-        let msg = ChatMessage { role: "user".into(), content: "hello db2".into() };
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello db2".into(),
+        };
         backend.append(&key, &msg).expect("append");
 
         let loaded = backend.load(&key);
