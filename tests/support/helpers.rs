@@ -10,7 +10,7 @@ use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::Memory;
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::Tool;
 
 /// Create an in-memory "none" backend for tests.
@@ -48,9 +48,9 @@ pub fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 }
 
 /// Build an agent with `NativeToolDispatcher`.
-pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -61,9 +61,9 @@ pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Ag
 }
 
 /// Build an agent with `XmlToolDispatcher`.
-pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -75,12 +75,12 @@ pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -
 
 /// Build an agent with optional custom `MemoryLoader`.
 pub fn build_recording_agent(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
 ) -> Agent {
     let mut builder = Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(make_memory())
         .observer(make_observer())
@@ -96,7 +96,7 @@ pub fn build_recording_agent(
 
 /// Build an agent with real `SqliteMemory` in a temporary directory.
 pub fn build_agent_with_sqlite_memory(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     temp_dir: &std::path::Path,
 ) -> Agent {
@@ -106,7 +106,7 @@ pub fn build_agent_with_sqlite_memory(
     };
     let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());
     Agent::builder()
-        .provider(provider)
+        .model_provider(model_provider)
         .tools(tools)
         .memory(mem)
         .observer(make_observer())

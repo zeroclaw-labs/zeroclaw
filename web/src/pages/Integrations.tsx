@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Puzzle, Check, Zap, Clock } from 'lucide-react';
+import { Puzzle, Check, Zap } from 'lucide-react';
 import type { Integration } from '@/types/api';
 import { getIntegrations } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -21,14 +21,6 @@ function statusBadge(status: Integration['status']) {
         color: 'var(--pc-accent)',
         border: 'var(--pc-accent-dim)',
         bg: 'var(--pc-accent-glow)'
-      };
-    case 'ComingSoon':
-      return {
-        icon: Clock,
-        label: t('integrations.status_coming_soon'),
-        color: 'var(--pc-text-muted)',
-        border: 'var(--pc-border)',
-        bg: 'transparent'
       };
   }
 }
@@ -62,7 +54,7 @@ export default function Integrations() {
   if (error) {
     return (
     <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+      <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
         {t('integrations.load_error')}: {error}
       </div>
     </div>

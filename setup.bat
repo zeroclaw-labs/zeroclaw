@@ -53,8 +53,8 @@ if defined FREE_RAM_MB (
 )
 
 :: Check disk space
-for /f "tokens=3" %%a in ('dir /-C "%~dp0" 2^>nul ^| findstr /C:"bytes free"') do (
-    set /a "FREE_DISK_GB=%%a / 1073741824"
+for /f %%a in ('powershell -Command "[math]::Round((Get-PSDrive $env:SystemDrive).Free / 1GB)"') do (
+    set "FREE_DISK_GB=%%a"
 )
 
 :: Check Rust
@@ -70,7 +70,7 @@ if %ERRORLEVEL% NEQ 0 (
 :: Check Node.js (optional)
 where node >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Node.js not found (optional - web dashboard will use stub).%RESET%
+    echo   %YELLOW%Node.js not found - optional, web dashboard will use stub%RESET%
 ) else (
     for /f "tokens=1" %%v in ('node --version 2^>nul') do set "NODE_VER=%%v"
     echo   %GREEN%OK%RESET% Node.js !NODE_VER! found
@@ -128,7 +128,7 @@ if "%MODE%"=="full"     goto :build_full
 echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
-echo   2) Minimal build     - Default features only (~15 min)
+echo   2) Minimal build     - Core only (^--no-default-features, ~15 min)
 echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
 echo   4) Full build        - All features including hardware + browser (~30 min)
 echo.
@@ -164,7 +164,7 @@ if not defined DOWNLOAD_URL (
 echo   Downloading from release...
 curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build (standard).%RESET%
+    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - standard%RESET%
     goto :build_standard
 )
 
@@ -185,12 +185,12 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo   %GREEN%OK%RESET% Binary installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
-goto :post_install
+goto verify
 
 :: ---- Minimal build ----
 :build_minimal
-set "FEATURES="
-set "BUILD_DESC=minimal (default features)"
+set "FEATURES=--no-default-features"
+set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :: ---- Standard build ----
@@ -227,14 +227,15 @@ rustup target add %TARGET% >nul 2>&1
 echo   This may take 15-30 minutes on first build...
 echo.
 
+echo   Command: cargo build --release --locked %FEATURES% --target %TARGET%
 cargo build --release --locked %FEATURES% --target %TARGET%
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo   %RED%ERROR: Build failed.%RESET%
     echo   Common fixes:
-    echo   - Ensure Visual Studio Build Tools are installed (C++ workload)
+    echo   - Ensure Visual Studio Build Tools are installed - C++ workload
     echo   - Run: rustup update
-    echo   - Check disk space (6 GB needed)
+    echo   - Check disk space - 6 GB needed
     goto :error_exit
 )
 
@@ -245,7 +246,15 @@ echo.
 echo %BOLD%[4/5] Installing binary...%RESET%
 mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
 copy /Y "target\%TARGET%\release\zeroclaw.exe" "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" >nul
-echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+set "BIN_PATH=%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
+for /f %%S in ('powershell -NoProfile -Command "[math]::Round(((Get-Item -LiteralPath ''%BIN_PATH%'').Length / 1MB), 2)"') do (
+    set "BINARY_MB=%%S"
+)
+if defined BINARY_MB (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(%BINARY_MB% MB^)
+) else (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(size unavailable^)
+)
 
 :: Add to PATH if not already there
 echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
@@ -255,10 +264,10 @@ if %ERRORLEVEL% NEQ 0 (
     echo   %GREEN%OK%RESET% Added to PATH
 )
 
-goto :post_install
+goto verify
 
 :: ---- Post install ----
-:post_install
+:verify
 echo.
 echo %BOLD%[5/5] Verifying installation...%RESET%
 
@@ -285,8 +294,14 @@ echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
-echo     2. Run: zeroclaw init
+if /I "%MODE%"=="minimal" (
+echo     2. Minimal build excludes onboarding ^(zeroclaw onboard is unavailable^)
+echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
+) else (
+echo     2. Run: zeroclaw onboard
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
+)
 echo.
 echo   Alternative install via Scoop:
 echo     scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
@@ -305,7 +320,7 @@ echo Usage: setup.bat [OPTIONS]
 echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
-echo   --minimal     Build with default features only
+echo   --minimal     Build core only ^(--no-default-features^)
 echo   --standard    Build with Matrix + Lark/Feishu
 echo   --full        Build with all features
 echo   --help, -h    Show this help message

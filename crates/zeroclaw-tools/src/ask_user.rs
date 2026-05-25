@@ -30,7 +30,7 @@ pub struct AskUserTool {
 
 impl AskUserTool {
     /// Create a new ask_user tool with an empty channel map.
-    /// Call [`channel_map_handle`] and write to the returned handle once channels
+    /// Call `channel_map_handle` and write to the returned handle once channels
     /// are available.
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
@@ -124,7 +124,16 @@ impl Tool for AskUserTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "question"})),
+                    "ask_user: missing question parameter"
+                );
+                anyhow::Error::msg("Missing 'question' parameter")
+            })?
             .to_string();
 
         let choices: Option<Vec<String>> = args.get("choices").and_then(|v| {
@@ -159,21 +168,83 @@ impl Tool for AskUserTool {
             }
             if let Some(ref name) = requested_channel {
                 let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
-                    let available: Vec<String> = channels.keys().cloned().collect();
-                    anyhow::anyhow!(
-                        "Channel '{}' not found. Available: {}",
-                        name,
-                        available.join(", ")
-                    )
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "ask_user: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
                 })?;
                 (name.clone(), ch)
             } else {
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
-                    anyhow::anyhow!("No channels available. Configure at least one channel.")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "ask_user: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
                 })?;
                 (name.clone(), ch.clone())
             }
         };
+
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        // Prefer the channel's native structured-choice flow when choices are
+        // present (e.g. ACP `session/request_permission`, Telegram inline
+        // keyboard). Channels that don't implement it return `Ok(None)` and
+        // we fall through to the generic send + listen path.
+        if let Some(ref choices_vec) = choices
+            && !choices_vec.is_empty()
+        {
+            match channel
+                .request_choice(&question, choices_vec, timeout)
+                .await
+            {
+                Ok(Some(answer)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: answer,
+                        error: None,
+                    });
+                }
+                Ok(None) => { /* fall through to send+listen */ }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to ask question on channel '{channel_name}': {e}"
+                        )),
+                    });
+                }
+            }
+        } else if !channel.supports_free_form_ask() {
+            // Free-form ask_user has no first-class ACP method yet. The ACP
+            // elicitation RFD is the future fix — until it lands, agents
+            // talking to ACP clients must supply `choices` so we can route
+            // through `session/request_permission`.
+            // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Channel '{channel_name}' requires `choices` for ask_user \
+                     (free-form questions await ACP elicitation RFD)"
+                )),
+            });
+        }
 
         // Format and send the question
         let text = format_question(&question, choices.as_deref());
@@ -190,7 +261,6 @@ impl Tool for AskUserTool {
 
         // Listen for user response with timeout
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
-        let timeout = std::time::Duration::from_secs(timeout_secs);
 
         // Spawn a listener task on the channel
         let listen_channel = Arc::clone(&channel);
@@ -242,6 +312,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for SilentChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for SilentChannel {
         fn name(&self) -> &str {
@@ -280,6 +361,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for RespondingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for RespondingChannel {
         fn name(&self) -> &str {
@@ -301,10 +393,12 @@ mod tests {
                 reply_target: "user".to_string(),
                 content: self.response.clone(),
                 channel: self.channel_name.clone(),
+                channel_alias: None,
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             };
             let _ = tx.send(msg).await;
             Ok(())

@@ -6,7 +6,7 @@ use std::fs;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -23,22 +23,41 @@ impl ModelRoutingConfigTool {
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
         let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config.config_path.display().to_string(),
+                        "error": format!("{}", error),
+                    })),
+                "model_routing_config: failed to read config file"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {}: {error}",
                 self.config.config_path.display()
-            )
+            ))
         })?;
 
-        let compat: zeroclaw_config::migration::V1Compat =
-            toml::from_str(&contents).map_err(|error| {
-                anyhow::anyhow!(
+        let mut parsed =
+            zeroclaw_config::migration::migrate_to_current(&contents).map_err(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "path": self.config.config_path.display().to_string(),
+                            "error": format!("{}", error),
+                        })),
+                    "model_routing_config: failed to parse config file"
+                );
+                anyhow::Error::msg(format!(
                     "Failed to parse config file {}: {error}",
                     self.config.config_path.display()
-                )
+                ))
             })?;
-        let mut parsed = compat.into_config();
         parsed.config_path = self.config.config_path.clone();
-        parsed.workspace_dir = self.config.workspace_dir.clone();
+        parsed.data_dir = self.config.data_dir.clone();
         Ok(parsed)
     }
 
@@ -75,9 +94,16 @@ impl ModelRoutingConfigTool {
         if let Some(array) = raw.as_array() {
             let mut out = Vec::new();
             for item in array {
-                let value = item
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'{field}' array must only contain strings"))?;
+                let value = item.as_str().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"field": field})),
+                        "model_routing_config: array element must be a string"
+                    );
+                    anyhow::Error::msg(format!("'{field}' array must only contain strings"))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     out.push(trimmed.to_string());
@@ -93,7 +119,16 @@ impl ModelRoutingConfigTool {
         let value = args
             .get(field)
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Missing '{field}'"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": field})),
+                    "model_routing_config: missing required string param"
+                );
+                anyhow::Error::msg(format!("Missing '{field}'"))
+            })?
             .trim();
 
         if value.is_empty() {
@@ -114,7 +149,16 @@ impl ModelRoutingConfigTool {
 
         let value = raw
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"field": field})),
+                    "model_routing_config: field must be string or null"
+                );
+                anyhow::Error::msg(format!("'{field}' must be a string or null"))
+            })?
             .trim()
             .to_string();
 
@@ -135,9 +179,16 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let value = raw
-            .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a number or null"))?;
+        let value = raw.as_f64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: field must be number or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a number or null"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -150,11 +201,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a non-negative integer or null"))?;
-        let value = usize::try_from(raw_value)
-            .map_err(|_| anyhow::anyhow!("'{field}' is too large for this platform"))?;
+        let raw_value = raw.as_u64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: usize field must be non-negative integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a non-negative integer or null"))
+        })?;
+        let value = usize::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: usize value too large"
+            );
+            anyhow::Error::msg(format!("'{field}' is too large for this platform"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -167,11 +233,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a non-negative integer or null"))?;
-        let value =
-            u32::try_from(raw_value).map_err(|_| anyhow::anyhow!("'{field}' must fit in u32"))?;
+        let raw_value = raw.as_u64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: u32 field must be non-negative integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a non-negative integer or null"))
+        })?;
+        let value = u32::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: u32 value too large"
+            );
+            anyhow::Error::msg(format!("'{field}' must fit in u32"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -184,11 +265,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be an integer or null"))?;
-        let value =
-            i32::try_from(raw_value).map_err(|_| anyhow::anyhow!("'{field}' must fit in i32"))?;
+        let raw_value = raw.as_i64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: i32 field must be integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be an integer or null"))
+        })?;
+        let value = i32::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: i32 value out of range"
+            );
+            anyhow::Error::msg(format!("'{field}' must fit in i32"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -197,9 +293,16 @@ impl ModelRoutingConfigTool {
             return Ok(None);
         };
 
-        let value = raw
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a boolean"))?;
+        let value = raw.as_bool().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: field must be boolean"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a boolean"))
+        })?;
         Ok(Some(value))
     }
 
@@ -216,7 +319,7 @@ impl ModelRoutingConfigTool {
 
         json!({
             "hint": route.hint,
-            "provider": route.provider,
+            "model_provider": route.model_provider,
             "model": route.model,
             "api_key_configured": route
                 .api_key
@@ -227,7 +330,7 @@ impl ModelRoutingConfigTool {
     }
 
     fn snapshot(cfg: &Config) -> Value {
-        let mut routes = cfg.providers.model_routes.clone();
+        let mut routes = cfg.model_routes.clone();
         routes.sort_by(|a, b| a.hint.cmp(&b.hint));
 
         let mut rules = cfg.query_classification.rules.clone();
@@ -260,30 +363,27 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
+            let risk = cfg.risk_profiles.get(&agent.risk_profile);
+            let runtime = cfg.runtime_profiles.get(&agent.runtime_profile);
             agents.insert(
                 name.clone(),
                 json!({
-                    "provider": agent.provider,
-                    "model": agent.model,
-                    "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "temperature": agent.temperature,
-                    "max_depth": agent.max_depth,
-                    "agentic": agent.agentic,
-                    "allowed_tools": agent.allowed_tools,
-                    "max_iterations": agent.max_iterations,
+                    "model_provider": agent.model_provider,
+                    "risk_profile": agent.risk_profile,
+                    "runtime_profile": agent.runtime_profile,
+                    "max_delegation_depth": runtime.map(|r| r.max_delegation_depth),
+                    "agentic": runtime.map(|r| r.agentic),
+                    "allowed_tools": risk.map(|r| &r.allowed_tools),
+                    "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
                 }),
             );
         }
 
         json!({
             "default": {
-                "provider": cfg.providers.fallback,
-                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
+                "model_provider": cfg.first_model_provider_type(),
+                "model": cfg.first_model_provider().and_then(|e| e.model.as_deref()),
+                "temperature": cfg.first_model_provider().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -333,12 +433,8 @@ impl ModelRoutingConfigTool {
 
     fn handle_list_hints(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
-        let mut route_hints: Vec<String> = cfg
-            .providers
-            .model_routes
-            .iter()
-            .map(|r| r.hint.clone())
-            .collect();
+        let mut route_hints: Vec<String> =
+            cfg.model_routes.iter().map(|r| r.hint.clone()).collect();
         route_hints.sort();
         route_hints.dedup();
 
@@ -360,14 +456,14 @@ impl ModelRoutingConfigTool {
                     "conversation": {
                         "action": "upsert_scenario",
                         "hint": "conversation",
-                        "provider": "kimi",
+                        "model_provider": "kimi",
                         "model": "moonshot-v1-8k",
                         "classification_enabled": false
                     },
                     "coding": {
                         "action": "upsert_scenario",
                         "hint": "coding",
-                        "provider": "openai",
+                        "model_provider": "openai",
                         "model": "gpt-5.3-codex",
                         "classification_enabled": true,
                         "keywords": ["code", "bug", "refactor", "test"],
@@ -381,7 +477,7 @@ impl ModelRoutingConfigTool {
     }
 
     async fn handle_set_default(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let provider_update = Self::parse_optional_string_update(args, "provider")?;
+        let provider_update = Self::parse_optional_string_update(args, "model_provider")?;
         let model_update = Self::parse_optional_string_update(args, "model")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
 
@@ -390,37 +486,51 @@ impl ModelRoutingConfigTool {
             || !matches!(temperature_update, MaybeSet::Unset);
 
         if !any_update {
-            anyhow::bail!("set_default requires at least one of: provider, model, temperature");
+            anyhow::bail!(
+                "set_default requires at least one of: model_provider, model, temperature"
+            );
         }
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg
-            .providers
-            .fallback
-            .as_deref()
-            .and_then(|name| cfg.providers.models.get(name))
-            .cloned();
+        // Capture previous first-provider entry for rollback on probe failure.
+        let previous_first_model_provider = cfg.first_model_provider().cloned();
 
-        let fallback_name = match &provider_update {
-            MaybeSet::Set(provider) => {
-                cfg.providers.fallback = Some(provider.clone());
-                provider.clone()
+        // Determine which models entry to update.
+        let (type_k, alias_k) = match &provider_update {
+            MaybeSet::Set(model_provider) => model_provider
+                .split_once('.')
+                .map(|(t, a)| (t.to_string(), a.to_string()))
+                .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
+            MaybeSet::Null | MaybeSet::Unset => {
+                // Update whichever entry is already first, or create a placeholder.
+                cfg.providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(t, a, _)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
-            MaybeSet::Null => {
-                cfg.providers.fallback = None;
-                "default".to_string()
-            }
-            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
-                let name = "default".to_string();
-                cfg.providers.fallback = Some(name.clone());
-                name
-            }),
         };
-
-        let entry = cfg.providers.models.entry(fallback_name).or_default();
+        let entry = cfg
+            .providers
+            .models
+            .ensure(&type_k, &alias_k)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider_type": &type_k,
+                            "alias": &alias_k,
+                        })),
+                    "model_routing_config: unknown model_provider type"
+                );
+                anyhow::Error::msg(format!(
+                    "unknown model_provider type `{type_k}`. no typed slot in ModelProviders"
+                ))
+            })?;
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -445,27 +555,27 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.clone();
-        let current_model = cfg
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.model.clone());
-        if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
+        let current_model = cfg.first_model_provider().and_then(|e| e.model.clone());
+        let provider_name = format!("{type_k}.{alias_k}");
+        if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_fallback_provider
+                let reverted_model = previous_first_model_provider
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback to previous config.
-                cfg.providers.fallback = previous_provider;
-                if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.as_deref()
+                // Rollback: restore the previous entry's baseline fields for
+                // this type.alias slot. Family-specific extras on the typed
+                // family config are NOT touched — they survive the modify+
+                // restore cycle because we only ever mutated baseline fields
+                // (model, temperature, api_key) above.
+                if let Some(prev_entry) = previous_first_model_provider
+                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
-                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                    *slot = prev_entry;
                 }
                 cfg.save().await?;
 
@@ -479,16 +589,13 @@ impl ModelRoutingConfigTool {
             }
             // Retryable errors (e.g. transient network issues) — keep the
             // new config and let the resilient wrapper handle retries.
-            tracing::warn!(
-                model = %model_name,
-                "Model probe returned retryable error (keeping new config): {probe_err}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model": model_name, "probe_err": probe_err.to_string()})), "Model probe returned retryable error (keeping new config)");
         }
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Default provider/model settings updated",
+                "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
             }))?,
             error: None,
@@ -498,33 +605,38 @@ impl ModelRoutingConfigTool {
     /// Send a minimal 1-token chat request to verify the model is accessible.
     /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
     /// (the probe would fail with an auth error unrelated to model validity).
-    /// Provider construction failures are also treated as non-fatal.
+    /// ModelProvider construction failures are also treated as non-fatal.
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
         let api_key = self
             .config
-            .providers
-            .fallback_provider()
+            .first_model_provider()
             .and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
 
-        let provider = match zeroclaw_providers::create_provider_with_url(
+        let model_provider = match zeroclaw_providers::create_model_provider_with_url(
             provider_name,
             api_key,
             self.config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.as_deref()),
+                .first_model_provider()
+                .and_then(|e| e.uri.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
 
-        provider
-            .chat_with_system(Some("Respond with OK."), "ping", model, 0.0)
+        // Greedy sampling: the ping is a liveness check, not a generation task.
+        const PING_TEMPERATURE: f64 = 0.0;
+        model_provider
+            .chat_with_system(
+                Some("Respond with OK."),
+                "ping",
+                model,
+                Some(PING_TEMPERATURE),
+            )
             .await?;
 
         Ok(())
@@ -532,7 +644,7 @@ impl ModelRoutingConfigTool {
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let hint = Self::parse_non_empty_string(args, "hint")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
 
@@ -561,7 +673,6 @@ impl ModelRoutingConfigTool {
         let mut cfg = self.load_config_without_env()?;
 
         let existing_route = cfg
-            .providers
             .model_routes
             .iter()
             .find(|route| route.hint == hint)
@@ -569,13 +680,13 @@ impl ModelRoutingConfigTool {
 
         let mut next_route = existing_route.unwrap_or(ModelRouteConfig {
             hint: hint.clone(),
-            provider: provider.clone(),
+            model_provider: model_provider.clone(),
             model: model.clone(),
             api_key: None,
         });
 
         next_route.hint = hint.clone();
-        next_route.provider = provider;
+        next_route.model_provider = model_provider;
         next_route.model = model;
 
         match api_key_update {
@@ -584,11 +695,9 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        cfg.providers.model_routes.push(next_route);
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
+        cfg.model_routes.retain(|route| route.hint != hint);
+        cfg.model_routes.push(next_route);
+        Self::normalize_and_sort_routes(&mut cfg.model_routes);
 
         if should_touch_rule {
             if matches!(classification_enabled, Some(false)) {
@@ -675,11 +784,9 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let before_routes = cfg.providers.model_routes.len();
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        let routes_removed = before_routes.saturating_sub(cfg.providers.model_routes.len());
+        let before_routes = cfg.model_routes.len();
+        cfg.model_routes.retain(|route| route.hint != hint);
+        let routes_removed = before_routes.saturating_sub(cfg.model_routes.len());
 
         let mut rules_removed = 0usize;
         if remove_classification {
@@ -694,7 +801,7 @@ impl ModelRoutingConfigTool {
             anyhow::bail!("No scenario found for hint '{hint}'");
         }
 
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
+        Self::normalize_and_sort_routes(&mut cfg.model_routes);
         Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
         cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
 
@@ -715,10 +822,9 @@ impl ModelRoutingConfigTool {
 
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
 
-        let system_prompt_update = Self::parse_optional_string_update(args, "system_prompt")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
@@ -733,87 +839,95 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let mut next_agent = cfg
-            .agents
-            .get(&name)
-            .cloned()
-            .unwrap_or(DelegateAgentConfig {
-                provider: provider.clone(),
-                model: model.clone(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: DEFAULT_AGENT_MAX_DEPTH,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            });
-
-        next_agent.provider = provider;
-        next_agent.model = model;
-
-        match system_prompt_update {
-            MaybeSet::Set(value) => next_agent.system_prompt = Some(value),
-            MaybeSet::Null => next_agent.system_prompt = None,
-            MaybeSet::Unset => {}
-        }
-
-        match api_key_update {
-            MaybeSet::Set(value) => next_agent.api_key = Some(value),
-            MaybeSet::Null => next_agent.api_key = None,
-            MaybeSet::Unset => {}
-        }
-
-        match temperature_update {
-            MaybeSet::Set(value) => {
-                if !(0.0..=2.0).contains(&value) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                }
-                next_agent.temperature = Some(value);
+        // synthesize providers.models[model_provider_family][name] from inline brain params.
+        // The arg is the family name (e.g. "openai"); the agent's `model_provider`
+        // reference becomes the dotted form (e.g. "openai.coder").
+        let model_provider_family = model_provider;
+        let agent_model_provider_ref = format!("{model_provider_family}.{name}");
+        {
+            let provider_entry =
+                cfg.providers.models
+                    .ensure(&model_provider_family, &name)
+                    .ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "model_provider_family": &model_provider_family,
+                                    "name": &name,
+                                })),
+                            "model_routing_config: unknown model_provider family"
+                        );
+                        anyhow::Error::msg(format!(
+                            "unknown model_provider type `{model_provider_family}`. no typed slot in ModelProviders"
+                        ))
+                    })?;
+            provider_entry.model = Some(model.clone());
+            match api_key_update {
+                MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
+                MaybeSet::Null => provider_entry.api_key = None,
+                MaybeSet::Unset => {}
             }
-            MaybeSet::Null => next_agent.temperature = None,
-            MaybeSet::Unset => {}
+            match temperature_update {
+                MaybeSet::Set(value) => {
+                    if !(0.0..=2.0).contains(&value) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    provider_entry.temperature = Some(value);
+                }
+                MaybeSet::Null => provider_entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
         }
 
-        match max_depth_update {
-            MaybeSet::Set(value) => next_agent.max_depth = value,
-            MaybeSet::Null => next_agent.max_depth = DEFAULT_AGENT_MAX_DEPTH,
-            MaybeSet::Unset => {}
+        // synthesize risk_profiles[name] from allowed_tools (authorization).
+        {
+            let risk = cfg.risk_profiles.entry(name.clone()).or_default();
+            if let Some(tools) = allowed_tools_update {
+                risk.allowed_tools = tools;
+            }
         }
 
-        match max_iterations_update {
-            MaybeSet::Set(value) => next_agent.max_iterations = value,
-            MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
-            MaybeSet::Unset => {}
+        // synthesize runtime_profiles[name] from agentic/max_iterations/max_depth.
+        {
+            let runtime = cfg.runtime_profiles.entry(name.clone()).or_default();
+            if let Some(agentic) = agentic_update {
+                runtime.agentic = agentic;
+            }
+            if let MaybeSet::Set(iters) = max_iterations_update {
+                if iters == 0 {
+                    anyhow::bail!("'max_iterations' must be greater than 0");
+                }
+                runtime.max_tool_iterations = iters;
+            } else if runtime.max_tool_iterations == 0 {
+                runtime.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS;
+            }
+            if let MaybeSet::Set(depth) = max_depth_update {
+                if depth == 0 {
+                    anyhow::bail!("'max_depth' must be greater than 0");
+                }
+                runtime.max_delegation_depth = depth;
+            } else if runtime.max_delegation_depth == 0 {
+                runtime.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
+            }
+            if runtime.agentic {
+                let allowed_tools_empty = cfg
+                    .risk_profiles
+                    .get(&name)
+                    .is_none_or(|r| r.allowed_tools.is_empty());
+                if allowed_tools_empty {
+                    anyhow::bail!("Agent '{name}' has agentic=true but allowed_tools is empty.");
+                }
+            }
         }
 
-        if let Some(agentic) = agentic_update {
-            next_agent.agentic = agentic;
-        }
+        // Get or create the agent and wire up alias references.
+        let next_agent = cfg.agents.entry(name.clone()).or_default();
+        next_agent.model_provider = agent_model_provider_ref.into();
+        next_agent.risk_profile = name.clone();
+        next_agent.runtime_profile = name.clone();
 
-        if let Some(allowed_tools) = allowed_tools_update {
-            next_agent.allowed_tools = allowed_tools;
-        }
-
-        if next_agent.max_depth == 0 {
-            anyhow::bail!("'max_depth' must be greater than 0");
-        }
-
-        if next_agent.max_iterations == 0 {
-            anyhow::bail!("'max_iterations' must be greater than 0");
-        }
-
-        if next_agent.agentic && next_agent.allowed_tools.is_empty() {
-            anyhow::bail!(
-                "Agent '{name}' has agentic=true but allowed_tools is empty. Set allowed_tools or disable agentic mode."
-            );
-        }
-
-        cfg.agents.insert(name.clone(), next_agent);
         cfg.save().await?;
 
         Ok(ToolResult {
@@ -832,7 +946,7 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
         if cfg.agents.remove(&name).is_none() {
-            anyhow::bail!("No delegate agent found with name '{name}'");
+            anyhow::bail!("No aliased agent found with name '{name}'");
         }
 
         cfg.save().await?;
@@ -840,7 +954,7 @@ impl ModelRoutingConfigTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Delegate agent removed",
+                "message": "Aliased agent removed",
                 "name": name,
                 "config": Self::snapshot(&cfg),
             }))?,
@@ -856,7 +970,7 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario-based model_provider/model routes, classification rules, and aliased agent profiles"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -880,9 +994,9 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "string",
                     "description": "Scenario hint name (for example: conversation, coding, reasoning)"
                 },
-                "provider": {
+                "model_provider": {
                     "type": "string",
-                    "description": "Provider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
                 },
                 "model": {
                     "type": "string",
@@ -894,7 +1008,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "api_key": {
                     "type": ["string", "null"],
-                    "description": "Optional API key override for scenario route or delegate agent"
+                    "description": "Optional API key override for scenario route or aliased agent"
                 },
                 "keywords": {
                     "description": "Classification keywords for upsert_scenario (string or string array)",
@@ -934,11 +1048,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Delegate sub-agent name for upsert_agent/remove_agent"
-                },
-                "system_prompt": {
-                    "type": ["string", "null"],
-                    "description": "Optional system prompt override for delegate agent"
+                    "description": "Aliased agent name for upsert_agent/remove_agent"
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
@@ -947,7 +1057,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "agentic": {
                     "type": "boolean",
-                    "description": "Enable tool-call loop mode for delegate agent"
+                    "description": "Enable tool-call loop mode for aliased agent"
                 },
                 "allowed_tools": {
                     "description": "Allowed tools for agentic delegate mode (string or string array)",
@@ -1032,7 +1142,7 @@ mod tests {
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
@@ -1048,7 +1158,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "kimi",
+                "model_provider": "moonshot",
                 "model": "moonshot-v1-8k",
                 "temperature": 0.2
             }))
@@ -1058,8 +1168,8 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         let output: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(
-            output["config"]["default"]["provider"].as_str(),
-            Some("kimi")
+            output["config"]["default"]["model_provider"].as_str(),
+            Some("moonshot")
         );
         assert_eq!(
             output["config"]["default"]["model"].as_str(),
@@ -1080,7 +1190,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
@@ -1101,7 +1211,7 @@ mod tests {
         let scenarios = output["scenarios"].as_array().unwrap();
         assert!(scenarios.iter().any(|item| {
             item["hint"] == json!("coding")
-                && item["provider"] == json!("openai")
+                && item["model_provider"] == json!("openai")
                 && item["model"] == json!("gpt-5.3-codex")
         }));
     }
@@ -1115,7 +1225,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code"]
@@ -1147,7 +1257,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_agent",
                 "name": "coder",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "agentic": true,
                 "allowed_tools": ["file_read", "file_write", "shell"],
@@ -1159,8 +1269,13 @@ mod tests {
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
-        assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
+        // V3 surfaces the dotted alias ref on the agent. The actual model
+        // string lives under model_providers.openai.coder (synthesized
+        // from the `model` upsert arg).
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("openai.coder")
+        );
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
 
         let remove = tool
@@ -1186,7 +1301,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "openai"
+                "model_provider": "openai"
             }))
             .await
             .unwrap();
@@ -1206,7 +1321,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "anthropic",
+                "model_provider": "anthropic",
                 "model": "totally-fake-model-12345"
             }))
             .await
@@ -1223,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
         // Temperature-only changes don't set a new model, so the probe should
-        // not fire at all (no provider/model to probe).
+        // not fire at all (no model_provider/model to probe).
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 

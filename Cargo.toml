@@ -1,29 +1,31 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
+exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.7.3"
+version = "0.8.0-beta-1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-1" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-1" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-1" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-1" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-1" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-1" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-1", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.8.0-beta-1" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-1" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-1" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-1" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-1" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-1" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
@@ -33,6 +35,7 @@ name = "zeroclawlabs"
 # on crates.io. Flip or remove this once the multi-crate publish topology is
 # designed per RFC #5579.
 publish = false
+default-run = "zeroclaw"
 version.workspace = true
 edition.workspace = true
 authors = ["theonlyhennygod"]
@@ -51,12 +54,17 @@ include = [
   "/LICENSE*",
   "/README.md",
   "/web/dist/**/*",
-  "/tool_descriptions/**/*",
+  "/locales/**/*",
 ]
 
 [[bin]]
 name = "zeroclaw"
 path = "src/main.rs"
+
+[[bin]]
+name = "zeroclaw-acp-bridge"
+path = "src/bin/zeroclaw-acp-bridge.rs"
+required-features = ["acp-bridge"]
 
 [lib]
 name = "zeroclaw"
@@ -66,7 +74,8 @@ path = "src/lib.rs"
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-config.workspace = true
+zeroclaw-config = { workspace = true, features = ["clap"] }
+zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
@@ -81,6 +90,7 @@ zeroclaw-macros.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+clap-markdown = "0.1"
 
 # Async runtime - feature-optimized for size
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
@@ -104,8 +114,6 @@ shellexpand = "3.1"
 schemars = "1.2"
 
 # Logging - minimal
-tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
@@ -116,8 +124,6 @@ urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
-
-rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -204,7 +210,7 @@ tokio-rustls = { version = "0.26.4", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 
@@ -224,7 +230,7 @@ mime_guess = { version = "2", optional = true }
 
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
-# Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
+# Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
@@ -233,12 +239,17 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "default-channels",
+    "acp-bridge",
+    "gateway",
+    "tui-onboarding",
     "observability-prometheus",
     "schema-export",
 ]
 
-# The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
+# The core agent runtime — agent loop, tools, persistence subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
+# Channels are opt-in via `default-channels` (all) or individual `channel-*` features.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
@@ -246,31 +257,37 @@ agent-runtime = [
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
-    "dep:lettre", "dep:mail-parser", "dep:async-imap",
-    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
-    "dep:mime_guess",
-    "gateway", "tui-onboarding",
+]
+
+# All channel features in one bundle. Included in `default` for backward compatibility.
+# For selective builds, use individual `channel-*` features instead.
+default-channels = [
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
-    "channel-twitter", "channel-reddit", "channel-notion",
+    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
     "channel-linq", "channel-wati", "channel-nextcloud",
-    "channel-mochat", "channel-wecom", "channel-clawdtalk",
+    "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
     "channel-voice-call",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
-gateway = ["dep:zeroclaw-gateway"]
+gateway = [
+    "dep:zeroclaw-gateway",
+    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
+    "dep:mime_guess",
+]
 tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
 
-# Channels — each forwards directly to zeroclaw-channels (1 hop)
-channel-email = ["zeroclaw-channels/channel-email"]
+# Channels — each forwards to zeroclaw-channels.
+channel-email = ["zeroclaw-channels/channel-email", "dep:lettre", "dep:mail-parser", "dep:async-imap"]
 channel-telegram = ["zeroclaw-channels/channel-telegram"]
 channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
+channel-nostr = ["zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
 channel-matrix = ["zeroclaw-channels/channel-matrix"]
 channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
@@ -284,19 +301,24 @@ channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
 channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
+channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
 channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
+channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
 channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+channel-line = ["zeroclaw-channels/channel-line"]
 channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
@@ -311,8 +333,9 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
-rag-pdf = ["zeroclaw-tools/rag-pdf"]
-webauthn = ["zeroclaw-runtime/webauthn"]
+rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
+webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
+embedded-web = ["zeroclaw-gateway/embedded-web"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]
@@ -322,12 +345,13 @@ metrics = ["observability-prometheus"]
 # CI meta-feature
 ci-all = [
     "agent-runtime",
+    "default-channels",
     "channel-nostr", "channel-matrix", "whatsapp-web",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "plugins-wasm", "probe", "rag-pdf",
-    "webauthn",
+    "webauthn", "memory-postgres",
 ]
 
 [profile.dev]
@@ -382,6 +406,14 @@ path = "tests/test_system.rs"
 [[test]]
 name = "live"
 path = "tests/test_live.rs"
+
+# Architecture invariant gates. Fail-on-detect for patterns that
+# violate the workspace's ABSOLUTE RULE (AGENTS.md §1) — duplicate
+# state across the codebase. Run with `cargo test --test architecture`
+# during development; the workspace `cargo test` already includes it.
+[[test]]
+name = "architecture"
+path = "tests/test_architecture.rs"
 
 [[bench]]
 name = "agent_benchmarks"

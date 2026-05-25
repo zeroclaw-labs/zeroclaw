@@ -8,7 +8,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
@@ -19,6 +19,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
+use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use std::collections::HashSet;
@@ -29,7 +30,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
-use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -38,30 +38,60 @@ pub use zeroclaw_config::scattered_types::EmailConfig;
 
 type ImapSession = Session<TlsStream<TcpStream>>;
 
-/// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound
+/// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound.
+///
+/// Inbound sender authorization lives in `peer_groups` in V3; this channel
+/// resolves the authorized senders at message-time via [`Self::peer_resolver`]
+/// rather than reading a per-channel `allowed_senders` field (it no longer
+/// exists on `EmailConfig`).
 pub struct EmailChannel {
     pub config: EmailConfig,
+    /// The alias key under `[channels.email.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    pub alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     seen_messages: Arc<Mutex<HashSet<String>>>,
 }
 
 impl EmailChannel {
-    pub fn new(config: EmailConfig) -> Self {
+    pub fn new(
+        config: EmailConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             config,
+            alias: alias.into(),
+            peer_resolver,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Check if a sender email is in the allowlist
+    /// Check if a sender email is in the allowlist (peer group).
+    ///
+    /// Email allowlist entries support three syntaxes — preserved from
+    /// the legacy `EmailConfig::allowed_senders` semantics:
+    /// - `*`                wildcard, allow anyone.
+    /// - `user@host`        full address, case-insensitive.
+    /// - `@host` / `host`   domain match, case-insensitive.
     pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
+        let peers = (self.peer_resolver)();
+        Self::is_email_sender_allowed(&peers, email)
+    }
+
+    /// Pure, testable predicate that applies the email-allowlist match
+    /// semantics against an already-resolved peer list.
+    fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
+        if peers.is_empty() {
             return false; // Empty = deny all
         }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
+        if peers.iter().any(|a| a == "*") {
             return true; // Wildcard = allow all
         }
         let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
+        peers.iter().any(|allowed| {
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())
@@ -157,9 +187,14 @@ impl EmailChannel {
             // Check size limit
             total_size += data.len();
             if total_size > self.config.max_attachment_bytes {
-                warn!(
-                    "Attachment size limit exceeded ({} bytes), dropping remaining attachments",
-                    self.config.max_attachment_bytes
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Attachment size limit exceeded ({} bytes), dropping remaining attachments",
+                        self.config.max_attachment_bytes
+                    )
                 );
                 break;
             }
@@ -180,7 +215,11 @@ impl EmailChannel {
     /// Connect to IMAP server with TLS and authenticate
     async fn connect_imap(&self) -> Result<ImapSession> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
-        debug!("Connecting to IMAP server at {}", addr);
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Connecting to IMAP server at {}", addr)
+        );
 
         // Connect TCP
         let tcp = TcpStream::connect(&addr).await?;
@@ -203,9 +242,25 @@ impl EmailChannel {
         let session = client
             .login(&self.config.username, &self.config.password)
             .await
-            .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
+            .map_err(|(e, _)| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "imap_login",
+                            "error": format!("{}", e),
+                        })),
+                    "email: IMAP login failed"
+                );
+                anyhow::Error::msg(format!("IMAP login failed: {}", e))
+            })?;
 
-        debug!("IMAP login successful");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "IMAP login successful"
+        );
         Ok(session)
     }
 
@@ -226,7 +281,11 @@ impl EmailChannel {
             return Ok(Vec::new());
         }
 
-        debug!("Found {} unseen messages", uids.len());
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Found {} unseen messages", uids.len())
+        );
 
         let uid_list: Vec<u32> = uids.into_iter().collect();
         let mut results = Vec::new();
@@ -287,6 +346,7 @@ impl EmailChannel {
                         _uid: uid,
                         msg_id,
                         sender,
+                        subject,
                         content,
                         timestamp: ts,
                         attachments,
@@ -317,7 +377,11 @@ impl EmailChannel {
         let mut idle = session.idle();
         idle.init().await?;
 
-        debug!("Entering IMAP IDLE mode");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Entering IMAP IDLE mode"
+        );
 
         // wait() returns (future, stop_source) - we only need the future
         let (wait_future, _stop_source) = idle.wait();
@@ -327,7 +391,11 @@ impl EmailChannel {
 
         match result {
             Ok(Ok(response)) => {
-                debug!("IDLE response: {:?}", response);
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("IDLE response: {:?}", response)
+                );
                 // Done with IDLE, return session to normal mode
                 let session = idle.done().await?;
                 let wait_result = match response {
@@ -340,11 +408,25 @@ impl EmailChannel {
             Ok(Err(e)) => {
                 // Try to clean up IDLE state
                 let _ = idle.done().await;
-                Err(anyhow!("IDLE error: {}", e))
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "idle_wait",
+                            "error": format!("{}", e),
+                        })),
+                    "email: IDLE error"
+                );
+                Err(anyhow::Error::msg(format!("IDLE error: {}", e)))
             }
             Err(_) => {
                 // Timeout - RFC 2177 recommends restarting IDLE every 29 minutes
-                debug!("IDLE timeout reached, will re-establish");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "IDLE timeout reached, will re-establish"
+                );
                 let session = idle.done().await?;
                 Ok((IdleWaitResult::Timeout, session))
             }
@@ -367,9 +449,14 @@ impl EmailChannel {
                     return Ok(());
                 }
                 Err(e) => {
-                    error!(
-                        "IMAP session error: {}. Reconnecting in {:?}...",
-                        e, backoff
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!(
+                            "IMAP session error: {}. Reconnecting in {:?}...",
+                            e, backoff
+                        )
                     );
                     sleep(backoff).await;
                     // Exponential backoff with cap
@@ -400,16 +487,24 @@ impl EmailChannel {
         self.process_unseen(&mut session, tx).await?;
 
         if has_idle {
-            info!(
-                "Email channel listening on {} (IMAP IDLE, instant push)",
-                self.config.imap_folder
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Email channel listening on {} (IMAP IDLE, instant push)",
+                    self.config.imap_folder
+                )
             );
             self.run_idle_inner(session, tx).await
         } else {
             let poll_interval = Duration::from_secs(self.config.poll_interval_secs);
-            info!(
-                "Email channel listening on {} (IMAP polling, server lacks IDLE, interval: {:?})",
-                self.config.imap_folder, poll_interval
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Email channel listening on {} (IMAP polling, server lacks IDLE, interval: {:?})",
+                    self.config.imap_folder, poll_interval
+                )
             );
             self.run_poll_inner(session, tx, poll_interval).await
         }
@@ -425,7 +520,11 @@ impl EmailChannel {
             // Enter IDLE and wait for changes (consumes session, returns it via result)
             match self.wait_for_changes(session).await {
                 Ok((IdleWaitResult::NewMail, returned_session)) => {
-                    debug!("New mail notification received");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "New mail notification received"
+                    );
                     session = returned_session;
                     self.process_unseen(&mut session, tx).await?;
                 }
@@ -435,7 +534,11 @@ impl EmailChannel {
                     self.process_unseen(&mut session, tx).await?;
                 }
                 Ok((IdleWaitResult::Interrupted, _)) => {
-                    info!("IDLE interrupted, exiting");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "IDLE interrupted, exiting"
+                    );
                     return Ok(());
                 }
                 Err(e) => {
@@ -475,7 +578,12 @@ impl EmailChannel {
         for email in messages {
             // Check allowlist
             if !self.is_sender_allowed(&email.sender) {
-                warn!("Blocked email from {}", email.sender);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("Blocked email from {}", email.sender)
+                );
                 continue;
             }
 
@@ -493,10 +601,12 @@ impl EmailChannel {
                 sender: email.sender,
                 content: email.content,
                 channel: "email".to_string(),
+                channel_alias: Some(self.alias.clone()),
                 timestamp: email.timestamp,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: email.attachments,
+                subject: Some(email.subject),
             };
 
             if tx.send(msg).await.is_err() {
@@ -508,8 +618,24 @@ impl EmailChannel {
         Ok(())
     }
 
+    fn smtp_credentials(&self) -> Credentials {
+        let user = self
+            .config
+            .smtp_username
+            .as_deref()
+            .unwrap_or(&self.config.username)
+            .to_owned();
+        let pass = self
+            .config
+            .smtp_password
+            .as_deref()
+            .unwrap_or(&self.config.password)
+            .to_owned();
+        Credentials::new(user, pass)
+    }
+
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
-        let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
+        let creds = self.smtp_credentials();
         let transport = if self.config.smtp_tls {
             SmtpTransport::relay(&self.config.smtp_host)?
                 .port(self.config.smtp_port)
@@ -530,6 +656,7 @@ struct ParsedEmail {
     _uid: u32,
     msg_id: String,
     sender: String,
+    subject: String,
     content: String,
     timestamp: u64,
     attachments: Vec<zeroclaw_api::media::MediaAttachment>,
@@ -542,7 +669,26 @@ enum IdleWaitResult {
     Interrupted,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for EmailChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Email)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+fn markdown_to_html(md: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(md, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
+}
 #[async_trait]
+
 impl Channel for EmailChannel {
     fn name(&self) -> &str {
         "email"
@@ -563,53 +709,88 @@ impl Channel for EmailChannel {
             (default_subject, message.content.as_str())
         };
 
-        let email = if message.attachments.is_empty() {
-            // Existing plain-text path
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .singlepart(SinglePart::plain(body.to_string()))?
-        } else {
-            // Multipart with attachments
-            let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+        let mut builder = Message::builder()
+            .from(self.config.from_address.parse()?)
+            .to(message.recipient.parse()?)
+            .subject(subject);
+        if let Some(ref reply_id) = message.in_reply_to {
+            builder = builder.in_reply_to(reply_id.clone());
+        }
+        let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
+        for att in &message.attachments {
+            let content_type = att
+                .mime_type
+                .as_deref()
+                .and_then(|m| ContentType::parse(m).ok())
+                .unwrap_or_else(|| {
+                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                });
+            let att_data = if att.data.is_empty() && std::path::Path::new(&att.file_name).exists() {
+                std::fs::read(&att.file_name).map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "failed to read attachment '{}': {}",
+                        att.file_name, e
+                    ))
+                })?
+            } else {
+                att.data.clone()
+            };
+            let att_name = std::path::Path::new(&att.file_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&att.file_name)
+                .to_string();
+            att_parts.push((att_name, att_data, content_type));
+        }
 
-            for att in &message.attachments {
-                let content_type = att
-                    .mime_type
-                    .as_deref()
-                    .and_then(|m| ContentType::parse(m).ok())
-                    .unwrap_or_else(|| {
-                        ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
-                    });
-
-                let attachment =
-                    Attachment::new(att.file_name.clone()).body(att.data.clone(), content_type);
-
-                multipart = multipart.singlepart(attachment);
+        let email = if self.config.html_body {
+            let alt = MultiPart::alternative()
+                .singlepart(SinglePart::plain(body.to_string()))
+                .singlepart(SinglePart::html(markdown_to_html(body)));
+            if att_parts.is_empty() {
+                builder.multipart(alt)?
+            } else {
+                let mut mixed = MultiPart::mixed().multipart(alt);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
             }
-
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .multipart(multipart)?
+        } else {
+            let plain = SinglePart::plain(body.to_string());
+            if att_parts.is_empty() {
+                builder.singlepart(plain)?
+            } else {
+                let mut mixed = MultiPart::mixed().singlepart(plain);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
+            }
         };
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
-        info!(
-            "Email sent to {} ({} attachments)",
-            message.recipient,
-            message.attachments.len()
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Email sent to {} ({} attachments)",
+                message.recipient,
+                message.attachments.len()
+            )
         );
         Ok(())
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        info!(
-            "Starting email channel on {} (IDLE preferred, polling fallback)",
-            self.config.imap_folder
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Starting email channel on {} (IDLE preferred, polling fallback)",
+                self.config.imap_folder
+            )
         );
         self.listen_with_reconnect(tx).await
     }
@@ -623,11 +804,19 @@ impl Channel for EmailChannel {
                 true
             }
             Ok(Err(e)) => {
-                debug!("Health check failed: {}", e);
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("Health check failed: {}", e)
+                );
                 false
             }
             Err(_) => {
-                debug!("Health check timed out");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Health check timed out"
+                );
                 false
             }
         }
@@ -700,14 +889,16 @@ mod tests {
 
     #[tokio::test]
     async fn seen_messages_starts_empty() {
-        let channel = EmailChannel::new(EmailConfig::default());
+        let channel =
+            EmailChannel::new(EmailConfig::default(), "email_test_alias", empty_resolver());
         let seen = channel.seen_messages.lock().await;
         assert!(seen.is_empty());
     }
 
     #[tokio::test]
     async fn seen_messages_tracks_unique_ids() {
-        let channel = EmailChannel::new(EmailConfig::default());
+        let channel =
+            EmailChannel::new(EmailConfig::default(), "email_test_alias", empty_resolver());
         let mut seen = channel.seen_messages.lock().await;
 
         assert!(seen.insert("first-id".to_string()));
@@ -731,7 +922,20 @@ mod tests {
         assert_eq!(config.password, "");
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
-        assert!(config.allowed_senders.is_empty());
+    }
+
+    // EmailChannel tests
+    //
+    // Inbound peer authorization lives in `peer_groups` in V3; the
+    // channel resolves the authorized senders via a peer_resolver
+    // closure provided at construction.
+
+    fn empty_resolver() -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(Vec::new)
+    }
+
+    fn resolver_from(peers: Vec<String>) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(move || peers.clone())
     }
 
     #[test]
@@ -746,12 +950,15 @@ mod tests {
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
+            smtp_username: None,
+            smtp_password: None,
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             poll_interval_secs: 60,
-            allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
+            excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -771,26 +978,26 @@ mod tests {
             smtp_tls: true,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
+            smtp_username: None,
+            smtp_password: None,
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
-            allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
+            excluded_tools: vec![],
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
-        assert_eq!(cloned.allowed_senders, config.allowed_senders);
         assert_eq!(cloned.default_subject, config.default_subject);
     }
-
-    // EmailChannel tests
 
     #[tokio::test]
     async fn email_channel_new() {
         let config = EmailConfig::default();
-        let channel = EmailChannel::new(config.clone());
+        let channel = EmailChannel::new(config.clone(), "email_test_alias", empty_resolver());
         assert_eq!(channel.config.imap_host, config.imap_host);
 
         let seen_guard = channel.seen_messages.lock().await;
@@ -799,7 +1006,8 @@ mod tests {
 
     #[test]
     fn email_channel_name() {
-        let channel = EmailChannel::new(EmailConfig::default());
+        let channel =
+            EmailChannel::new(EmailConfig::default(), "email_test_alias", empty_resolver());
         assert_eq!(channel.name(), "email");
     }
 
@@ -807,22 +1015,19 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_empty_list_denies_all() {
-        let config = EmailConfig {
-            allowed_senders: vec![],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel =
+            EmailChannel::new(EmailConfig::default(), "email_test_alias", empty_resolver());
         assert!(!channel.is_sender_allowed("anyone@example.com"));
         assert!(!channel.is_sender_allowed("user@test.com"));
     }
 
     #[test]
     fn is_sender_allowed_wildcard_allows_all() {
-        let config = EmailConfig {
-            allowed_senders: vec!["*".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string()]),
+        );
         assert!(channel.is_sender_allowed("anyone@example.com"));
         assert!(channel.is_sender_allowed("user@test.com"));
         assert!(channel.is_sender_allowed("random@domain.org"));
@@ -830,11 +1035,11 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_specific_email() {
-        let config = EmailConfig {
-            allowed_senders: vec!["allowed@example.com".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["allowed@example.com".to_string()]),
+        );
         assert!(channel.is_sender_allowed("allowed@example.com"));
         assert!(!channel.is_sender_allowed("other@example.com"));
         assert!(!channel.is_sender_allowed("allowed@other.com"));
@@ -842,11 +1047,11 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_domain_with_at_prefix() {
-        let config = EmailConfig {
-            allowed_senders: vec!["@example.com".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["@example.com".to_string()]),
+        );
         assert!(channel.is_sender_allowed("user@example.com"));
         assert!(channel.is_sender_allowed("admin@example.com"));
         assert!(!channel.is_sender_allowed("user@other.com"));
@@ -854,11 +1059,11 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_domain_without_at_prefix() {
-        let config = EmailConfig {
-            allowed_senders: vec!["example.com".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["example.com".to_string()]),
+        );
         assert!(channel.is_sender_allowed("user@example.com"));
         assert!(channel.is_sender_allowed("admin@example.com"));
         assert!(!channel.is_sender_allowed("user@other.com"));
@@ -866,11 +1071,11 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_case_insensitive() {
-        let config = EmailConfig {
-            allowed_senders: vec!["Allowed@Example.COM".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["Allowed@Example.COM".to_string()]),
+        );
         assert!(channel.is_sender_allowed("allowed@example.com"));
         assert!(channel.is_sender_allowed("ALLOWED@EXAMPLE.COM"));
         assert!(channel.is_sender_allowed("AlLoWeD@eXaMpLe.cOm"));
@@ -878,15 +1083,15 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_multiple_senders() {
-        let config = EmailConfig {
-            allowed_senders: vec![
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec![
                 "user1@example.com".to_string(),
                 "user2@test.com".to_string(),
                 "@allowed.com".to_string(),
-            ],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+            ]),
+        );
         assert!(channel.is_sender_allowed("user1@example.com"));
         assert!(channel.is_sender_allowed("user2@test.com"));
         assert!(channel.is_sender_allowed("anyone@allowed.com"));
@@ -895,22 +1100,22 @@ mod tests {
 
     #[test]
     fn is_sender_allowed_wildcard_with_specific() {
-        let config = EmailConfig {
-            allowed_senders: vec!["*".to_string(), "specific@example.com".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string(), "specific@example.com".to_string()]),
+        );
         assert!(channel.is_sender_allowed("anyone@example.com"));
         assert!(channel.is_sender_allowed("specific@example.com"));
     }
 
     #[test]
     fn is_sender_allowed_empty_sender() {
-        let config = EmailConfig {
-            allowed_senders: vec!["@example.com".to_string()],
-            ..Default::default()
-        };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(
+            EmailConfig::default(),
+            "email_test_alias",
+            resolver_from(vec!["@example.com".to_string()]),
+        );
         assert!(!channel.is_sender_allowed(""));
         // "@example.com" ends with "@example.com" so it's allowed
         assert!(channel.is_sender_allowed("@example.com"));
@@ -1021,12 +1226,15 @@ mod tests {
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
+            smtp_username: None,
+            smtp_password: None,
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             poll_interval_secs: 60,
-            allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: vec![],
+            html_body: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1034,7 +1242,6 @@ mod tests {
 
         assert_eq!(deserialized.imap_host, config.imap_host);
         assert_eq!(deserialized.smtp_port, config.smtp_port);
-        assert_eq!(deserialized.allowed_senders, config.allowed_senders);
         assert_eq!(deserialized.default_subject, config.default_subject);
     }
 
@@ -1053,7 +1260,7 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
-        assert_eq!(config.default_subject, "ZeroClaw Message"); // default
+        assert_eq!(config.default_subject, "Re: Message"); // default
     }
 
     #[test]
@@ -1105,10 +1312,11 @@ mod tests {
     #[test]
     fn idle_timeout_propagates_to_channel() {
         let config = EmailConfig {
+            enabled: true,
             idle_timeout_secs: 600,
             ..Default::default()
         };
-        let channel = EmailChannel::new(config);
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         assert_eq!(channel.config.idle_timeout_secs, 600);
     }
 
@@ -1121,5 +1329,45 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("imap.debug.com"));
+    }
+
+    #[test]
+    fn email_config_smtp_credentials_default_to_none() {
+        let config = EmailConfig::default();
+        assert!(config.smtp_username.is_none());
+        assert!(config.smtp_password.is_none());
+    }
+
+    #[test]
+    fn smtp_credentials_fallback_to_shared() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        // Credentials doesn't expose fields directly, so round-trip via a
+        // fresh construction for comparison
+        let expected =
+            Credentials::new("shared@example.com".to_string(), "shared_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_uses_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("smtp@example.com".to_string()),
+            smtp_password: Some("smtp_pass".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
+        assert_eq!(creds, expected);
     }
 }

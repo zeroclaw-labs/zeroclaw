@@ -12,12 +12,12 @@
 //!    the **Pub/Sub Publisher** role on that topic.
 //! 2. Create a push subscription pointing to `https://<your-domain>/webhook/gmail`.
 //! 3. Configure `[channels_config.gmail_push]` in `config.toml` with `topic` and
-//!    `oauth_token` (or set `GMAIL_PUSH_OAUTH_TOKEN` env var).
+//!    `oauth_token`.
 //!
 //! The channel automatically calls `users.watch` to register the subscription
 //! and renews it before the 7-day expiry.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Client;
@@ -26,7 +26,6 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, error, info, warn};
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -169,8 +168,19 @@ pub struct WatchResponse {
 /// Incoming messages arrive via webhook (`POST /webhook/gmail`) and are
 /// dispatched to the agent.  The `listen` method registers the Gmail watch
 /// subscription and periodically renews it.
+///
+/// Inbound sender authorization lives in `peer_groups` in V3; this channel
+/// resolves the authorized senders at message-time via [`Self::peer_resolver`]
+/// rather than reading a per-channel `allowed_senders` field (it no longer
+/// exists on `GmailPushConfig`).
 pub struct GmailPushChannel {
     pub config: GmailPushConfig,
+    /// The alias key under `[channels.gmail.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    pub alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     http: Client,
     last_history_id: Arc<Mutex<u64>>,
     /// Sender half injected by the gateway to forward webhook-received messages.
@@ -178,40 +188,36 @@ pub struct GmailPushChannel {
 }
 
 impl GmailPushChannel {
-    pub fn new(config: GmailPushConfig) -> Self {
+    pub fn new(
+        config: GmailPushConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
         Self {
             config,
+            alias: alias.into(),
+            peer_resolver,
             http,
             last_history_id: Arc::new(Mutex::new(0)),
             tx: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Resolve the webhook secret from config or environment.
-    pub fn resolve_webhook_secret(&self) -> String {
-        if !self.config.webhook_secret.is_empty() {
-            return self.config.webhook_secret.clone();
-        }
-        std::env::var("GMAIL_PUSH_WEBHOOK_SECRET").unwrap_or_default()
-    }
-
-    /// Resolve the OAuth token from config or environment.
-    pub fn resolve_oauth_token(&self) -> String {
-        if !self.config.oauth_token.is_empty() {
-            return self.config.oauth_token.clone();
-        }
-        std::env::var("GMAIL_PUSH_OAUTH_TOKEN").unwrap_or_default()
-    }
-
     /// Register a Gmail watch subscription via `POST /gmail/v1/users/me/watch`.
     pub async fn register_watch(&self) -> Result<WatchResponse> {
-        let token = self.resolve_oauth_token();
+        let token = self.config.oauth_token.clone();
         if token.is_empty() {
-            return Err(anyhow!("Gmail OAuth token is not configured"));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Gmail OAuth token is not configured"
+            );
+            anyhow::bail!("Gmail OAuth token is not configured");
         }
 
         let body = serde_json::json!({
@@ -230,11 +236,21 @@ impl GmailPushChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "watch_registration",
+                        "status": status.as_u16(),
+                        "body": text,
+                    })),
+                "gmail_push: watch registration failed"
+            );
+            return Err(anyhow::Error::msg(format!(
                 "Gmail watch registration failed ({}): {}",
-                status,
-                text
-            ));
+                status, text
+            )));
         }
 
         let watch: WatchResponse = resp.json().await?;
@@ -242,9 +258,13 @@ impl GmailPushChannel {
         if *last_id == 0 {
             *last_id = watch.history_id;
         }
-        info!(
-            "Gmail watch registered — historyId={}, expiration={}",
-            watch.history_id, watch.expiration
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Gmail watch registered — historyId={}, expiration={}",
+                watch.history_id, watch.expiration
+            )
         );
         Ok(watch)
     }
@@ -263,9 +283,15 @@ impl GmailPushChannel {
         start_history_id: u64,
         last_id: &mut u64,
     ) -> Result<Vec<String>> {
-        let token = self.resolve_oauth_token();
+        let token = self.config.oauth_token.clone();
         if token.is_empty() {
-            return Err(anyhow!("Gmail OAuth token is not configured"));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Gmail OAuth token is not configured"
+            );
+            anyhow::bail!("Gmail OAuth token is not configured");
         }
 
         let mut message_ids = Vec::new();
@@ -285,7 +311,21 @@ impl GmailPushChannel {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                return Err(anyhow!("Gmail history fetch failed ({}): {}", status, text));
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "history_fetch",
+                            "status": status.as_u16(),
+                            "body": text,
+                        })),
+                    "gmail_push: history fetch failed"
+                );
+                return Err(anyhow::Error::msg(format!(
+                    "Gmail history fetch failed ({}): {}",
+                    status, text
+                )));
             }
 
             let history_resp: HistoryResponse = resp.json().await?;
@@ -314,7 +354,7 @@ impl GmailPushChannel {
 
     /// Fetch a full message by ID from the Gmail API.
     pub async fn fetch_message(&self, message_id: &str) -> Result<GmailMessage> {
-        let token = self.resolve_oauth_token();
+        let token = self.config.oauth_token.clone();
         let url = format!(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
             message_id
@@ -325,22 +365,49 @@ impl GmailPushChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gmail message fetch failed ({}): {}", status, text));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "message_fetch",
+                        "status": status.as_u16(),
+                        "body": text,
+                    })),
+                "gmail_push: message fetch failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "Gmail message fetch failed ({}): {}",
+                status, text
+            )));
         }
 
         Ok(resp.json().await?)
     }
 
     /// Check if a sender email is in the allowlist.
+    ///
+    /// Email allowlist entries support three syntaxes — preserved from
+    /// the legacy `GmailPushConfig::allowed_senders` semantics:
+    /// - `*`                wildcard, allow anyone.
+    /// - `user@host`        full address, case-insensitive.
+    /// - `@host` / `host`   domain match, case-insensitive.
     pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
+        let peers = (self.peer_resolver)();
+        Self::is_email_sender_allowed(&peers, email)
+    }
+
+    /// Pure, testable predicate that applies the email-allowlist match
+    /// semantics against an already-resolved peer list.
+    fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
+        if peers.is_empty() {
             return false;
         }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
+        if peers.iter().any(|a| a == "*") {
             return true;
         }
         let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
+        peers.iter().any(|allowed| {
             if allowed.starts_with('@') {
                 email_lower.ends_with(&allowed.to_lowercase())
             } else if allowed.contains('@') {
@@ -354,9 +421,13 @@ impl GmailPushChannel {
     /// Process a Pub/Sub push notification and dispatch new messages to the agent.
     pub async fn handle_notification(&self, envelope: &PubSubEnvelope) -> Result<()> {
         let notification = parse_notification(&envelope.message)?;
-        debug!(
-            "Gmail push notification: email={}, historyId={}",
-            notification.email_address, notification.history_id
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Gmail push notification: email={}, historyId={}",
+                notification.email_address, notification.history_id
+            )
         );
 
         // Hold the lock across read-fetch-update to prevent duplicate
@@ -366,9 +437,13 @@ impl GmailPushChannel {
         if *last_id == 0 {
             // First notification — just record the history ID.
             *last_id = notification.history_id;
-            info!(
-                "Gmail push: first notification, seeding historyId={}",
-                notification.history_id
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Gmail push: first notification, seeding historyId={}",
+                    notification.history_id
+                )
             );
             return Ok(());
         }
@@ -379,13 +454,21 @@ impl GmailPushChannel {
         drop(last_id);
 
         if message_ids.is_empty() {
-            debug!("Gmail push: no new messages in history");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Gmail push: no new messages in history"
+            );
             return Ok(());
         }
 
-        info!(
-            "Gmail push: {} new message(s) to process",
-            message_ids.len()
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Gmail push: {} new message(s) to process",
+                message_ids.len()
+            )
         );
 
         // Clone the sender and drop the mutex immediately to avoid holding it
@@ -395,7 +478,12 @@ impl GmailPushChannel {
             match tx_guard.clone() {
                 Some(tx) => tx,
                 None => {
-                    warn!("Gmail push: no listener registered, dropping messages");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Gmail push: no listener registered, dropping messages"
+                    );
                     return Ok(());
                 }
             }
@@ -408,7 +496,15 @@ impl GmailPushChannel {
                     let sender_email = extract_email_from_header(&sender);
 
                     if !self.is_sender_allowed(&sender_email) {
-                        warn!("Gmail push: blocked message from {}", sender_email);
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!("Gmail push: blocked message from {}", sender_email)
+                        );
                         continue;
                     }
 
@@ -433,24 +529,49 @@ impl GmailPushChannel {
                         sender: sender_email,
                         content,
                         channel: "gmail_push".to_string(),
+                        channel_alias: Some(self.alias.clone()),
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
                         attachments: Vec::new(),
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
-                        debug!("Gmail push: listener channel closed");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Gmail push: listener channel closed"
+                        );
                         return Ok(());
                     }
                 }
                 Err(e) => {
-                    error!("Gmail push: failed to fetch message {}: {}", msg_id, e);
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!("Gmail push: failed to fetch message {}: {}", msg_id, e)
+                    );
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for GmailPushChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::GmailPush,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -462,9 +583,15 @@ impl Channel for GmailPushChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Send via Gmail API (drafts.send or messages.send)
-        let token = self.resolve_oauth_token();
+        let token = self.config.oauth_token.clone();
         if token.is_empty() {
-            return Err(anyhow!("Gmail OAuth token is not configured for sending"));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Gmail OAuth token is not configured for sending"
+            );
+            anyhow::bail!("Gmail OAuth token is not configured for sending");
         }
 
         let subject = message.subject.as_deref().unwrap_or("ZeroClaw Message");
@@ -494,10 +621,28 @@ impl Channel for GmailPushChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gmail send failed ({}): {}", status, text));
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "send",
+                        "status": status.as_u16(),
+                        "body": text,
+                    })),
+                "gmail_push: send failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "Gmail send failed ({}): {}",
+                status, text
+            )));
         }
 
-        info!("Gmail message sent to {}", message.recipient);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Gmail message sent to {}", message.recipient)
+        );
         Ok(())
     }
 
@@ -508,13 +653,23 @@ impl Channel for GmailPushChannel {
             *tx_guard = Some(tx);
         }
 
-        info!("Gmail push channel started — registering watch subscription");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Gmail push channel started — registering watch subscription"
+        );
 
         // Register initial watch
         if !self.config.webhook_url.is_empty()
             && let Err(e) = self.register_watch().await
         {
-            error!("Gmail watch registration failed: {e:#}");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "Gmail watch registration failed"
+            );
             // Non-fatal — external subscription management may be in use
         }
 
@@ -523,15 +678,25 @@ impl Channel for GmailPushChannel {
         let renewal_interval = Duration::from_secs(6 * 24 * 60 * 60); // 6 days
         loop {
             tokio::time::sleep(renewal_interval).await;
-            info!("Gmail push: renewing watch subscription");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Gmail push: renewing watch subscription"
+            );
             if let Err(e) = self.register_watch().await {
-                error!("Gmail watch renewal failed: {e:#}");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "Gmail watch renewal failed"
+                );
             }
         }
     }
 
     async fn health_check(&self) -> bool {
-        let token = self.resolve_oauth_token();
+        let token = self.config.oauth_token.clone();
         if token.is_empty() {
             return false;
         }
@@ -554,11 +719,26 @@ impl Channel for GmailPushChannel {
 
 /// Parse and decode the Gmail notification from a Pub/Sub message.
 pub fn parse_notification(msg: &PubSubMessage) -> Result<GmailNotification> {
-    let decoded = BASE64
-        .decode(&msg.data)
-        .map_err(|e| anyhow!("Invalid base64 in Pub/Sub message: {e}"))?;
-    let notification: GmailNotification = serde_json::from_slice(&decoded)
-        .map_err(|e| anyhow!("Invalid JSON in Gmail notification: {e}"))?;
+    let decoded = BASE64.decode(&msg.data).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Invalid base64 in Pub/Sub message"
+        );
+        anyhow::Error::msg(format!("Invalid base64 in Pub/Sub message: {e}"))
+    })?;
+    let notification: GmailNotification = serde_json::from_slice(&decoded).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Invalid JSON in Gmail notification"
+        );
+        anyhow::Error::msg(format!("Invalid JSON in Gmail notification: {e}"))
+    })?;
     Ok(notification)
 }
 
@@ -948,37 +1128,52 @@ mod tests {
 
     // ── Sender allowlist ─────────────────────────────────────────
 
+    fn empty_resolver() -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(Vec::new)
+    }
+
+    fn resolver_from(peers: Vec<String>) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(move || peers.clone())
+    }
+
     #[test]
     fn sender_allowed_empty_denies() {
-        let ch = GmailPushChannel::new(GmailPushConfig::default());
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            empty_resolver(),
+        );
         assert!(!ch.is_sender_allowed("anyone@example.com"));
     }
 
     #[test]
     fn sender_allowed_wildcard() {
-        let ch = GmailPushChannel::new(GmailPushConfig {
-            allowed_senders: vec!["*".into()],
-            ..Default::default()
-        });
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            resolver_from(vec!["*".into()]),
+        );
         assert!(ch.is_sender_allowed("anyone@example.com"));
     }
 
     #[test]
     fn sender_allowed_specific_email() {
-        let ch = GmailPushChannel::new(GmailPushConfig {
-            allowed_senders: vec!["user@example.com".into()],
-            ..Default::default()
-        });
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            resolver_from(vec!["user@example.com".into()]),
+        );
         assert!(ch.is_sender_allowed("user@example.com"));
         assert!(!ch.is_sender_allowed("other@example.com"));
     }
 
     #[test]
     fn sender_allowed_domain_with_at() {
-        let ch = GmailPushChannel::new(GmailPushConfig {
-            allowed_senders: vec!["@example.com".into()],
-            ..Default::default()
-        });
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            resolver_from(vec!["@example.com".into()]),
+        );
         assert!(ch.is_sender_allowed("user@example.com"));
         assert!(ch.is_sender_allowed("admin@example.com"));
         assert!(!ch.is_sender_allowed("user@other.com"));
@@ -986,10 +1181,11 @@ mod tests {
 
     #[test]
     fn sender_allowed_domain_without_at() {
-        let ch = GmailPushChannel::new(GmailPushConfig {
-            allowed_senders: vec!["example.com".into()],
-            ..Default::default()
-        });
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            resolver_from(vec!["example.com".into()]),
+        );
         assert!(ch.is_sender_allowed("user@example.com"));
         assert!(!ch.is_sender_allowed("user@other.com"));
     }
@@ -1014,11 +1210,9 @@ mod tests {
     #[test]
     fn config_default_values() {
         let config = GmailPushConfig::default();
-        assert!(!config.enabled);
         assert!(config.topic.is_empty());
         assert_eq!(config.label_filter, vec!["INBOX"]);
         assert!(config.oauth_token.is_empty());
-        assert!(config.allowed_senders.is_empty());
         assert!(config.webhook_url.is_empty());
     }
 
@@ -1026,7 +1220,6 @@ mod tests {
     fn config_deserialize_with_defaults() {
         let json = r#"{"topic": "projects/my-proj/topics/gmail"}"#;
         let config: GmailPushConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.enabled);
         assert_eq!(config.topic, "projects/my-proj/topics/gmail");
         assert_eq!(config.label_filter, vec!["INBOX"]);
     }
@@ -1038,9 +1231,9 @@ mod tests {
             topic: "projects/test/topics/gmail".into(),
             label_filter: vec!["INBOX".into(), "IMPORTANT".into()],
             oauth_token: "test-token".into(),
-            allowed_senders: vec!["@example.com".into()],
             webhook_url: "https://example.com/webhook/gmail".into(),
             webhook_secret: "my-secret".into(),
+            excluded_tools: vec![],
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: GmailPushConfig = serde_json::from_str(&json).unwrap();
@@ -1053,7 +1246,11 @@ mod tests {
 
     #[test]
     fn channel_name() {
-        let ch = GmailPushChannel::new(GmailPushConfig::default());
+        let ch = GmailPushChannel::new(
+            GmailPushConfig::default(),
+            "gmail_push_test_alias",
+            empty_resolver(),
+        );
         assert_eq!(ch.name(), "gmail_push");
     }
 

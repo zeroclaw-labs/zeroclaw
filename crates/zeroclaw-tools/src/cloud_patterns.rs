@@ -66,7 +66,7 @@ impl Tool for CloudPatternsTool {
                 },
                 "cloud": {
                     "type": "string",
-                    "description": "Filter patterns by cloud provider (aws, azure, gcp). Optional."
+                    "description": "Filter patterns by cloud model_provider (aws, azure, gcp). Optional."
                 }
             },
             "required": ["action"]
@@ -170,7 +170,7 @@ impl CloudPatternsTool {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         // Built-in IaC examples are AWS Terraform only; include them only when
         // the cloud filter is unset or explicitly "aws".

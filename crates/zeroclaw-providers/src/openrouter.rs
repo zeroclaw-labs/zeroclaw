@@ -2,7 +2,7 @@ use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
+    ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
     TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -13,14 +13,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
-pub struct OpenRouterProvider {
+pub struct OpenRouterModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     credential: Option<String>,
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
 }
 
-const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
+/// OpenRouter's public aggregator endpoint.
+pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Serialize)]
@@ -61,11 +64,28 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Marker placed on a content block to opt it into OpenRouter prompt caching.
+///
+/// Currently only `{"type": "ephemeral"}` is defined. OpenRouter forwards this
+/// field to upstream providers that support prompt caching (Anthropic,
+/// DeepSeek, Qwen). Providers without caching ignore the marker.
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -112,7 +132,7 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
-    /// Raw reasoning content from thinking models; pass-through for providers
+    /// Raw reasoning content from thinking models; pass-through for model_providers
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
@@ -160,6 +180,17 @@ struct UsageInfo {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// Per-category prompt-token breakdown. Only present when the upstream
+    /// provider returns cached-token accounting. Absent for providers that
+    /// do not support prompt caching.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,18 +209,18 @@ struct NativeResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
-impl OpenRouterProvider {
-    pub fn new(credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
+impl OpenRouterModelProvider {
+    pub fn new(alias: &str, credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
         Self {
+            alias: alias.to_string(),
             credential: credential.map(ToString::to_string),
             timeout_secs: timeout_secs
                 .filter(|secs| *secs > 0)
-                .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             max_tokens: None,
             extra_body: None,
         }
     }
-
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
@@ -301,6 +332,21 @@ impl OpenRouterProvider {
     }
 
     fn to_message_content(role: &str, content: &str) -> MessageContent {
+        if role == "system" {
+            // Serialize system messages as a single-text-part array so we can
+            // attach `cache_control: {"type": "ephemeral"}`. OpenRouter forwards
+            // this marker to upstream providers that support prompt caching
+            // (Anthropic, DeepSeek, Qwen); providers without caching ignore
+            // the field. The wire shape is identical to a plain-string system
+            // message for ignoring providers, so this is safe across the
+            // provider fleet.
+            return MessageContent::Parts(vec![MessagePart::Text {
+                text: content.to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                }),
+            }]);
+        }
         if role != "user" {
             return MessageContent::Text(content.to_string());
         }
@@ -315,6 +361,7 @@ impl OpenRouterProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -337,6 +384,7 @@ impl OpenRouterProvider {
                 id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
+                extra_content: None,
             })
             .collect::<Vec<_>>();
 
@@ -360,10 +408,20 @@ impl OpenRouterProvider {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         response.text().await.map_err(|error| {
-            let sanitized = super::sanitize_api_error(&error.to_string());
-            anyhow::anyhow!(
+            let sanitized = super::format_error_chain(&error);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": provider_name,
+                        "body": &sanitized,
+                    })),
+                "openrouter: transport error reading response body"
+            );
+            anyhow::Error::msg(format!(
                 "{provider_name} transport error while reading response body: {sanitized}"
-            )
+            ))
         })
     }
 
@@ -374,9 +432,21 @@ impl OpenRouterProvider {
     ) -> anyhow::Result<T> {
         serde_json::from_str::<T>(body).map_err(|error| {
             let snippet = Self::compact_sanitized_body_snippet(body);
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": provider_name,
+                        "kind": kind,
+                        "body": &snippet,
+                        "error": format!("{}", error),
+                    })),
+                "openrouter: unexpected response payload"
+            );
+            anyhow::Error::msg(format!(
                 "{provider_name} API returned an unexpected {kind} payload: {error}; body={snippet}"
-            )
+            ))
         })
     }
 
@@ -386,9 +456,18 @@ impl OpenRouterProvider {
         let Some(extra) = &self.extra_body else {
             return Ok(serde_json::to_value(request)?);
         };
-        let overrides = extra
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("provider_extra must be a JSON object, got: {extra}"))?;
+        let overrides = extra.as_object().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"provider_extra": extra})),
+                "openrouter: provider_extra must be a JSON object"
+            );
+            anyhow::Error::msg(format!(
+                "provider_extra must be a JSON object, got: {extra}"
+            ))
+        })?;
         let mut value = serde_json::to_value(request)?;
         if let Some(base) = value.as_object_mut() {
             for (k, v) in overrides {
@@ -400,7 +479,7 @@ impl OpenRouterProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.openrouter",
+            "model_provider.openrouter",
             self.timeout_secs,
             OPENROUTER_CONNECT_TIMEOUT_SECS,
         )
@@ -408,12 +487,18 @@ impl OpenRouterProvider {
 }
 
 #[async_trait]
-impl Provider for OpenRouterProvider {
+impl ModelProvider for OpenRouterModelProvider {
+    // ── ModelProvider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -431,15 +516,52 @@ impl Provider for OpenRouterProvider {
         Ok(())
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // OpenRouter's /models endpoint is public — no credential required.
+        // Returns ~300 models across every model_provider OpenRouter proxies.
+        let response = self
+            .http_client()
+            .get("https://openrouter.ai/api/v1/models")
+            .send()
+            .await?
+            .error_for_status()?;
+
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+        }
+
+        let body: Resp = response.json().await?;
+        let mut ids: Vec<String> = body.data.into_iter().map(|e| e.id).collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+            )
+        })?;
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let mut messages = Vec::new();
 
@@ -489,17 +611,37 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })
     }
 
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+            )
+        })?;
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let api_messages: Vec<Message> = messages
             .iter()
@@ -543,20 +685,37 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })
     }
 
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-            "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
-        )
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+            )
         })?;
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -590,17 +749,29 @@ impl Provider for OpenRouterProvider {
             &resp_body,
             "native chat",
         )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
         });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -622,7 +793,7 @@ impl Provider for OpenRouterProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
@@ -633,13 +804,15 @@ impl Provider for OpenRouterProvider {
             Some(c) => c.clone(),
             None => {
                 return stream::once(async {
-                    Err(StreamError::Provider(
+                    Err(StreamError::ModelProvider(
                         "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
                     ))
                 })
                 .boxed();
             }
         };
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -677,7 +850,9 @@ impl Provider for OpenRouterProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -689,7 +864,9 @@ impl Provider for OpenRouterProvider {
                     .await
                     .unwrap_or_else(|_| format!("HTTP error: {status}"));
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{status}: {error}"
+                    ))))
                     .await;
                 return;
             }
@@ -708,7 +885,7 @@ impl Provider for OpenRouterProvider {
         // the consumer is gone, holding a connection-pool slot and
         // consuming OpenRouter quota for a request the caller no longer
         // wants. `AbortHandle::abort` is a no-op if the task has already
-        // finished, so the happy path is unaffected. See #5822.
+        // finished, so the happy path is unaffected.
         let guard = AbortOnDrop(handle.abort_handle());
 
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
@@ -722,13 +899,22 @@ impl Provider for OpenRouterProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
             )
         })?;
+
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         // Convert tool JSON values to NativeToolSpec
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -793,17 +979,29 @@ impl Provider for OpenRouterProvider {
             &resp_body,
             "native chat",
         )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
         });
         let message = native_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -820,29 +1018,45 @@ fn is_valid_openai_tool_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+impl ::zeroclaw_api::attribution::Attributable for OpenRouterModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::OpenRouter,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{ChatMessage, Provider};
+    use crate::traits::{ChatMessage, ModelProvider};
 
     #[test]
     fn capabilities_report_vision_support() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
-        let caps = <OpenRouterProvider as Provider>::capabilities(&provider);
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        let caps = <OpenRouterModelProvider as ModelProvider>::capabilities(&model_provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
     }
 
     #[test]
     fn supports_streaming_returns_true() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
-        assert!(provider.supports_streaming());
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        assert!(model_provider.supports_streaming());
     }
 
     #[test]
     fn supports_streaming_tool_events_returns_true() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
-        assert!(provider.supports_streaming_tool_events());
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
+        assert!(model_provider.supports_streaming_tool_events());
     }
 
     #[tokio::test]
@@ -850,7 +1064,7 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest};
         use futures_util::StreamExt as _;
 
-        let provider = OpenRouterProvider::new(None, None);
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -858,12 +1072,13 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
-        let mut stream = provider.stream_chat(
+        let mut stream = model_provider.stream_chat(
             request,
             "anthropic/claude-haiku-4-5",
-            0.0,
+            Some(0.0),
             crate::traits::StreamOptions {
                 enabled: true,
                 count_tokens: false,
@@ -888,7 +1103,7 @@ mod tests {
         use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
         use futures_util::StreamExt as _;
 
-        let provider = OpenRouterProvider::new(Some("key"), None);
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
@@ -896,12 +1111,13 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
-        let mut stream = provider.stream_chat(
+        let mut stream = model_provider.stream_chat(
             request,
             "anthropic/claude-haiku-4-5",
-            0.0,
+            Some(0.0),
             crate::traits::StreamOptions {
                 enabled: false,
                 count_tokens: false,
@@ -947,43 +1163,49 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), None);
         assert_eq!(
-            provider.credential.as_deref(),
+            model_provider.credential.as_deref(),
             Some("openrouter-test-credential")
         );
     }
 
     #[test]
     fn creates_without_key() {
-        let provider = OpenRouterProvider::new(None, None);
-        assert!(provider.credential.is_none());
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        assert!(model_provider.credential.is_none());
     }
 
     #[test]
     fn uses_configured_timeout_when_provided() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), Some(1200));
-        assert_eq!(provider.timeout_secs, 1200);
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(1200));
+        assert_eq!(model_provider.timeout_secs, 1200);
     }
 
     #[test]
     fn falls_back_to_default_timeout_for_zero() {
-        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), Some(0));
-        assert_eq!(provider.timeout_secs, DEFAULT_OPENROUTER_TIMEOUT_SECS);
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("openrouter-test-credential"), Some(0));
+        assert_eq!(
+            model_provider.timeout_secs,
+            zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS
+        );
     }
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = OpenRouterProvider::new(None, None);
-        let result = provider.warmup().await;
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let provider = OpenRouterProvider::new(None, None);
-        let result = provider
-            .chat_with_system(Some("system"), "hello", "openai/gpt-4o", 0.2)
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
+        let result = model_provider
+            .chat_with_system(Some("system"), "hello", "openai/gpt-4o", Some(0.2))
             .await;
 
         assert!(result.is_err());
@@ -992,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_fails_without_key() {
-        let provider = OpenRouterProvider::new(None, None);
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
@@ -1004,8 +1226,8 @@ mod tests {
             },
         ];
 
-        let result = provider
-            .chat_with_history(&messages, "anthropic/claude-sonnet-4", 0.7)
+        let result = model_provider
+            .chat_with_history(&messages, "anthropic/claude-sonnet-4", Some(0.7))
             .await;
 
         assert!(result.is_err());
@@ -1092,7 +1314,7 @@ mod tests {
     #[test]
     fn parse_chat_response_body_reports_sanitized_snippet() {
         let body = r#"{"choices":"invalid","api_key":"sk-test-secret-value"}"#;
-        let err = OpenRouterProvider::parse_response_body::<ApiChatResponse>(
+        let err = OpenRouterModelProvider::parse_response_body::<ApiChatResponse>(
             "OpenRouter",
             body,
             "chat-completions",
@@ -1109,7 +1331,7 @@ mod tests {
     #[test]
     fn parse_native_response_body_reports_sanitized_snippet() {
         let body = r#"{"choices":123,"api_key":"sk-another-secret"}"#;
-        let err = OpenRouterProvider::parse_response_body::<NativeChatResponse>(
+        let err = OpenRouterModelProvider::parse_response_body::<NativeChatResponse>(
             "OpenRouter",
             body,
             "native chat",
@@ -1125,7 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let provider = OpenRouterProvider::new(None, None);
+        let model_provider = OpenRouterModelProvider::new("test", None, None);
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
@@ -1139,8 +1361,8 @@ mod tests {
             }
         })];
 
-        let result = provider
-            .chat_with_tools(&messages, &tools, "deepseek/deepseek-chat", 0.5)
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "deepseek/deepseek-chat", Some(0.5))
             .await;
 
         assert!(result.is_err());
@@ -1210,7 +1432,7 @@ mod tests {
             }]),
         };
 
-        let response = OpenRouterProvider::parse_native_response(message);
+        let response = OpenRouterModelProvider::parse_native_response(message);
 
         assert_eq!(response.text.as_deref(), Some("Here you go."));
         assert_eq!(response.tool_calls.len(), 1);
@@ -1226,7 +1448,7 @@ mod tests {
                 .into(),
         }];
 
-        let converted = OpenRouterProvider::convert_messages(&messages);
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "assistant");
         assert_eq!(
@@ -1254,7 +1476,7 @@ mod tests {
             content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
         }];
 
-        let converted = OpenRouterProvider::convert_messages(&messages);
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
@@ -1275,7 +1497,8 @@ mod tests {
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
         let value =
-            serde_json::to_value(OpenRouterProvider::to_message_content("user", content)).unwrap();
+            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
+                .unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1306,6 +1529,192 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: request-side serialization
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn system_message_serializes_as_content_block_with_cache_control() {
+        let content = OpenRouterModelProvider::to_message_content("system", "You are helpful.");
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json.as_array().expect("system content should be an array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "You are helpful.");
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn user_message_without_images_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content("user", "Hello");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "user content should be a plain string");
+        assert_eq!(json.as_str().unwrap(), "Hello");
+    }
+
+    #[test]
+    fn assistant_message_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content("assistant", "Hi there.");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(
+            json.is_string(),
+            "assistant content should be a plain string"
+        );
+        assert_eq!(json.as_str().unwrap(), "Hi there.");
+    }
+
+    #[test]
+    fn tool_message_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content(
+            "tool",
+            r#"{"tool_call_id":"call_1","content":"ok"}"#,
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "tool content should be a plain string");
+    }
+
+    #[test]
+    fn cache_control_absent_on_user_image_text_part() {
+        let content = OpenRouterModelProvider::to_message_content(
+            "user",
+            "Describe this\n\n[IMAGE:data:image/png;base64,abcd]",
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json
+            .as_array()
+            .expect("multimodal content should be an array");
+        let text_part = &parts[0];
+        assert_eq!(text_part["type"], "text");
+        assert!(
+            text_part.get("cache_control").is_none(),
+            "cache_control should not appear on user image text parts (got {:?})",
+            text_part.get("cache_control")
+        );
+    }
+
+    #[test]
+    fn full_native_request_serializes_system_as_blocks_user_as_string() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be helpful".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+        ];
+        let native = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 2);
+
+        let sys_json = serde_json::to_value(&native[0].content).unwrap();
+        let sys_parts = sys_json.as_array().expect("system content should be array");
+        assert_eq!(sys_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_parts[0]["text"], "Be helpful");
+
+        let user_json = serde_json::to_value(&native[1].content).unwrap();
+        assert!(user_json.is_string(), "user content should be a string");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: response-side deserialization and token mapping
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn usage_info_deserializes_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 25000,
+            "completion_tokens": 500,
+            "prompt_tokens_details": {"cached_tokens": 20000}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, Some(25000));
+        assert_eq!(usage.completion_tokens, Some(500));
+        let details = usage
+            .prompt_tokens_details
+            .expect("prompt_tokens_details should deserialize");
+        assert_eq!(details.cached_tokens, Some(20000));
+    }
+
+    #[test]
+    fn usage_info_deserializes_without_prompt_tokens_details() {
+        let json = r#"{"prompt_tokens": 100, "completion_tokens": 50}"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert!(
+            usage.prompt_tokens_details.is_none(),
+            "absent field should deserialize to None (backward compat with providers without caching)"
+        );
+    }
+
+    #[test]
+    fn usage_info_deserializes_empty_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert!(details.cached_tokens.is_none());
+    }
+
+    #[test]
+    fn usage_info_deserializes_zero_cached_tokens_as_some_zero() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, Some(0));
+    }
+
+    #[test]
+    fn native_response_maps_cached_tokens_into_token_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 25000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": 15000}
+            }
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert_eq!(usage.input_tokens, Some(25000));
+        assert_eq!(usage.output_tokens, Some(500));
+        assert_eq!(usage.cached_input_tokens, Some(15000));
+    }
+
+    #[test]
+    fn native_response_maps_none_when_prompt_tokens_details_absent() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert!(
+            usage.cached_input_tokens.is_none(),
+            "absent details should map to None (providers without caching are unaffected)"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // reasoning_content pass-through tests
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -1323,7 +1732,7 @@ mod tests {
                 },
             }]),
         };
-        let parsed = OpenRouterProvider::parse_native_response(message);
+        let parsed = OpenRouterModelProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
         assert_eq!(parsed.tool_calls.len(), 1);
     }
@@ -1335,7 +1744,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
         };
-        let parsed = OpenRouterProvider::parse_native_response(message);
+        let parsed = OpenRouterModelProvider::parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
     }
 
@@ -1373,7 +1782,7 @@ mod tests {
             role: "assistant".into(),
             content: history_json.to_string(),
         }];
-        let native = OpenRouterProvider::convert_messages(&messages);
+        let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(
             native[0].reasoning_content.as_deref(),
@@ -1396,7 +1805,7 @@ mod tests {
             role: "assistant".into(),
             content: history_json.to_string(),
         }];
-        let native = OpenRouterProvider::convert_messages(&messages);
+        let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
@@ -1434,14 +1843,15 @@ mod tests {
 
     #[test]
     fn default_timeout_is_120() {
-        let provider = OpenRouterProvider::new(Some("key"), None);
-        assert_eq!(provider.timeout_secs, 120);
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
+        assert_eq!(model_provider.timeout_secs, 120);
     }
 
     #[test]
     fn with_timeout_secs_overrides_default() {
-        let provider = OpenRouterProvider::new(Some("key"), None).with_timeout_secs(300);
-        assert_eq!(provider.timeout_secs, 300);
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("key"), None).with_timeout_secs(300);
+        assert_eq!(model_provider.timeout_secs, 300);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1490,10 +1900,49 @@ mod tests {
             },
         ];
 
-        let result = OpenRouterProvider::convert_tools(Some(&tools)).unwrap();
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].function.name, "valid_tool");
         assert_eq!(result[1].function.name, "another-valid");
+    }
+
+    /// Regression: skill tools used to be registered with a `.` separator
+    /// (`{skill}.{tool}`), e.g. `openrouter-spend.check_openrouter_spend`.
+    /// That format silently failed `is_valid_openai_tool_name` and got
+    /// dropped from the function-call spec list sent to OpenAI-compatible
+    /// providers, while still appearing in the system prompt — leaving the
+    /// LLM hallucinating "unknown tool" errors. Skill tools now use the
+    /// `__` separator (matching the MCP `<server>__<tool>` convention),
+    /// which passes the validator and survives `convert_tools`.
+    #[test]
+    fn convert_tools_preserves_skill_namespaced_names_with_double_underscore() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let tools = vec![
+            // New format — must pass through.
+            ToolSpec {
+                name: "openrouter-spend__check_openrouter_spend".into(),
+                description: "Skill tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            // Old format — must still be rejected so the regression stays caught.
+            ToolSpec {
+                name: "openrouter-spend.check_openrouter_spend".into(),
+                description: "Skill tool with legacy dotted name".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "only the __ form should survive convert_tools"
+        );
+        assert_eq!(
+            result[0].function.name,
+            "openrouter-spend__check_openrouter_spend"
+        );
     }
 
     #[test]
@@ -1506,19 +1955,20 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
         }];
 
-        assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
+        assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
     }
 
     #[test]
     fn with_extra_body_sets_value() {
-        let extra = serde_json::json!({"provider": {"only": ["Anthropic"]}});
-        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(extra.clone());
-        assert_eq!(provider.extra_body, Some(extra));
+        let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
+        let model_provider =
+            OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(extra.clone());
+        assert_eq!(model_provider.extra_body, Some(extra));
     }
 
     #[test]
     fn extra_body_none_produces_unchanged_request() {
-        let provider = OpenRouterProvider::new(Some("key"), None);
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None);
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1527,14 +1977,14 @@ mod tests {
         };
 
         let base = serde_json::to_value(&request).unwrap();
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         assert_eq!(base, merged);
     }
 
     #[test]
     fn extra_body_empty_object_produces_unchanged_request() {
-        let provider =
-            OpenRouterProvider::new(Some("key"), None).with_extra_body(serde_json::json!({}));
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
+            .with_extra_body(serde_json::json!({}));
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1543,14 +1993,14 @@ mod tests {
         };
 
         let base = serde_json::to_value(&request).unwrap();
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         assert_eq!(base, merged);
     }
 
     #[test]
     fn extra_body_adds_new_top_level_keys() {
-        let provider = OpenRouterProvider::new(Some("key"), None)
-            .with_extra_body(serde_json::json!({"provider": {"only": ["Anthropic"]}}));
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
+            .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -1558,10 +2008,10 @@ mod tests {
             max_tokens: None,
         };
 
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         let obj = merged.as_object().unwrap();
         assert_eq!(
-            obj.get("provider").unwrap(),
+            obj.get("model_provider").unwrap(),
             &serde_json::json!({"only": ["Anthropic"]})
         );
         assert_eq!(obj.get("model").unwrap(), "test-model");
@@ -1570,7 +2020,7 @@ mod tests {
 
     #[test]
     fn extra_body_overrides_existing_keys() {
-        let provider = OpenRouterProvider::new(Some("key"), None)
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
             .with_extra_body(serde_json::json!({"temperature": 0.9}));
         let request = ChatRequest {
             model: "test-model".into(),
@@ -1579,14 +2029,14 @@ mod tests {
             max_tokens: None,
         };
 
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         let obj = merged.as_object().unwrap();
         assert_eq!(obj.get("temperature").unwrap(), 0.9);
     }
 
     #[test]
     fn extra_body_merges_at_top_level_not_nested() {
-        let provider = OpenRouterProvider::new(Some("key"), None)
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None)
             .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
         let request = ChatRequest {
             model: "test-model".into(),
@@ -1595,7 +2045,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         let obj = merged.as_object().unwrap();
         assert_eq!(
             obj.get("transforms").unwrap(),
@@ -1606,8 +2056,8 @@ mod tests {
 
     #[test]
     fn extra_body_with_nested_provider_routing() {
-        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(
-            serde_json::json!({"provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
+        let model_provider = OpenRouterModelProvider::new("test", Some("key"), None).with_extra_body(
+            serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
         );
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
@@ -1619,9 +2069,9 @@ mod tests {
             stream: None,
         };
 
-        let merged = provider.merge_extra_body(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
         let obj = merged.as_object().unwrap();
-        let prov = obj.get("provider").unwrap();
+        let prov = obj.get("model_provider").unwrap();
         assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
         assert_eq!(prov["allow_fallbacks"], false);
     }

@@ -64,9 +64,16 @@ impl SecretStore {
         let cipher = ChaCha20Poly1305::new(key);
 
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+        let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "ChaCha20-Poly1305 encryption failed"
+            );
+            anyhow::Error::msg(format!("Encryption failed: {e}"))
+        })?;
 
         // Prepend nonce to ciphertext for storage
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -106,7 +113,10 @@ impl SecretStore {
             Ok((plaintext, None))
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             // Legacy XOR cipher — decrypt and re-encrypt with ChaCha20-Poly1305
-            tracing::warn!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "Decrypting legacy XOR-encrypted secret (enc: prefix). \
                  This format is insecure and will be removed in a future release. \
                  The secret will be automatically migrated to enc2: (ChaCha20-Poly1305)."
@@ -142,7 +152,14 @@ impl SecretStore {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
+            .map_err(|_| {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+                     Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
+                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw onboard`.");
+                anyhow::Error::msg(
+                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)"
+                )
+            })?;
 
         String::from_utf8(plaintext_bytes)
             .context("Decrypted secret is not valid UTF-8 — corrupt data")
@@ -201,7 +218,10 @@ impl SecretStore {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "USERNAME environment variable is empty; \
                          cannot restrict key file permissions via icacls"
                     );
@@ -217,16 +237,40 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to take ownership of key file via takeown (exit code {:?})",
-                            o.status.code()
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "Failed to take ownership of key file via takeown (exit code {:?})",
+                                o.status.code()
+                            )
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Could not take ownership of key file: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Could not take ownership of key file"
+                        );
                     }
                     _ => {
-                        tracing::debug!("Key file ownership set to current user via takeown");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Key file ownership set to current user via takeown"
+                        );
                     }
                 }
 
@@ -237,16 +281,40 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "Failed to set key file permissions via icacls (exit code {:?})",
+                                o.status.code()
+                            )
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Could not set key file permissions"
+                        );
                     }
                     _ => {
-                        tracing::debug!("Key file permissions restricted via icacls");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Key file permissions restricted via icacls"
+                        );
                     }
                 }
             }
@@ -306,7 +374,7 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| anyhow::anyhow!("Invalid hex at position {i}: {e}"))
+                .map_err(|e| anyhow::Error::msg(format!("Invalid hex at position {i}: {e}")))
         })
         .collect()
 }
@@ -469,6 +537,27 @@ mod tests {
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let result = store2.decrypt(&encrypted);
         assert!(result.is_err(), "Decrypting with a different key must fail");
+    }
+
+    #[test]
+    fn decrypt_error_message_mentions_secret_key() {
+        // Operators hitting a missing or mismatched `.secret_key` (volume wipe,
+        // container migration, backup-restore without the key file) need the
+        // error message to point at the root cause. Otherwise the failure
+        // cascades into a misleading "All providers/models failed" message
+        // with no diagnostic for the underlying decrypt failure.
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        let encrypted = store1.encrypt("secret-for-store1").unwrap();
+        let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".secret_key"),
+            "decrypt error must mention `.secret_key` so operators can diagnose missing/mismatched keys: got {msg:?}"
+        );
     }
 
     #[test]
@@ -884,7 +973,7 @@ mod tests {
     ///
     /// Without `takeown`, the file owner may be an invalid SID, causing `icacls`
     /// grants to succeed against an unowned file that later becomes unreadable.
-    /// This test verifies the code structure expectation (see issue #4532).
+    /// This test verifies the code structure expectation.
     #[test]
     fn takeown_runs_before_icacls_on_windows() {
         // Read the source to confirm `takeown` appears before `icacls` in the

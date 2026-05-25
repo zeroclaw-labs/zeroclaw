@@ -1,5 +1,4 @@
 use crate::agent::personality;
-use crate::i18n::ToolDescriptions;
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -12,15 +11,22 @@ use zeroclaw_config::schema::IdentityConfig;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
+    /// Per-agent persona workspace (where SOUL.md / IDENTITY.md / USER.md /
+    /// AGENTS.md live). Separate from `workspace_dir`, which is the security
+    /// sandbox root and can be overridden per session by an IDE-supplied cwd.
+    /// Channel-driven runs typically pass the same path for both; gateway and
+    /// ACP sessions pass the agent's own dir here while letting `workspace_dir`
+    /// follow the session cwd.
+    pub agent_workspace_dir: &'a Path,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
     pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
-    /// Locale-aware tool descriptions. When present, tool descriptions in
-    /// prompts are resolved from the locale file instead of hardcoded values.
-    pub tool_descriptions: Option<&'a ToolDescriptions>,
+    /// True when the provider request carries native tool specs. In that mode
+    /// the prompt must not duplicate the same tool catalog in prose.
+    pub sends_native_tool_specs: bool,
     /// Pre-rendered security policy summary for inclusion in the Safety
     /// prompt section.  When present, the LLM sees the concrete constraints
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
@@ -98,7 +104,7 @@ impl PromptSection for IdentitySection {
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config
             && identity::is_aieos_configured(config)
-            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.workspace_dir)
+            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.agent_workspace_dir)
         {
             let rendered = identity::aieos_to_system_prompt(&aieos);
             if !rendered.is_empty() {
@@ -114,8 +120,7 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        // Use the personality module for structured file loading.
-        let profile = personality::load_personality(ctx.workspace_dir);
+        let profile = personality::load_personality(ctx.agent_workspace_dir);
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -127,7 +132,11 @@ impl PromptSection for ToolHonestySection {
         "tool_honesty"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+
         Ok(
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
@@ -144,12 +153,17 @@ impl PromptSection for ToolsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+        if ctx.sends_native_tool_specs {
+            return Ok(ctx.dispatcher_instructions.to_string());
+        }
+
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
-            let desc = ctx
-                .tool_descriptions
-                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
-                .unwrap_or_else(|| tool.description());
+            let i18n_description = crate::i18n::get_tool_description(tool.name());
+            let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
@@ -175,7 +189,7 @@ impl PromptSection for SafetySection {
         let mut out = String::from("## Safety\n\n- Do not exfiltrate private data.\n");
 
         // Omit "ask before acting" instructions when autonomy is Full —
-        // mirrors build_system_prompt_with_mode_and_autonomy. See #3952.
+        // mirrors build_system_prompt_with_mode_and_autonomy.
         if ctx.autonomy_level != AutonomyLevel::Full {
             out.push_str(
                 "- Do not run destructive commands without asking.\n\
@@ -201,7 +215,7 @@ impl PromptSection for SafetySection {
             }
         });
 
-        // Append concrete security policy constraints when available (#2404).
+        // Append concrete security policy constraints when available.
         // This tells the LLM exactly what commands are allowed, which paths
         // are off-limits, etc. — preventing wasteful trial-and-error.
         if let Some(ref summary) = ctx.security_summary {
@@ -301,6 +315,8 @@ mod tests {
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
 
+    zeroclaw_api::mock_tool_attribution!(TestTool);
+
     struct TestTool;
 
     #[async_trait]
@@ -349,13 +365,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: &workspace,
+            agent_workspace_dir: &workspace,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -380,13 +398,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -394,6 +414,58 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn prompt_builder_skips_tools_section_for_native_tool_specs() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: true,
+
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("test_tool"));
+        assert!(prompt.contains("## Safety"));
+    }
+
+    #[test]
+    fn prompt_builder_omits_tool_sections_when_no_tools_available() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## CRITICAL: Tool Honesty"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(!prompt.contains("<tool_call>"));
+        assert!(prompt.contains("## Project Context"));
+        assert!(prompt.contains("## Workspace"));
+        assert!(prompt.contains("## Runtime"));
     }
 
     #[test]
@@ -418,13 +490,15 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -435,7 +509,7 @@ mod tests {
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -460,13 +534,15 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            agent_workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -480,7 +556,7 @@ mod tests {
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -488,13 +564,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -529,13 +607,15 @@ mod tests {
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            agent_workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -563,13 +643,15 @@ mod tests {
             .to_string();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -598,13 +680,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -625,13 +709,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
         };
@@ -660,13 +746,15 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+            sends_native_tool_specs: false,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };

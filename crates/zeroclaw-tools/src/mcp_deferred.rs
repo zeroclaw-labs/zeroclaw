@@ -125,7 +125,7 @@ impl DeferredMcpToolSet {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         scored
             .into_iter()
             .take(max_results)
@@ -182,7 +182,7 @@ impl ActivatedToolSet {
 
     /// Resolve an activated tool by exact name first, then by unique MCP suffix.
     ///
-    /// Some providers occasionally strip the `<server>__` prefix when calling a
+    /// Some model_providers occasionally strip the `<server>__` prefix when calling a
     /// deferred MCP tool after `tool_search` activation. When the suffix maps to
     /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -291,6 +291,16 @@ mod tests {
         use zeroclaw_api::tool::ToolResult;
 
         struct FakeTool;
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {
@@ -325,6 +335,16 @@ mod tests {
         use zeroclaw_api::tool::ToolResult;
 
         struct FakeTool;
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {
@@ -356,6 +376,16 @@ mod tests {
         use zeroclaw_api::tool::ToolResult;
 
         struct FakeTool(&'static str);
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {

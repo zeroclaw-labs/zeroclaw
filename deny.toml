@@ -1,4 +1,4 @@
-# cargo-deny configuration — v2 schema
+# cargo-deny configuration -- v2 schema
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
@@ -9,46 +9,40 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
-    # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
-    "RUSTSEC-2025-0141",
-    { id = "RUSTSEC-2024-0384", reason = "Reported to `rust-nostr/nostr` and it's WIP" },
-    { id = "RUSTSEC-2024-0388", reason = "derivative via extism → wasmtime transitive dep" },
-    { id = "RUSTSEC-2025-0057", reason = "fxhash via extism → wasmtime transitive dep" },
-    { id = "RUSTSEC-2025-0119", reason = "number_prefix via indicatif — cosmetic dep" },
-    # rand — unsound with custom global logger; affects all rand versions transitively;
-    # no patched version available at time of triage; tracked for remediation
-    { id = "RUSTSEC-2026-0097", reason = "rand re-entrancy unsoundness via custom logger; transitive across multiple versions; no patch available yet" },
-    # rustls-pemfile — unmaintained, functionality moved to rustls-pki-types;
+    # rand -- re-entrancy unsoundness via custom global logger; fixed in rand 0.8.6
+    # for the 0.8.x copy in our tree; the 0.7.x copy predates rand::rng() entirely
+    # and is not affected; the 0.9.x copy is outside the advisory's affected range
+    { id = "RUSTSEC-2026-0097", reason = "rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected" },
+    # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
-    # rustls-webpki — two versions in tree; direct dep was bumped in #5786 but a
-    # second transitive copy remains; all three advisories below affect the old copy
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL matching bug; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; transitive duplicate copy remains after #5786 bump; awaiting dep tree cleanup" },
-    # glib — unsoundness in VariantStrIter Iterator/DoubleEndedIterator impls;
-    # transitive via tauri → webkit2gtk; glib 0.18.5 is the latest compatible
-    # version with the GTK3 stack; no fix available until gtk-rs bumps the series
-    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
-    # wasmtime — multiple advisories via extism 1.21.0 which pins wasmtime 41.x;
-    # extism has not released a version with a fixed wasmtime; plugins are
-    # feature-gated behind --features plugins and the Winch/Cranelift backends
-    # are not used in production (default backend is unaffected by aarch64 issues)
-    { id = "RUSTSEC-2026-0006",  reason = "wasmtime f64.copysign segfault; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0020",  reason = "wasmtime WASI resource exhaustion; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0021",  reason = "wasmtime WASI http fields panic; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0085",  reason = "wasmtime flags component panic; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0086",  reason = "wasmtime 64-bit table data leakage (Winch); extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0087",  reason = "wasmtime f64x2.splat Cranelift segfault; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0088",  reason = "wasmtime pooling allocator data leakage; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0089",  reason = "wasmtime Winch table.fill panic; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0091",  reason = "wasmtime OOB write transcoding strings; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0092",  reason = "wasmtime UTF-16 transcoding panic; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0093",  reason = "wasmtime heap OOB read UTF-16 transcoding; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0094",  reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0095",  reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0096",  reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; no extism release with fix" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; v0.102.8 copy via rumqttc v0.25.1 has no fix in 0.102.x series, tracked for resolution when rumqttc upgrades past v0.25.x; v0.103.x copy fixed by cargo update to v0.103.13" },
+    # rustls-webpki -- two versions in tree; direct dep bumped in #5786 but a
+    # second transitive copy via rumqttc v0.25.1 remains; all advisories below
+    # affect only the 0.102.x copy; the 0.103.x copy is patched
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL matching bug; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; 0.102.x copy via rumqttc v0.25.1 has no fix in 0.102.x series; 0.103.x copy patched at v0.103.13; awaiting rumqttc upgrade" },
+    # glib -- unsoundness in VariantStrIter Iterator/DoubleEndedIterator impls;
+    # transitive via zeroclaw-desktop (tauri -> webkit2gtk); glib 0.18.5 is the
+    # latest compatible version with the GTK3 stack; fix requires gtk-rs series bump
+    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
+    # wasmtime -- multiple advisories via extism 1.21.0 which pins wasmtime 41.x;
+    # all CVEs fixed in wasmtime 42.0.2; extism has not released a version with
+    # wasmtime 42+; plugins are feature-gated behind --features plugins-wasm;
+    # the critical aarch64 sandbox-escape CVEs require the Winch compiler backend
+    # which is not enabled in production (default Cranelift backend is unaffected)
+    { id = "RUSTSEC-2026-0085", reason = "wasmtime flags component panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0086", reason = "wasmtime 64-bit table data leakage (Winch); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0087", reason = "wasmtime f64x2.splat Cranelift segfault; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0088", reason = "wasmtime pooling allocator data leakage; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0089", reason = "wasmtime Winch table.fill panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0091", reason = "wasmtime OOB write transcoding strings; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0092", reason = "wasmtime UTF-16 transcoding panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0093", reason = "wasmtime heap OOB read UTF-16 transcoding; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0094", reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
+    { id = "RUSTSEC-2026-0095", reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; Winch backend not used in production" },
+    { id = "RUSTSEC-2026-0096", reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; default Cranelift backend on x86-64 unaffected" },
 ]
 
 [licenses]

@@ -20,6 +20,19 @@ pub enum PropKind {
     Enum,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
+    /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
+    /// `Vec<PeripheralBoardConfig>`). Round-tripped on the wire as a JSON array of
+    /// objects; the dashboard renders a per-row sub-form using the JSON Schema
+    /// from `OPTIONS /api/config` to discover the element type's field shape.
+    /// Schema v3 / #5947 will migrate the load-bearing ones (mcp.servers etc.)
+    /// to `HashMap<String, T>` keyed tables; until then this kind covers them.
+    ObjectArray,
+    /// A struct-shaped scalar field (e.g. `Option<ModelPricing>`). Round-tripped
+    /// on the wire as a JSON object; the dashboard renders a sub-form for the
+    /// inner fields using the JSON Schema from `OPTIONS /api/config`. Distinct
+    /// from `String`, which inserts the raw value as a TOML string and breaks
+    /// the serde round-trip for typed structs.
+    Object,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -55,11 +68,96 @@ impl HasPropKind for Vec<String> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
 
+// The per-category provider-ref newtypes (defined in `crate::providers`)
+// serialize as plain strings; the schema-tooling layer treats them as
+// strings too.
+impl HasPropKind for crate::providers::ModelProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::TtsProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::TranscriptionProviderRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::providers::ChannelRef {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for Vec<crate::providers::ChannelRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+
+// Multi-agent typed primitives. AgentAlias / PeerGroupName /
+// PeerUsername round-trip as plain strings; AccessMode and
+// MemoryBackendKind are enums.
+impl HasPropKind for crate::multi_agent::AgentAlias {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::PeerGroupName {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::PeerUsername {
+    const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for crate::multi_agent::AccessMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for crate::multi_agent::MemoryBackendKind {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for Vec<crate::multi_agent::PeerUsername> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind
+    for std::collections::BTreeMap<crate::multi_agent::AgentAlias, crate::multi_agent::AccessMode>
+{
+    // Serialized as a TOML inline table: `{ beta = "read", gamma = "read_write" }`.
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
+// Vec<struct> fields are surfaced as PropKind::ObjectArray — each
+// element renders as a per-row sub-form on the dashboard rather than a
+// chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
+// for every Vec field, so a missing impl here surfaces as a "trait bound
+// not satisfied" compile error pointing at the field. Add the impl in
+// the same module that defines the type if traits.rs's crate scope is
+// too narrow.
+impl HasPropKind for Vec<crate::schema::ClassificationRule> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::McpServerConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
-    /// Full dotted name (e.g. `channels.telegram.draft-update-interval-ms`)
-    pub name: &'static str,
+    /// Full dotted name (e.g. `channels.telegram.draft-update-interval-ms`).
+    /// Owned so the `HashMap<String, T>` branch of the derive can inject the
+    /// runtime map key into the path (`model_providers.anthropic.api-key`)
+    /// — `&'static str` can't carry user-supplied keys.
+    pub name: String,
     /// Category for grouping in property listings
     pub category: &'static str,
     /// Current value formatted for display (secrets show `"****"`)
@@ -72,6 +170,14 @@ pub struct PropFieldInfo {
     pub is_secret: bool,
     /// Returns valid variant names for enum fields (None for non-enum fields)
     pub enum_variants: Option<fn() -> Vec<String>>,
+    /// Field's `///` doc comment, flattened to a single line. Empty string
+    /// when the field has no doc comment. Onboard uses this as human-readable
+    /// prompt text instead of the raw kebab-case field name.
+    pub description: &'static str,
+    /// Whether this field's value is derived from a secret (`#[derived_from_secret]`).
+    /// Subject to the same write-only / no-readback rules as `#[secret]`.
+    /// Reserved for future schema additions; currently no fields are derived.
+    pub derived_from_secret: bool,
 }
 
 impl PropFieldInfo {
@@ -90,6 +196,145 @@ impl std::fmt::Debug for PropFieldInfo {
     }
 }
 
+/// Mask and restore secret fields on config structs.
+///
+/// Automatically implemented by `#[derive(Configurable)]` for any struct that
+/// has fields annotated with `#[secret]` or `#[nested]`. A blanket impl covers
+/// `HashMap<String, T: MaskSecrets>` so the trait propagates through alias maps
+/// without any per-type boilerplate.
+pub trait MaskSecrets {
+    fn mask_secrets(&mut self);
+    fn restore_secrets_from(&mut self, current: &Self);
+}
+
+impl<T: MaskSecrets> MaskSecrets for std::collections::HashMap<String, T> {
+    fn mask_secrets(&mut self) {
+        for v in self.values_mut() {
+            v.mask_secrets();
+        }
+    }
+    fn restore_secrets_from(&mut self, current: &Self) {
+        for (k, v) in self.iter_mut() {
+            if let Some(cur) = current.get(k) {
+                v.restore_secrets_from(cur);
+            }
+        }
+    }
+}
+
+pub const MASKED_SECRET: &str = "***MASKED***";
+
+pub fn is_masked_secret(value: &str) -> bool {
+    value == MASKED_SECRET
+}
+
+pub fn mask_optional_secret(value: &mut Option<String>) {
+    if value.is_some() {
+        *value = Some(MASKED_SECRET.to_string());
+    }
+}
+
+pub fn mask_required_secret(value: &mut String) {
+    if !value.is_empty() {
+        *value = MASKED_SECRET.to_string();
+    }
+}
+
+#[allow(clippy::ref_option)]
+pub fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
+    if value.as_deref().is_some_and(is_masked_secret) {
+        *value = current.clone();
+    }
+}
+
+pub fn restore_required_secret(value: &mut String, current: &str) {
+    if is_masked_secret(value) {
+        *value = current.to_string();
+    }
+}
+
+/// Stable wire-form for an addable section — a `HashMap<String, T>` (Map) or
+/// `Vec<T>` (List) field whose value type implements `Configurable`. The
+/// dashboard / CLI use this to surface `+ Add` affordances without
+/// hardcoding the section list. Auto-discovered by the `Configurable` derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "schema-export", serde(rename_all = "snake_case"))]
+pub enum MapKeyKind {
+    /// `HashMap<String, T>` — key is user-supplied; new value is default.
+    Map,
+    /// `Vec<T>` — entries are appended; the user-supplied "key" is stored
+    /// in the value type's natural identifier field (e.g. `name`, `hint`).
+    List,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, schemars::JsonSchema)
+)]
+pub struct MapKeySection {
+    /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
+    pub path: &'static str,
+    /// Whether the section is a map or a list.
+    pub kind: MapKeyKind,
+    /// Rust type name of the value, e.g. `ModelProviderConfig`. For display only.
+    pub value_type: &'static str,
+    /// Doc comment on the field (flattened to one line). What the user sees
+    /// when picking which kind of thing to add.
+    pub description: &'static str,
+}
+
+/// One row emitted by the `Configurable` derive's `nested_option_entries()`
+/// method — every `#[nested] Option<XConfig>` field on a struct shows up here
+/// with its `present` bit and the per-field `#[display_name = "..."]` /
+/// `#[description = "..."]` metadata. The integrations registry consumes
+/// this verbatim instead of carrying its own per-field hand-list.
+#[derive(Debug, Clone, Copy)]
+pub struct NestedOptionEntry {
+    /// snake_case field name on the parent struct (e.g. `"telegram"`,
+    /// `"voice_duplex"`).
+    pub field: &'static str,
+    /// `true` when the parent struct's field is `Some(_)`.
+    pub present: bool,
+    /// Display name from `#[display_name = "..."]`; falls back to a
+    /// title-cased rendering of the snake_case field name when the
+    /// attribute is absent.
+    pub display_name: &'static str,
+    /// One-line summary from `#[description = "..."]`. Empty when the
+    /// attribute is absent.
+    pub description: &'static str,
+}
+
+/// One row emitted by the `Configurable` derive's `integration_descriptor()`
+/// method on structs annotated with `#[integration(...)]`. Used for nested
+/// toggleable configs (e.g. `BrowserConfig`, `CronConfig`) where the
+/// integration is "active" iff a named bool field on the struct is `true`.
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrationDescriptor {
+    pub display_name: &'static str,
+    pub description: &'static str,
+    /// Free-form category label (e.g. `"ToolsAutomation"`). The
+    /// integrations registry maps this string to its own
+    /// `IntegrationCategory` enum so the schema crate doesn't have to
+    /// depend on it.
+    pub category: &'static str,
+    /// Snapshot of the named status field at the moment this descriptor
+    /// was built (`status_field = "enabled"` ⇒ `self.enabled`).
+    pub active: bool,
+}
+
+/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub configured: bool,
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name
@@ -98,9 +343,102 @@ pub trait ChannelConfig {
     fn desc() -> &'static str;
 }
 
-// Maybe there should be a `&self` as parameter for custom channel/info or what...
+/// A menu item for `OnboardUi::select`, with an optional status badge
+/// (e.g. `[configured]` / `[not set]`) that backends render next to the label.
+#[derive(Debug, Clone)]
+pub struct SelectItem {
+    pub label: String,
+    pub badge: Option<String>,
+}
 
-pub trait ConfigHandle {
-    fn name(&self) -> &'static str;
-    fn desc(&self) -> &'static str;
+impl SelectItem {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            badge: None,
+        }
+    }
+
+    pub fn with_badge(label: impl Into<String>, badge: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            badge: Some(badge.into()),
+        }
+    }
+}
+
+/// Result of a single prompt — either the value the user chose, or a
+/// navigation signal. Backends return `Answer::Back` when the user presses
+/// the backend's back key (Esc on ratatui / dialoguer). Callers rewind.
+#[derive(Debug, Clone)]
+pub enum Answer<T> {
+    Value(T),
+    Back,
+}
+
+/// Prompt-surface the onboard orchestrator drives.
+///
+/// Async is deliberate: the orchestrator is already async (Config::load_or_init,
+/// Config::save), and a future gateway-backed onboarder (WebSocket → browser)
+/// needs to await network I/O per prompt. A sync trait would force that
+/// backend to bridge sync↔async via blocking threads and channels, which
+/// starves the tokio runtime under concurrent onboarding sessions. Blocking
+/// backends (dialoguer) wrap their calls in `tokio::task::spawn_blocking`.
+///
+/// Idempotency contract: prompts accept a `current` value and pre-populate it
+/// as the default. `secret(has_current=true)` returns `None` when the user
+/// declines to rotate; callers then skip the write. The orchestrator never
+/// calls `config.set_prop` unless the new value differs from `current`.
+#[async_trait::async_trait]
+pub trait OnboardUi: Send {
+    async fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<Answer<bool>>;
+
+    /// Single-line text/number/path input.
+    ///
+    /// - `current`: existing value to pre-fill into the editable buffer
+    ///   (edit mode — user lands on the prompt with the value typed in
+    ///   and can modify it before Enter).
+    /// - `placeholder`: a schema/runtime default to surface as ghost-text
+    ///   when the buffer is empty. Backends that support styled output
+    ///   render this dim; pressing Enter on an empty buffer commits the
+    ///   placeholder as the chosen value.
+    ///
+    /// At most one of `current` / `placeholder` should be `Some` at any
+    /// call site: if the user has set a value already, pre-fill it;
+    /// otherwise surface the default as ghost text. Passing both
+    /// devolves to pre-fill semantics (the placeholder is ignored).
+    async fn string(
+        &mut self,
+        prompt: &str,
+        current: Option<&str>,
+        placeholder: Option<&str>,
+    ) -> anyhow::Result<Answer<String>>;
+
+    /// `Answer::Value(Some(v))` = new secret entered. `Answer::Value(None)` =
+    /// user declined to update an existing secret (only when `has_current`).
+    /// `Answer::Back` = rewind.
+    async fn secret(
+        &mut self,
+        prompt: &str,
+        has_current: bool,
+    ) -> anyhow::Result<Answer<Option<String>>>;
+
+    async fn select(
+        &mut self,
+        prompt: &str,
+        items: &[SelectItem],
+        current: Option<usize>,
+    ) -> anyhow::Result<Answer<usize>>;
+
+    async fn editor(&mut self, hint: &str, initial: &str) -> anyhow::Result<Answer<String>>;
+
+    /// Announce a new section or subsection. `level == 1` = section
+    /// (Providers, Channels, …). `level == 2` = subsection within a section
+    /// (Hardware › Transport). Backends render these persistently so every
+    /// prompt remains anchored to its phase — rendered like Markdown
+    /// headings. `level == 1` resets any prior subsection.
+    fn heading(&mut self, level: u8, text: &str);
+    fn note(&mut self, msg: &str);
+    fn status(&mut self, msg: &str);
+    fn warn(&mut self, msg: &str);
 }

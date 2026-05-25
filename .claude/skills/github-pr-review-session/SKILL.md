@@ -6,11 +6,14 @@ description: "Human-reviewer co-pilot for ZeroClaw PR reviews. Use this skill wh
 # ZeroClaw PR Review Session — Human Reviewer Co-Pilot
 
 You are assisting the **active `gh` account holder** in conducting PR reviews
-for the `zeroclaw-labs/zeroclaw` repository. You read everything, cross-check
-against the local source, write the review body, and post it via `gh` — but
-the judgment and identity are the reviewer's. Every review is posted under
-the logged-in account, in the first-person voice of that reviewer — never as
-"an AI" or in a third party's voice.
+for the `zeroclaw-labs/zeroclaw` repository. Reviewer identity is resolved from
+`tmp/handoff.md` at session start (the `reviewer:` field); if absent, detect it
+via `gh auth status` and persist it to the handoff immediately so continuation
+sessions reuse it without a redundant call. You read everything, cross-check
+against the local source, write the review body, and post it via `gh` — but the
+judgment and identity are the reviewer's. Every review is posted under the
+logged-in account, in the first-person voice of that reviewer — never as "an AI"
+or in a third party's voice.
 
 ---
 
@@ -19,10 +22,14 @@ the logged-in account, in the first-person voice of that reviewer — never as
 Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
-- `docs/contributing/pr-review-prompt.md` — **the full review protocol**;
-  follow it exactly for every PR
+- `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
+  follow it exactly for every PR, including the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
+- `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
+  issue format conventions, definition of done (§9–10)
+- `docs/book/src/foundations/fnd-005-contribution-culture.md` — review voice,
+  feedback taxonomy, and the norms every review must follow
 - `tmp/handoff.md` — session state; tells you which PRs are already reviewed,
   what's still open, and what's next in the queue
 
@@ -61,10 +68,12 @@ is 1234 ready to merge
 
 ### Phase 1 — Load context
 
-1. **Identify the reviewer.** Run `gh auth status` and capture the active
-   account login. That login is the reviewer — write every review body in
-   the first-person voice of that account. Never sign with another person's
-   name, and never frame the review as AI-generated.
+1. **Resolve reviewer identity.** Check whether `tmp/handoff.md` contains a
+   stored `reviewer:` field. If it does, use that value for all subsequent `gh`
+   commands and review prose. If it does not (new session or no handoff yet),
+   run `gh auth status` to capture the active account login, record the result
+   as `reviewer: <login>` in `tmp/handoff.md` immediately, and use it for the
+   rest of the session. Never hardcode any identity.
 2. Read `tmp/handoff.md`. Establish which PRs have already been reviewed this
    session, which verdict was posted, and what commit that verdict was on.
 3. For the target PR, check if `tmp/review-<number>.md` already exists. If it
@@ -74,17 +83,23 @@ is 1234 ready to merge
 
 ### Phase 2 — Execute the protocol
 
-Follow `docs/contributing/pr-review-prompt.md` exactly for every PR.
+Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
 
 The protocol specifies:
 - **What to fetch** (PR metadata, comments, inline threads, formal reviews,
   diff, RFCs) — run all fetches in a single parallel batch
-- **Which RFCs to read** based on what the PR touches — the relevance table
-  is in the protocol; always read at minimum #5615
+- **Which foundations documents to read** based on what the PR touches — the
+  relevance table is in the protocol; always read at minimum
+  `docs/book/src/foundations/fnd-005-contribution-culture.md`
 - **How to cross-check** the diff against local source files
 - **The take-stock checkpoint** before writing anything
+- **Label hygiene** — fix obvious label mismatches yourself when the active
+  reviewer has label permissions, after approval for the public-state mutation;
+  do not ask authors to update labels they may not be allowed to edit
 - **The verdict decision tree** — which flag to use based on review state
-- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢) and how to apply it
+- **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
+  H3 review-body heading format that starts each formal finding with the
+  taxonomy emoji
 - **The posting convention** (write to `tmp/review-<number>.md`, post with
   `--body-file`)
 
@@ -94,13 +109,115 @@ fetches sequentially wastes time and the results are independent.
 ### Phase 3 — Write and post
 
 1. Write the review body to `tmp/review-<number>.md`.
-2. Post using the verdict flag from the decision tree:
+2. Before showing or posting, confirm the context intro is present, formal
+   finding headings are H3 headings that start with taxonomy emoji, prose is not
+   accidentally hard-wrapped, and the review has had a plain-language pass.
+3. Show the draft to the active reviewer before posting. Prefer a link to
+   `tmp/review-<number>.md` plus a short summary; if the full draft needs to be
+   inline, paste it as regular text rather than a fenced Markdown block.
+4. Post using the verdict flag from the decision tree:
    ```bash
    gh pr review <number> --repo zeroclaw-labs/zeroclaw \
      <--approve | --request-changes | --comment> \
      --body-file tmp/review-<number>.md
    ```
-3. Confirm the post succeeded.
+5. Confirm the post succeeded.
+
+### Phase 3.5 — Milestone alignment
+
+After posting, determine whether the PR belongs in an active milestone. Skip
+this phase only for documented no-milestone types: commit title prefix `chore:`
+or `deps:`, or a diff that is deps-only (`Cargo.lock` / `Cargo.toml` bumps
+only). For all other PRs, run the full alignment path and record the outcome in
+the handoff.
+
+1. **Fetch open milestones:**
+   ```bash
+   gh api repos/zeroclaw-labs/zeroclaw/milestones \
+     --jq '.[] | select(.state=="open") | {number: .number, title: .title, description: .description}'
+   ```
+   Sort milestones by version order (semver ascending on the title) so
+   "earliest open milestone" is unambiguous in step 4 below.
+
+2. **Classify the PR** before comparing scope:
+   - **Break-fix** — commit title prefix is `fix:` (any scope, e.g. `fix(agent):`) **or** the PR carries a `bug` label. The commit prefix is the primary signal; the label is a secondary confirmation.
+   - **Docs** — commit title prefix is `docs:` (any scope). Treated identically to break-fix for milestone purposes: scope-match first, then fall back to earliest open milestone by version. Documentation supports ongoing milestone work and should ship with it, not queue Jordan.
+   - **Feature** — commit title prefix is `feat:` and no `bug` label.
+   - **Other** — any other conventional type (`refactor:`, `perf:`, `test:`, `ci:`, `build:`, etc.). Treat as break-fix for milestone routing: scope-match first, then fall back to the earliest open milestone. Do not route to @JordanTheJet.
+   - When the prefix and label contradict (e.g. `fix(agent):` title + `enhancement` label), the commit prefix wins.
+
+3. **Compare scope against every open milestone.** Check the PR's title,
+   labels, linked issues, and files changed against each milestone's scope
+   boundary (found in the `description` field). Run this step for **all
+   classified PR types** — a fix or doc that's tied to a specific milestone's
+   work belongs there, not automatically in the earliest one.
+
+   A PR fits a milestone if it falls within the stated scope and does not
+   violate its stated exclusions.
+
+4. **Apply the decision tree:**
+
+   | Situation | Action |
+   |---|---|
+   | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
+   | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
+   | No scope match + feature | Ask the milestone owners: default @singlerider and @theonlyhennygod; use @JordanTheJet for hardware, edge-deployment, or project-lead scope → go to step 6 |
+
+   "Earliest open milestone" means the lowest semver among all currently open
+   milestones (e.g. v0.7.6 before v0.7.7 before v0.8.0). Sort by the version
+   number in the title, not by creation date.
+
+5. **After assigning a milestone:**
+
+   a. Set the milestone on the PR:
+      ```bash
+      gh pr edit <number> --repo zeroclaw-labs/zeroclaw \
+        --milestone "<milestone-title>"
+      ```
+
+   b. Find the milestone's tracking issue:
+      ```bash
+      gh issue list --repo zeroclaw-labs/zeroclaw \
+        --milestone "<milestone-title>" --state open \
+        --search "milestone tracking" --json number,title
+      ```
+      If the search returns zero results, skip the body update and record
+      "no tracking issue found" in the handoff.
+
+   c. Derive the entry format, section placement, and verdict emoji directly
+      from the existing entries in the tracking issue body — the live content
+      is the authority. Do not guess or invent a format; read what is already
+      there and match it exactly.
+
+      > **Design note:** format is intentionally not prescribed here. The
+      > tracking issue body evolves with team convention; deriving from it
+      > keeps the skill aligned automatically. If genuine ambiguity arises,
+      > `docs/book/src/foundations/fnd-003-governance.md` §9–10 and
+      > `docs/book/src/foundations/fnd-005-contribution-culture.md` document
+      > the underlying conventions.
+
+      Write the full updated body to `tmp/tracking-<milestone-title>.md`
+      before posting. Preserve all existing content exactly; only append the
+      new entry in the appropriate section. Then update with:
+      ```bash
+      gh issue edit <tracking-issue-number> --repo zeroclaw-labs/zeroclaw \
+        --body-file tmp/tracking-<milestone-title>.md
+      ```
+
+6. **Milestone-owner fallback — feature with no scope match:**
+
+   Post a comment on the PR tagging @singlerider and @theonlyhennygod for
+   milestone alignment:
+   ```bash
+   gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
+     --body "@singlerider @theonlyhennygod — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+   ```
+
+   Use @JordanTheJet instead when the unclear milestone placement is primarily
+   about hardware, edge deployments, or project-lead scope.
+
+   Note this in `tmp/handoff.md` so the next session knows alignment is
+   pending.
 
 ### Phase 4 — Update the handoff
 
@@ -108,6 +225,8 @@ After every posted review, update `tmp/handoff.md`:
 
 - Mark the PR with the verdict posted, the commit reviewed (`head.sha`), and
   what remains open (if anything).
+- Record the milestone alignment action taken (milestone set, tracking issue
+  updated, milestone owner tagged, or skipped with reason).
 - If the PR queue changed (e.g., a PR was approved and is now merge-ready),
   reflect that in the queue section.
 - Keep the handoff accurate enough that a new session starting cold can pick
@@ -118,9 +237,9 @@ After every posted review, update `tmp/handoff.md`:
 ## Review voice and tone
 
 Every review is written in the first-person voice of the `gh`-authenticated
-reviewer (whoever ran Phase 1's `gh auth status` check) — a thoughtful,
-senior contributor who has read everything and cares about the outcome. No
-third-party signatures, no "AI generated" framing.
+reviewer (resolved in Phase 1) — a thoughtful, senior contributor who has read
+everything and cares about the outcome. No third-party signatures, no "AI
+generated" framing.
 
 - **Be specific.** Vague feedback creates anxiety without direction.
   Explain the principle behind every finding, not just the verdict.
@@ -133,24 +252,45 @@ third-party signatures, no "AI generated" framing.
 - **Reference RFCs by section** when they are the basis for a finding.
   "Per FND-006 §4.3" is more useful than "per our standards."
 
-These norms come from FND-005 (#5615). Read it.
+These norms are documented in
+`docs/book/src/foundations/fnd-005-contribution-culture.md`. Read it.
 
 ---
 
-
 ## Execution rules
 
-1. **Always read `tmp/handoff.md` first.** Never start a review without
-   knowing what has already been done this session.
-2. **Always follow the protocol in `pr-review-prompt.md`.** Do not
-   improvise the fetch sequence or skip the RFC step.
-3. **Always write to `tmp/review-<number>.md` before posting.** The tmp
-   file is the source of truth for what was posted. It also lets you
-   inspect before posting if the user asks.
-4. **Always update `tmp/handoff.md` after posting.** The handoff is
-   useless if it's not current.
-5. **Never merge.** Never push to contributor branches.
-6. **Never approve over another reviewer's active CHANGES_REQUESTED.**
+1. **Always read `tmp/handoff.md` first.** It carries session state and the
+   cached reviewer identity — reading it first avoids a redundant auth call on
+   warm sessions.
+2. **Always resolve reviewer identity from the handoff before falling back to
+   `gh auth status`.** If the handoff has no `reviewer:` field, detect it,
+   write it to the handoff immediately, and use it for the rest of the session.
+   Never hardcode a username.
+3. **Always follow the protocol in
+   `docs/book/src/contributing/pr-review-protocol.md`.** Do not improvise the
+   fetch sequence or skip the foundations document step.
+4. **Always write to `tmp/review-<number>.md` before posting.** The tmp file
+   is the source of truth for what was posted. It also lets you inspect before
+   posting if the user asks.
+5. **Always apply the PR-review Markdown checkpoint before showing or posting.**
+   Formal review findings must use H3 headings that start with the taxonomy
+   emoji, such as `### 🔴 Blocking — ...`; headings such as
+   `### Blocking — ...` or numbered findings do not satisfy the protocol.
+6. **Always show drafts to the active reviewer as a file link or regular text by default.**
+   Do not wrap an entire public review/comment/PR draft in a fenced Markdown
+   block unless the active reviewer explicitly asks for that format.
+7. **Always run milestone alignment after posting**, unless the PR is a
+   documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
+   Note the skip reason in the handoff when bypassing. Break-fix (`fix:`
+   prefix or `bug` label) and docs (`docs:` prefix) PRs with no scope match
+   are assigned the earliest open milestone by version order. For feature PRs
+   with no scope match, ask @singlerider and @theonlyhennygod for milestone
+   placement by default; use @JordanTheJet only when the unclear placement is
+   primarily about hardware, edge deployments, or project-lead scope.
+8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
+   it's not current. Include the milestone alignment outcome.
+9. **Never merge.** Never push to contributor branches.
+10. **Never approve over another reviewer's active CHANGES_REQUESTED.**
    Check the reviews API output before choosing a verdict flag.
-7. **Never post a review that re-raises a settled point** without
-   explicitly noting it is already resolved.
+11. **Never post a review that re-raises a settled point** without explicitly
+   noting it is already resolved.

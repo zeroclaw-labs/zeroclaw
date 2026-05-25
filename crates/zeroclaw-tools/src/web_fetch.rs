@@ -111,10 +111,19 @@ impl WebFetchTool {
     /// Fetch content via the Firecrawl API.
     async fn fetch_via_firecrawl(&self, url: &str) -> anyhow::Result<ToolResult> {
         let api_key = std::env::var(&self.firecrawl.api_key_env).map_err(|_| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "env_var": &self.firecrawl.api_key_env,
+                    })),
+                "web_fetch: Firecrawl API key missing from env"
+            );
+            anyhow::Error::msg(format!(
                 "Firecrawl API key not found in environment variable '{}'",
                 self.firecrawl.api_key_env
-            )
+            ))
         })?;
 
         let endpoint = format!("{}/scrape", self.firecrawl.api_url.trim_end_matches('/'));
@@ -122,7 +131,16 @@ impl WebFetchTool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build Firecrawl HTTP client: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "web_fetch: failed to build Firecrawl HTTP client"
+                );
+                anyhow::Error::msg(format!("Failed to build Firecrawl HTTP client: {e}"))
+            })?;
 
         let body = json!({
             "url": url,
@@ -136,7 +154,19 @@ impl WebFetchTool {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Firecrawl request failed: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "firecrawl_request",
+                            "error": format!("{}", e),
+                        })),
+                    "web_fetch: Firecrawl request failed"
+                );
+                anyhow::Error::msg(format!("Firecrawl request failed: {e}"))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -152,10 +182,19 @@ impl WebFetchTool {
             });
         }
 
-        let resp_json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Firecrawl response: {e}"))?;
+        let resp_json: serde_json::Value = response.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "firecrawl_response_parse",
+                        "error": format!("{}", e),
+                    })),
+                "web_fetch: failed to parse Firecrawl response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Firecrawl response: {e}"))
+        })?;
 
         let markdown = resp_json
             .get("data")
@@ -288,10 +327,16 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+        let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "url"})),
+                "web_fetch: missing url parameter"
+            );
+            anyhow::Error::msg("Missing 'url' parameter")
+        })?;
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -301,13 +346,8 @@ impl Tool for WebFetchTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         let url = match self.validate_url(url) {
             Ok(v) => v,
@@ -322,7 +362,12 @@ impl Tool for WebFetchTool {
 
         // Build client: follow redirects, set timeout, set User-Agent
         let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "web_fetch: timeout_secs is 0, using safe default of 30s"
+            );
             30
         } else {
             self.timeout_secs
@@ -375,22 +420,36 @@ impl Tool for WebFetchTool {
         // If standard fetch succeeded well enough, return it directly.
         // Otherwise, try Firecrawl fallback if enabled.
         if self.should_fallback_to_firecrawl(&standard_result) {
-            tracing::info!(
-                "web_fetch: standard fetch insufficient for {url}, attempting Firecrawl fallback"
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"url": url})),
+                "web_fetch: standard fetch insufficient for , attempting Firecrawl fallback"
             );
             match Box::pin(self.fetch_via_firecrawl(&url)).await {
                 Ok(firecrawl_result) if firecrawl_result.success => {
                     return Ok(firecrawl_result);
                 }
                 Ok(firecrawl_result) => {
-                    tracing::warn!(
-                        "web_fetch: Firecrawl fallback also failed: {:?}",
-                        firecrawl_result.error
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "web_fetch: Firecrawl fallback also failed: {:?}",
+                            firecrawl_result.error
+                        )
                     );
                     // Return original standard result if Firecrawl also failed
                 }
                 Err(e) => {
-                    tracing::warn!("web_fetch: Firecrawl fallback error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "web_fetch: Firecrawl fallback error"
+                    );
                 }
             }
         }
@@ -447,8 +506,12 @@ fn validate_target_url(
     }
 
     if private_host_allowed {
-        tracing::warn!(
-            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"tool_name": tool_name, "host": host})),
+            ": allowing private/local host '' via allowed_private_hosts"
         );
     }
 
@@ -521,12 +584,27 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"url": url})),
+                "web_fetch: non-http(s) URL rejected"
+            );
+            anyhow::Error::msg("Only http:// and https:// URLs are allowed")
+        })?;
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url})),
+            "web_fetch: invalid URL"
+        );
+        anyhow::Error::msg("Invalid URL")
+    })?;
 
     if authority.is_empty() {
         anyhow::bail!("URL must include a host");
@@ -599,7 +677,19 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
 
     let ips = (host, 0)
         .to_socket_addrs()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve host '{host}': {e}"))?
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "host": host,
+                        "error": format!("{}", e),
+                    })),
+                "web_fetch: failed to resolve host"
+            );
+            anyhow::Error::msg(format!("Failed to resolve host '{host}': {e}"))
+        })?
         .map(|addr| addr.ip())
         .collect::<Vec<_>>();
 
@@ -946,29 +1036,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn blocks_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = WebFetchTool::new(
-            security,
-            vec!["example.com".into()],
-            vec![],
-            500_000,
-            30,
-            FirecrawlConfig::default(),
-            vec![],
-        );
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
     }
 
     // ── Response truncation ──────────────────────────────────────

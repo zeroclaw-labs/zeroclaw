@@ -7,6 +7,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 /// to a configurable outbound URL. This is the "universal adapter" for any system
 /// that supports webhooks.
 pub struct WebhookChannel {
+    alias: String,
     listen_port: u16,
     listen_path: String,
     send_url: Option<String>,
@@ -36,6 +37,7 @@ struct OutgoingWebhook {
 
 impl WebhookChannel {
     pub fn new(
+        alias: String,
         listen_port: u16,
         listen_path: Option<String>,
         send_url: Option<String>,
@@ -52,6 +54,7 @@ impl WebhookChannel {
         };
 
         Self {
+            alias,
             listen_port,
             listen_path,
             send_url,
@@ -98,6 +101,17 @@ impl WebhookChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for WebhookChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for WebhookChannel {
     fn name(&self) -> &str {
@@ -106,7 +120,11 @@ impl Channel for WebhookChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let Some(ref send_url) = self.send_url else {
-            tracing::debug!("Webhook channel: no send_url configured, skipping outbound message");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "channel: no send_url configured, skipping outbound message"
+            );
             return Ok(());
         };
 
@@ -200,7 +218,12 @@ impl Channel for WebhookChannel {
                 };
 
                 if !valid {
-                    tracing::warn!("Webhook: invalid signature, rejecting request");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "invalid signature, rejecting request"
+                    );
                     return StatusCode::UNAUTHORIZED;
                 }
             }
@@ -208,7 +231,13 @@ impl Channel for WebhookChannel {
             let payload: IncomingWebhook = match serde_json::from_slice(&body) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!("Webhook: invalid JSON payload: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "invalid JSON payload"
+                    );
                     return StatusCode::BAD_REQUEST;
                 }
             };
@@ -236,10 +265,12 @@ impl Channel for WebhookChannel {
                 reply_target,
                 content: payload.content,
                 channel: "webhook".to_string(),
+                channel_alias: None,
                 timestamp,
                 thread_ts: payload.thread_id,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             };
 
             if state.tx.send(msg).await.is_err() {
@@ -254,16 +285,26 @@ impl Channel for WebhookChannel {
             .with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.listen_port));
-        tracing::info!(
-            "Webhook channel listening on http://0.0.0.0:{}{} ...",
-            self.listen_port,
-            self.listen_path
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Webhook channel listening on http://0.0.0.0:{}{} ...",
+                self.listen_port, self.listen_path
+            )
         );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow::anyhow!("Webhook server error: {e}"))?;
+        axum::serve(listener, app).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Webhook server error"
+            );
+            anyhow::Error::msg(format!("Webhook server error: {e}"))
+        })?;
 
         Ok(())
     }
@@ -281,6 +322,7 @@ mod tests {
 
     fn make_channel() -> WebhookChannel {
         WebhookChannel::new(
+            "test-hook".into(),
             8080,
             Some("/webhook".into()),
             Some("https://example.com/callback".into()),
@@ -292,6 +334,7 @@ mod tests {
 
     fn make_channel_with_secret() -> WebhookChannel {
         WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some("https://example.com/callback".into()),
@@ -303,13 +346,21 @@ mod tests {
 
     #[test]
     fn default_path() {
-        let ch = WebhookChannel::new(8080, None, None, None, None, None);
+        let ch = WebhookChannel::new("test-hook".into(), 8080, None, None, None, None, None);
         assert_eq!(ch.listen_path, "/webhook");
     }
 
     #[test]
     fn path_normalized() {
-        let ch = WebhookChannel::new(8080, Some("hooks/incoming".into()), None, None, None, None);
+        let ch = WebhookChannel::new(
+            "test-hook".into(),
+            8080,
+            Some("hooks/incoming".into()),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(ch.listen_path, "/hooks/incoming");
     }
 
@@ -322,6 +373,7 @@ mod tests {
     #[test]
     fn send_method_put() {
         let ch = WebhookChannel::new(
+            "test-hook".into(),
             8080,
             None,
             Some("https://example.com".into()),

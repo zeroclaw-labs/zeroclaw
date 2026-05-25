@@ -102,6 +102,8 @@ impl LeakDetector {
                     Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
                     "Anthropic API key",
                 ),
+                // Groq
+                (Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(), "Groq API key"),
                 // Google
                 (
                     Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
@@ -312,7 +314,7 @@ impl LeakDetector {
         // segments are not mistaken for high-entropy credentials.
         // Media markers like [IMAGE:/path/to/file.png] contain filesystem paths
         // that look like high-entropy tokens when `/` is included in the token
-        // character set (#4604).
+        // character set.
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -321,7 +323,7 @@ impl LeakDetector {
         });
         // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
         // intentionally appear in output. Strip them before entropy scanning so
-        // they are not redacted as leaked credentials. See #4830.
+        // they are not redacted as leaked credentials.
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let receipt_re =
             RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
@@ -410,6 +412,21 @@ mod tests {
                 assert!(patterns.iter().any(|p| p.contains("AWS")));
             }
             LeakResult::Clean => panic!("Should detect AWS key"),
+        }
+    }
+
+    #[test]
+    fn detects_groq_api_keys() {
+        let detector = LeakDetector::new();
+        let content = "Groq key: gsk_abcdefghijklmnopqrstuvwxyz123456";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Groq")));
+                assert!(redacted.contains("[REDACTED"));
+                assert!(!redacted.contains("gsk_abcdefghijklmnopqrstuvwxyz123456"));
+            }
+            LeakResult::Clean => panic!("Should detect Groq API key"),
         }
     }
 

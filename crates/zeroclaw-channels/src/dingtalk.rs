@@ -14,7 +14,12 @@ const DINGTALK_BOT_CALLBACK_TOPIC: &str = "/v1.0/im/bot/messages/get";
 pub struct DingTalkChannel {
     client_id: String,
     client_secret: String,
-    allowed_users: Vec<String>,
+    /// The alias key under `[channels.dingtalk.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Per-chat session webhooks for sending replies (chatID -> webhook URL).
     /// DingTalk provides a unique webhook URL with each incoming message.
     session_webhooks: Arc<RwLock<HashMap<String, String>>>,
@@ -30,14 +35,26 @@ struct GatewayResponse {
 }
 
 impl DingTalkChannel {
-    pub fn new(client_id: String, client_secret: String, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        client_id: String,
+        client_secret: String,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             client_id,
             client_secret,
-            allowed_users,
+            alias: alias.into(),
+            peer_resolver,
             session_webhooks: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
         }
+    }
+
+    /// Return the alias under `[channels.dingtalk.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -54,7 +71,8 @@ impl DingTalkChannel {
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
     fn parse_stream_data(frame: &serde_json::Value) -> Option<serde_json::Value> {
@@ -109,11 +127,22 @@ impl DingTalkChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk gateway registration failed ({status}): {err}");
+            anyhow::bail!("gateway registration failed ({status}): {err}");
         }
 
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for DingTalkChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::DingTalk,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -126,11 +155,21 @@ impl Channel for DingTalkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let webhooks = self.session_webhooks.read().await;
         let webhook_url = webhooks.get(&message.recipient).ok_or_else(|| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "recipient": message.recipient,
+                        "reason": "no_session_webhook",
+                    })),
+                "dingtalk: no session webhook for recipient"
+            );
+            anyhow::Error::msg(format!(
                 "No session webhook found for chat {}. \
                  The user must send a message first to establish a session.",
                 message.recipient
-            )
+            ))
         })?;
 
         let title = message.subject.as_deref().unwrap_or("ZeroClaw");
@@ -152,19 +191,27 @@ impl Channel for DingTalkChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("DingTalk webhook reply failed ({status}): {err}");
+            anyhow::bail!("webhook reply failed ({status}): {err}");
         }
 
         Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("DingTalk: registering gateway connection...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "registering gateway connection..."
+        );
 
         let gw = self.register_connection().await?;
         let ws_url = format!("{}?ticket={}", gw.endpoint, gw.ticket);
 
-        tracing::info!("DingTalk: connecting to stream WebSocket...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "connecting to stream WebSocket..."
+        );
         let (ws_stream, _) = zeroclaw_config::schema::ws_connect_with_proxy(
             &ws_url,
             "channel.dingtalk",
@@ -173,14 +220,24 @@ impl Channel for DingTalkChannel {
         .await?;
         let (mut write, mut read) = ws_stream.split();
 
-        tracing::info!("DingTalk: connected and listening for messages...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "connected and listening for messages..."
+        );
 
         while let Some(msg) = read.next().await {
             let msg = match msg {
                 Ok(Message::Text(t)) => t,
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    tracing::warn!("DingTalk WebSocket error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "WebSocket error"
+                    );
                     break;
                 }
                 _ => continue,
@@ -213,7 +270,16 @@ impl Channel for DingTalkChannel {
                     });
 
                     if let Err(e) = write.send(Message::Text(pong.to_string().into())).await {
-                        tracing::warn!("DingTalk: failed to send pong: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "failed to send pong"
+                        );
                         break;
                     }
                 }
@@ -222,7 +288,14 @@ impl Channel for DingTalkChannel {
                     let data = match Self::parse_stream_data(&frame) {
                         Some(v) => v,
                         None => {
-                            tracing::debug!("DingTalk: frame has no parseable data payload");
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                "frame has no parseable data payload"
+                            );
                             continue;
                         }
                     };
@@ -245,8 +318,15 @@ impl Channel for DingTalkChannel {
                         .unwrap_or("unknown");
 
                     if !self.is_user_allowed(sender_id) {
-                        tracing::warn!(
-                            "DingTalk: ignoring message from unauthorized user: {sender_id}"
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"sender_id": sender_id})),
+                            "ignoring message from unauthorized user"
                         );
                         continue;
                     }
@@ -287,6 +367,7 @@ impl Channel for DingTalkChannel {
                         reply_target: chat_id,
                         content: content.to_string(),
                         channel: "dingtalk".to_string(),
+                        channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -294,10 +375,19 @@ impl Channel for DingTalkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                         attachments: vec![],
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
-                        tracing::warn!("DingTalk: message channel closed");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "message channel closed"
+                        );
                         break;
                     }
                 }
@@ -305,7 +395,7 @@ impl Channel for DingTalkChannel {
             }
         }
 
-        anyhow::bail!("DingTalk WebSocket stream ended")
+        anyhow::bail!("WebSocket stream ended")
     }
 
     async fn health_check(&self) -> bool {
@@ -319,50 +409,101 @@ mod tests {
 
     #[test]
     fn test_name() {
-        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
         assert_eq!(ch.name(), "dingtalk");
     }
 
     #[test]
     fn test_user_allowed_wildcard() {
-        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["*".into()]);
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        );
         assert!(ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn test_user_allowed_specific() {
-        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec!["user123".into()]);
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(|| vec!["user123".into()]),
+        );
         assert!(ch.is_user_allowed("user123"));
         assert!(!ch.is_user_allowed("other"));
     }
 
     #[test]
     fn test_user_denied_empty() {
-        let ch = DingTalkChannel::new("id".into(), "secret".into(), vec![]);
+        let ch = DingTalkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "dingtalk_test_alias",
+            Arc::new(Vec::new),
+        );
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
-    fn test_config_serde() {
-        let toml_str = r#"
+    fn v2_allowed_users_fold_into_peer_groups() {
+        // V2 `[channels.dingtalk].allowed_users` migrates into a synthesized
+        // `[peer_groups.dingtalk_default]` block in V3. The wildcard sentinel
+        // is filtered out during synthesis so only concrete usernames survive
+        // as external peers.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.dingtalk]
+enabled = true
 client_id = "app_id_123"
 client_secret = "secret_456"
 allowed_users = ["user1", "*"]
 "#;
-        let config: zeroclaw_config::schema::DingTalkConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.client_id, "app_id_123");
-        assert_eq!(config.client_secret, "secret_456");
-        assert_eq!(config.allowed_users, vec!["user1", "*"]);
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 dingtalk config migrates to V3");
+        let dingtalk = cfg
+            .channels
+            .dingtalk
+            .get("default")
+            .expect("V2 dingtalk folds under alias `default`");
+        assert_eq!(dingtalk.client_id, "app_id_123");
+        assert_eq!(dingtalk.client_secret, "secret_456");
+
+        let group = cfg
+            .peer_groups
+            .get("dingtalk_default")
+            .expect("dingtalk allow-list synthesizes [peer_groups.dingtalk_default]");
+        assert_eq!(group.channel, "dingtalk");
+        let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
+        assert_eq!(peers, vec!["user1"]);
     }
 
     #[test]
-    fn test_config_serde_defaults() {
-        let toml_str = r#"
+    fn v2_no_allowed_users_synthesizes_no_peer_group() {
+        // V2 dingtalk without `allowed_users` must not synthesize a peer group;
+        // V3 leaves `peer_groups` empty rather than emitting an empty block.
+        let v2_toml = r#"
+schema_version = 2
+
+[channels.dingtalk]
+enabled = true
 client_id = "id"
 client_secret = "secret"
 "#;
-        let config: zeroclaw_config::schema::DingTalkConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.allowed_users.is_empty());
+        let cfg = zeroclaw_config::migration::migrate_to_current(v2_toml)
+            .expect("V2 dingtalk config without allowed_users migrates");
+        assert!(
+            !cfg.peer_groups.contains_key("dingtalk_default"),
+            "no peer group synthesized when allowed_users is absent"
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
+import ReloadBanner from '@/components/layout/ReloadBanner';
+import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import { ErrorBoundary } from '@/App';
 
 const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
@@ -49,11 +51,17 @@ export default function Layout() {
           onCollapseToggle={() => setCollapsed((c) => !c)}
           collapsed={collapsed}
         />
+        <ReloadBanner />
+        <UnsavedChangesBanner />
 
-        {/* Page content — ErrorBoundary keyed by pathname so the nav shell
-            survives a page crash and the boundary resets on route change */}
+        {/* Page content — ErrorBoundary keyed by the first path segment
+            so the boundary resets when the user navigates between pages
+            (e.g. /agent → /config), but stays mounted across param-only
+            changes within a page (e.g. /config/providers → /config/browser).
+            Keying on the full pathname remounted the entire route tree
+            on every section click and reset scroll/state. */}
         <main className="flex-1 overflow-y-auto min-h-0">
-          <ErrorBoundary key={pathname}>
+          <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
             <Outlet />
           </ErrorBoundary>
         </main>
