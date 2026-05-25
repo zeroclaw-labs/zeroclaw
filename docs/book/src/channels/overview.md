@@ -23,7 +23,10 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | Mattermost | `channel-mattermost` | [Mattermost](./mattermost.md) |
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
-| Discord, Slack, Telegram, Signal, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| Signal | `channel-signal` | [Signal](./signal.md) |
+| WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
+| WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
+| Discord, Slack, Telegram, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -71,17 +74,21 @@ See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
 ## Configuration
 
-Every channel is configured under `[channels.<name>]`:
+Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias:
 
 ```toml
-[channels.discord]
+[channels.discord.default]
 enabled = true
 bot_token = "..."
 allowed_users = ["123456789012345678"]
 reply_to_mentions_only = false
+
+[agents.assistant]
+enabled = true
+channels = ["discord.default"]
 ```
 
-Channel-specific options live under the same block. Common keys across channels:
+The `channels` entry binds the channel alias to the agent that should answer it. Some older per-channel guides still show legacy flat examples; prefer the alias shape above for new config. Channel-specific options live under the same block. Common keys across channels:
 
 | Key | What it does |
 |---|---|
@@ -94,7 +101,7 @@ Channel-specific options live under the same block. Common keys across channels:
 
 ## Pairing
 
-Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. `zeroclaw onboard channels` walks you through pairing each channel you configure; use `zeroclaw channel add` and `zeroclaw channel bind-telegram` (for Telegram specifically) to pair additional identities later. Without pairing, the channel rejects everything.
+Most channels require **pairing** — a one-time handshake that binds an incoming message source to the agent's policy. `zeroclaw onboard channels` walks you through pairing each channel you configure; use `zeroclaw channel bind-telegram` for Telegram-specific identities and the channel-specific guide for channels such as WhatsApp or Signal. Without pairing, the channel rejects everything.
 
 The rationale: an agent with a public Telegram bot token and no pairing is a publicly-accessible shell. Pairing is the gate.
 

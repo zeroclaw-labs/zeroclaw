@@ -47,17 +47,6 @@ use_long_polling = true            # default — no webhook needed
 - Long polling is the default; no public URL required. Switch to webhook mode by setting `webhook_url` (then expose the gateway).
 - Streaming draft edits are supported but capped by Telegram's rate limit. Tune `draft_update_interval_ms` if you see "Too Many Requests".
 
-## Signal
-
-```toml
-[channels.signal]
-enabled = true
-phone_number = "+14155550123"
-signal_cli_rest_url = "http://localhost:8080"   # signal-cli-rest-api service
-```
-
-Signal integration requires running the [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container locally — Signal has no official bot API, so we tunnel through `signal-cli`.
-
 ## iMessage (macOS only)
 
 ```toml
@@ -207,5 +196,7 @@ Channels with more intricate setup (OAuth flows, end-to-end encryption, multi-de
 - [Mattermost](./mattermost.md)
 - [LINE](./line.md)
 - [Nextcloud Talk](./nextcloud-talk.md)
+- [Signal](./signal.md)
+- [WhatsApp](./whatsapp.md)
 
 If you run into configuration friction on any channel above, file an issue with the repro and we'll consider promoting it to a dedicated guide.

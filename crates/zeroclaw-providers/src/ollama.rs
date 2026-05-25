@@ -805,6 +805,7 @@ impl ModelProvider for OllamaModelProvider {
             native_tool_calling: false,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
