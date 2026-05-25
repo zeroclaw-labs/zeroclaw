@@ -45,7 +45,10 @@
 //! Supports Db2 HADR standbys, pureScale, and Db2 on Cloud — just point the
 //! connection string at the correct endpoint.
 
-use crate::session_backend::{SessionBackend, SessionMetadata, SessionQuery, SessionState};
+use crate::session_backend::{
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    TimestampedMessage,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use odbc_api::{
@@ -627,6 +630,141 @@ impl SessionBackend for Db2SessionBackend {
             &VarCharSlice::new(session_key.as_bytes()),
         );
         rows.into_iter().next().map(|row| row_to_meta(&row))
+    }
+
+    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
+        let Ok(g) = self.pool.get() else { return Vec::new() };
+        select_rows(
+            &g.0,
+            "SELECT ROLE, CONTENT, CREATED_AT FROM ZC_SESSIONS
+             WHERE SESSION_KEY = ? ORDER BY ID ASC",
+            &VarCharSlice::new(session_key.as_bytes()),
+        )
+        .into_iter()
+        .map(|row| {
+            // parse_ts handles Db2's "YYYY-MM-DD HH:MM:SS±HH:MM" format.
+            let ts = row
+                .get(2)
+                .and_then(|v| v.as_deref())
+                .and_then(|s| {
+                    DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z").ok()
+                })
+                .map(|dt| dt.with_timezone(&Utc));
+            TimestampedMessage {
+                message: ChatMessage {
+                    role: col_str(&row, 0),
+                    content: col_str(&row, 1),
+                },
+                created_at: ts,
+            }
+        })
+        .collect()
+    }
+
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let g = self.pool.get().map_err(std::io::Error::other)?;
+        let conn = &g.0;
+        let sk = VarCharSlice::new(session_key.as_bytes());
+        // Count before delete so we can return an accurate value.
+        let count_rows = select_rows(
+            conn,
+            "SELECT COUNT(*) FROM ZC_SESSIONS WHERE SESSION_KEY = ?",
+            &sk,
+        );
+        let n = count_rows
+            .into_iter()
+            .next()
+            .and_then(|r| col_opt(&r, 0))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if n > 0 {
+            conn.execute(
+                "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = ?",
+                &VarCharSlice::new(session_key.as_bytes()),
+            )
+            .map_err(std::io::Error::other)?;
+            conn.execute(
+                "UPDATE ZC_SESSION_META
+                 SET MESSAGE_COUNT = 0, LAST_ACTIVITY = SYSTIMESTAMP
+                 WHERE SESSION_KEY = ?",
+                &VarCharSlice::new(session_key.as_bytes()),
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        Ok(n)
+    }
+
+    fn set_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<()> {
+        let g = self.pool.get().map_err(std::io::Error::other)?;
+        let alias_val = if agent_alias.is_empty() {
+            VarCharBox::null()
+        } else {
+            VarCharBox::from_string(agent_alias.to_string())
+        };
+        let sk = VarCharSlice::new(session_key.as_bytes());
+        // USING aliases both parameters so WHEN NOT MATCHED INSERT can reference src.*
+        // without re-binding — ODBC positional `?` markers are consumed left-to-right.
+        g.0.execute(
+            "MERGE INTO ZC_SESSION_META m
+             USING (SELECT ? AS SK, ? AS ALIAS FROM SYSIBM.SYSDUMMY1) src
+                 ON (m.SESSION_KEY = src.SK)
+             WHEN MATCHED THEN UPDATE SET m.AGENT_ALIAS = src.ALIAS
+             WHEN NOT MATCHED THEN INSERT
+                 (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT, AGENT_ALIAS)
+             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.ALIAS)",
+            (&sk, &alias_val),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let Ok(g) = self.pool.get() else { return Ok(None) };
+        let rows = select_rows(
+            &g.0,
+            "SELECT AGENT_ALIAS FROM ZC_SESSION_META WHERE SESSION_KEY = ?",
+            &VarCharSlice::new(session_key.as_bytes()),
+        );
+        Ok(rows.into_iter().next().and_then(|r| col_opt(&r, 0)))
+    }
+
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        let g = self.pool.get().map_err(std::io::Error::other)?;
+        fn to_varchar(v: Option<&str>) -> VarCharBox {
+            match v.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => VarCharBox::from_string(s.to_string()),
+                None => VarCharBox::null(),
+            }
+        }
+        let channel_id = to_varchar(context.channel_id);
+        let room_id = to_varchar(context.room_id);
+        let sender_id = to_varchar(context.sender_id);
+        let sk = VarCharSlice::new(session_key.as_bytes());
+        // Four params in USING; all WHEN clauses reference src.* aliases.
+        g.0.execute(
+            "MERGE INTO ZC_SESSION_META m
+             USING (SELECT ? AS SK, ? AS CID, ? AS RID, ? AS SID
+                    FROM SYSIBM.SYSDUMMY1) src ON (m.SESSION_KEY = src.SK)
+             WHEN MATCHED THEN UPDATE SET
+                 m.CHANNEL_ID = COALESCE(src.CID, m.CHANNEL_ID),
+                 m.ROOM_ID    = COALESCE(src.RID, m.ROOM_ID),
+                 m.SENDER_ID  = COALESCE(src.SID, m.SENDER_ID)
+             WHEN NOT MATCHED THEN INSERT
+                 (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
+                  CHANNEL_ID, ROOM_ID, SENDER_ID)
+             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.CID, src.RID, src.SID)",
+            (&sk, &channel_id, &room_id, &sender_id),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
 }
 

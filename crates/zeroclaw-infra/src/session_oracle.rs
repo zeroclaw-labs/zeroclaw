@@ -32,7 +32,10 @@
 //! The schema uses the same logical columns as the SQLite and PostgreSQL
 //! backends so data can be migrated between backends without transformation.
 
-use crate::session_backend::{SessionBackend, SessionMetadata, SessionQuery, SessionState};
+use crate::session_backend::{
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    TimestampedMessage,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use oracle::Connection;
@@ -503,6 +506,126 @@ impl SessionBackend for OracleSessionBackend {
             room_id: row.get(7).unwrap_or(None),
             sender_id: row.get(8).unwrap_or(None),
         })
+    }
+
+    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
+        let Ok(mut g) = self.pool.get() else {
+            return Vec::new();
+        };
+        let conn = &mut g.0;
+        let Ok(rows) = conn.query(
+            "SELECT ROLE, CONTENT, CREATED_AT FROM ZC_SESSIONS
+             WHERE SESSION_KEY = :1 ORDER BY ID ASC",
+            &[&session_key],
+        ) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok())
+            .map(|row| {
+                let ts: Option<DateTime<Utc>> = row.get(2).unwrap_or(None);
+                TimestampedMessage {
+                    message: ChatMessage {
+                        role: row.get(0).unwrap_or_default(),
+                        content: row.get(1).unwrap_or_default(),
+                    },
+                    created_at: ts,
+                }
+            })
+            .collect()
+    }
+
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+        let conn = &mut g.0;
+        let stmt = conn
+            .execute("DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1", &[&session_key])
+            .map_err(std::io::Error::other)?;
+        let n = stmt.row_count().map_err(std::io::Error::other)? as usize;
+        if n > 0 {
+            conn.execute(
+                "UPDATE ZC_SESSION_META
+                 SET MESSAGE_COUNT = 0, LAST_ACTIVITY = SYSTIMESTAMP
+                 WHERE SESSION_KEY = :1",
+                &[&session_key],
+            )
+            .map_err(std::io::Error::other)?;
+            conn.commit().map_err(std::io::Error::other)?;
+        }
+        Ok(n)
+    }
+
+    fn set_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<()> {
+        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+        let conn = &mut g.0;
+        let alias_val: Option<&str> =
+            if agent_alias.is_empty() { None } else { Some(agent_alias) };
+        conn.execute(
+            "MERGE INTO ZC_SESSION_META m
+             USING (SELECT :1 AS SK, :2 AS ALIAS FROM DUAL) src ON (m.SESSION_KEY = src.SK)
+             WHEN MATCHED THEN UPDATE SET m.AGENT_ALIAS = src.ALIAS
+             WHEN NOT MATCHED THEN INSERT
+                 (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT, AGENT_ALIAS)
+             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.ALIAS)",
+            &[&session_key, &alias_val],
+        )
+        .map_err(std::io::Error::other)?;
+        conn.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let Ok(mut g) = self.pool.get() else {
+            return Ok(None);
+        };
+        let conn = &mut g.0;
+        let Ok(mut rows) = conn.query(
+            "SELECT AGENT_ALIAS FROM ZC_SESSION_META WHERE SESSION_KEY = :1",
+            &[&session_key],
+        ) else {
+            return Ok(None);
+        };
+        let Some(Ok(row)) = rows.next() else {
+            return Ok(None);
+        };
+        Ok(row.get(0).unwrap_or(None))
+    }
+
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+        let conn = &mut g.0;
+        fn norm(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|s| !s.is_empty())
+        }
+        let channel_id = norm(context.channel_id);
+        let room_id = norm(context.room_id);
+        let sender_id = norm(context.sender_id);
+        // USING aliases the parameters so both WHEN MATCHED and WHEN NOT MATCHED
+        // reference src.* without rebinding, avoiding OCI positional ambiguity.
+        conn.execute(
+            "MERGE INTO ZC_SESSION_META m
+             USING (SELECT :1 AS SK, :2 AS CID, :3 AS RID, :4 AS SID FROM DUAL) src
+                 ON (m.SESSION_KEY = src.SK)
+             WHEN MATCHED THEN UPDATE SET
+                 m.CHANNEL_ID = COALESCE(src.CID, m.CHANNEL_ID),
+                 m.ROOM_ID    = COALESCE(src.RID, m.ROOM_ID),
+                 m.SENDER_ID  = COALESCE(src.SID, m.SENDER_ID)
+             WHEN NOT MATCHED THEN INSERT
+                 (SESSION_KEY, CREATED_AT, LAST_ACTIVITY, MESSAGE_COUNT,
+                  CHANNEL_ID, ROOM_ID, SENDER_ID)
+             VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.CID, src.RID, src.SID)",
+            &[&session_key, &channel_id, &room_id, &sender_id],
+        )
+        .map_err(std::io::Error::other)?;
+        conn.commit().map_err(std::io::Error::other)?;
+        Ok(())
     }
 }
 

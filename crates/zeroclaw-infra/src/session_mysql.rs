@@ -26,7 +26,10 @@
 //! Oracle backends so data can be migrated between backends without
 //! transformation.
 
-use crate::session_backend::{SessionBackend, SessionMetadata, SessionQuery, SessionState};
+use crate::session_backend::{
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    TimestampedMessage,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use mysql::{prelude::*, Pool};
@@ -374,6 +377,100 @@ impl SessionBackend for MysqlSessionBackend {
         )
         .ok()?
         .map(map_row)
+    }
+
+    fn load_with_timestamps(&self, session_key: &str) -> Vec<TimestampedMessage> {
+        let Ok(mut conn) = self.pool.get_conn() else {
+            return Vec::new();
+        };
+        conn.exec_map(
+            "SELECT role, content, created_at FROM sessions
+             WHERE session_key = ? ORDER BY id ASC",
+            (session_key,),
+            |(role, content, created_at): (String, String, chrono::NaiveDateTime)| {
+                TimestampedMessage {
+                    message: ChatMessage { role, content },
+                    created_at: Some(DateTime::from_naive_utc_and_offset(created_at, Utc)),
+                }
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+        conn.exec_drop("DELETE FROM sessions WHERE session_key = ?", (session_key,))
+            .map_err(std::io::Error::other)?;
+        let n = conn.affected_rows() as usize;
+        if n > 0 {
+            conn.exec_drop(
+                "UPDATE session_metadata
+                 SET message_count = 0, last_activity = NOW(6)
+                 WHERE session_key = ?",
+                (session_key,),
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        Ok(n)
+    }
+
+    fn set_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<()> {
+        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+        let alias_val: Option<&str> =
+            if agent_alias.is_empty() { None } else { Some(agent_alias) };
+        conn.exec_drop(
+            "INSERT INTO session_metadata
+                 (session_key, created_at, last_activity, message_count, agent_alias)
+             VALUES (?, NOW(6), NOW(6), 0, ?)
+             ON DUPLICATE KEY UPDATE agent_alias = VALUES(agent_alias)",
+            (session_key, alias_val),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let Ok(mut conn) = self.pool.get_conn() else {
+            return Ok(None);
+        };
+        let row: Option<Option<String>> = conn
+            .exec_first(
+                "SELECT agent_alias FROM session_metadata WHERE session_key = ?",
+                (session_key,),
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(row.flatten())
+    }
+
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+        fn norm(v: Option<&str>) -> Option<String> {
+            v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+        }
+        let channel_id = norm(context.channel_id);
+        let room_id = norm(context.room_id);
+        let sender_id = norm(context.sender_id);
+        conn.exec_drop(
+            "INSERT INTO session_metadata
+                 (session_key, created_at, last_activity, message_count,
+                  channel_id, room_id, sender_id)
+             VALUES (?, NOW(6), NOW(6), 0, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                 channel_id = COALESCE(VALUES(channel_id), channel_id),
+                 room_id    = COALESCE(VALUES(room_id),    room_id),
+                 sender_id  = COALESCE(VALUES(sender_id),  sender_id)",
+            (session_key, channel_id, room_id, sender_id),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
     }
 }
 
