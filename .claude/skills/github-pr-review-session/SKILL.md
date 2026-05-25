@@ -161,7 +161,7 @@ the handoff.
    |---|---|
    | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
    | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
-   | No scope match + feature | Tag @JordanTheJet → go to step 6 |
+   | No scope match + feature | Ask the milestone owners: default @singlerider and @theonlyhennygod; use @JordanTheJet for hardware, edge-deployment, or project-lead scope → go to step 6 |
 
    "Earliest open milestone" means the lowest semver among all currently open
    milestones (e.g. v0.7.6 before v0.7.7 before v0.8.0). Sort by the version
@@ -204,13 +204,17 @@ the handoff.
         --body-file tmp/tracking-<milestone-title>.md
       ```
 
-6. **Jordan trapdoor — feature with no scope match:**
+6. **Milestone-owner fallback — feature with no scope match:**
 
-   Post a comment on the PR tagging @JordanTheJet for milestone alignment:
+   Post a comment on the PR tagging @singlerider and @theonlyhennygod for
+   milestone alignment:
    ```bash
    gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
-     --body "@JordanTheJet — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+     --body "@singlerider @theonlyhennygod — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
    ```
+
+   Use @JordanTheJet instead when the unclear milestone placement is primarily
+   about hardware, edge deployments, or project-lead scope.
 
    Note this in `tmp/handoff.md` so the next session knows alignment is
    pending.
@@ -222,7 +226,7 @@ After every posted review, update `tmp/handoff.md`:
 - Mark the PR with the verdict posted, the commit reviewed (`head.sha`), and
   what remains open (if anything).
 - Record the milestone alignment action taken (milestone set, tracking issue
-  updated, @JordanTheJet tagged, or skipped with reason).
+  updated, milestone owner tagged, or skipped with reason).
 - If the PR queue changed (e.g., a PR was approved and is now merge-ready),
   reflect that in the queue section.
 - Keep the handoff accurate enough that a new session starting cold can pick
@@ -279,9 +283,10 @@ These norms are documented in
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
    Note the skip reason in the handoff when bypassing. Break-fix (`fix:`
    prefix or `bug` label) and docs (`docs:` prefix) PRs with no scope match
-   are assigned the earliest open milestone by version order — do not tag
-   @JordanTheJet for those. @JordanTheJet is only the fallback for feature
-   PRs with no scope match.
+   are assigned the earliest open milestone by version order. For feature PRs
+   with no scope match, ask @singlerider and @theonlyhennygod for milestone
+   placement by default; use @JordanTheJet only when the unclear placement is
+   primarily about hardware, edge deployments, or project-lead scope.
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.

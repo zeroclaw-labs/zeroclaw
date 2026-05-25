@@ -18,7 +18,7 @@ Read these repository files at the start of every session — they are authorita
 
 Then read `references/triage-protocol.md` for the full mode-by-mode workflow.
 
-The protocol encodes operational details from RFC #5577 (governance, stale policy, label taxonomy) and RFC #5615 (contribution culture). If you need background context beyond what the protocol provides, fetch these RFCs (open issues in zeroclaw-labs/zeroclaw). The RFCs are authoritative where they conflict with this skill — but the protocol already reflects their current state, so routine sessions should not need to fetch them.
+The protocol encodes operational details from RFC #5577 (governance and stale thresholds), RFC #5615 (contribution culture), and later maintainer label-policy corrections. If you need background context beyond what the protocol provides, fetch those RFCs or the current maintainer label guide. RFC #5577 remains authoritative for stale timing; `docs/book/src/maintainers/labels.md` and `references/triage-protocol.md` carry the current operational label policy.
 
 ## Invocation
 
@@ -50,7 +50,7 @@ The protocol encodes operational details from RFC #5577 (governance, stale polic
 | Action | Authority | Condition |
 |---|---|---|
 | Apply labels | Act | Always |
-| Remove labels | Act | Only for labels the agent applied in this session, or `status:stale` when the author has re-engaged. Never remove `status:no-stale`, `priority:critical`, `status:blocked`, or `type:rfc` — these are protection labels. |
+| Remove labels | Act | Only for labels the agent applied in this session, or `status:stale` when the author has re-engaged. Never remove `status:no-stale`, `priority:p0`, or `type:rfc` autonomously. Do not remove `status:blocked` during routine triage; during a stale pass, first verify the recorded blocker and present any proposed `status:blocked` change to the user. |
 | Comment on an issue | Act | Always |
 | Close — fixed by merged PR | Act (single-issue: present first) | PR confirmed merged; issue explicitly referenced in PR |
 | Close — duplicate | Act (single-issue: present first) | Concrete shared identifier confirmed per §3 Pass 2; primary issue clearly identified |

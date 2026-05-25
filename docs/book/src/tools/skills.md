@@ -136,6 +136,8 @@ allow_scripts = true
 
 Keep this disabled unless you trust the skill source and have reviewed what the scripts do.
 
+For Python-specific execution patterns, interpreter policy, and native versus Docker trade-offs, see [Running Python skills](./python-skills.md).
+
 ## Loading community skills
 
 Community open-skills loading is opt-in:
