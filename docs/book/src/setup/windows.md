@@ -37,6 +37,9 @@ $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $dst) {
     [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
 }
+if (($env:Path -split ';') -notcontains $dst) {
+    $env:Path = "$dst;$env:Path"
+}
 
 & $exe onboard
 ```
@@ -64,7 +67,7 @@ Flags:
 | `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
 | `--full`     | Build everything |
 
-> ⚠️ **Known issues.** `setup.bat` has two hard-stop failures, one `--prebuilt` mode mismatch, and one onboarding-command naming inconsistency tracked in [#6118](https://github.com/zeroclaw-labs/zeroclaw/issues/6118). Fall back to **Option 1** above if you hit any installer blocker.
+> ⚠️ **Known issues.** `setup.bat` has two hard-stop failures, one `--prebuilt` mode mismatch, and one onboarding-command naming inconsistency reported in [#6118](https://github.com/zeroclaw-labs/zeroclaw/issues/6118). Fall back to **Option 1** above if you hit any installer blocker.
 >
 > - `Invalid number. Numbers are limited to 32-bits of precision.` — the disk-space pre-flight check uses `set /a`, so free-space byte counts above 2^31 bytes (2.147 GB) overflow cmd's 32-bit signed arithmetic on Windows 10/11 volumes with more than ~2 GB free.
 > - `.[0m was unexpected at this time.` — an echo inside an `if/else` block contains unescaped parens that some shells parse as control-flow syntax.
