@@ -2954,14 +2954,13 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::effective_*` helpers for precedence rules.
-        let eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
+        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
         let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
-        let eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
-        // ── Wire up agnostic subsystems ──────────────────────────────
+        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
+        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
@@ -4305,13 +4304,13 @@ pub async fn process_message(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::effective_*` helpers for precedence rules.
-        let eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
+        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let _eff_max_history_messages = config.effective_max_history_messages(agent_alias);
         let _eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
         let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
+        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
