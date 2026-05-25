@@ -99,11 +99,32 @@ export interface CronRun {
   duration_ms: number | null;
 }
 
-export interface Integration {
+export interface Plugin {
   name: string;
   description: string;
   category: string;
   status: 'Available' | 'Active';
+}
+
+export type WasmPluginCapability = 'tool' | 'channel' | 'memory' | 'observer' | 'skill';
+
+export type WasmPluginPermission =
+  | 'http_client' | 'file_read' | 'file_write'
+  | 'env_read' | 'memory_read' | 'memory_write';
+
+export interface WasmPlugin {
+  name: string;
+  version: string;
+  description: string | null;
+  capabilities: WasmPluginCapability[];
+  loaded: boolean;
+  permissions?: WasmPluginPermission[];
+}
+
+export interface WasmPluginsResponse {
+  plugins_enabled: boolean;
+  plugins_dir: string;
+  plugins: WasmPlugin[];
 }
 
 export interface DiagResult {

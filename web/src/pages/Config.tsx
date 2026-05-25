@@ -53,7 +53,7 @@ const GROUP_ORDER = [
   'Agent',
   'Multi-agent',
   'Tools',
-  'Integrations',
+  'Plugins',
   'Network',
   'Storage',
   'Operations',

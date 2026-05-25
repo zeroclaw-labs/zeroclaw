@@ -26,7 +26,7 @@ const navItems: NavItem[] = [
   { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+  { to: '/plugins', icon: Puzzle, labelKey: 'nav.plugins' },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },

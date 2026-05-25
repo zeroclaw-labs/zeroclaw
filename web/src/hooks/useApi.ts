@@ -3,7 +3,8 @@ import {
   getStatus,
   getTools,
   getCronJobs,
-  getIntegrations,
+  getPlugins,
+  getWasmPlugins,
   getMemory,
   getCliTools,
   getHealth,
@@ -13,7 +14,8 @@ import type {
   StatusResponse,
   ToolSpec,
   CronJob,
-  Integration,
+  Plugin,
+  WasmPluginsResponse,
   MemoryEntry,
   CliTool,
   HealthSnapshot,
@@ -96,9 +98,14 @@ export function useCronJobs(): UseApiResult<CronJob[]> {
   return useApiCall(getCronJobs);
 }
 
-/** Fetch integrations from /api/integrations. */
-export function useIntegrations(): UseApiResult<Integration[]> {
-  return useApiCall(getIntegrations);
+/** Fetch plugins from /api/integrations. */
+export function usePlugins(): UseApiResult<Plugin[]> {
+  return useApiCall(getPlugins);
+}
+
+/** Fetch WASM plugins. Returns null when plugins-wasm feature is not enabled. */
+export function useWasmPlugins(): UseApiResult<WasmPluginsResponse | null> {
+  return useApiCall(getWasmPlugins);
 }
 
 /** Fetch memory entries, optionally filtered by query and category. */

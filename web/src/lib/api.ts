@@ -3,7 +3,8 @@ import type {
   ToolSpec,
   CronJob,
   CronRun,
-  Integration,
+  Plugin,
+  WasmPluginsResponse,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -1187,16 +1188,28 @@ export function patchCronSettings(
 }
 
 // ---------------------------------------------------------------------------
-// Integrations
+// Plugins
 // ---------------------------------------------------------------------------
 
-export function getIntegrations(): Promise<Integration[]> {
-  return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
+export function getPlugins(): Promise<Plugin[]> {
+  return apiFetch<Plugin[] | { integrations: Plugin[] }>('/api/integrations').then(
     (data) => {
       const result = unwrapField(data, 'integrations');
       return Array.isArray(result) ? result : [];
     },
   );
+}
+
+/** Fetch WASM plugins from GET /api/plugins (behind plugins-wasm feature).
+ *  Returns null when the endpoint is not available (404). */
+export async function getWasmPlugins(): Promise<WasmPluginsResponse | null> {
+  try {
+    return await apiFetch<WasmPluginsResponse>('/api/plugins');
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    if (err instanceof Error && err.message.startsWith('API 404')) return null;
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
