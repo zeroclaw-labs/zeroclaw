@@ -63,6 +63,25 @@ fn is_loadable_image_reference(candidate: &str) -> bool {
         || candidate.starts_with("http://")
         || candidate.starts_with("https://")
         || candidate.starts_with("data:")
+        || is_windows_path(candidate)
+}
+
+/// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
+fn is_windows_path(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let Some(second) = chars.next() else {
+        return false;
+    };
+    if second != ':' {
+        return false;
+    }
+    matches!(chars.next(), Some('\\') | Some('/'))
 }
 
 /// Normalize a marker payload that may have been line-wrapped when pasted
