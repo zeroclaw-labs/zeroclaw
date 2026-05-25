@@ -56,6 +56,9 @@ hex = "0.4"
 # Database (session queue)
 rusqlite = { version = "0.37", features = ["bundled"] }
 
+# TCP socket options (SO_REUSEADDR for graceful restart)
+socket2 = "0.5"
+
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
