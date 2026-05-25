@@ -22,6 +22,7 @@ backend-mysql = ["dep:mysql"]
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-config.workspace = true
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"

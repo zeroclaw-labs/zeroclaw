@@ -22,72 +22,27 @@ use std::sync::Arc;
 
 use crate::session_backend::SessionBackend;
 
-/// Construct the configured session-persistence backend.
+/// Construct the configured session-persistence backend from `[channels]` config.
 ///
-/// `backend` is the value of `[channels].session_backend` from config:
-/// `"sqlite"` (default) opens `{workspace}/sessions/sessions.db`, `"jsonl"`
-/// opens `{workspace}/sessions/*.jsonl`. Unknown values fall back to
-/// SQLite with a warning so a typo in config never silently disables
-/// persistence. The `Arc<dyn SessionBackend>` return type keeps every
-/// call site (channel orchestrator, runtime tools) reading from the
-/// same store.
-///
-/// Errors propagate from the underlying backend constructor (typically
-/// filesystem permissions on the sessions directory).
-/// Configuration for optional remote session backends.
-///
-/// Only fields relevant to the chosen `backend` need to be populated.
-#[derive(Default)]
-pub struct RemoteSessionConfig<'a> {
-    /// ODBC connection string for `backend = "db2"`, e.g.
-    /// `"DSN=ZEROCLAW;UID=zeroclaw;PWD=secret;"`.
-    /// Db2 must be started with `DB2_COMPATIBILITY_VECTOR=ORA`.
-    pub db2_conn_str: Option<&'a str>,
-    /// libpq DSN for `backend = "postgres"`, e.g.
-    /// `"postgresql://zeroclaw:secret@primary/zeroclaw"`.
-    pub postgres_url: Option<&'a str>,
-    /// Oracle user for `backend = "oracle"`.
-    pub oracle_user: Option<&'a str>,
-    /// Oracle password for `backend = "oracle"`.
-    pub oracle_password: Option<&'a str>,
-    /// Oracle Easy Connect DSN for `backend = "oracle"`, e.g.
-    /// `"//host:1521/ORCLPDB1"`.
-    pub oracle_dsn: Option<&'a str>,
-    /// MySQL DSN for `backend = "mysql"`, e.g.
-    /// `"mysql://zeroclaw:secret@primary:3306/zeroclaw"`.
-    /// MySQL 9.0+ required (earlier versions lack native VECTOR support used
-    /// by co-located fleet services and have fractional-second timestamp edge cases).
-    pub mysql_url: Option<&'a str>,
-    /// Maximum pool connections (used by postgres and oracle backends).
-    /// MySQL uses its own built-in pool; this field sets its max size too.
-    /// Defaults to `5`.
-    pub pool_size: Option<u32>,
-}
-
-/// Construct the configured session-persistence backend.
-///
-/// `backend` selects the implementation:
+/// Selects the backend named by `channels.session_backend`:
 /// - `"sqlite"` (default) — file-backed, single-host.
 /// - `"jsonl"` — legacy one-file-per-session format.
-/// - `"postgres"` — shared PostgreSQL store; requires `backend-postgres` feature.
-/// - `"oracle"` — Oracle 23ai store; requires `backend-oracle` feature.
+/// - `"postgres"` — shared PostgreSQL store; requires `backend-postgres` feature
+///   and `channels.postgres_url`.
+/// - `"oracle"` — Oracle 23ai store; requires `backend-oracle` feature and
+///   `channels.oracle_user` / `oracle_password` / `oracle_dsn`.
+/// - `"db2"` — IBM Db2 store; requires `backend-db2` feature and
+///   `channels.db2_conn_str`.
+/// - `"mysql"` — MySQL 9.0+ store; requires `backend-mysql` feature and
+///   `channels.mysql_url`.
 ///
 /// Unknown values fall back to SQLite with a warning so a typo in config
 /// never silently disables persistence.
 pub fn make_session_backend(
     workspace_dir: &Path,
-    backend: &str,
+    channels: &zeroclaw_config::schema::ChannelsConfig,
 ) -> std::io::Result<Arc<dyn SessionBackend>> {
-    make_session_backend_with_config(workspace_dir, backend, &RemoteSessionConfig::default())
-}
-
-/// Like [`make_session_backend`] but accepts remote-backend credentials.
-pub fn make_session_backend_with_config(
-    workspace_dir: &Path,
-    backend: &str,
-    cfg: &RemoteSessionConfig<'_>,
-) -> std::io::Result<Arc<dyn SessionBackend>> {
-    match backend {
+    match channels.session_backend.as_str() {
         "jsonl" => {
             let store = session_store::SessionStore::new(workspace_dir)?;
             Ok(Arc::new(store))
@@ -96,56 +51,53 @@ pub fn make_session_backend_with_config(
 
         #[cfg(feature = "backend-postgres")]
         "postgres" => {
-            let url = cfg.postgres_url.ok_or_else(|| {
-                std::io::Error::other("session_backend=postgres requires postgres_url in config")
+            let url = channels.postgres_url.as_deref().ok_or_else(|| {
+                std::io::Error::other("session_backend=postgres requires postgres_url in [channels]")
             })?;
-            let pool_size = cfg.pool_size.unwrap_or(5);
-            let store = session_postgres::PostgresSessionBackend::new(url, pool_size)
+            let store = session_postgres::PostgresSessionBackend::new(url, channels.pool_size)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(Arc::new(store))
         }
 
         #[cfg(feature = "backend-db2")]
         "db2" => {
-            let conn_str = cfg.db2_conn_str.ok_or_else(|| {
+            let conn_str = channels.db2_conn_str.as_deref().ok_or_else(|| {
                 std::io::Error::other(
-                    "session_backend=db2 requires db2_conn_str in config",
+                    "session_backend=db2 requires db2_conn_str in [channels]",
                 )
             })?;
-            let pool_size = cfg.pool_size.unwrap_or(5);
-            let store = session_db2::Db2SessionBackend::new(conn_str, pool_size)
+            let store = session_db2::Db2SessionBackend::new(conn_str, channels.pool_size)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(Arc::new(store))
         }
 
         #[cfg(feature = "backend-oracle")]
         "oracle" => {
-            let user = cfg.oracle_user.ok_or_else(|| {
-                std::io::Error::other("session_backend=oracle requires oracle_user in config")
+            let user = channels.oracle_user.as_deref().ok_or_else(|| {
+                std::io::Error::other("session_backend=oracle requires oracle_user in [channels]")
             })?;
-            let password = cfg.oracle_password.ok_or_else(|| {
+            let password = channels.oracle_password.as_deref().ok_or_else(|| {
                 std::io::Error::other(
-                    "session_backend=oracle requires oracle_password in config",
+                    "session_backend=oracle requires oracle_password in [channels]",
                 )
             })?;
-            let dsn = cfg.oracle_dsn.ok_or_else(|| {
-                std::io::Error::other("session_backend=oracle requires oracle_dsn in config")
+            let dsn = channels.oracle_dsn.as_deref().ok_or_else(|| {
+                std::io::Error::other("session_backend=oracle requires oracle_dsn in [channels]")
             })?;
-            let pool_size = cfg.pool_size.unwrap_or(5);
             let store =
-                session_oracle::OracleSessionBackend::new(user, password, dsn, pool_size)
+                session_oracle::OracleSessionBackend::new(user, password, dsn, channels.pool_size)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(Arc::new(store))
         }
 
         #[cfg(feature = "backend-mysql")]
         "mysql" => {
-            let url = cfg.mysql_url.ok_or_else(|| {
-                std::io::Error::other("session_backend=mysql requires mysql_url in config")
+            let url = channels.mysql_url.as_deref().ok_or_else(|| {
+                std::io::Error::other("session_backend=mysql requires mysql_url in [channels]")
             })?;
-            let pool_size = cfg.pool_size.unwrap_or(5) as usize;
-            let store = session_mysql::MysqlSessionBackend::new(url, pool_size)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let store =
+                session_mysql::MysqlSessionBackend::new(url, channels.pool_size as usize)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(Arc::new(store))
         }
 
@@ -209,10 +161,17 @@ mod tests {
         ChatMessage::user(content)
     }
 
+    fn channels_with_backend(backend: &str) -> zeroclaw_config::schema::ChannelsConfig {
+        zeroclaw_config::schema::ChannelsConfig {
+            session_backend: backend.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn make_session_backend_jsonl_round_trips_through_session_store() {
         let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "jsonl").unwrap();
+        let backend = make_session_backend(tmp.path(), &channels_with_backend("jsonl")).unwrap();
         backend.append("k1", &user_msg("hello-jsonl")).unwrap();
         let loaded = backend.load("k1");
         assert_eq!(loaded.len(), 1);
@@ -224,7 +183,7 @@ mod tests {
     #[test]
     fn make_session_backend_sqlite_round_trips_through_sqlite_db() {
         let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "sqlite").unwrap();
+        let backend = make_session_backend(tmp.path(), &channels_with_backend("sqlite")).unwrap();
         backend.append("k1", &user_msg("hello-sqlite")).unwrap();
         let loaded = backend.load("k1");
         assert_eq!(loaded.len(), 1);
@@ -237,7 +196,9 @@ mod tests {
     #[test]
     fn make_session_backend_unknown_value_falls_back_to_sqlite() {
         let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "totally-not-a-backend").unwrap();
+        let backend =
+            make_session_backend(tmp.path(), &channels_with_backend("totally-not-a-backend"))
+                .unwrap();
         backend.append("k1", &user_msg("hello-fallback")).unwrap();
         let db = tmp.path().join("sessions").join("sessions.db");
         assert!(
@@ -254,10 +215,11 @@ mod tests {
         // operator can roll back.
         let tmp = TempDir::new().unwrap();
         {
-            let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
+            let jsonl =
+                make_session_backend(tmp.path(), &channels_with_backend("jsonl")).unwrap();
             jsonl.append("legacy", &user_msg("from-jsonl")).unwrap();
         }
-        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        let sqlite = make_session_backend(tmp.path(), &channels_with_backend("sqlite")).unwrap();
         let loaded = sqlite.load("legacy");
         assert_eq!(
             loaded.len(),

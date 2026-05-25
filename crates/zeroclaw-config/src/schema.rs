@@ -9955,6 +9955,53 @@ pub struct ChannelsConfig {
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
+
+    // ── Remote session backend credentials ───────────────────────────────
+    // Only the fields for the selected `session_backend` are required.
+
+    /// PostgreSQL DSN for `session_backend = "postgres"`, e.g.
+    /// `"postgresql://zeroclaw:secret@primary/zeroclaw"`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_url: Option<String>,
+
+    /// Oracle username for `session_backend = "oracle"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_user: Option<String>,
+
+    /// Oracle password for `session_backend = "oracle"`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_password: Option<String>,
+
+    /// Oracle Easy Connect DSN for `session_backend = "oracle"`, e.g.
+    /// `"//primary:1521/ORCLPDB1"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_dsn: Option<String>,
+
+    /// Db2 ODBC connection string for `session_backend = "db2"`, e.g.
+    /// `"DSN=ZEROCLAW;UID=zeroclaw;PWD=secret;"`.  Db2 must be started
+    /// with `DB2_COMPATIBILITY_VECTOR=ORA`.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db2_conn_str: Option<String>,
+
+    /// MySQL DSN for `session_backend = "mysql"`, e.g.
+    /// `"mysql://zeroclaw:secret@primary:3306/zeroclaw"`.
+    /// MySQL 9.0+ required.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql_url: Option<String>,
+
+    /// Maximum pooled connections for remote session backends
+    /// (`postgres`, `oracle`, `db2`, `mysql`). Default: `5`.
+    #[serde(default = "default_session_pool_size")]
+    pub pool_size: u32,
+
     /// Inbound message debounce window in milliseconds. When a sender fires
     /// multiple messages within this window, they are accumulated and dispatched
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
@@ -10145,6 +10192,10 @@ fn default_session_backend() -> String {
     "sqlite".into()
 }
 
+fn default_session_pool_size() -> u32 {
+    5
+}
+
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
@@ -10187,6 +10238,13 @@ impl Default for ChannelsConfig {
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            postgres_url: None,
+            oracle_user: None,
+            oracle_password: None,
+            oracle_dsn: None,
+            db2_conn_str: None,
+            mysql_url: None,
+            pool_size: default_session_pool_size(),
             debounce_ms: 0,
         }
     }
@@ -16255,6 +16313,13 @@ auto_save = true
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
+                postgres_url: None,
+                oracle_user: None,
+                oracle_password: None,
+                oracle_dsn: None,
+                db2_conn_str: None,
+                mysql_url: None,
+                pool_size: default_session_pool_size(),
                 debounce_ms: 0,
             },
             memory: MemoryConfig::default(),
@@ -17487,6 +17552,13 @@ allowed_users = ["@u:matrix.org"]
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            postgres_url: None,
+            oracle_user: None,
+            oracle_password: None,
+            oracle_dsn: None,
+            db2_conn_str: None,
+            mysql_url: None,
+            pool_size: default_session_pool_size(),
             debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -17871,6 +17943,13 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            postgres_url: None,
+            oracle_user: None,
+            oracle_password: None,
+            oracle_dsn: None,
+            db2_conn_str: None,
+            mysql_url: None,
+            pool_size: default_session_pool_size(),
             debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();

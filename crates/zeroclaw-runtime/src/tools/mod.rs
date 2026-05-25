@@ -863,7 +863,7 @@ pub fn all_tools_with_runtime(
     // `sessions_history`. Routing both call sites through the factory
     // closes that gap and honors the operator's configured backend.
     if let Ok(backend) =
-        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels)
     {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));

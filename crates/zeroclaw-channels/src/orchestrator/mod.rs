@@ -7222,7 +7222,7 @@ pub async fn start_channels(
         if config.channels.session_persistence {
             match zeroclaw_infra::make_session_backend(
                 &config.data_dir,
-                &config.channels.session_backend,
+                &config.channels,
             ) {
                 Ok(backend) => {
                     ::zeroclaw_log::record!(
