@@ -1704,6 +1704,7 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
             E::new(vec!["Shift+Tab", "h", "←"], "Previous tab"),
             E::key("1–7", "Jump to tab"),
             E::key("r", "Refresh now"),
+            E::key("q", "Quit TUI"),
             E::key("?", "This help"),
         ];
 
@@ -1719,9 +1720,12 @@ impl crate::widgets::HelpContext for Dashboard<'_> {
                 E::new(vec!["Esc", "Enter"], "Close detail"),
                 E::new(vec!["j", "k"], "Move list cursor"),
                 E::new(vec!["J", "K"], "Scroll detail"),
+                E::new(vec!["Shift+↑", "Shift+↓"], "Scroll detail"),
                 E::key("Shift+←/→", "Resize detail pane"),
+                E::key("r", "Refresh"),
                 E::key("/", "Search"),
                 E::key("c", "Clear search"),
+                E::key("q", "Quit TUI"),
                 E::key("?", "This help"),
             ]);
         }

@@ -18,6 +18,7 @@ mod file_explorer;
 mod input_bar;
 mod logs;
 mod mouse;
+mod onboard_pane;
 mod theme;
 mod widgets;
 
@@ -178,7 +179,7 @@ async fn run_with_reconnect(
 ) -> anyhow::Result<()> {
     loop {
         let label = target.label();
-        let should_reconnect = match app::run(rpc, term, &label).await {
+        let should_reconnect = match app::run(rpc, term, &label, None).await {
             Ok(reconnect) => reconnect,
             Err(_) if rpc.is_disconnected() => {
                 // RPC error caused by a dead connection — treat as

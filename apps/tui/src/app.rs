@@ -16,6 +16,7 @@ use crate::config_manager;
 use crate::dashboard;
 use crate::logs;
 use crate::mouse;
+use crate::onboard_pane::OnboardPane;
 use crate::theme;
 use crate::widgets::{HelpContext, HelpEntry, HelpNode};
 
@@ -23,12 +24,13 @@ use crate::widgets::{HelpContext, HelpEntry, HelpNode};
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 5] = [
+const MODES: [Mode; 6] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
     Mode::Chat,
     Mode::Logs,
+    Mode::Onboard,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -40,6 +42,7 @@ enum Mode {
     Acp,
     Chat,
     Logs,
+    Onboard,
 }
 
 impl Mode {
@@ -50,6 +53,7 @@ impl Mode {
             Mode::Acp => "ACP",
             Mode::Chat => "Chat",
             Mode::Logs => "Logs",
+            Mode::Onboard => "Onboard",
         }
     }
 
@@ -60,6 +64,7 @@ impl Mode {
             Mode::Acp => "F3",
             Mode::Chat => "F4",
             Mode::Logs => "F5",
+            Mode::Onboard => "F6",
         }
     }
 }
@@ -72,8 +77,13 @@ pub async fn run(
     rpc: &RpcClient,
     term: &mut config_manager::Term,
     connect_label: &str,
+    onboard_pane: Option<OnboardPane>,
 ) -> Result<bool> {
-    let mut mode = Mode::Dashboard;
+    let mut mode = if onboard_pane.is_some() {
+        Mode::Onboard
+    } else {
+        Mode::Dashboard
+    };
     let mut show_help = false;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
@@ -89,6 +99,7 @@ pub async fn run(
     chat_pane.init().await?;
     let mut logs_pane = logs::Logs::new(rpc);
     logs_pane.init().await?;
+    let mut onboard_pane = onboard_pane;
 
     loop {
         // Draw
@@ -113,6 +124,11 @@ pub async fn run(
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
+                Mode::Onboard => {
+                    if let Some(ref pane) = onboard_pane {
+                        pane.draw(frame, chunks[1]);
+                    }
+                }
             }
 
             draw_status_bar(frame, chunks[2], &conn_state, rpc.tui_id());
@@ -120,7 +136,7 @@ pub async fn run(
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
                 let mut node = HelpNode::entries(vec![
-                    HelpEntry::new(vec!["F1–F5"], "Switch mode"),
+                    HelpEntry::new(vec!["F1–F6"], "Switch mode"),
                     HelpEntry::key("Ctrl+C", "Quit"),
                     HelpEntry::spacer(),
                 ]);
@@ -130,6 +146,10 @@ pub async fn run(
                     Mode::Acp => acp_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
+                    Mode::Onboard => onboard_pane
+                        .as_ref()
+                        .map(|p| p.help_context())
+                        .unwrap_or_else(|| HelpNode::entries(vec![])),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
@@ -174,7 +194,7 @@ pub async fn run(
                     continue;
                 }
 
-                // Global keys: F1–F5 switch modes
+                // Global keys: F1–F6 switch modes
                 match key.code {
                     KeyCode::F(1) => {
                         mode = Mode::Dashboard;
@@ -196,6 +216,10 @@ pub async fn run(
                         mode = Mode::Logs;
                         continue;
                     }
+                    KeyCode::F(6) if onboard_pane.is_some() => {
+                        mode = Mode::Onboard;
+                        continue;
+                    }
                     _ => {}
                 }
 
@@ -207,6 +231,10 @@ pub async fn run(
                         Mode::Acp => acp_pane.wants_text_input(),
                         Mode::Chat => chat_pane.wants_text_input(),
                         Mode::Logs => logs_pane.wants_text_input(),
+                        Mode::Onboard => onboard_pane
+                            .as_ref()
+                            .map(|p| p.wants_text_input())
+                            .unwrap_or(false),
                     };
                     if !in_text_input {
                         show_help = true;
@@ -226,6 +254,13 @@ pub async fn run(
                     Mode::Acp => acp_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
+                    Mode::Onboard => {
+                        if let Some(ref mut pane) = onboard_pane {
+                            pane.handle_key(key).await
+                        } else {
+                            false
+                        }
+                    }
                 };
                 if quit {
                     break;
@@ -271,6 +306,9 @@ pub async fn run(
                         }
                         Mode::Chat => {
                             chat_pane.handle_mouse(mouse, content_area);
+                        }
+                        Mode::Onboard => {
+                            // Onboard pane has no mouse handler.
                         }
                     }
                 }
