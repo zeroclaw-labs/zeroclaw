@@ -4,7 +4,7 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local};
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -279,16 +279,13 @@ impl PromptSection for DateTimeSection {
         let now = Local::now();
         // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
         let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
 
         Ok(format!(
-            "## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n\
-             The following is the ABSOLUTE TRUTH regarding the current date and time. \
+            "## CRITICAL CONTEXT: CURRENT DATE\n\n\
+             The following is the ABSOLUTE TRUTH regarding the current date. \
              Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
              Date: {year:04}-{month:02}-{day:02}\n\
-             Time: {hour:02}:{minute:02}:{second:02} ({tz})\n\
-             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
+             UTC offset: {}",
             now.format("%:z")
         ))
     }
@@ -560,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn datetime_section_includes_timestamp_and_timezone() {
+    fn datetime_section_includes_date_and_offset_without_wall_clock_time() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -578,12 +575,15 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n"));
+        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE\n\n"));
+        assert!(!rendered.contains("CURRENT DATE & TIME"));
 
-        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n");
+        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE\n\n");
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains("Date:"));
-        assert!(payload.contains("Time:"));
+        assert!(payload.contains("UTC offset:"));
+        assert!(!payload.contains("Time:"));
+        assert!(!payload.contains("ISO 8601:"));
     }
 
     #[test]
