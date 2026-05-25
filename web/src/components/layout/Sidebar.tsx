@@ -10,10 +10,16 @@ import {
   Settings,
   Stethoscope,
   Wrench,
+  ArrowUpCircle,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { useEffect, useState } from 'react';
 import { getStatus } from '@/lib/api';
+import { useUpdate } from '@/hooks/useUpdate';
+import type { UpdateState } from '@/hooks/useUpdate';
 
 interface NavItem {
   to: string;
@@ -197,6 +203,7 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
 
 function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'desktop' | 'mobile' }) {
   const [version, setVersion] = useState<string | null>(null);
+  const update = useUpdate();
 
   useEffect(() => {
     getStatus()
@@ -204,16 +211,77 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
       .catch(() => { /* silently ignore */ });
   }, []);
 
+  const renderUpdateButton = () => {
+    if (collapsed) return null;
+
+    switch (update.state) {
+      case 'checking':
+        return (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px]" style={{ color: 'var(--pc-text-muted)' }}>
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            Checking...
+          </div>
+        );
+      case 'available':
+        return (
+          <button
+            onClick={update.run}
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors cursor-pointer"
+            style={{ background: 'var(--pc-accent)', color: '#fff' }}
+            title={`Update to v${update.latestVersion}`}
+          >
+            <ArrowUpCircle className="h-3.5 w-3.5" />
+            Update to v{update.latestVersion}
+          </button>
+        );
+      case 'updating':
+        return (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px]" style={{ color: 'var(--pc-text-muted)' }}>
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <span className="truncate max-w-[140px]">{update.progressMsg}</span>
+          </div>
+        );
+      case 'complete':
+        return (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px]" style={{ color: 'var(--color-status-success)' }}>
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Updated — restarting...
+          </div>
+        );
+      case 'error':
+        return (
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] cursor-pointer" style={{ color: 'var(--color-status-error)' }} onClick={update.check}>
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate max-w-30">{update.errorMsg}</span>
+            <span style={{ color: 'var(--pc-accent)' }} className="underline ml-0.5">Retry</span>
+          </div>
+        );
+      default:
+        return (
+          <button
+            onClick={update.check}
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors cursor-pointer"
+            style={{ background: 'var(--pc-accent-glow)', color: 'var(--pc-accent)', border: '1px solid var(--pc-accent-dim)' }}
+            title="Check for updates"
+          >
+            <ArrowUpCircle className="h-3.5 w-3.5" />
+            Check for updates
+          </button>
+        );
+    }
+  };
+
   if (layout === 'mobile') {
     return (
       <div
-        className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
-        style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
+        className="px-5 py-4 border-t space-y-2"
+        style={{ borderColor: 'var(--pc-border)' }}
       >
-        ZeroClaw Gateway
+        {renderUpdateButton()}
         {version && (
-          <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
-            v{version}
+          <div className="text-[12px] uppercase tracking-wider" style={{ color: 'var(--pc-text-faint)' }}>
+            ZeroClaw Gateway
+            <span className="ml-1 normal-case tracking-normal" style={{ fontSize: '11px' }}>v{version}</span>
           </div>
         )}
       </div>
@@ -224,19 +292,20 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
       className="border-t shrink-0 whitespace-nowrap overflow-hidden transition-opacity duration-200"
       style={{
         borderColor: 'var(--pc-border)',
-        padding: collapsed ? '12px 0' : '16px 20px',
-        fontSize: '10px',
-        color: 'var(--pc-text-faint)',
-        textTransform: 'uppercase',
-        letterSpacing: '0.1em',
+        padding: collapsed ? '12px 0' : '12px 16px',
         opacity: collapsed ? 0 : 1,
-        textAlign: collapsed ? 'center' : 'left',
       }}
     >
-      {!collapsed && 'ZeroClaw Gateway'}
-      {!collapsed && version && (
-        <div style={{ marginTop: '2px', fontSize: '9px', textTransform: 'none', letterSpacing: 'normal' }}>
-          v{version}
+      {!collapsed && renderUpdateButton()}
+      {!collapsed && (
+        <div
+          className="mt-1.5 text-[12px] uppercase tracking-wider"
+          style={{ color: 'var(--pc-text-faint)', paddingLeft: '4px' }}
+        >
+          ZeroClaw Gateway
+          {version && (
+            <span className="ml-1 normal-case tracking-normal" style={{ fontSize: '11px' }}>v{version}</span>
+          )}
         </div>
       )}
     </div>

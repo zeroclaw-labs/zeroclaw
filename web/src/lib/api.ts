@@ -1404,3 +1404,22 @@ export function getCliTools(): Promise<CliTool[]> {
     return Array.isArray(result) ? result : [];
   });
 }
+
+// ---------------------------------------------------------------------------
+// Self-update
+// ---------------------------------------------------------------------------
+
+export interface UpdateCheckResponse {
+  current_version: string;
+  latest_version: string;
+  is_newer: boolean;
+  download_url: string | null;
+}
+
+export function checkForUpdate(): Promise<UpdateCheckResponse> {
+  return apiFetch<UpdateCheckResponse>('/api/update/check');
+}
+
+export function runUpdate(): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>('/api/update/run', { method: 'POST' });
+}
