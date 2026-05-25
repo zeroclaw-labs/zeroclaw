@@ -3466,7 +3466,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3537,7 +3537,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4089,7 +4089,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4173,7 +4173,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4269,7 +4269,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4337,7 +4337,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4410,7 +4410,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4488,7 +4488,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4566,7 +4566,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4671,7 +4671,7 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wati: None,
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
