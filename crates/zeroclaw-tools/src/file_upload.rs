@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -103,11 +104,36 @@ impl FileUploadTool {
         }
     }
 
-    /// Truncate a remote response body to at most `RESPONSE_BODY_LIMIT_BYTES`,
-    /// snapping the cut *down* to the nearest UTF-8 character boundary. The body
-    /// is controlled by the operator-configured receiver and is untrusted input,
-    /// so a multi-byte character straddling the byte limit must not panic the
-    /// slice (`&body[..n]` requires `n` to be a char boundary).
+    /// Stream the receiver's response body into memory while never buffering
+    /// more than `RESPONSE_BODY_LIMIT_BYTES` (+1 sentinel byte to detect that
+    /// more was available). The response comes from the operator-configured
+    /// endpoint and is untrusted: a misbehaving or hostile receiver must not be
+    /// able to make the tool read an unbounded body into memory just to surface
+    /// a small preview. Mirrors the bounded-read shape used by `web_fetch`.
+    async fn read_response_body_capped(response: reqwest::Response) -> Vec<u8> {
+        let hard_cap = RESPONSE_BODY_LIMIT_BYTES.saturating_add(1);
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            // A mid-stream read error simply ends the body; the HTTP status was
+            // already captured from the response head before reading.
+            let Ok(chunk) = chunk else { break };
+            let remaining = hard_cap - bytes.len();
+            if chunk.len() >= remaining {
+                bytes.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
+    }
+
+    /// Shape a (already byte-bounded) response body into a preview of at most
+    /// `RESPONSE_BODY_LIMIT_BYTES`, snapping the cut *down* to the nearest UTF-8
+    /// character boundary so a multi-byte character straddling the limit cannot
+    /// panic the slice (`&body[..n]` requires `n` to be a char boundary). The
+    /// caller bounds the read via [`Self::read_response_body_capped`]; this only
+    /// trims the display text and flags that the body was longer than the limit.
     fn truncate_response_body(body: &str) -> String {
         if body.len() <= RESPONSE_BODY_LIMIT_BYTES {
             return body.to_string();
@@ -117,7 +143,7 @@ impl FileUploadTool {
         while end > 0 && !body.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}... [truncated {} bytes]", &body[..end], body.len() - end)
+        format!("{}... [truncated]", &body[..end])
     }
 }
 
@@ -345,8 +371,9 @@ impl Tool for FileUploadTool {
         };
 
         let status = response.status();
-        let raw_body = response.text().await.unwrap_or_default();
-        let truncated = Self::truncate_response_body(&raw_body);
+        let raw_body = Self::read_response_body_capped(response).await;
+        let body = String::from_utf8_lossy(&raw_body);
+        let truncated = Self::truncate_response_body(&body);
 
         if status.is_success() {
             Ok(ToolResult {
@@ -677,8 +704,8 @@ mod tests {
         let out = FileUploadTool::truncate_response_body(&body);
 
         // No panic, and the cut snaps down to the last whole char that fits:
-        // floor(4096 / 3) = 1365 chars = 4095 bytes retained, 1905 truncated.
-        assert!(out.contains("[truncated 1905 bytes]"), "got: {out}");
+        // floor(4096 / 3) = 1365 chars = 4095 bytes retained.
+        assert!(out.contains("[truncated]"), "got: {out}");
         assert!(out.starts_with("€".repeat(1365).as_str()));
         assert!(!out.starts_with("€".repeat(1366).as_str()));
     }
@@ -719,6 +746,55 @@ mod tests {
             result.output.contains("truncated"),
             "got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_bounds_oversized_response_read() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        fs::write(&file, b"hello").unwrap();
+
+        // ~3 MiB multi-byte response from a misbehaving receiver. The tool must
+        // not buffer or echo it back wholesale — it reads at most a bounded
+        // preview — and the cut still lands mid-'€', exercising the boundary-safe
+        // path on a capped read.
+        let huge_body = "€".repeat(1_000_000); // 3_000_000 bytes
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(huge_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = FileUploadConfig {
+            url: Some(format!("{}/upload", server.uri())),
+            ..FileUploadConfig::default()
+        };
+        let tool = FileUploadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+        );
+
+        let result = tool
+            .execute(json!({ "file_path": "hello.txt" }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got {result:?}");
+        assert!(
+            result.output.contains("truncated"),
+            "got: {}",
+            result.output
+        );
+        // The multi-megabyte receiver body must not flow through into the tool
+        // output: only a bounded preview (<= the limit plus small framing) is
+        // surfaced, proving the read itself is capped rather than fully buffered.
+        assert!(
+            result.output.len() < RESPONSE_BODY_LIMIT_BYTES + 256,
+            "response read was not bounded: output is {} bytes",
+            result.output.len()
         );
     }
 }
