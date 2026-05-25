@@ -725,17 +725,16 @@ impl Channel for EmailChannel {
                 .unwrap_or_else(|| {
                     ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
                 });
-            let att_data =
-                if att.data.is_empty() && std::path::Path::new(&att.file_name).exists() {
-                    std::fs::read(&att.file_name).map_err(|e| {
-                        anyhow::Error::msg(format!(
-                            "failed to read attachment '{}': {}",
-                            att.file_name, e
-                        ))
-                    })?
-                } else {
-                    att.data.clone()
-                };
+            let att_data = if att.data.is_empty() && std::path::Path::new(&att.file_name).exists() {
+                std::fs::read(&att.file_name).map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "failed to read attachment '{}': {}",
+                        att.file_name, e
+                    ))
+                })?
+            } else {
+                att.data.clone()
+            };
             let att_name = std::path::Path::new(&att.file_name)
                 .file_name()
                 .and_then(|n| n.to_str())
