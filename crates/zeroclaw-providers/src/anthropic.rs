@@ -71,6 +71,15 @@ struct NativeChatRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<NativeThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 /// Claude opus-4-7 rejects `temperature` with a 400 on the native Anthropic API,
@@ -80,6 +89,16 @@ struct NativeChatRequest<'a> {
 /// variants.
 fn anthropic_model_omits_temperature(model: &str) -> bool {
     model.contains("claude-opus-4-7")
+}
+
+/// Whether a model accepts the fixed-budget native-thinking request shape
+/// (`{"thinking": {"type": "enabled", "budget_tokens": N}}`). Opus 4.7 supports
+/// only adaptive thinking and rejects fixed budgets with a 400; until adaptive
+/// thinking is implemented, those models stay on prompt-based reasoning.
+/// Anthropic's extended-thinking docs:
+/// <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
+fn anthropic_model_supports_native_thinking(model: &str) -> bool {
+    !model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +140,15 @@ enum NativeContentOut {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+    },
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 }
 
@@ -187,6 +215,11 @@ struct NativeContentIn {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    /// Signature for integrity verification of thinking blocks.
+    #[serde(default)]
+    signature: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -302,7 +335,9 @@ impl AnthropicModelProvider {
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral());
                 }
-                NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
+                NativeContentOut::ToolUse { .. }
+                | NativeContentOut::Image { .. }
+                | NativeContentOut::Thinking { .. } => {}
             }
         }
     }
@@ -337,6 +372,36 @@ impl AnthropicModelProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with thinking blocks (including signatures) before any tool_use
+        // blocks. The reasoning_content field stores JSON-encoded thinking
+        // blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let thinking = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(NativeContentOut::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -537,6 +602,7 @@ impl AnthropicModelProvider {
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
@@ -552,6 +618,22 @@ impl AnthropicModelProvider {
                         && !text.is_empty()
                     {
                         text_parts.push(text);
+                    }
+                }
+                "thinking" => {
+                    // Store thinking text byte-for-byte: the signature is
+                    // computed over the exact bytes the model returned, so
+                    // any mutation (including trim()) invalidates it on
+                    // replay. Only skip when the provider returns genuinely
+                    // empty content.
+                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
+                        && !thinking.is_empty()
+                    {
+                        let json_block = serde_json::json!({
+                            "thinking": thinking,
+                            "signature": block.signature.as_deref().unwrap_or(""),
+                        });
+                        thinking_parts.push(json_block.to_string());
                     }
                 }
                 "tool_use" => {
@@ -573,6 +655,12 @@ impl AnthropicModelProvider {
             }
         }
 
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
+
         ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
@@ -581,7 +669,54 @@ impl AnthropicModelProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content,
+        }
+    }
+
+    /// Resolve thinking parameters for an API request. Returns the effective
+    /// temperature (forced to 1.0 when thinking is active), the thinking
+    /// config for the request body, and the effective max_tokens (raised to
+    /// meet budget_tokens minimum when needed).
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        model: &str,
+    ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
+        match thinking {
+            Some(params) if anthropic_model_supports_native_thinking(model) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                    "Native extended thinking enabled; forcing temperature=1.0"
+                );
+                // API requires max_tokens > budget_tokens (strictly greater).
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (
+                    Some(1.0),
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                    max_tokens,
+                )
+            }
+            Some(_) => {
+                // Caller asked for native thinking but the model rejects the
+                // fixed-budget request shape. Drop to prompt-based reasoning
+                // (the agent loop's prefix already injected) and keep the
+                // caller-supplied temperature so per-model guards still apply.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
+                );
+                (temperature, None, self.max_tokens)
+            }
+            None => (temperature, None, self.max_tokens),
         }
     }
 
@@ -739,6 +874,9 @@ impl AnthropicModelProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
+                            // TODO: handle "thinking_delta" events for streaming
+                            // extended thinking content. Currently thinking blocks
+                            // are only captured in non-streaming parse_native_response().
                             _ => {}
                         }
                     }
@@ -887,6 +1025,7 @@ impl ModelProvider for AnthropicModelProvider {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let mut request = self
@@ -962,25 +1101,31 @@ impl ModelProvider for AnthropicModelProvider {
         } else {
             system_prompt
         };
+
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"max_tokens": self.max_tokens, "model": model})),
-            "streaming API request"
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
+            ),
+            "non-streaming API request"
         );
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
             temperature: if anthropic_model_omits_temperature(model) {
                 None
             } else {
-                temperature
+                effective_temperature
             },
             tools: native_tools,
             tool_choice,
             stream: None,
+            thinking: thinking_config,
         };
 
         let req = self
@@ -1004,6 +1149,7 @@ impl ModelProvider for AnthropicModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: true,
+            extended_thinking: true,
         }
     }
 
@@ -1064,6 +1210,7 @@ impl ModelProvider for AnthropicModelProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking: None,
         };
         self.chat(request, model, temperature).await
     }
@@ -1141,25 +1288,139 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+
+        // When native thinking is enabled, streamed `thinking_delta` /
+        // `signature_delta` SSE events are not yet parsed into
+        // `reasoning_content`, which means a tool-use turn could emit a
+        // tool call without preserving the signed thinking block that
+        // justified it — breaking Anthropic's signature round-trip. Fall
+        // back to a non-streaming request so `parse_native_response` can
+        // preserve the signed blocks, and synthesize a short stream from
+        // the completed response. Full streaming thinking_delta
+        // preservation is tracked as a follow-up.
+        if thinking_config.is_some() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model": model})),
+                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
+            );
+            let native_request = NativeChatRequest {
+                model: model.to_string(),
+                max_tokens: effective_max_tokens,
+                system: system_prompt,
+                messages,
+                temperature: if anthropic_model_omits_temperature(model) {
+                    None
+                } else {
+                    effective_temperature
+                },
+                tools: native_tools,
+                tool_choice,
+                stream: None,
+                thinking: thinking_config,
+            };
+            // Serialize eagerly so the request body is owned and `'static`
+            // across the async boundary — `NativeToolSpec<'a>` borrows from
+            // `request.tools`, which prevents moving `native_request` into
+            // the spawned future otherwise.
+            let body = serde_json::to_value(&native_request)
+                .expect("NativeChatRequest should serialize to JSON");
+            let client = self.http_client();
+            let url = format!("{}/v1/messages", self.base_url);
+            let is_oauth = Self::is_setup_token(&credential);
+
+            return stream::once(async move {
+                let mut req = client
+                    .post(&url)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&body);
+                if is_oauth {
+                    req = req
+                        .header("Authorization", format!("Bearer {credential}"))
+                        .header(
+                            "anthropic-beta",
+                            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                        )
+                        .header("anthropic-dangerous-direct-browser-access", "true");
+                } else {
+                    req = req.header("x-api-key", &credential);
+                }
+                let response = req
+                    .send()
+                    .await
+                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                }
+                let parsed: NativeChatResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                Ok(Self::parse_native_response(parsed))
+            })
+            .flat_map(|result| match result {
+                Ok(resp) => {
+                    let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
+                    // Emit signed thinking blocks first via `StreamChunk.reasoning`
+                    // so the agent loop can accumulate them into
+                    // `ChatResponse.reasoning_content` for multi-turn replay.
+                    // Anthropic requires signed thinking blocks to precede
+                    // tool-use blocks in conversation history.
+                    if let Some(rc) = resp.reasoning_content {
+                        events.push(Ok(StreamEvent::TextDelta(StreamChunk {
+                            delta: String::new(),
+                            reasoning: Some(rc),
+                            is_final: false,
+                            token_count: 0,
+                        })));
+                    }
+                    if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
+                        events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
+                    }
+                    for tc in resp.tool_calls {
+                        events.push(Ok(StreamEvent::ToolCall(tc)));
+                    }
+                    if let Some(usage) = resp.usage {
+                        events.push(Ok(StreamEvent::Usage(usage)));
+                    }
+                    events.push(Ok(StreamEvent::Final));
+                    stream::iter(events)
+                }
+                Err(e) => stream::iter(vec![Err(e)]),
+            })
+            .boxed();
+        }
+
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"max_tokens": self.max_tokens, "model": model})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
+            ),
             "stream_chat request"
         );
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
             temperature: if anthropic_model_omits_temperature(model) {
                 None
             } else {
-                temperature
+                effective_temperature
             },
             tools: native_tools,
             tool_choice,
             stream: Some(true),
+            thinking: thinking_config,
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1608,6 +1869,58 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+        // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
+        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
+        assert!(!anthropic_model_supports_native_thinking(
+            "claude-opus-4-7-20260101"
+        ));
+    }
+
+    #[test]
+    fn anthropic_model_supports_native_thinking_allows_other_models() {
+        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
+        assert!(anthropic_model_supports_native_thinking(
+            "claude-sonnet-4-6"
+        ));
+        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn resolve_thinking_drops_native_for_opus_4_7() {
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
+        assert!(
+            config.is_none(),
+            "native thinking should be gated off for opus-4-7"
+        );
+        // Caller-supplied temperature is preserved (so per-model omit guard
+        // can still take effect downstream).
+        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_keeps_native_for_supported_models() {
+        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+        };
+        let (temp, config, _) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        assert!(
+            config.is_some(),
+            "native thinking should activate on supported models"
+        );
+        // Forced to 1.0 per Anthropic native-thinking contract.
+        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn native_chat_request_serializes_without_temperature_when_none() {
         let req = NativeChatRequest {
             model: "claude-opus-4-7".to_string(),
@@ -1618,6 +1931,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -1638,6 +1952,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -2005,6 +2320,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -2032,6 +2348,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -2234,6 +2551,48 @@ data: {\"type\":\"message_stop\"}\n\n";
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn native_response_preserves_thinking_text_byte_for_byte() {
+        // Signatures on extended-thinking blocks are computed over the exact
+        // bytes the model returned. Any mutation — including trim() — breaks
+        // signature validation on replay in a multi-turn tool-use conversation.
+        let json = r#"{
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "  \nStep 1: consider the request.\nStep 2: respond.\n  ",
+                    "signature": "sig_abc123"
+                },
+                {"type": "text", "text": "ok"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = result.reasoning_content.expect("thinking preserved");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            parsed.get("thinking").and_then(|v| v.as_str()),
+            Some("  \nStep 1: consider the request.\nStep 2: respond.\n  ")
+        );
+        assert_eq!(
+            parsed.get("signature").and_then(|v| v.as_str()),
+            Some("sig_abc123")
+        );
+    }
+
+    #[test]
+    fn native_response_drops_empty_thinking_blocks() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
+                {"type": "text", "text": "hello"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        assert!(result.reasoning_content.is_none());
     }
 
     #[test]

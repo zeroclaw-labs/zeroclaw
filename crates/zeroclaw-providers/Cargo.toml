@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
-zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
