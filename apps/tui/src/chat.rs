@@ -729,73 +729,73 @@ impl<'a> Chat<'a> {
         }
     }
 
-    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+}
+
+impl<'a> crate::widgets::HelpContext for Chat<'a> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
                 if *loading {
-                    vec![("", "Loading agents\u{2026}")]
+                    HelpNode::entries(vec![E::key("", "Loading agents…")])
                 } else {
-                    vec![
-                        ("\u{2191}/\u{2193}", "Navigate"),
-                        ("Enter", "Select agent"),
-                        ("q", "Quit"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], "Navigate"),
+                        E::key("Enter", "Select agent"),
+                        E::key("q", "Quit"),
+                    ])
                 }
             }
-            ChatPhase::Error(_) => vec![("q", "Quit")],
+            ChatPhase::Error(_) => HelpNode::entries(vec![E::key("q", "Quit")]),
             ChatPhase::Active(state) => {
                 match &state.session_overlay {
                     SessionOverlay::List { .. } => {
-                        return vec![
-                            ("\u{2191}/\u{2193}", "Navigate"),
-                            ("Enter", "Switch session"),
-                            ("Esc", "Close"),
-                        ];
+                        return HelpNode::entries(vec![
+                            E::new(vec!["↑", "↓"], "Navigate"),
+                            E::key("Enter", "Switch session"),
+                            E::key("Esc", "Close"),
+                        ]);
                     }
                     SessionOverlay::Rename { .. } => {
-                        return vec![("Enter", "Submit name"), ("Esc", "Cancel")];
+                        return HelpNode::entries(vec![
+                            E::key("Enter", "Submit name"),
+                            E::key("Esc", "Cancel"),
+                        ]);
                     }
                     SessionOverlay::None => {}
                 }
-                // Input bar may have context-sensitive help (file explorer, etc.)
-                let bar_help = state.input_bar.help_entries();
-                if !bar_help.is_empty() {
-                    return bar_help;
-                }
                 if state.pending_approval().is_some() {
-                    vec![
-                        ("Enter", "Approve"),
-                        ("a", "Always approve"),
-                        ("Ctrl+D", "Deny"),
-                        ("Ctrl+C", "Cancel turn"),
-                    ]
-                } else if state.in_browse_mode() {
-                    vec![
-                        ("↑ / k", "Move cursor up"),
-                        ("↓ / j", "Move cursor down"),
-                        ("Shift+↑/↓", "Extend selection"),
-                        ("y", "Yank selection"),
-                        ("Ctrl+↓ / Esc", "Return to input"),
-                    ]
-                } else if state.turn_in_flight {
-                    vec![("Ctrl+C / Esc", "Cancel turn")]
-                } else {
-                    vec![
-                        ("Enter", "Send message"),
-                        ("Shift+Enter", "Insert newline"),
-                        ("/attach", "Attach file"),
-                        ("Ctrl+A", "File browser"),
-                        ("Ctrl+V", "Paste"),
-                        ("/toggle-thinking", "Toggle thinking visibility"),
-                        ("Ctrl+↑", "Browse mode (select entries)"),
-                        ("Shift+↑/↓", "Scroll conversation"),
-                        ("t", "Toggle thoughts"),
-                        ("Ctrl+N", "New session"),
-                        ("Ctrl+S", "Session list"),
-                        ("Ctrl+R", "Rename session"),
-                        ("Ctrl+C", "Quit"),
-                    ]
+                    return HelpNode::entries(vec![
+                        E::key("Enter", "Approve"),
+                        E::key("a", "Always approve"),
+                        E::key("Ctrl+D", "Deny"),
+                        E::key("Ctrl+C", "Cancel turn"),
+                    ]);
                 }
+                if state.in_browse_mode() {
+                    return HelpNode::entries(vec![
+                        E::new(vec!["↑", "k"], "Move cursor up"),
+                        E::new(vec!["↓", "j"], "Move cursor down"),
+                        E::key("Shift+↑/↓", "Extend selection"),
+                        E::key("y", "Yank selection"),
+                        E::new(vec!["Ctrl+↓", "Esc"], "Return to input"),
+                    ]);
+                }
+                if state.turn_in_flight {
+                    return HelpNode::entries(vec![E::new(vec!["Ctrl+C", "Esc"], "Cancel turn")]);
+                }
+                // Idle: compose pane-level bindings + input bar as child.
+                let pane = HelpNode::entries(vec![
+                    E::key("Ctrl+↑", "Browse mode"),
+                    E::key("Shift+↑/↓", "Scroll conversation"),
+                    E::key("t", "Toggle thoughts"),
+                    E::key("/toggle-thinking", "Toggle thinking visibility"),
+                    E::spacer(),
+                    E::key("Ctrl+N", "New session"),
+                    E::key("Ctrl+S", "Session list"),
+                    E::key("Ctrl+R", "Rename session"),
+                ]);
+                pane.with_child(state.input_bar.help_context())
             }
         }
     }

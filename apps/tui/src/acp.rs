@@ -43,7 +43,10 @@ impl<'a> Acp<'a> {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
-        self.inner.help_lines()
+}
+
+impl<'a> crate::widgets::HelpContext for Acp<'a> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        self.inner.help_context()
     }
 }

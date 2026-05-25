@@ -1692,34 +1692,40 @@ impl<'a> Dashboard<'a> {
         self.search_active
     }
 
-    /// Context-aware keybinding lines for the help modal.
-    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+}
+
+impl crate::widgets::HelpContext for Dashboard<'_> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {
-            vec![("Enter", "Apply search"), ("Esc", "Cancel search")]
+            HelpNode::entries(vec![
+                E::key("Enter", "Apply search"),
+                E::key("Esc", "Cancel search"),
+            ])
         } else if self.detail_open {
-            vec![
-                ("Esc / Enter", "Close detail"),
-                ("j / k", "Move list cursor"),
-                ("J / K", "Scroll detail"),
-                ("Shift+\u{2190}/\u{2192}", "Resize detail pane"),
-                ("/", "Search"),
-                ("c", "Clear search"),
-                ("?", "This help"),
-            ]
+            HelpNode::entries(vec![
+                E::new(vec!["Esc", "Enter"], "Close detail"),
+                E::new(vec!["j", "k"], "Move list cursor"),
+                E::new(vec!["J", "K"], "Scroll detail"),
+                E::key("Shift+←/→", "Resize detail pane"),
+                E::key("/", "Search"),
+                E::key("c", "Clear search"),
+                E::key("?", "This help"),
+            ])
         } else {
-            vec![
-                ("Tab / l / \u{2192}", "Next tab"),
-                ("Shift+Tab / h / \u{2190}", "Previous tab"),
-                ("1\u{2013}7", "Jump to tab"),
-                ("j / k / \u{2191}\u{2193}", "Move cursor"),
-                ("G / End", "Jump to bottom"),
-                ("g / Home", "Jump to top"),
-                ("Enter", "Open detail pane"),
-                ("/", "Search / filter"),
-                ("c", "Clear search"),
-                ("r", "Refresh now"),
-                ("?", "This help"),
-            ]
+            HelpNode::entries(vec![
+                E::new(vec!["Tab", "l", "→"], "Next tab"),
+                E::new(vec!["Shift+Tab", "h", "←"], "Previous tab"),
+                E::key("1–7", "Jump to tab"),
+                E::new(vec!["j", "k", "↑↓"], "Move cursor"),
+                E::new(vec!["G", "End"], "Jump to bottom"),
+                E::new(vec!["g", "Home"], "Jump to top"),
+                E::key("Enter", "Open detail pane"),
+                E::key("/", "Search / filter"),
+                E::key("c", "Clear search"),
+                E::key("r", "Refresh now"),
+                E::key("?", "This help"),
+            ])
         }
     }
 }

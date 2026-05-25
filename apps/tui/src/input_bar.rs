@@ -1098,22 +1098,28 @@ impl InputBarState {
         }
     }
 
-    /// Help line entries for the input bar (when idle, no turn in flight).
-    pub fn help_entries(&self) -> Vec<(&'static str, &'static str)> {
-        if self.file_explorer.is_some() {
-            vec![
-                ("j / k", "Navigate"),
-                ("Enter", "Open / Confirm"),
-                ("Space", "Select file"),
-                ("Backspace", "Parent dir"),
-                ("/", "Search"),
-                (".", "Toggle hidden"),
-                ("Esc", "Cancel"),
-            ]
-        } else {
-            // Input hints are part of the chat-level help modal.
-            vec![]
+}
+
+impl crate::widgets::HelpContext for InputBarState {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
+        if let Some(explorer) = &self.file_explorer {
+            return explorer.help_context();
         }
+        if self.autocomplete_active {
+            return HelpNode::entries(vec![
+                E::new(vec!["↑", "↓"], "Navigate completions"),
+                E::key("Tab", "Accept"),
+                E::key("Esc", "Dismiss"),
+            ]);
+        }
+        HelpNode::entries(vec![
+            E::key("Enter", "Send"),
+            E::key("Shift+Enter", "Insert newline"),
+            E::key("Ctrl+A", "File browser"),
+            E::key("Ctrl+V", "Paste image"),
+            E::key("/attach", "Attach file by path"),
+        ])
     }
 }
 

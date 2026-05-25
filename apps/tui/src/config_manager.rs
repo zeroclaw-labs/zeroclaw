@@ -24,6 +24,7 @@ use zeroclaw_config::traits::{ConfigFieldEntry, ConfigTab, PropKind};
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::theme;
 
+
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub(crate) fn init_terminal() -> Result<Term> {
@@ -2717,184 +2718,190 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Context-aware keybinding lines for the help modal.
-    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+}
+
+impl crate::widgets::HelpContext for App<'_> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.screen {
             Screen::SectionList => {
                 if self.filter.is_some() {
-                    vec![
-                        ("\u{2191} / \u{2193}", "Navigate"),
-                        ("Enter", "Open section"),
-                        ("Esc", "Clear filter"),
-                        ("?", "This help"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], "Navigate"),
+                        E::key("Enter", "Open section"),
+                        E::key("Esc", "Clear filter"),
+                        E::key("?", "This help"),
+                    ])
                 } else {
-                    vec![
-                        ("\u{2191}\u{2193} / j k", "Navigate"),
-                        ("Enter", "Open section"),
-                        ("/", "Filter"),
-                        ("q", "Quit"),
-                        ("?", "This help"),
-                        ("", ""),
-                        ("Mouse", "Click, scroll, double-click to open"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                        E::key("Enter", "Open section"),
+                        E::key("/", "Filter"),
+                        E::key("q", "Quit"),
+                        E::key("?", "This help"),
+                        E::spacer(),
+                        E::key("Mouse", "Click, scroll, double-click to open"),
+                    ])
                 }
             }
             Screen::TypeList { .. } => {
                 if self.filter.is_some() {
-                    vec![
-                        ("\u{2191} / \u{2193}", "Navigate"),
-                        ("Enter", "Open type"),
-                        ("Esc", "Clear filter"),
-                        ("?", "This help"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], "Navigate"),
+                        E::key("Enter", "Open type"),
+                        E::key("Esc", "Clear filter"),
+                        E::key("?", "This help"),
+                    ])
                 } else {
-                    vec![
-                        ("\u{2191}\u{2193} / j k", "Navigate"),
-                        ("Enter", "Open type"),
-                        ("/", "Filter"),
-                        ("Esc", "Back"),
-                        ("?", "This help"),
-                        ("", ""),
-                        ("Mouse", "Click, scroll, double-click to open"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                        E::key("Enter", "Open type"),
+                        E::key("/", "Filter"),
+                        E::key("Esc", "Back"),
+                        E::key("?", "This help"),
+                        E::spacer(),
+                        E::key("Mouse", "Click, scroll, double-click to open"),
+                    ])
                 }
             }
             Screen::AliasList { .. } => {
                 if self.filter.is_some() {
-                    vec![
-                        ("\u{2191} / \u{2193}", "Navigate"),
-                        ("Enter", "Open alias"),
-                        ("Esc", "Clear filter"),
-                        ("?", "This help"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], "Navigate"),
+                        E::key("Enter", "Open alias"),
+                        E::key("Esc", "Clear filter"),
+                        E::key("?", "This help"),
+                    ])
                 } else {
-                    vec![
-                        ("\u{2191}\u{2193} / j k", "Navigate"),
-                        ("Enter", "Open alias"),
-                        ("x", "Delete alias"),
-                        ("/", "Filter"),
-                        ("Esc", "Back"),
-                        ("?", "This help"),
-                        ("", ""),
-                        ("Mouse", "Click, scroll, double-click to open"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                        E::key("Enter", "Open alias"),
+                        E::key("x", "Delete alias"),
+                        E::key("/", "Filter"),
+                        E::key("Esc", "Back"),
+                        E::key("?", "This help"),
+                        E::spacer(),
+                        E::key("Mouse", "Click, scroll, double-click to open"),
+                    ])
                 }
             }
             Screen::AliasCreate { .. } => {
-                vec![
-                    ("Enter", "Create alias"),
-                    ("Esc", "Cancel"),
-                    ("?", "This help"),
-                ]
+                HelpNode::entries(vec![
+                    E::key("Enter", "Create alias"),
+                    E::key("Esc", "Cancel"),
+                    E::key("?", "This help"),
+                ])
             }
             Screen::FieldList { .. } => {
                 if self.filter.is_some() {
-                    vec![
-                        ("\u{2191} / \u{2193}", "Navigate"),
-                        ("Enter", "Edit field"),
-                        ("Esc", "Clear filter"),
-                        ("?", "This help"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::new(vec!["↑", "↓"], "Navigate"),
+                        E::key("Enter", "Edit field"),
+                        E::key("Esc", "Clear filter"),
+                        E::key("?", "This help"),
+                    ])
                 } else if self.is_composite_tab() {
                     match self.tab_names.get(self.active_tab) {
                         Some(ConfigTab::Personality) => {
                             if self.personality_active_file.is_some() {
-                                vec![
-                                    ("Ctrl+S", "Save"),
-                                    ("Esc", "Back to files"),
-                                    ("?", "This help"),
-                                ]
+                                HelpNode::entries(vec![
+                                    E::key("Ctrl+S", "Save"),
+                                    E::key("Esc", "Back to files"),
+                                    E::key("?", "This help"),
+                                ])
                             } else {
-                                vec![
-                                    ("\u{2190}\u{2192} / h l", "Switch tabs"),
-                                    ("\u{2191}\u{2193} / j k", "Navigate"),
-                                    ("Enter", "Edit file"),
-                                    ("t", "Fill from template"),
-                                    ("Esc", "Back"),
-                                    ("?", "This help"),
-                                    ("", ""),
-                                    ("Mouse", "Click, scroll, click tabs"),
-                                ]
+                                HelpNode::entries(vec![
+                                    E::new(vec!["←→", "h", "l"], "Switch tabs"),
+                                    E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                                    E::key("Enter", "Edit file"),
+                                    E::key("t", "Fill from template"),
+                                    E::key("Esc", "Back"),
+                                    E::key("?", "This help"),
+                                    E::spacer(),
+                                    E::key("Mouse", "Click, scroll, click tabs"),
+                                ])
                             }
                         }
                         Some(ConfigTab::Skills) => {
                             if self.skills_active.is_some() {
-                                vec![
-                                    ("Ctrl+S", "Save"),
-                                    ("Esc", "Back to skills"),
-                                    ("?", "This help"),
-                                ]
+                                HelpNode::entries(vec![
+                                    E::key("Ctrl+S", "Save"),
+                                    E::key("Esc", "Back to skills"),
+                                    E::key("?", "This help"),
+                                ])
                             } else {
-                                vec![
-                                    ("\u{2190}\u{2192} / h l", "Switch tabs"),
-                                    ("\u{2191}\u{2193} / j k", "Navigate"),
-                                    ("Enter", "Edit skill"),
-                                    ("x", "Archive skill"),
-                                    ("Esc", "Back"),
-                                    ("?", "This help"),
-                                    ("", ""),
-                                    ("Mouse", "Click, scroll, click tabs"),
-                                ]
+                                HelpNode::entries(vec![
+                                    E::new(vec!["←→", "h", "l"], "Switch tabs"),
+                                    E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                                    E::key("Enter", "Edit skill"),
+                                    E::key("x", "Archive skill"),
+                                    E::key("Esc", "Back"),
+                                    E::key("?", "This help"),
+                                    E::spacer(),
+                                    E::key("Mouse", "Click, scroll, click tabs"),
+                                ])
                             }
                         }
-                        _ => self.field_list_help(),
+                        _ => self.field_list_context(),
                     }
                 } else {
-                    self.field_list_help()
+                    self.field_list_context()
                 }
             }
             Screen::FieldEdit { .. } => {
                 if self.is_select_edit() {
                     if self.filter.is_some() {
-                        vec![
-                            ("\u{2191} / \u{2193}", "Navigate"),
-                            ("Enter", "Save selection"),
-                            ("Esc", "Clear filter"),
-                            ("?", "This help"),
-                        ]
+                        HelpNode::entries(vec![
+                            E::new(vec!["↑", "↓"], "Navigate"),
+                            E::key("Enter", "Save selection"),
+                            E::key("Esc", "Clear filter"),
+                            E::key("?", "This help"),
+                        ])
                     } else {
-                        vec![
-                            ("\u{2191}\u{2193} / j k", "Navigate"),
-                            ("Enter", "Save selection"),
-                            ("/", "Filter"),
-                            ("Esc", "Cancel"),
-                            ("?", "This help"),
-                            ("", ""),
-                            ("Mouse", "Click, scroll, double-click to save"),
-                        ]
+                        HelpNode::entries(vec![
+                            E::new(vec!["↑↓", "j", "k"], "Navigate"),
+                            E::key("Enter", "Save selection"),
+                            E::key("/", "Filter"),
+                            E::key("Esc", "Cancel"),
+                            E::key("?", "This help"),
+                            E::spacer(),
+                            E::key("Mouse", "Click, scroll, double-click to save"),
+                        ])
                     }
                 } else {
-                    vec![
-                        ("Enter", "Save value"),
-                        ("Esc", "Cancel"),
-                        ("?", "This help"),
-                    ]
+                    HelpNode::entries(vec![
+                        E::key("Enter", "Save value"),
+                        E::key("Esc", "Cancel"),
+                        E::key("?", "This help"),
+                    ])
                 }
             }
         }
     }
+}
 
-    fn field_list_help(&self) -> Vec<(&str, &str)> {
+impl App<'_> {
+    fn field_list_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
         let has_tabs = !self.tab_names.is_empty();
-        let mut lines = Vec::new();
+        let mut entries = Vec::new();
         if has_tabs {
-            lines.push(("\u{2190}\u{2192} / h l", "Switch tabs"));
+            entries.push(E::new(vec!["←→", "h", "l"], "Switch tabs"));
         }
-        lines.push(("\u{2191}\u{2193} / j k", "Navigate"));
-        lines.push(("Enter", "Edit field"));
-        lines.push(("d", "Reset to default"));
-        lines.push(("/", "Filter"));
-        lines.push(("Esc", "Back"));
-        lines.push(("?", "This help"));
-        lines.push(("", ""));
+        entries.push(E::new(vec!["↑↓", "j", "k"], "Navigate"));
+        entries.push(E::key("Enter", "Edit field"));
+        entries.push(E::key("d", "Reset to default"));
+        entries.push(E::key("/", "Filter"));
+        entries.push(E::key("Esc", "Back"));
+        entries.push(E::key("?", "This help"));
+        entries.push(E::spacer());
         let mouse = if has_tabs {
             "Click, scroll, click tabs, double-click to edit"
         } else {
             "Click, scroll, double-click to edit"
         };
-        lines.push(("Mouse", mouse));
-        lines
+        entries.push(E::key("Mouse", mouse));
+        HelpNode::entries(entries)
     }
 }
 

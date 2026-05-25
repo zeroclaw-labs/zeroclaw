@@ -524,6 +524,29 @@ impl FileExplorerState {
     }
 }
 
+impl crate::widgets::HelpContext for FileExplorerState {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
+        if self.searching {
+            HelpNode::entries(vec![
+                E::key("Enter", "Confirm search"),
+                E::key("Esc", "Cancel search"),
+            ])
+        } else {
+            HelpNode::entries(vec![
+                E::new(vec!["j", "↓"], "Next entry"),
+                E::new(vec!["k", "↑"], "Prev entry"),
+                E::key("Enter", "Open dir / confirm"),
+                E::key("Space", "Select file"),
+                E::key("Backspace", "Parent dir"),
+                E::key("/", "Search"),
+                E::key(".", "Toggle hidden"),
+                E::new(vec!["q", "Esc"], "Cancel"),
+            ])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

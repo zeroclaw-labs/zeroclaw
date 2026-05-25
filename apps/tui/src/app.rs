@@ -17,6 +17,7 @@ use crate::dashboard;
 use crate::logs;
 use crate::mouse;
 use crate::theme;
+use crate::widgets::{HelpContext, HelpEntry, HelpNode};
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
@@ -118,18 +119,20 @@ pub async fn run(
 
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
-                let help = match mode {
-                    Mode::Dashboard => dashboard_pane.help_lines(),
-                    Mode::Config => config_app.help_lines(),
-                    Mode::Acp => acp_pane.help_lines(),
-                    Mode::Chat => chat_pane.help_lines(),
-                    Mode::Logs => logs_pane.help_lines(),
+                let mut node = HelpNode::entries(vec![
+                    HelpEntry::new(vec!["F1–F5"], "Switch mode"),
+                    HelpEntry::key("Ctrl+C", "Quit"),
+                    HelpEntry::spacer(),
+                ]);
+                let pane_node = match mode {
+                    Mode::Dashboard => dashboard_pane.help_context(),
+                    Mode::Config => config_app.help_context(),
+                    Mode::Acp => acp_pane.help_context(),
+                    Mode::Chat => chat_pane.help_context(),
+                    Mode::Logs => logs_pane.help_context(),
                 };
-                // Global keys always shown.
-                let mut lines = vec![("F1–F5", "Switch mode"), ("Ctrl+C", "Quit")];
-                lines.push(("", ""));
-                lines.extend(help);
-                draw_help_modal(frame, frame.area(), &lines);
+                node.children.push(pane_node);
+                draw_help_modal(frame, frame.area(), &node);
             }
         })?;
 
@@ -354,21 +357,92 @@ fn draw_status_bar(
 
 // ── Help modal ───────────────────────────────────────────────────
 
-fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, lines: &[(&str, &str)]) {
-    // Compute minimum dimensions.
-    let key_width = lines.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    let val_width = lines.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
-    // key column + "  " gap + value column + border padding (2 each side)
-    let inner_w = key_width + 2 + val_width;
-    let box_w = (inner_w + 4) as u16; // 2 border + 2 padding
-    let box_h = (lines.len() + 4) as u16; // 2 border + 1 title + 1 footer hint
+/// Flatten a `HelpNode` tree into renderable lines, depth-first.
+/// Returns `(key_string, action)` pairs; both empty = spacer; action empty +
+/// key non-empty = section header; key == "\x01" = dim rule separator.
+fn flatten_help_node(node: &HelpNode, out: &mut Vec<(String, String)>, inner_width: usize) {
+    // Section title → dim header line.
+    if let Some(title) = node.title {
+        out.push(("\x01".into(), title.to_string())); // sentinel = separator/header
+    }
 
-    // Center in the terminal area.
+    // Description prose → soft-wrapped plain lines, no key column.
+    if let Some(desc) = node.description {
+        let wrap_at = inner_width.saturating_sub(2).max(20);
+        for line in soft_wrap(desc, wrap_at) {
+            out.push(("".into(), line));
+        }
+        out.push(("".into(), "".into())); // blank after prose
+    }
+
+    // Keybinding entries.
+    for entry in &node.entries {
+        let k = entry.key_str();
+        out.push((k, entry.action.to_string()));
+    }
+
+    // Children with a dim rule before each.
+    for child in &node.children {
+        out.push(("\x01".into(), "".into())); // dim rule
+        flatten_help_node(child, out, inner_width);
+    }
+}
+
+/// Naive soft-wrap: split `text` into lines no longer than `width`.
+/// Breaks on word boundaries where possible.
+fn soft_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.len() + 1 + word.len() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current.clone());
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    lines
+}
+
+fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, node: &HelpNode) {
+    // We need inner_width to soft-wrap descriptions. Use a generous default
+    // first pass, then clamp to terminal width.
+    let max_inner_w = (area.width as usize).saturating_sub(6).max(30);
+
+    let mut flat: Vec<(String, String)> = Vec::new();
+    flatten_help_node(node, &mut flat, max_inner_w);
+
+    // Compute key column width (skip sentinels and prose-only lines).
+    let key_width = flat
+        .iter()
+        .filter(|(k, _)| k != "\x01")
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(0);
+    let val_width = flat
+        .iter()
+        .filter(|(k, _)| k != "\x01")
+        .map(|(_, v)| v.len())
+        .max()
+        .unwrap_or(0);
+
+    let inner_w = key_width + 2 + val_width;
+    let box_w = (inner_w + 4).min(area.width as usize) as u16;
+    // +4: 2 border + 1 title + 1 footer + 1 blank
+    let box_h = (flat.len() + 5).min(area.height as usize) as u16;
+
     let x = area.x + area.width.saturating_sub(box_w) / 2;
     let y = area.y + area.height.saturating_sub(box_h) / 2;
-    let modal_rect = Rect::new(x, y, box_w.min(area.width), box_h.min(area.height));
+    let modal_rect = Rect::new(x, y, box_w, box_h);
 
-    // Clear the area behind the modal.
     frame.render_widget(Clear, modal_rect);
 
     let block = Block::default()
@@ -379,11 +453,32 @@ fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, lines: &[(&str, &str)
     let inner = block.inner(modal_rect);
     frame.render_widget(block, modal_rect);
 
-    // Render keybinding lines.
+    let rule_width = inner.width as usize;
     let mut text_lines: Vec<Line> = Vec::new();
-    for (key, desc) in lines {
-        if key.is_empty() && desc.is_empty() {
+
+    for (key, val) in &flat {
+        if key == "\x01" {
+            // Dim horizontal rule, optionally with a label.
+            if val.is_empty() {
+                let rule = "─".repeat(rule_width);
+                text_lines.push(Line::from(Span::styled(rule, theme::dim_style())));
+            } else {
+                // "── Label ──"
+                let label = format!(" {} ", val);
+                let sides = rule_width.saturating_sub(label.len());
+                let left = "─".repeat(sides / 2);
+                let right = "─".repeat(sides - sides / 2);
+                text_lines.push(Line::from(vec![
+                    Span::styled(left, theme::dim_style()),
+                    Span::styled(label, theme::dim_style()),
+                    Span::styled(right, theme::dim_style()),
+                ]));
+            }
+        } else if key.is_empty() && val.is_empty() {
             text_lines.push(Line::from(""));
+        } else if key.is_empty() {
+            // Prose line — no key column, full width.
+            text_lines.push(Line::from(Span::styled(val.clone(), theme::body_style())));
         } else {
             text_lines.push(Line::from(vec![
                 Span::styled(
@@ -391,11 +486,11 @@ fn draw_help_modal(frame: &mut ratatui::Frame, area: Rect, lines: &[(&str, &str)
                     theme::accent_style(),
                 ),
                 Span::styled("  ", theme::dim_style()),
-                Span::styled(*desc, theme::body_style()),
+                Span::styled(val.clone(), theme::body_style()),
             ]));
         }
     }
-    // Footer hint
+
     text_lines.push(Line::from(""));
     text_lines.push(Line::from(Span::styled(
         "Press any key to close",

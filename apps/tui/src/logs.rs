@@ -940,40 +940,43 @@ impl<'a> Logs<'a> {
         self.search_active
     }
 
-    /// Context-aware keybinding lines for the help modal.
-    pub(crate) fn help_lines(&self) -> Vec<(&str, &str)> {
+}
+
+impl crate::widgets::HelpContext for Logs<'_> {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::widgets::{HelpEntry as E, HelpNode};
         if self.search_active {
-            vec![("Enter", "Apply search"), ("Esc", "Cancel search")]
+            HelpNode::entries(vec![
+                E::key("Enter", "Apply search"),
+                E::key("Esc", "Cancel search"),
+            ])
         } else if self.detail_open {
-            vec![
-                ("Esc / Enter", "Close detail"),
-                ("j / k / \u{2191}\u{2193}", "Move list cursor"),
-                ("J / K / Shift+\u{2191}\u{2193}", "Scroll detail pane"),
-                ("Shift+\u{2190}\u{2192}", "Resize detail pane"),
-                ("/", "Search"),
-                ("+ / -", "Raise / lower severity filter"),
-                ("c", "Clear search filter"),
-                ("y", "Yank detail to clipboard"),
-                ("?", "This help"),
-            ]
+            HelpNode::entries(vec![
+                E::new(vec!["Esc", "Enter"], "Close detail"),
+                E::new(vec!["j", "k", "↑↓"], "Move list cursor"),
+                E::new(vec!["J", "K", "Shift+↑↓"], "Scroll detail pane"),
+                E::key("Shift+←→", "Resize detail pane"),
+                E::key("/", "Search"),
+                E::key("+ / -", "Raise / lower severity filter"),
+                E::key("c", "Clear search filter"),
+                E::key("y", "Yank detail to clipboard"),
+                E::key("?", "This help"),
+            ])
         } else {
-            vec![
-                ("j / k / \u{2191}\u{2193}", "Move cursor"),
-                ("G / End", "Jump to bottom (follow)"),
-                ("g / Home", "Jump to top"),
-                ("PgDn / PgUp", "Page down / up"),
-                ("Enter", "Open detail pane"),
-                ("f", "Toggle follow mode"),
-                ("/", "Search"),
-                ("+ / -", "Raise / lower severity filter"),
-                ("c", "Clear search filter"),
-                ("?", "This help"),
-                ("", ""),
-                (
-                    "Mouse",
-                    "Click to select, scroll wheel, double-click detail",
-                ),
-            ]
+            HelpNode::entries(vec![
+                E::new(vec!["j", "k", "↑↓"], "Move cursor"),
+                E::new(vec!["G", "End"], "Jump to bottom (follow)"),
+                E::new(vec!["g", "Home"], "Jump to top"),
+                E::key("PgDn / PgUp", "Page down / up"),
+                E::key("Enter", "Open detail pane"),
+                E::key("f", "Toggle follow mode"),
+                E::key("/", "Search"),
+                E::key("+ / -", "Raise / lower severity filter"),
+                E::key("c", "Clear search filter"),
+                E::key("?", "This help"),
+                E::spacer(),
+                E::key("Mouse", "Click to select, scroll wheel, double-click detail"),
+            ])
         }
     }
 }
