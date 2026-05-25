@@ -4,8 +4,10 @@ use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Default maximum shell command execution time before kill.
@@ -260,54 +262,150 @@ impl Tool for ShellTool {
         }
 
         let timeout_secs = self.timeout_secs;
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = decode_output(&output.stdout);
-                let mut stderr = decode_output(&output.stderr);
+        // Use spawn + explicit wait + pipe drain to handle grandchild processes
+        // that inherit pipe handles (e.g., agent-browser spawning Chrome on Windows).
+        // On Windows, child processes like Chrome keep pipe write handles open,
+        // preventing .output() from ever reaching EOF and causing a hang.
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::Error::msg(format!("Failed to execute command: {e}")))?;
 
-                // Truncate output to prevent OOM
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                    while b > 0 && !stdout.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stdout.truncate(b);
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                    while b > 0 && !stderr.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stderr.truncate(b);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("Failed to capture stdout from shell command"))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("Failed to capture stderr from shell command"))?;
 
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
+        // Wait for the main process to exit (not its grandchildren)
+        let status_result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+
+        // After the main process exits, drain remaining pipe data with a short
+        // timeout. Grandchild processes (e.g. Chrome) may still hold the pipe's
+        // write handles, so we cannot assume EOF will ever arrive.
+        const PIPE_DRAIN_TIMEOUT_SECS: u64 = 10;
+
+        let status = match status_result {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                // I/O error during wait — try to drain pipes before returning
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                tokio::join!(
+                    async {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                            child_stdout.read_to_end(&mut stdout_buf),
+                        )
+                        .await;
                     },
-                })
+                    async {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                            child_stderr.read_to_end(&mut stderr_buf),
+                        )
+                        .await;
+                    },
+                );
+
+                return Ok(ToolResult {
+                    success: false,
+                    output: decode_output(&stdout_buf),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {timeout_secs}s and was killed"
-                )),
-            }),
+            Err(_) => {
+                // Command timed out — kill the child process
+                child.kill().await.ok();
+                child.wait().await.ok();
+
+                // Try to drain whatever output was produced before the kill
+                let mut stdout_buf = Vec::new();
+                let mut stderr_buf = Vec::new();
+                tokio::join!(
+                    async {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                            child_stdout.read_to_end(&mut stdout_buf),
+                        )
+                        .await;
+                    },
+                    async {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                            child_stderr.read_to_end(&mut stderr_buf),
+                        )
+                        .await;
+                    },
+                );
+
+                return Ok(ToolResult {
+                    success: false,
+                    output: decode_output(&stdout_buf),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                });
+            }
+        };
+
+        // Process exited normally — drain remaining pipe data with timeout
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        tokio::join!(
+            async {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                    child_stdout.read_to_end(&mut stdout_buf),
+                )
+                .await;
+            },
+            async {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(PIPE_DRAIN_TIMEOUT_SECS),
+                    child_stderr.read_to_end(&mut stderr_buf),
+                )
+                .await;
+            },
+        );
+
+        let mut stdout = decode_output(&stdout_buf);
+        let mut stderr = decode_output(&stderr_buf);
+
+        // Truncate output to prevent OOM
+        if stdout.len() > MAX_OUTPUT_BYTES {
+            let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
+            while b > 0 && !stdout.is_char_boundary(b) {
+                b -= 1;
+            }
+            stdout.truncate(b);
+            stdout.push_str("\n... [output truncated at 1MB]");
         }
+        if stderr.len() > MAX_OUTPUT_BYTES {
+            let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
+            while b > 0 && !stderr.is_char_boundary(b) {
+                b -= 1;
+            }
+            stderr.truncate(b);
+            stderr.push_str("\n... [stderr truncated at 1MB]");
+        }
+
+        Ok(ToolResult {
+            success: status.success(),
+            output: stdout,
+            error: if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            },
+        })
     }
 }
 
