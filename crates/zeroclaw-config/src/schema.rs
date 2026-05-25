@@ -3641,8 +3641,11 @@ pub struct McpServerConfig {
     /// Optional environment variables for stdio transport.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Optional HTTP headers for HTTP/SSE transports.
+    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret —
+    /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
@@ -10569,6 +10572,8 @@ pub struct WebhookConfig {
     pub send_method: Option<String>,
     /// Optional `Authorization` header value for outbound requests.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_header: Option<String>,
     /// Optional shared secret for webhook signature verification (HMAC-SHA256).
     #[secret]
@@ -17011,6 +17016,33 @@ default_temperature = 0.7
             },
         );
 
+        // Webhook channel: auth_header carries a Bearer token; must be
+        // encrypted alongside the existing webhook `secret` field.
+        config.channels.webhook.insert(
+            "primary".into(),
+            WebhookConfig {
+                enabled: true,
+                port: 8080,
+                auth_header: Some("Bearer webhook-cred".into()),
+                secret: Some("webhook-shared-secret".into()),
+                ..Default::default()
+            },
+        );
+
+        // MCP server: HTTP headers map carries an Authorization Bearer
+        // token; the new `#[secret]` on `HashMap<String, String>` must
+        // encrypt every value (and only every value — keys stay plain).
+        config.mcp.servers.push(McpServerConfig {
+            name: "primary".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://mcp.example.invalid/sse".into()),
+            headers: HashMap::from([
+                ("Authorization".to_string(), "Bearer mcp-cred".to_string()),
+                ("X-Tenant".to_string(), "tenant-42".to_string()),
+            ]),
+            ..Default::default()
+        });
+
         config.save().await.unwrap();
 
         let contents = tokio::fs::read_to_string(config.config_path.clone())
@@ -17110,6 +17142,42 @@ default_temperature = 0.7
                 .unwrap(),
             "feishu-verify"
         );
+
+        // Webhook auth_header — newly tagged `#[secret]`.
+        let webhook = stored.channels.webhook.get("primary").unwrap();
+        let webhook_auth = webhook.auth_header.as_deref().unwrap();
+        assert!(
+            crate::secrets::SecretStore::is_encrypted(webhook_auth),
+            "webhook auth_header must be encrypted on save"
+        );
+        assert_eq!(store.decrypt(webhook_auth).unwrap(), "Bearer webhook-cred");
+        // The pre-existing webhook `secret` field stays encrypted too —
+        // sanity check that the refactor didn't regress it.
+        let webhook_secret = webhook.secret.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(webhook_secret));
+        assert_eq!(
+            store.decrypt(webhook_secret).unwrap(),
+            "webhook-shared-secret"
+        );
+
+        // MCP server headers — every value must be encrypted; the keys
+        // stay plaintext (TOML table headers are not secret).
+        let mcp_server = stored
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "primary")
+            .expect("mcp server `primary` round-trips through save");
+        for (key, value) in &mcp_server.headers {
+            assert!(
+                crate::secrets::SecretStore::is_encrypted(value),
+                "mcp.servers.primary.headers.{key} must be encrypted on save"
+            );
+        }
+        let auth = mcp_server.headers.get("Authorization").unwrap();
+        let tenant = mcp_server.headers.get("X-Tenant").unwrap();
+        assert_eq!(store.decrypt(auth).unwrap(), "Bearer mcp-cred");
+        assert_eq!(store.decrypt(tenant).unwrap(), "tenant-42");
 
         let _ = fs::remove_dir_all(&dir).await;
     }

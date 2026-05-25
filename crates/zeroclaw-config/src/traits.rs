@@ -222,34 +222,271 @@ impl<T: MaskSecrets> MaskSecrets for std::collections::HashMap<String, T> {
     }
 }
 
+impl<T: MaskSecrets> MaskSecrets for Vec<T> {
+    fn mask_secrets(&mut self) {
+        for v in self.iter_mut() {
+            v.mask_secrets();
+        }
+    }
+    fn restore_secrets_from(&mut self, current: &Self) {
+        for (v, cur) in self.iter_mut().zip(current.iter()) {
+            v.restore_secrets_from(cur);
+        }
+    }
+}
+
 pub const MASKED_SECRET: &str = "***MASKED***";
 
 pub fn is_masked_secret(value: &str) -> bool {
     value == MASKED_SECRET
 }
 
-pub fn mask_optional_secret(value: &mut Option<String>) {
-    if value.is_some() {
-        *value = Some(MASKED_SECRET.to_string());
+/// Per-field secret operations the `Configurable` derive emits for every
+/// `#[secret]` field. Generalizes mask / restore / encrypt / decrypt / is_set
+/// across the supported shapes — `String`, `Option<String>`, `Vec<String>`,
+/// `HashMap<String, String>`, and `Option<HashMap<String, String>>` — so adding
+/// a new shape is a single trait impl rather than a fourth branch in the macro.
+///
+/// `encrypt_in_place` and `decrypt_in_place` are idempotent: encrypting an
+/// already-`enc2:`-prefixed value or decrypting a plaintext value is a no-op,
+/// detected via [`crate::security::SecretStore::is_encrypted`]. The `field`
+/// argument is the dotted config-path (e.g. `mcp.servers`); the impls suffix
+/// per-element coordinates (`[<idx>]` for `Vec`, `.<key>` for `HashMap`) so
+/// error messages point at the exact failed entry.
+pub trait SecretField {
+    /// Replace each non-empty inner string with [`MASKED_SECRET`].
+    fn mask(&mut self);
+
+    /// Restore inner strings that currently equal [`MASKED_SECRET`] from the
+    /// matching position in `current`. The dashboard write path relies on this
+    /// so re-posting an already-displayed masked value doesn't overwrite the
+    /// real secret in config.
+    fn restore_from(&mut self, current: &Self);
+
+    /// Encrypt every non-empty, not-already-encrypted inner string.
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Inverse of [`Self::encrypt_in_place`].
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Whether the field carries at least one non-empty inner string. Reported
+    /// back through [`SecretFieldInfo::is_set`].
+    fn is_set(&self) -> bool;
+}
+
+impl SecretField for String {
+    fn mask(&mut self) {
+        if !self.is_empty() {
+            *self = MASKED_SECRET.to_string();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        if is_masked_secret(self) {
+            self.clone_from(current);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
+            *self = store
+                .encrypt(self)
+                .with_context(|| format!("Failed to encrypt {field}"))?;
+        }
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        if crate::security::SecretStore::is_encrypted(self) {
+            *self = store
+                .decrypt(self)
+                .with_context(|| format!("Failed to decrypt {field}"))?;
+        }
+        Ok(())
+    }
+
+    fn is_set(&self) -> bool {
+        !self.is_empty()
     }
 }
 
-pub fn mask_required_secret(value: &mut String) {
-    if !value.is_empty() {
-        *value = MASKED_SECRET.to_string();
+impl SecretField for Option<String> {
+    fn mask(&mut self) {
+        if let Some(inner) = self {
+            inner.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        if let (Some(inner), Some(cur)) = (self.as_mut(), current.as_ref()) {
+            inner.restore_from(cur);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.encrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.decrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.as_ref().is_some_and(|v| !v.is_empty())
     }
 }
 
-#[allow(clippy::ref_option)]
-pub fn restore_optional_secret(value: &mut Option<String>, current: &Option<String>) {
-    if value.as_deref().is_some_and(is_masked_secret) {
-        *value = current.clone();
+impl SecretField for Vec<String> {
+    fn mask(&mut self) {
+        for element in self.iter_mut() {
+            element.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        for (element, cur) in self.iter_mut().zip(current.iter()) {
+            element.restore_from(cur);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        for (idx, element) in self.iter_mut().enumerate() {
+            element.encrypt_in_place(store, &format!("{field}[{idx}]"))?;
+        }
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        for (idx, element) in self.iter_mut().enumerate() {
+            element.decrypt_in_place(store, &format!("{field}[{idx}]"))?;
+        }
+        Ok(())
+    }
+
+    fn is_set(&self) -> bool {
+        !self.is_empty()
     }
 }
 
-pub fn restore_required_secret(value: &mut String, current: &str) {
-    if is_masked_secret(value) {
-        *value = current.to_string();
+impl SecretField for std::collections::HashMap<String, String> {
+    fn mask(&mut self) {
+        for value in self.values_mut() {
+            value.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        for (key, value) in self.iter_mut() {
+            if let Some(cur) = current.get(key) {
+                value.restore_from(cur);
+            }
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        for (key, value) in self.iter_mut() {
+            value.encrypt_in_place(store, &format!("{field}.{key}"))?;
+        }
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        for (key, value) in self.iter_mut() {
+            value.decrypt_in_place(store, &format!("{field}.{key}"))?;
+        }
+        Ok(())
+    }
+
+    fn is_set(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl SecretField for Option<std::collections::HashMap<String, String>> {
+    fn mask(&mut self) {
+        if let Some(inner) = self {
+            inner.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        if let (Some(inner), Some(cur)) = (self.as_mut(), current.as_ref()) {
+            inner.restore_from(cur);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.encrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.decrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.as_ref().is_some_and(|m| !m.is_empty())
     }
 }
 
@@ -441,4 +678,176 @@ pub trait OnboardUi: Send {
     fn note(&mut self, msg: &str);
     fn status(&mut self, msg: &str);
     fn warn(&mut self, msg: &str);
+}
+
+#[cfg(test)]
+mod secret_field_tests {
+    use super::{MASKED_SECRET, SecretField};
+    use crate::security::SecretStore;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, SecretStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        (tmp, store)
+    }
+
+    #[test]
+    fn string_roundtrip_and_idempotent() {
+        let (_tmp, store) = store();
+        let mut s = String::from("sk-abc");
+        s.encrypt_in_place(&store, "test.s").unwrap();
+        assert!(SecretStore::is_encrypted(&s));
+        let enc1 = s.clone();
+        // idempotent: encrypting again must not double-wrap
+        s.encrypt_in_place(&store, "test.s").unwrap();
+        assert_eq!(s, enc1);
+        s.decrypt_in_place(&store, "test.s").unwrap();
+        assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_empty_stays_empty() {
+        let (_tmp, store) = store();
+        let mut s = String::new();
+        s.encrypt_in_place(&store, "test.s").unwrap();
+        assert_eq!(s, "");
+        assert!(!s.is_set());
+    }
+
+    #[test]
+    fn string_mask_and_restore() {
+        let mut s = String::from("Bearer xyz");
+        let cur = String::from("Bearer xyz");
+        s.mask();
+        assert_eq!(s, MASKED_SECRET);
+        s.restore_from(&cur);
+        assert_eq!(s, "Bearer xyz");
+    }
+
+    #[test]
+    fn option_string_none_is_noop() {
+        let (_tmp, store) = store();
+        let mut v: Option<String> = None;
+        v.encrypt_in_place(&store, "test.o").unwrap();
+        v.decrypt_in_place(&store, "test.o").unwrap();
+        v.mask();
+        assert_eq!(v, None);
+        assert!(!v.is_set());
+    }
+
+    #[test]
+    fn option_string_some_roundtrip() {
+        let (_tmp, store) = store();
+        let mut v: Option<String> = Some("Bearer xyz".into());
+        v.encrypt_in_place(&store, "test.o").unwrap();
+        assert!(SecretStore::is_encrypted(v.as_ref().unwrap()));
+        v.decrypt_in_place(&store, "test.o").unwrap();
+        assert_eq!(v.as_deref(), Some("Bearer xyz"));
+        assert!(v.is_set());
+    }
+
+    #[test]
+    fn vec_string_roundtrip_per_element() {
+        let (_tmp, store) = store();
+        let mut v: Vec<String> = vec!["one".into(), "".into(), "two".into()];
+        v.encrypt_in_place(&store, "test.v").unwrap();
+        assert!(SecretStore::is_encrypted(&v[0]));
+        assert_eq!(v[1], "", "empty element must stay empty");
+        assert!(SecretStore::is_encrypted(&v[2]));
+        v.decrypt_in_place(&store, "test.v").unwrap();
+        assert_eq!(v, vec!["one", "", "two"]);
+    }
+
+    #[test]
+    fn hashmap_string_string_roundtrip_per_value() {
+        let (_tmp, store) = store();
+        let mut h: HashMap<String, String> = HashMap::from([
+            ("Authorization".into(), "Bearer sk-abc".into()),
+            ("X-Trace".into(), "req-123".into()),
+        ]);
+        h.encrypt_in_place(&store, "mcp.servers.foo.headers")
+            .unwrap();
+        for v in h.values() {
+            assert!(SecretStore::is_encrypted(v));
+        }
+        h.decrypt_in_place(&store, "mcp.servers.foo.headers")
+            .unwrap();
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some("Bearer sk-abc")
+        );
+        assert_eq!(h.get("X-Trace").map(String::as_str), Some("req-123"));
+        assert!(h.is_set());
+    }
+
+    #[test]
+    fn hashmap_string_string_mask_and_restore() {
+        let mut h: HashMap<String, String> =
+            HashMap::from([("Authorization".into(), "Bearer xyz".into())]);
+        let cur = h.clone();
+        h.mask();
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some(MASKED_SECRET)
+        );
+        h.restore_from(&cur);
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some("Bearer xyz")
+        );
+    }
+
+    #[test]
+    fn option_hashmap_none_is_noop() {
+        let (_tmp, store) = store();
+        let mut v: Option<HashMap<String, String>> = None;
+        v.encrypt_in_place(&store, "test.oh").unwrap();
+        v.decrypt_in_place(&store, "test.oh").unwrap();
+        v.mask();
+        assert!(v.is_none());
+        assert!(!v.is_set());
+    }
+
+    #[test]
+    fn option_hashmap_some_roundtrip() {
+        let (_tmp, store) = store();
+        let mut v: Option<HashMap<String, String>> =
+            Some(HashMap::from([("k".into(), "secret".into())]));
+        v.encrypt_in_place(&store, "test.oh").unwrap();
+        assert!(SecretStore::is_encrypted(
+            v.as_ref().unwrap().get("k").unwrap()
+        ));
+        v.decrypt_in_place(&store, "test.oh").unwrap();
+        assert_eq!(
+            v.as_ref().unwrap().get("k").map(String::as_str),
+            Some("secret")
+        );
+        assert!(v.is_set());
+    }
+
+    #[test]
+    fn hashmap_empty_is_not_set() {
+        let h: HashMap<String, String> = HashMap::new();
+        assert!(!h.is_set());
+        let oh: Option<HashMap<String, String>> = Some(HashMap::new());
+        assert!(!oh.is_set());
+    }
+
+    #[test]
+    fn encrypt_decrypt_failure_message_includes_field_path() {
+        let tmp = TempDir::new().unwrap();
+        let bad_store = SecretStore::new(tmp.path(), true);
+        // Construct a malformed enc2 string that will fail to decrypt.
+        let mut s = String::from("enc2:not-valid-hex");
+        let err = s
+            .decrypt_in_place(&bad_store, "mcp.servers.foo.headers.Authorization")
+            .expect_err("malformed ciphertext must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mcp.servers.foo.headers.Authorization"),
+            "error must include field path; got: {msg}"
+        );
+    }
 }
