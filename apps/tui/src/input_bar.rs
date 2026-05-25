@@ -575,12 +575,14 @@ impl InputBarState {
             KeyCode::Enter => self.handle_enter(),
 
             // ── Up/Down: move cursor in wrapped text ─────────
-            // Always consumed — cursor stays in the input box.
-            KeyCode::Up => {
+            // Only bare Up/Down — any modifier (Ctrl/Shift/Alt) falls
+            // through so chat-level handlers (browse mode, scroll,
+            // fast-scroll) work from the input box.
+            KeyCode::Up if key.modifiers.is_empty() => {
                 self.move_cursor_up();
                 InputBarAction::Consumed
             }
-            KeyCode::Down => {
+            KeyCode::Down if key.modifiers.is_empty() => {
                 self.move_cursor_down();
                 InputBarAction::Consumed
             }
