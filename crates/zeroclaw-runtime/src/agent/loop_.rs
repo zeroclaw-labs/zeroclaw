@@ -3477,8 +3477,12 @@ pub async fn run(
             system_prompt.push_str(&deferred_section);
         }
 
-        // Inject configured channel targets so the agent knows where to deliver outbound messages
-        if let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config) {
+        // Inject configured channel targets so the agent knows where to deliver outbound messages.
+        // Only when channel_send is in the effective tool set — otherwise the prompt would
+        // advertise a disabled tool's targets.
+        if tools_registry.iter().any(|t| t.name() == "channel_send")
+            && let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config)
+        {
             system_prompt.push('\n');
             system_prompt.push_str(&channel_targets);
         }
@@ -4678,8 +4682,12 @@ pub async fn process_message(
             system_prompt.push_str(&deferred_section);
         }
 
-        // Inject configured channel targets so the agent knows where to deliver outbound messages
-        if let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config) {
+        // Inject configured channel targets so the agent knows where to deliver outbound messages.
+        // Only when channel_send is in the effective tool set — otherwise the prompt would
+        // advertise a disabled tool's targets.
+        if effective_tool_names.contains("channel_send")
+            && let Some(channel_targets) = crate::channel_targets::build_channel_targets(&config)
+        {
             system_prompt.push('\n');
             system_prompt.push_str(&channel_targets);
         }

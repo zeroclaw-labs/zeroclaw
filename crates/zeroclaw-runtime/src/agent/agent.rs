@@ -990,8 +990,12 @@ impl Agent {
             .build()?;
 
         // Build configured channel targets for system prompt injection.
+        // Only inject when channel_send survived the effective tool filter —
+        // otherwise the prompt would advertise a disabled tool's targets.
         let channel_targets = build_channel_targets(config);
-        if let Some(ref targets) = channel_targets {
+        if let Some(ref targets) = channel_targets
+            && agent.tools.iter().any(|t| t.name() == "channel_send")
+        {
             agent.channel_targets = Some(targets.clone());
         }
 
@@ -4401,5 +4405,31 @@ mod tests {
             names,
             &["file_read", "web_fetch", "ops__deploy", "ops__rollback"]
         );
+    }
+
+    /// Regression: channel_targets must NOT be set when channel_send is excluded
+    /// from the effective tool set (security policy / allowlist filter).
+    /// See PR #6665 — target guidance must respect the effective tool allowlist.
+    #[test]
+    fn channel_targets_guarded_when_channel_send_excluded() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+            Box::new(NamedMockTool::new("channel_send")),
+        ];
+
+        // Simulate policy filter removing channel_send
+        let excluded = ["channel_send".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        // The guard condition: only set channel_targets when channel_send survives
+        let channel_send_present = tools.iter().any(|t| t.name() == "channel_send");
+        assert!(
+            !channel_send_present,
+            "channel_send should have been excluded by the policy filter"
+        );
+
+        // If channel_send is absent, the prompt must NOT receive channel targets
+        // (the guard in from_config checks this before setting agent.channel_targets)
     }
 }

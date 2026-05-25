@@ -11,8 +11,9 @@ use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Shared channel map handle — Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>
-pub type ChannelMapHandle =
+/// Per-tool channel-map handle — matches `zeroclaw_runtime::tools::PerToolChannelHandle`.
+/// Defined locally so `zeroclaw-tools` doesn't depend on `zeroclaw-runtime`.
+pub type PerToolChannelHandle =
     Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn Channel>>>>;
 
 /// Tool that sends a message through a configured channel.
@@ -24,11 +25,11 @@ pub type ChannelMapHandle =
 /// - `body`: Message content to send
 pub struct ChannelSendTool {
     security: Arc<SecurityPolicy>,
-    channel_map: ChannelMapHandle,
+    channel_map: PerToolChannelHandle,
 }
 
 impl ChannelSendTool {
-    pub fn new(security: Arc<SecurityPolicy>, channel_map: ChannelMapHandle) -> Self {
+    pub fn new(security: Arc<SecurityPolicy>, channel_map: PerToolChannelHandle) -> Self {
         Self {
             security,
             channel_map,
@@ -139,7 +140,9 @@ impl Tool for ChannelSendTool {
             });
 
             channel.ok_or_else(|| {
-                // Build a helpful list of available channels
+                // Intentional: enumerating available channel keys in the error
+                // helps the agent correct a wrong channel name. These keys are
+                // operator-configured, not secrets — safe to expose in ToolResult.error.
                 let available: Vec<String> = channel_map.keys().cloned().collect();
                 anyhow::Error::msg(format!(
                     "Channel '{}' not found. Available channels: {:?}",
@@ -213,7 +216,7 @@ mod tests {
         }
     }
 
-    fn make_tool(handles: ChannelMapHandle) -> ChannelSendTool {
+    fn make_tool(handles: PerToolChannelHandle) -> ChannelSendTool {
         ChannelSendTool::new(Arc::new(SecurityPolicy::default()), handles)
     }
 
@@ -259,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn composite_key_resolves_exact_match() {
-        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         map.write().insert(
             "telegram.prod".to_string(),
             Arc::new(StubChannel::new("telegram.prod")),
@@ -277,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_type_key_resolves_to_default() {
-        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         map.write().insert(
             "telegram.default".to_string(),
             Arc::new(StubChannel::new("telegram.default")),
@@ -295,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn aliased_key_falls_back_to_default() {
-        let map: ChannelMapHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         map.write().insert(
             "telegram.default".to_string(),
             Arc::new(StubChannel::new("telegram.default")),
