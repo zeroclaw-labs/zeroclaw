@@ -351,6 +351,9 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+        ChannelApprovalResponse::DenyWithEdit { .. } => {
+            unreachable!("DenyWithEdit is only valid for ACP channels")
+        }
     };
 
     serde_json::json!({
@@ -2367,7 +2370,7 @@ impl LarkChannel {
         arguments_summary: &str,
         decision: zeroclaw_api::channel::ChannelApprovalResponse,
     ) {
-        let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
+        let card = build_resolved_approval_card(tool_name, arguments_summary, decision.clone());
         let url = self.patch_message_url(message_id);
         let body = serde_json::json!({
             "content": card.to_string(),
@@ -2640,7 +2643,7 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision);
+        let _ = pending.sender.send(decision.clone());
 
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
