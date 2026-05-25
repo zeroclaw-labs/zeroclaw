@@ -72,6 +72,15 @@ pub struct DiscordChannel {
     /// Value is `Some(parent_id)` when the channel is a thread, `None`
     /// when it is a regular (non-thread) channel.
     thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Ephemeral Discord gateway session state for Resume across reconnects.
+    gateway_session: Mutex<DiscordGatewaySession>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiscordGatewaySession {
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    sequence: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -128,6 +137,7 @@ impl DiscordChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway_session: Mutex::new(DiscordGatewaySession::default()),
         }
     }
 
@@ -1418,6 +1428,14 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn is_fatal_gateway_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
+fn requires_new_session_close_code(code: u16) -> bool {
+    matches!(code, 4007 | 4009)
+}
+
 impl ::zeroclaw_api::attribution::Attributable for DiscordChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Channel(
@@ -1541,6 +1559,7 @@ impl Channel for DiscordChannel {
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+        let mut had_ready = false;
 
         // Get Gateway URL
         let gw_resp = self
@@ -1568,15 +1587,28 @@ impl Channel for DiscordChannel {
             ));
         }
 
-        let gw_url = gw_resp
+        let fresh_gateway_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?;
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?
+            .to_string();
+        let session_snapshot = self.gateway_session.lock().clone();
+        let can_resume =
+            session_snapshot.session_id.is_some() && session_snapshot.sequence.is_some();
+        let gw_url = if can_resume {
+            session_snapshot
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| fresh_gateway_url.clone())
+        } else {
+            fresh_gateway_url.clone()
+        };
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"resume": can_resume, "gateway_url": gw_url})),
             "connecting to gateway..."
         );
 
@@ -1606,32 +1638,46 @@ impl Channel for DiscordChannel {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(41250);
 
-        // Send Identify (opcode 2)
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": self.bot_token,
-                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
+        let mut sequence = session_snapshot.sequence.unwrap_or(-1);
+
+        if can_resume {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": self.bot_token,
+                    "session_id": session_snapshot.session_id,
+                    "seq": session_snapshot.sequence,
                 }
-            }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "connected and identified"
-        );
-
-        // Track the last sequence number for heartbeats and resume.
-        // Only accessed in the select! loop below, so a plain i64 suffices.
-        let mut sequence: i64 = -1;
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sequence": sequence})),
+                "sent Discord Resume"
+            );
+        } else {
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": self.bot_token,
+                    "intents": 37377,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "zeroclaw",
+                        "device": "zeroclaw"
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "sent Discord Identify"
+            );
+        }
 
         // Spawn heartbeat timer — sends a tick signal, actual heartbeat
         // is assembled in the select! loop where `sequence` lives.
@@ -1701,9 +1747,31 @@ impl Channel for DiscordChannel {
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                let code = u16::from(frame.code);
+                                let reason = frame.reason.to_string();
+                                if requires_new_session_close_code(code) {
+                                    let mut session = self.gateway_session.lock();
+                                    session.session_id = None;
+                                    session.resume_gateway_url = None;
+                                    session.sequence = None;
+                                }
+                                if is_fatal_gateway_close_code(code) {
+                                    return Err(Self::fatal_listener_error(format!(
+                                        "discord gateway closed with fatal code {code}: {reason}"
+                                    )));
+                                }
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
+                            }
+                            break;
+                        }
+                        None => {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "discord gateway stream ended; reconnecting");
+                            break;
+                        }
                         Some(Err(e)) => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "websocket read error, reconnecting");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "had_ready": had_ready, "sequence": sequence})), "websocket read error, reconnecting");
                             break;
                         }
                         _ => continue,
@@ -1723,9 +1791,53 @@ impl Channel for DiscordChannel {
                     // Track sequence number from all dispatch events
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.gateway_session.lock().sequence = Some(s);
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "READY" => {
+                            had_ready = true;
+                            let session_id = event
+                                .get("d")
+                                .and_then(|d| d.get("session_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let resume_gateway_url = event
+                                .get("d")
+                                .and_then(|d| d.get("resume_gateway_url"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = session_id.clone();
+                                session.resume_gateway_url = resume_gateway_url;
+                                session.sequence = if sequence >= 0 { Some(sequence) } else { None };
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence, "session_id_present": session_id.is_some()})
+                                ),
+                                "discord READY received"
+                            );
+                            continue;
+                        }
+                        "RESUMED" => {
+                            had_ready = true;
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence})
+                                ),
+                                "discord RESUMED received"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
 
                     match op {
                         // Op 1: Server requests an immediate heartbeat
@@ -1739,19 +1851,25 @@ impl Channel for DiscordChannel {
                         }
                         // Op 7: Reconnect
                         7 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Reconnect (op 7), closing for restart");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "received Reconnect (op 7), closing for restart");
                             break;
                         }
                         // Op 9: Invalid Session
                         9 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Invalid Session (op 9), closing for restart");
+                            let resumable = event.get("d").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            if !resumable {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = None;
+                                session.resume_gateway_url = None;
+                                session.sequence = None;
+                            }
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"resumable": resumable, "had_ready": had_ready, "sequence": sequence})), "received Invalid Session (op 9), closing for restart");
                             break;
                         }
                         _ => {}
                     }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
-                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -2666,6 +2784,25 @@ mod tests {
     fn base64_decode_empty_string() {
         let decoded = base64_decode("");
         assert_eq!(decoded, Some(String::new()));
+    }
+
+    #[test]
+    fn fatal_gateway_close_codes_match_expected_discord_auth_and_intent_errors() {
+        for code in [4004_u16, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                is_fatal_gateway_close_code(code),
+                "code {code} should be fatal"
+            );
+        }
+        assert!(!is_fatal_gateway_close_code(4007));
+        assert!(!is_fatal_gateway_close_code(4009));
+    }
+
+    #[test]
+    fn new_session_close_codes_match_invalidated_gateway_sessions() {
+        assert!(requires_new_session_close_code(4007));
+        assert!(requires_new_session_close_code(4009));
+        assert!(!requires_new_session_close_code(4004));
     }
 
     #[test]
