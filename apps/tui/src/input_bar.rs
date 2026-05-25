@@ -23,6 +23,7 @@ use crate::clipboard;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::mouse;
 use crate::theme;
+use crate::turn_status::TurnStatus;
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -902,12 +903,19 @@ impl InputBarState {
     ///
     /// `show_cursor` controls whether the terminal cursor is positioned in the
     /// input box (false when an approval overlay is active).
+    ///
+    /// `turn_status` drives the title-bar label (verb + animated dots); it is
+    /// always `Idle` when no turn is in flight. `turn_started_at` is the
+    /// animation anchor — pass the `Instant` recorded when the turn began so
+    /// the dots cycle deterministically across redraws.
     pub fn render(
         &mut self,
         f: &mut Frame,
         area: Rect,
         turn_in_flight: bool,
         show_cursor: bool,
+        turn_status: &TurnStatus,
+        turn_started_at: Instant,
     ) -> Rect {
         let has_attachments = !self.pending_attachments.is_empty();
 
@@ -954,11 +962,13 @@ impl InputBarState {
         }
 
         // Input box.
-        let label = if turn_in_flight {
-            " (thinking\u{2026}) "
-        } else {
-            " > "
-        };
+        //
+        // Title comes from `TurnStatus::label`, which encodes both the verb
+        // and the dot-pulse animation (anchored to `turn_started_at` so paints
+        // within the same animation phase render identically). When idle, the
+        // status is `Idle` and the label is the plain " > " prompt.
+        let label_owned = turn_status.label(turn_started_at);
+        let label: &str = &label_owned;
         let block = Block::default()
             .borders(Borders::ALL)
             .title(label)

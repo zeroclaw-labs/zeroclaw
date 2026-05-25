@@ -20,6 +20,7 @@ mod logs;
 mod mouse;
 mod onboard_pane;
 mod theme;
+mod turn_status;
 mod widgets;
 
 const DAEMON_CONNECT_INTERVAL: Duration = Duration::from_millis(50);

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
@@ -23,6 +24,7 @@ use crate::diff;
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::mouse;
 use crate::theme;
+use crate::turn_status::TurnStatus;
 use zeroclaw_api::jsonrpc::RpcOutbound;
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -443,6 +445,7 @@ impl<'a> Chat<'a> {
                 if state.turn_in_flight {
                     let _ = self.rpc.session_cancel(&state.session_id).await;
                     state.turn_in_flight = false;
+                    state.turn_status = TurnStatus::Idle;
                 } else {
                     return true;
                 }
@@ -454,6 +457,7 @@ impl<'a> Chat<'a> {
                 } else if state.turn_in_flight {
                     let _ = self.rpc.session_cancel(&state.session_id).await;
                     state.turn_in_flight = false;
+                    state.turn_status = TurnStatus::Idle;
                 }
                 // Esc never quits the TUI — use q or Ctrl+C for that.
             }
@@ -906,9 +910,16 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let show_cursor = state.pending_approval().is_none();
-    let conv_area = state
-        .input_bar
-        .render(f, area, state.turn_in_flight, show_cursor);
+    let turn_status = state.turn_status.clone();
+    let turn_started_at = state.turn_started_at;
+    let conv_area = state.input_bar.render(
+        f,
+        area,
+        state.turn_in_flight,
+        show_cursor,
+        &turn_status,
+        turn_started_at,
+    );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
     let actual_conv = if let Some(ref cwd) = state.cwd {
@@ -1538,6 +1549,13 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pub turn_in_flight: bool,
+    /// Fine-grained label for the input-bar title while a turn is active.
+    /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
+    /// thinking / responding / tool-call breakdown for the UI.
+    pub turn_status: TurnStatus,
+    /// Anchor for the dots animation — reset each time a turn begins so
+    /// the pulse starts from phase 0.
+    turn_started_at: Instant,
     show_thoughts: bool,
     /// Browse mode cursor (most-recently moved position).
     browse_cursor: Option<usize>,
@@ -1573,6 +1591,8 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             turn_in_flight: false,
+            turn_status: TurnStatus::Idle,
+            turn_started_at: Instant::now(),
             show_thoughts: true,
             browse_cursor: None,
             browse_anchor: None,
@@ -1805,9 +1825,11 @@ impl ChatState {
                     self.flush_streaming_thought();
                 }
                 self.streaming_text.push_str(&text);
+                self.turn_status = TurnStatus::Responding;
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
                 self.streaming_thought.push_str(&text);
+                self.turn_status = TurnStatus::Thinking;
             }
             SessionUpdate::ToolCall {
                 tool_call_id,
@@ -1820,6 +1842,7 @@ impl ChatState {
                 // conversation order before the Tool entry.
                 self.flush_streaming_text();
                 self.flush_streaming_thought();
+                self.turn_status = TurnStatus::CallingTool(name.clone());
                 self.entries.push(ChatEntry::Tool {
                     tool_call_id,
                     name,
@@ -1855,6 +1878,13 @@ impl ChatState {
                         break;
                     }
                 }
+                // Tool finished; we're back in the model's hands. Don't clobber
+                // a more specific status if one has already arrived (chunks can
+                // race the result), so only step down from the matching
+                // CallingTool state.
+                if matches!(self.turn_status, TurnStatus::CallingTool(_)) {
+                    self.turn_status = TurnStatus::Working;
+                }
             }
             SessionUpdate::ApprovalRequest {
                 request_id,
@@ -1869,6 +1899,7 @@ impl ChatState {
                     arguments_summary,
                     timeout_secs,
                 });
+                self.turn_status = TurnStatus::WaitingForApproval;
             }
         }
     }
@@ -1901,6 +1932,7 @@ impl ChatState {
         let _ = full_text; // consumed by flush above; kept as parameter for API stability
         self.mark_dirty_append();
         self.turn_in_flight = false;
+        self.turn_status = TurnStatus::Idle;
         self.input_bar.cleanup_temps();
     }
 
@@ -1909,6 +1941,10 @@ impl ChatState {
             .push(ChatEntry::UserMessage { text, attachments });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        // Start a fresh status + animation anchor. We're `Working` until the
+        // first chunk (thought / message / tool-call) tells us otherwise.
+        self.turn_status = TurnStatus::Working;
+        self.turn_started_at = Instant::now();
     }
 
     /// Reset conversational state for a new or switched session.
@@ -1925,6 +1961,7 @@ impl ChatState {
         self.cached_render_start = 0;
         self.pending_approval = None;
         self.turn_in_flight = false;
+        self.turn_status = TurnStatus::Idle;
         self.browse_cursor = None;
         self.browse_anchor = None;
     }
