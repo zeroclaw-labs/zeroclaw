@@ -254,10 +254,7 @@ pub async fn list_nodes(
 
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/json; charset=utf-8",
-        )],
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         axum::Json(serde_json::json!({
             "nodes": nodes,
             "count": count,
