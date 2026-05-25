@@ -2100,8 +2100,12 @@ pub async fn run_tool_call_loop(
             return Ok(accumulated_display_text);
         }
 
-        // Accumulate text from this iteration (tool calls present, loop continues).
-        accumulated_display_text.push_str(&display_text);
+        // Do NOT accumulate intermediate-turn display_text into the final
+        // channel response: intermediate text is the model's narration
+        // between tool calls (chain-of-thought leakage on thinking-mode
+        // models like GLM-4.5+, DeepSeek-R1, QwQ). Streaming users still
+        // see it via tx.send(StreamDelta::Text(...)) below. Channel layer
+        // delivers only the final assistant turn's content.
 
         // Native tool-call model_providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
