@@ -1446,6 +1446,7 @@ impl Agent {
                         } else {
                             None
                         },
+                        thinking: None,
                     },
                     &effective_model,
                     Some(self.temperature),
@@ -1647,6 +1648,7 @@ impl Agent {
                     } else {
                         None
                     },
+                    thinking: None,
                 },
                 &effective_model,
                 Some(self.temperature),
@@ -1654,6 +1656,7 @@ impl Agent {
             );
 
             let mut streamed_text = String::new();
+            let mut streamed_reasoning = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut streamed_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
             let mut got_stream = false;
@@ -1687,6 +1690,10 @@ impl Agent {
                             if let Some(reasoning) = chunk.reasoning
                                 && !reasoning.is_empty()
                             {
+                                // Accumulate for signed-block round-trip on
+                                // providers that carry signatures in this
+                                // field (Anthropic native-thinking fallback).
+                                streamed_reasoning.push_str(&reasoning);
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
@@ -1768,12 +1775,20 @@ impl Agent {
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
-                // Build a synthetic ChatResponse from streamed text
+                // Build a synthetic ChatResponse from streamed text.
+                // `streamed_reasoning` carries signed thinking blocks from
+                // providers that emit them via `StreamChunk.reasoning`
+                // (Anthropic's native-thinking non-streaming fallback), so
+                // the signature round-trip survives into conversation history.
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: streamed_usage.clone(),
-                    reasoning_content: None,
+                    reasoning_content: if streamed_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(streamed_reasoning)
+                    },
                 }
             } else {
                 // Fall back to non-streaming chat, with cancellation guard
@@ -1785,6 +1800,7 @@ impl Agent {
                         } else {
                             None
                         },
+                        thinking: None,
                     },
                     &effective_model,
                     Some(self.temperature),
