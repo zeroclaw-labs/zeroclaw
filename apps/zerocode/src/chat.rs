@@ -659,18 +659,21 @@ impl<'a> Chat<'a> {
             }
             // ── Browse mode: enter (Ctrl+↑) ──────────────────────
             KeyCode::Up
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.in_browse_mode() =>
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !state.in_browse_mode() =>
             {
                 state.enter_browse_mode();
             }
             KeyCode::Up
-                if key.modifiers.contains(KeyModifiers::CONTROL) && state.in_browse_mode() =>
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && state.in_browse_mode() =>
             {
                 state.browse_move_up(1, false);
             }
             // ── Browse mode: exit (Ctrl+↓) ───────────────────────
             KeyCode::Down
-                if key.modifiers.contains(KeyModifiers::CONTROL) && state.in_browse_mode() =>
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && state.in_browse_mode() =>
             {
                 state.exit_browse_mode();
             }
