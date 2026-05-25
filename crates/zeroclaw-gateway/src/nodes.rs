@@ -146,6 +146,39 @@ impl NodeRegistry {
     }
 }
 
+/// `GET /api/nodes` — list currently connected nodes with their capabilities.
+pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(e) = super::api::require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let nodes_guard = state.node_registry.nodes.read();
+    let nodes: Vec<serde_json::Value> = nodes_guard
+        .values()
+        .map(|info| {
+            serde_json::json!({
+                "node_id": info.node_id,
+                "capabilities": info.capabilities,
+                "capability_count": info.capabilities.len(),
+                "status": "online",
+            })
+        })
+        .collect();
+    let count = nodes.len();
+    drop(nodes_guard);
+
+    let nodes_cfg = state.config.read().nodes.clone();
+    axum::response::Json(serde_json::json!({
+        "nodes": nodes,
+        "count": count,
+        "policy": {
+            "stale_after_secs": nodes_cfg.stale_after_secs,
+            "offline_after_secs": nodes_cfg.offline_after_secs,
+        }
+    }))
+    .into_response()
+}
+
 /// Messages received from a node.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

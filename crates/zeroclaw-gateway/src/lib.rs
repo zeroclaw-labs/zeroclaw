@@ -23,6 +23,7 @@ pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 pub mod api_skills;
+pub mod api_update;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 pub mod auth_rate_limit;
@@ -439,6 +440,8 @@ pub struct AppState {
     /// need to be rebuilt to apply it." The dashboard polls
     /// `/api/config/reload-status` and surfaces a reload banner when true.
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight guard for the update pipeline. Only one update can run at a time.
+    pub update_in_progress: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1132,6 +1135,7 @@ pub async fn run_gateway(
     println!("  GET  {pfx}/api/*     — REST API (bearer token required)");
     println!("  GET  {pfx}/ws/chat   — WebSocket agent chat");
     if config.nodes.enabled {
+        println!("  GET  {pfx}/api/nodes — list connected nodes");
         println!("  GET  {pfx}/ws/nodes  — WebSocket node discovery");
     }
     println!("  GET  {pfx}/health    — health check");
@@ -1226,6 +1230,7 @@ pub async fn run_gateway(
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1393,6 +1398,14 @@ pub async fn run_gateway(
             "/api/doctor",
             get(api::handle_api_doctor).post(api::handle_api_doctor),
         )
+        .route(
+            "/api/update/check",
+            get(api_update::handle_api_update_check),
+        )
+        .route(
+            "/api/update/run",
+            post(api_update::handle_api_update_run),
+        )
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
@@ -1480,7 +1493,8 @@ pub async fn run_gateway(
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
-        // ── WebSocket node discovery ──
+        // ── Node discovery ──
+        .route("/api/nodes", get(nodes::list_nodes))
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
@@ -3454,6 +3468,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3524,6 +3539,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4075,6 +4091,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4158,6 +4175,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4253,6 +4271,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4320,6 +4339,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4392,6 +4412,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4469,6 +4490,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4546,6 +4568,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4650,6 +4673,7 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: None,
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            update_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wati: None,
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),

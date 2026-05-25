@@ -12,6 +12,9 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  NodesResponse,
+  PairedDeviceInfo,
+  DevicesResponse,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -1403,4 +1406,48 @@ export function getCliTools(): Promise<CliTool[]> {
     const result = unwrapField(data, 'cli_tools');
     return Array.isArray(result) ? result : [];
   });
+}
+
+// ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
+
+export function getNodes(): Promise<NodesResponse> {
+  return apiFetch<NodesResponse>('/api/nodes');
+}
+
+// ---------------------------------------------------------------------------
+// Paired Devices
+// ---------------------------------------------------------------------------
+
+export function getPairedDevices(): Promise<PairedDeviceInfo[]> {
+  return apiFetch<DevicesResponse | PairedDeviceInfo[]>('/api/pairing/devices').then((data) => {
+    if (Array.isArray(data)) return data;
+    return data.devices ?? [];
+  });
+}
+
+export function revokePairedDevice(id: string): Promise<void> {
+  return apiFetch<void>(`/api/pairing/devices/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Self-update
+// ---------------------------------------------------------------------------
+
+export interface UpdateCheckResponse {
+  current_version: string;
+  latest_version: string;
+  is_newer: boolean;
+  download_url: string | null;
+}
+
+export function checkForUpdate(): Promise<UpdateCheckResponse> {
+  return apiFetch<UpdateCheckResponse>('/api/update/check');
+}
+
+export function runUpdate(): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>('/api/update/run', { method: 'POST' });
 }

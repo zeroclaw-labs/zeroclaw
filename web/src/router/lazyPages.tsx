@@ -7,6 +7,7 @@ export const AgentWorkspaceExplorer = lazy(() => import('../pages/AgentWorkspace
 export const Tools = lazy(() => import('../pages/Tools'));
 export const Cron = lazy(() => import('../pages/Cron'));
 export const Integrations = lazy(() => import('../pages/Integrations'));
+export const Nodes = lazy(() => import('../pages/Nodes'));
 export const Config = lazy(() => import('../pages/Config'));
 export const Logs = lazy(() => import('../pages/Logs'));
 export const Doctor = lazy(() => import('../pages/Doctor'));

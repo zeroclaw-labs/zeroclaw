@@ -268,3 +268,51 @@ export interface SessionMessagesResponse {
   messages: SessionMessageRow[];
   session_persistence: boolean;
 }
+
+// ── Nodes ────────────────────────────────────────────────────────────────
+
+export interface NodeCapability {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface DaemonNode {
+  node_id: string;
+  capabilities: NodeCapability[];
+  capability_count: number;
+  status: string;
+}
+
+export interface NodePolicy {
+  stale_after_secs: number;
+  offline_after_secs: number;
+}
+
+export interface NodesResponse {
+  nodes: DaemonNode[];
+  count: number;
+  policy: NodePolicy;
+}
+
+export interface PairedDeviceInfo {
+  id: string;
+  token_fingerprint: string;
+  created_at: string | null;
+  last_seen_at: string | null;
+  paired_by: string | null;
+}
+
+export interface DevicesResponse {
+  devices: PairedDeviceInfo[];
+  policy?: NodePolicy;
+}
+
+// ── Self-update ─────────────────────────────────────────────────────
+
+export interface UpdateCheckResponse {
+  current_version: string;
+  latest_version: string;
+  is_newer: boolean;
+  download_url: string | null;
+}

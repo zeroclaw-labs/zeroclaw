@@ -413,6 +413,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.cost': 'Cost Tracker',
     'nav.logs': 'Logs',
     'nav.doctor': 'Doctor',
+    'nav.nodes': 'Nodes',
     'nav.canvas': 'Canvas',
     'nav.onboard': 'Onboard',
 

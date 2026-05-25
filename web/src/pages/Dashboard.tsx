@@ -269,6 +269,7 @@ function healthBg(status: string): string {
 // were single-agent leftovers from pre-v0.8.0 and are gone: each agent now
 // picks its own model_provider and memory backend (shown per agent on the
 // agent cards above this grid).
+
 const STATUS_CARDS = [
   {
     icon: Clock,
