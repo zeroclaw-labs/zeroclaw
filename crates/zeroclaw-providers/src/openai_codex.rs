@@ -1092,8 +1092,24 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
     }
 
     if !pending_utf8.is_empty() {
-        let err = std::str::from_utf8(&pending_utf8)
-            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        let err = match std::str::from_utf8(&pending_utf8) {
+            Err(e) => e,
+            Ok(_) => {
+                // Structurally unreachable: append_utf8_stream_chunk only accumulates
+                // incomplete multi-byte sequences (error_len == None), so from_utf8
+                // always returns Err here. Handled as an error rather than a panic so
+                // the daemon survives if the invariant is somehow violated.
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai_codex: pending bytes were valid UTF-8 (invariant violated)"
+                );
+                return Err(anyhow::Error::msg(
+                    "OpenAI Codex response stream ended with valid UTF-8 in pending bytes (unexpected)",
+                ));
+            }
+        };
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
