@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 
+use daemonclaw_api::agent::TurnResult;
 use daemonclaw_api::channel::ChannelMessage;
 use daemonclaw_api::provider::{ChatMessage, ChatResponse};
 use daemonclaw_api::tool::ToolResult;
@@ -38,6 +39,7 @@ pub trait HookHandler: Send + Sync {
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
+    async fn on_turn_complete(&self, _result: &TurnResult) {}
 
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(

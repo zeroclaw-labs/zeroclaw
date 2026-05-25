@@ -111,9 +111,9 @@ Options:
   --api-key <key>            API key (skips interactive prompt)
   --provider <id>            Provider ID (skips interactive prompt)
   --model <id>               Model override (optional)
+  --skip-build               Skip build/install (configure an existing install)
   --skip-onboard             Skip provider/API key configuration
-  --skip-build               Skip build step
-  --skip-install             Skip cargo install step
+  --force-build              Force rebuild even if a release binary already exists
   --prefix PATH              Install prefix (default: $HOME)
   --dry-run                  Show what would happen without changes
   --uninstall                Remove DaemonClaw binary and optionally config/data
@@ -135,6 +135,9 @@ Examples:
 
   # Build only, configure later
   ./install.sh --skip-onboard
+
+  # Force rebuild (ignores existing binary)
+  ./install.sh --source --force-build
 
   # Isolated test install
   ./install.sh --prefix /tmp/dc-test --skip-onboard
@@ -519,9 +522,19 @@ install_prebuilt() {
 
   mkdir -p "$CARGO_HOME/bin"
   install -m 0755 "$extracted_bin" "$CARGO_HOME/bin/daemonclaw"
-  rm -rf "$tmp_dir"
 
-  step_ok "Installed pre-built binary to $CARGO_HOME/bin/daemonclaw"
+  # Also install to /usr/local/bin (used by systemd unit)
+  if [[ -w /usr/local/bin ]] || [[ "$(id -u)" -eq 0 ]]; then
+    install -m 0755 "$extracted_bin" /usr/local/bin/daemonclaw
+    step_ok "Installed pre-built binary ($CARGO_HOME/bin + /usr/local/bin)"
+  elif have_cmd sudo; then
+    sudo install -m 0755 "$extracted_bin" /usr/local/bin/daemonclaw
+    step_ok "Installed pre-built binary ($CARGO_HOME/bin + /usr/local/bin)"
+  else
+    step_ok "Installed pre-built binary to $CARGO_HOME/bin/daemonclaw"
+  fi
+
+  rm -rf "$tmp_dir"
   return 0
 }
 
@@ -531,15 +544,17 @@ prompt_provider() {
   echo
   echo -e "  ${BOLD}Select your AI provider${RESET}"
   echo
-  echo -e "  ${BOLD_BLUE}1)${RESET} ZAI ${DIM}(DaemonClaw native inference)${RESET}"
-  echo -e "  ${BOLD_BLUE}2)${RESET} Anthropic ${DIM}(Claude)${RESET}"
-  echo -e "  ${BOLD_BLUE}3)${RESET} OpenAI ${DIM}(GPT)${RESET}"
-  echo -e "  ${BOLD_BLUE}4)${RESET} OpenRouter ${DIM}(multi-model gateway)${RESET}"
-  echo -e "  ${BOLD_BLUE}5)${RESET} Gemini ${DIM}(Google)${RESET}"
-  echo -e "  ${BOLD_BLUE}6)${RESET} Ollama ${DIM}(local, no API key needed)${RESET}"
-  echo -e "  ${BOLD_BLUE}7)${RESET} Groq ${DIM}(fast inference)${RESET}"
-  echo -e "  ${BOLD_BLUE}8)${RESET} Venice ${DIM}(privacy-focused)${RESET}"
-  echo -e "  ${BOLD_BLUE}9)${RESET} Other ${DIM}(enter provider ID manually)${RESET}"
+  echo -e "  ${BOLD_BLUE} 1)${RESET} Z.AI ${DIM}(DaemonClaw native inference — GLM-5)${RESET}"
+  echo -e "  ${BOLD_BLUE} 2)${RESET} GLM ${DIM}(ChatGLM / Zhipu — international)${RESET}"
+  echo -e "  ${BOLD_BLUE} 3)${RESET} OpenRouter ${DIM}(200+ models, 1 API key)${RESET}"
+  echo -e "  ${BOLD_BLUE} 4)${RESET} Anthropic ${DIM}(Claude)${RESET}"
+  echo -e "  ${BOLD_BLUE} 5)${RESET} OpenAI ${DIM}(GPT)${RESET}"
+  echo -e "  ${BOLD_BLUE} 6)${RESET} DeepSeek ${DIM}(V3 & R1)${RESET}"
+  echo -e "  ${BOLD_BLUE} 7)${RESET} Gemini ${DIM}(Google)${RESET}"
+  echo -e "  ${BOLD_BLUE} 8)${RESET} Venice ${DIM}(privacy-focused)${RESET}"
+  echo -e "  ${BOLD_BLUE} 9)${RESET} Groq ${DIM}(fast inference)${RESET}"
+  echo -e "  ${BOLD_BLUE}10)${RESET} Ollama ${DIM}(local, no API key needed)${RESET}"
+  echo -e "  ${BOLD_BLUE}11)${RESET} Other ${DIM}(enter provider ID manually)${RESET}"
   echo
 
   if ! guided_read provider_input "  Provider: "; then
@@ -549,14 +564,16 @@ prompt_provider() {
 
   case "${provider_input}" in
     1) PROVIDER="zai" ;;
-    2) PROVIDER="anthropic" ;;
-    3) PROVIDER="openai" ;;
-    4) PROVIDER="openrouter" ;;
-    5) PROVIDER="gemini" ;;
-    6) PROVIDER="ollama" ;;
-    7) PROVIDER="groq" ;;
+    2) PROVIDER="glm" ;;
+    3) PROVIDER="openrouter" ;;
+    4) PROVIDER="anthropic" ;;
+    5) PROVIDER="openai" ;;
+    6) PROVIDER="deepseek" ;;
+    7) PROVIDER="gemini" ;;
     8) PROVIDER="venice" ;;
-    9)
+    9) PROVIDER="groq" ;;
+    10) PROVIDER="ollama" ;;
+    11)
       if ! guided_read provider_input "  Provider ID: "; then
         error "input was interrupted."
         exit 1
@@ -569,7 +586,7 @@ prompt_provider() {
       if [[ -n "$provider_input" ]]; then
         PROVIDER="$provider_input"
       else
-        error "No provider selected. Please pick a number (1-9)."
+        error "No provider selected. Please pick a number (1-11)."
         exit 1
       fi
       ;;
@@ -611,15 +628,136 @@ prompt_api_key() {
 }
 
 prompt_model() {
-  local model_input=""
-  echo -e "  ${DIM}Model (press Enter for provider default):${RESET}"
-  if ! guided_read model_input "  Model [default]: "; then
-    error "input was interrupted."
-    exit 1
+  local model_input="" _models=() _line=""
+
+  echo
+
+  # Dynamic model lookup: write a temp config so the binary can fetch from the provider API
+  if [[ -n "$API_KEY" && -n "$PROVIDER" && -f "$BIN" ]]; then
+    local _tmp_cfg_dir
+    _tmp_cfg_dir=$(mktemp -d /tmp/daemonclaw-model-lookup.XXXXXX)
+    mkdir -p "$_tmp_cfg_dir/workspace/state"
+    cat > "$_tmp_cfg_dir/config.toml" <<CFGEOF
+schema_version = 2
+workspace_dir = "$_tmp_cfg_dir/workspace"
+
+[providers]
+fallback = "$PROVIDER"
+
+[providers.models.$PROVIDER]
+api_key = "$API_KEY"
+CFGEOF
+
+    step_dot "Fetching available models from ${PROVIDER}..."
+    if "$BIN" models refresh --provider "$PROVIDER" --force --config-dir "$_tmp_cfg_dir" >/dev/null 2>&1; then
+      local _list_output
+      _list_output=$("$BIN" models list --provider "$PROVIDER" --config-dir "$_tmp_cfg_dir" 2>/dev/null || true)
+      while IFS= read -r _line; do
+        _line=$(echo "$_line" | sed 's/^[* ]*//' | xargs)
+        [[ -z "$_line" ]] && continue
+        # Skip header/info lines (contain "models for" or "cached")
+        [[ "$_line" == *"models for"* || "$_line" == *"cached"* ]] && continue
+        _models+=("$_line")
+      done <<< "$_list_output"
+    fi
+    rm -rf "$_tmp_cfg_dir"
   fi
-  if [[ -n "$model_input" ]]; then
-    MODEL="$model_input"
+
+  if [[ ${#_models[@]} -gt 0 ]]; then
+    step_ok "Found ${#_models[@]} models"
+    echo
+    echo -e "  ${BOLD}Select a model${RESET}"
+    echo
+    local i=1 _max=20
+    for m in "${_models[@]}"; do
+      if (( i > _max )); then
+        echo -e "  ${DIM}  ... and $(( ${#_models[@]} - _max )) more (enter model ID directly)${RESET}"
+        break
+      fi
+      echo -e "  ${BOLD_BLUE}$(printf '%2d' $i))${RESET} $m"
+      ((i++))
+    done
+    echo
+    if ! guided_read model_input "  Model [1]: "; then
+      error "input was interrupted."
+      exit 1
+    fi
+    if [[ -z "$model_input" ]]; then
+      MODEL="${_models[0]}"
+    elif [[ "$model_input" =~ ^[0-9]+$ && "$model_input" -ge 1 && "$model_input" -le ${#_models[@]} ]]; then
+      MODEL="${_models[$((model_input - 1))]}"
+    else
+      MODEL="$model_input"
+    fi
+  else
+    echo -e "  ${DIM}Model (press Enter for provider default):${RESET}"
+    if ! guided_read model_input "  Model [default]: "; then
+      error "input was interrupted."
+      exit 1
+    fi
+    if [[ -n "$model_input" ]]; then
+      MODEL="$model_input"
+    fi
   fi
+  step_ok "Model: ${MODEL:-provider default}"
+}
+
+# --- Patch service config with provider/API key/model ---
+# Writes PROVIDER, API_KEY, MODEL into SERVICE_CONFIG using sed.
+patch_service_config() {
+  local _svc_tmp _block_tmp _prov_line _next_section _insert_at
+
+  _svc_tmp=$(mktemp /tmp/daemonclaw-svc-config.XXXXXX)
+  _block_tmp=$(mktemp /tmp/daemonclaw-provider-block.XXXXXX)
+  sudo cat "$SERVICE_CONFIG" > "$_svc_tmp"
+
+  # Update fallback provider
+  if grep -q '^\[providers\]' "$_svc_tmp"; then
+    if grep -q '^fallback *=' "$_svc_tmp"; then
+      sed -i "s/^fallback *=.*/fallback = \"$PROVIDER\"/" "$_svc_tmp"
+    else
+      sed -i "/^\[providers\]/a fallback = \"$PROVIDER\"" "$_svc_tmp"
+    fi
+  fi
+
+  # Remove existing provider model section if present
+  sed -i "/^\[providers\.models\.$PROVIDER\]/,/^\[/{ /^\[providers\.models\.$PROVIDER\]/d; /^\[/!d; }" "$_svc_tmp"
+
+  # Build the new provider section in a temp file
+  {
+    echo ""
+    echo "[providers.models.$PROVIDER]"
+    echo "api_key = \"$API_KEY\""
+    if [[ -n "$MODEL" ]]; then
+      echo "model = \"$MODEL\""
+    fi
+  } > "$_block_tmp"
+
+  # Insert after [providers] section, before the next non-providers section
+  _prov_line=$(grep -n '^\[providers\]' "$_svc_tmp" | head -1 | cut -d: -f1)
+  if [[ -n "$_prov_line" ]]; then
+    _next_section=$(tail -n +"$((_prov_line + 1))" "$_svc_tmp" | grep -n '^\[' | grep -v '^\[0-9]*:\[providers' | head -1 | cut -d: -f1)
+    if [[ -n "$_next_section" ]]; then
+      _insert_at=$((_prov_line + _next_section - 1))
+    else
+      _insert_at=$(wc -l < "$_svc_tmp")
+      (( _insert_at++ ))
+    fi
+    sed -i "${_insert_at}r ${_block_tmp}" "$_svc_tmp"
+  else
+    # No [providers] section — append it
+    {
+      echo ""
+      echo "[providers]"
+      echo "fallback = \"$PROVIDER\""
+      cat "$_block_tmp"
+    } >> "$_svc_tmp"
+  fi
+
+  sudo cp "$_svc_tmp" "$SERVICE_CONFIG"
+  sudo chown root:agents "$SERVICE_CONFIG"
+  sudo chmod 0640 "$SERVICE_CONFIG"
+  rm -f "$_svc_tmp" "$_block_tmp"
 }
 
 # --- Guided installer ---
@@ -679,11 +817,6 @@ run_guided_installer() {
     INSTALL_MODE="source"
   fi
 
-  # --- Provider + API key ---
-  prompt_provider
-  prompt_api_key
-  prompt_model
-
   # --- Install plan summary ---
   echo
   echo -e "${BOLD}Install plan${RESET}"
@@ -691,15 +824,7 @@ run_guided_installer() {
   step_dot "Install system deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
   step_dot "Install Rust: $(bool_to_word "$INSTALL_RUST")"
   step_dot "Install method: ${INSTALL_MODE}"
-  step_dot "Provider: ${PROVIDER}"
-  if [[ -n "$MODEL" ]]; then
-    step_dot "Model: ${MODEL}"
-  fi
-  if [[ -n "$API_KEY" ]]; then
-    step_ok "API key: configured"
-  else
-    step_dot "API key: not set (configure later)"
-  fi
+  step_dot "Provider/model: configured after install via setup wizard"
 
   echo
   if ! prompt_yes_no "Proceed with this install plan?" "yes"; then
@@ -872,9 +997,9 @@ INSTALL_RUST=false
 INSTALL_MODE=""
 MINIMAL=false
 USER_FEATURES=""
-SKIP_ONBOARD=false
 SKIP_BUILD=false
-SKIP_INSTALL=false
+SKIP_ONBOARD=false
+FORCE_BUILD=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
@@ -911,9 +1036,9 @@ while [[ $# -gt 0 ]]; do
     --model)
       [[ $# -ge 2 ]] || { error "--model requires a value"; exit 1; }
       shift; MODEL="$1"; shift ;;
-    --skip-onboard)        SKIP_ONBOARD=true; shift ;;
     --skip-build)          SKIP_BUILD=true; shift ;;
-    --skip-install)        SKIP_INSTALL=true; shift ;;
+    --skip-onboard)        SKIP_ONBOARD=true; shift ;;
+    --force-build)         FORCE_BUILD=true; shift ;;
     --prefix)
       [[ $# -ge 2 ]] || { error "--prefix requires a value"; exit 1; }
       shift; PREFIX="${1%/}"; shift ;;
@@ -1041,6 +1166,111 @@ else
   step_dot "Git not found"
 fi
 
+# ── Source build pre-flight checks ──
+if [[ "$INSTALL_MODE" == "source" ]]; then
+  PREFLIGHT_FAIL=false
+
+  # Locate the source directory for .cargo/config.toml inspection
+  _preflight_dir=""
+  if [[ -f "Cargo.toml" ]] && grep -q "daemonclaw" "Cargo.toml" 2>/dev/null; then
+    _preflight_dir="$(pwd)"
+  fi
+
+  if [[ -n "$_preflight_dir" && -f "$_preflight_dir/.cargo/config.toml" ]]; then
+    # ── rustc-wrapper (sccache) ──
+    _wrapper=$(grep -E '^rustc-wrapper' "$_preflight_dir/.cargo/config.toml" 2>/dev/null \
+      | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/' || true)
+    if [[ -n "$_wrapper" ]]; then
+      _wrapper_available=false
+      if [[ "$_wrapper" == /* ]]; then
+        [[ -x "$_wrapper" ]] && _wrapper_available=true
+      else
+        have_cmd "$_wrapper" && _wrapper_available=true
+      fi
+
+      if [[ "$_wrapper_available" == false ]]; then
+        # Try to install it via cargo
+        step_dot "rustc-wrapper \"$_wrapper\" not found — installing"
+        if cargo install "$_wrapper" 2>/dev/null; then
+          step_ok "Installed $_wrapper"
+        else
+          # Can't install — disable it for this build (it's optional)
+          warn "Could not install $_wrapper — disabling for this build"
+          export RUSTC_WRAPPER=""
+        fi
+      else
+        step_ok "rustc-wrapper: $_wrapper"
+      fi
+    fi
+
+    # ── Linker (mold, lld, etc.) ──
+    _linker_flag=$(grep -E 'fuse-ld=' "$_preflight_dir/.cargo/config.toml" 2>/dev/null \
+      | head -1 | sed 's/.*fuse-ld=\([a-z]*\).*/\1/' || true)
+    if [[ -n "$_linker_flag" ]] && ! have_cmd "$_linker_flag"; then
+      step_dot "Linker \"$_linker_flag\" not found — installing"
+      if _have_cmd apt-get; then
+        _run_privileged apt-get install -y "$_linker_flag" 2>/dev/null && step_ok "Installed $_linker_flag"
+      elif _have_cmd dnf; then
+        _run_privileged dnf install -y "$_linker_flag" 2>/dev/null && step_ok "Installed $_linker_flag"
+      elif _have_cmd pacman; then
+        _run_privileged pacman -S --noconfirm "$_linker_flag" 2>/dev/null && step_ok "Installed $_linker_flag"
+      fi
+      if ! have_cmd "$_linker_flag"; then
+        step_fail "Linker \"$_linker_flag\" could not be installed"
+        step_dot "Build may still succeed with the default linker, continuing..."
+      fi
+    elif [[ -n "$_linker_flag" ]]; then
+      step_ok "Linker: $_linker_flag"
+    fi
+  fi
+
+  # ── Build target directory write access ──
+  if [[ -n "$_preflight_dir" && -d "$_preflight_dir/target" && ! -w "$_preflight_dir/target" ]]; then
+    step_dot "Fixing permissions on target/ (owned by another user)"
+    if _run_privileged chmod -R a+rwX "$_preflight_dir/target" 2>/dev/null; then
+      step_ok "target/ permissions fixed"
+    else
+      step_fail "Cannot write to $_preflight_dir/target/ — build will fail"
+      step_dot "Fix: sudo chmod -R a+rwX $_preflight_dir/target"
+      PREFLIGHT_FAIL=true
+    fi
+  fi
+
+  # ── Rustup toolchain permissions ──
+  if have_cmd rustup; then
+    _rustup_home="${RUSTUP_HOME:-$(rustup show home 2>/dev/null || true)}"
+    if [[ -n "$_rustup_home" && -d "$_rustup_home" && ! -w "$_rustup_home" ]]; then
+      step_dot "Fixing permissions on $_rustup_home"
+      if _run_privileged chmod -R a+rwX "$_rustup_home" 2>/dev/null; then
+        step_ok "RUSTUP_HOME permissions fixed"
+      else
+        step_fail "Cannot write to RUSTUP_HOME ($_rustup_home) — toolchain sync will fail"
+        step_dot "Fix: sudo chmod -R a+rwX $_rustup_home"
+        PREFLIGHT_FAIL=true
+      fi
+    fi
+  fi
+
+  # ── CARGO_HOME/bin write access ──
+  _cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+  if [[ -d "$_cargo_bin" && ! -w "$_cargo_bin" ]]; then
+    step_dot "Fixing permissions on $_cargo_bin"
+    if _run_privileged chmod a+rwX "$_cargo_bin" 2>/dev/null; then
+      step_ok "CARGO_HOME/bin permissions fixed"
+    else
+      step_fail "Cannot write to $_cargo_bin — binary install will fail"
+      step_dot "Fix: sudo chmod a+rwX $_cargo_bin"
+      PREFLIGHT_FAIL=true
+    fi
+  fi
+
+  if [[ "$PREFLIGHT_FAIL" == true ]]; then
+    echo
+    error "Pre-flight checks failed. Fix the issues above and retry."
+    exit 1
+  fi
+fi
+
 # ── [2/4] Installing DaemonClaw ──────────────────────────────────
 
 echo
@@ -1048,7 +1278,9 @@ echo -e "${BOLD_BLUE}[2/4]${RESET} ${BOLD}Installing DaemonClaw${RESET}"
 
 PREBUILT_OK=false
 
-if [[ "$INSTALL_MODE" == "prebuilt" ]]; then
+if [[ "$SKIP_BUILD" == true ]]; then
+  step_dot "Skipping build (--skip-build)"
+elif [[ "$INSTALL_MODE" == "prebuilt" ]]; then
   if [[ "$DRY_RUN" == true ]]; then
     step_dot "[dry-run] Would download pre-built binary"
   else
@@ -1061,7 +1293,7 @@ if [[ "$INSTALL_MODE" == "prebuilt" ]]; then
   fi
 fi
 
-if [[ "$PREBUILT_OK" == false && "$INSTALL_MODE" == "source" ]]; then
+if [[ "$SKIP_BUILD" == false && "$PREBUILT_OK" == false && "$INSTALL_MODE" == "source" ]]; then
   # Locate source
   WORK_DIR=""
   TEMP_CLONE=false
@@ -1118,18 +1350,32 @@ if [[ "$PREBUILT_OK" == false && "$INSTALL_MODE" == "source" ]]; then
         fi
       fi
 
-      if [[ "$SKIP_BUILD" == false ]]; then
+      _release_bin="$WORK_DIR/target/release/daemonclaw"
+
+      if [[ "$FORCE_BUILD" == false && -x "$_release_bin" ]]; then
+        step_ok "Found existing release binary — skipping build"
+      else
+        if [[ "$FORCE_BUILD" == true && -x "$_release_bin" ]]; then
+          step_dot "Force rebuild requested"
+        fi
         step_dot "Building release binary"
         # shellcheck disable=SC2086
-        (cd "$WORK_DIR" && cargo build --release --locked $CARGO_FLAGS)
+        (cd "$WORK_DIR" && cargo build --release $CARGO_FLAGS)
         step_ok "Release binary built"
       fi
 
-      if [[ "$SKIP_INSTALL" == false ]]; then
-        step_dot "Installing to $CARGO_HOME/bin"
-        # shellcheck disable=SC2086
-        (cd "$WORK_DIR" && cargo install --path . --locked --force $CARGO_FLAGS)
-        step_ok "DaemonClaw installed"
+      step_dot "Installing to $CARGO_HOME/bin"
+      mkdir -p "$CARGO_HOME/bin"
+      install -m 0755 "$_release_bin" "$CARGO_HOME/bin/daemonclaw"
+      # Also install to /usr/local/bin if writable (system-wide, used by systemd unit)
+      if [[ -w /usr/local/bin ]] || [[ "$(id -u)" -eq 0 ]]; then
+        install -m 0755 "$_release_bin" /usr/local/bin/daemonclaw
+        step_ok "DaemonClaw installed ($CARGO_HOME/bin + /usr/local/bin)"
+      elif have_cmd sudo; then
+        sudo install -m 0755 "$_release_bin" /usr/local/bin/daemonclaw
+        step_ok "DaemonClaw installed ($CARGO_HOME/bin + /usr/local/bin)"
+      else
+        step_ok "DaemonClaw installed ($CARGO_HOME/bin)"
       fi
     fi
   fi
@@ -1137,6 +1383,9 @@ fi
 
 # Show installed binary info
 BIN="$CARGO_HOME/bin/daemonclaw"
+if [[ ! -f "$BIN" && -f /usr/local/bin/daemonclaw ]]; then
+  BIN="/usr/local/bin/daemonclaw"
+fi
 if [[ -f "$BIN" && "$DRY_RUN" != true ]]; then
   NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
   SIZE=$(du -h "$BIN" | awk '{print $1}')
@@ -1144,7 +1393,7 @@ if [[ -f "$BIN" && "$DRY_RUN" != true ]]; then
 fi
 
 # Web dashboard build
-if [[ "$DRY_RUN" == false && "$SKIP_BUILD" == false && -n "${WORK_DIR:-}" && -d "$WORK_DIR/web" ]]; then
+if [[ "$SKIP_BUILD" == false && "$DRY_RUN" == false && -n "${WORK_DIR:-}" && -d "$WORK_DIR/web" ]]; then
   if have_cmd node && have_cmd npm; then
     step_dot "Building web dashboard"
     if (cd "$WORK_DIR/web" && npm ci --ignore-scripts 2>/dev/null && npm run build 2>/dev/null); then
@@ -1157,71 +1406,44 @@ if [[ "$DRY_RUN" == false && "$SKIP_BUILD" == false && -n "${WORK_DIR:-}" && -d 
   fi
 fi
 
-# ── [3/4] Configuring ────────────────────────────────────────────
+# ── [3/4] Installing service ─────────────────────────────────────
+#
+# Service install happens BEFORE provider configuration so that:
+#   1. The service user, dirs, and secret key are created first
+#   2. The default config is written to /etc/daemonclaw/config.toml
+#   3. Provider/API key is written directly to the service config
+#   4. No intermediate ~/.daemonclaw/config.toml is needed
+#
+# This avoids secret key mismatches and ensures the service config
+# has the correct defaults from generate_install_config().
 
 echo
-echo -e "${BOLD_BLUE}[3/4]${RESET} ${BOLD}Configuring${RESET}"
+echo -e "${BOLD_BLUE}[3/4]${RESET} ${BOLD}Installing service${RESET}"
+
+SERVICE_INSTALLED=false
+SERVICE_CONFIG="/etc/daemonclaw/config.toml"
 
 if [[ "$DRY_RUN" == true ]]; then
-  step_dot "[dry-run] Would configure provider and workspace"
-elif [[ "$SKIP_ONBOARD" == true ]]; then
-  step_dot "Skipping configuration (run daemonclaw onboard later)"
+  step_dot "[dry-run] Would install system service"
+elif systemctl is-enabled daemonclaw.service >/dev/null 2>&1; then
+  # Service already installed — don't overwrite config
+  SERVICE_INSTALLED=true
+  step_ok "System service already installed"
 elif [[ -f "$BIN" ]]; then
-  if [[ -n "$API_KEY" && -n "$PROVIDER" ]]; then
-    step_dot "Configuring provider: ${PROVIDER}"
-    ONBOARD_CMD=("$BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
-    if [[ -n "$MODEL" ]]; then
-      ONBOARD_CMD+=(--model "$MODEL")
-    fi
-    if "${ONBOARD_CMD[@]}" 2>/dev/null; then
-      step_ok "Provider configured"
-    else
-      step_fail "Provider configuration failed — run 'daemonclaw onboard' to retry"
-    fi
-  elif [[ "$PROVIDER" == "ollama" ]]; then
-    step_dot "Configuring Ollama (no API key needed)"
-    if "$BIN" onboard --provider ollama 2>/dev/null; then
-      step_ok "Ollama configured"
-    else
-      step_fail "Ollama configuration failed — run 'daemonclaw onboard' to retry"
-    fi
-  elif [[ -t 0 && -t 1 && -z "$PROVIDER" ]]; then
-    echo
-    echo -e "  ${BOLD}Running setup wizard...${RESET}"
-    echo
-    "$BIN" onboard || warn "Onboard wizard exited with an error — run 'daemonclaw onboard' manually"
-  elif [[ -n "$PROVIDER" ]]; then
-    step_dot "No API key — skipping provider configuration"
-  else
-    step_dot "No provider specified — run 'daemonclaw onboard' to configure"
-  fi
-fi
-
-# Workspace scaffold
-_native_config_dir="${HOME}/.daemonclaw"
-_native_workspace_dir="${_native_config_dir}/workspace"
-ensure_default_config_and_workspace "$_native_config_dir" "$_native_workspace_dir"
-
-# ── [4/4] Finalizing ────────────────────────────────────────────
-
-echo
-echo -e "${BOLD_BLUE}[4/4]${RESET} ${BOLD}Finalizing${RESET}"
-
-if [[ "$DRY_RUN" == true ]]; then
-  step_dot "[dry-run] Would install and start system service"
-  step_dot "[dry-run] Would run doctor check"
-elif [[ -f "$BIN" ]]; then
-  # Service install (requires root)
   step_dot "Installing system service"
   if [[ "$(id -u)" -eq 0 ]]; then
-    if "$BIN" service install 2>/dev/null; then
-      step_ok "System service installed and started"
+    if "$BIN" service install; then
+      SERVICE_INSTALLED=true
+      systemctl stop daemonclaw.service 2>/dev/null || true
+      step_ok "System service installed"
     else
       step_fail "Service install failed — run 'sudo daemonclaw service install' manually"
     fi
   elif have_cmd sudo; then
-    if sudo "$BIN" service install 2>/dev/null; then
-      step_ok "System service installed and started"
+    if sudo "$BIN" service install; then
+      SERVICE_INSTALLED=true
+      sudo systemctl stop daemonclaw.service 2>/dev/null || true
+      step_ok "System service installed"
     else
       step_fail "Service install failed — run 'sudo daemonclaw service install' manually"
     fi
@@ -1229,8 +1451,69 @@ elif [[ -f "$BIN" ]]; then
     step_dot "Not root and no sudo — skipping service install"
     step_dot "Run 'sudo daemonclaw service install' to install the system service"
   fi
+fi
 
-  # Doctor check
+# ── [4/4] Configuring & starting ────────────────────────────────
+
+echo
+echo -e "${BOLD_BLUE}[4/4]${RESET} ${BOLD}Configuring${RESET}"
+
+if [[ "$DRY_RUN" == true ]]; then
+  step_dot "[dry-run] Would configure provider and workspace"
+elif [[ "$SKIP_ONBOARD" == true ]]; then
+  step_dot "Skipping configuration (run daemonclaw onboard later)"
+elif [[ -f "$BIN" ]]; then
+  # Write provider config directly to the service config if service was installed,
+  # otherwise fall back to onboard for the user's local config.
+  if [[ -n "$API_KEY" && -n "$PROVIDER" ]]; then
+    # Non-interactive: values given via flags
+    step_dot "Configuring provider: ${PROVIDER}"
+    if [[ "$SERVICE_INSTALLED" == true && -f "$SERVICE_CONFIG" ]]; then
+      patch_service_config
+      step_ok "Provider configured in service config"
+    else
+      ONBOARD_CMD=("$BIN" onboard --force --api-key "$API_KEY" --provider "$PROVIDER")
+      if [[ -n "$MODEL" ]]; then
+        ONBOARD_CMD+=(--model "$MODEL")
+      fi
+      if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+        step_ok "Provider configured"
+      else
+        step_fail "Provider configuration failed — run 'daemonclaw onboard' to retry"
+      fi
+    fi
+  elif [[ -t 0 && -t 1 ]]; then
+    # Interactive: run the onboard wizard (arrow-key TUI)
+    # Ensure TERM is set — sudo can strip it, breaking color/highlighting
+    export TERM="${TERM:-xterm-256color}"
+    if [[ "$SERVICE_INSTALLED" == true ]]; then
+      if "$BIN" --config-dir /var/lib/daemonclaw/.daemonclaw onboard --force; then
+        chown root:agents "$SERVICE_CONFIG" 2>/dev/null || true
+        chmod 0640 "$SERVICE_CONFIG" 2>/dev/null || true
+        step_ok "Provider configured in service config"
+      else
+        step_fail "Setup wizard failed — run 'daemonclaw --config-dir /var/lib/daemonclaw/.daemonclaw onboard' to retry"
+      fi
+    else
+      "$BIN" onboard --force || step_fail "Setup wizard failed — run 'daemonclaw onboard' to retry"
+    fi
+  else
+    step_dot "No provider specified — run 'daemonclaw onboard' to configure"
+  fi
+fi
+
+# (Re)start the service now that config is written
+if [[ "$SERVICE_INSTALLED" == true && "$DRY_RUN" != true ]]; then
+  step_dot "Starting service"
+  if sudo systemctl restart daemonclaw.service 2>/dev/null; then
+    step_ok "Service started"
+  else
+    step_fail "Service failed to start — check: sudo journalctl -u daemonclaw"
+  fi
+fi
+
+# Doctor check
+if [[ -f "$BIN" && "$DRY_RUN" != true ]]; then
   step_dot "Running doctor check"
   if "$BIN" doctor 2>/dev/null; then
     step_ok "Doctor complete"

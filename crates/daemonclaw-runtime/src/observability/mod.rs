@@ -1,4 +1,5 @@
 pub mod dora;
+pub mod jsonl;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -12,6 +13,7 @@ pub mod verbose;
 
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
+pub use self::jsonl::JsonlObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 pub use noop::NoopObserver;
@@ -24,9 +26,60 @@ pub use traits::{Observer, ObserverEvent};
 pub use verbose::VerboseObserver;
 
 use daemonclaw_config::schema::ObservabilityConfig;
+use std::path::Path;
 
-/// Factory: create the right observer from config
+/// Factory: create the right observer from config.
+///
+/// When `jsonl_log_path` is set, the JSONL observer is composed alongside
+/// the primary backend via MultiObserver — all events flow to both.
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
+    let primary: Box<dyn Observer> = create_primary_observer(config);
+
+    let jsonl_path = config.jsonl_log_path.as_deref().unwrap_or_default().trim();
+    if jsonl_path.is_empty() {
+        return primary;
+    }
+
+    let workspace_dir = Path::new(".");
+    let resolved = jsonl::resolve_jsonl_path(jsonl_path, workspace_dir);
+    let mode = match config.jsonl_log_mode.as_deref().unwrap_or("rolling") {
+        "full" => jsonl::JsonlStorageMode::Full,
+        _ => jsonl::JsonlStorageMode::Rolling,
+    };
+    let max = config.jsonl_log_max_entries.unwrap_or(2000).max(1);
+
+    let jsonl_obs = JsonlObserver::new(resolved, mode, max);
+    tracing::info!(path = %jsonl_path, mode = ?mode, max_entries = max, "JSONL observer initialized");
+
+    Box::new(MultiObserver::new(vec![primary, Box::new(jsonl_obs)]))
+}
+
+/// Factory: create the right observer from config (workspace-aware variant).
+///
+/// Use this when workspace_dir is known at the call site — resolves relative
+/// JSONL paths correctly.
+pub fn create_observer_with_workspace(config: &ObservabilityConfig, workspace_dir: &Path) -> Box<dyn Observer> {
+    let primary: Box<dyn Observer> = create_primary_observer(config);
+
+    let jsonl_path = config.jsonl_log_path.as_deref().unwrap_or_default().trim();
+    if jsonl_path.is_empty() {
+        return primary;
+    }
+
+    let resolved = jsonl::resolve_jsonl_path(jsonl_path, workspace_dir);
+    let mode = match config.jsonl_log_mode.as_deref().unwrap_or("rolling") {
+        "full" => jsonl::JsonlStorageMode::Full,
+        _ => jsonl::JsonlStorageMode::Rolling,
+    };
+    let max = config.jsonl_log_max_entries.unwrap_or(2000).max(1);
+
+    let jsonl_obs = JsonlObserver::new(resolved, mode, max);
+    tracing::info!(path = %jsonl_path, "JSONL observer initialized");
+
+    Box::new(MultiObserver::new(vec![primary, Box::new(jsonl_obs)]))
+}
+
+fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
         "verbose" => Box::new(VerboseObserver::new()),

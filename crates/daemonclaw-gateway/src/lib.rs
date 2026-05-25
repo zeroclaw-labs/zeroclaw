@@ -484,6 +484,8 @@ pub async fn run_gateway(
             .and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
+        None,
+        None,
     );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
@@ -844,7 +846,7 @@ pub async fn run_gateway(
     // Wrap observer with broadcast capability for SSE
     let broadcast_observer: Arc<dyn daemonclaw_runtime::observability::Observer> =
         Arc::new(sse::BroadcastObserver::new(
-            daemonclaw_runtime::observability::create_observer(&config.observability),
+            daemonclaw_runtime::observability::create_observer_with_workspace(&config.observability, &config.workspace_dir),
             event_tx.clone(),
             event_buffer.clone(),
         ));

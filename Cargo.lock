@@ -1485,8 +1485,6 @@ dependencies = [
 [[package]]
 name = "console"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
 dependencies = [
  "encode_unicode",
  "libc",
@@ -2477,6 +2475,7 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "shellexpand",
  "tar",

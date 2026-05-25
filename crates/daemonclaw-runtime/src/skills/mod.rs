@@ -1,5 +1,8 @@
+pub mod curator;
 pub mod skill_http;
 pub mod skill_tool;
+pub mod store;
+pub mod types;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use reqwest::Url;

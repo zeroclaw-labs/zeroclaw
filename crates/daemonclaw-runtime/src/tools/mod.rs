@@ -27,6 +27,8 @@ pub mod model_switch;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
+pub mod skill_activate;
+pub mod skill_manage;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
@@ -125,6 +127,8 @@ pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
+pub use skill_activate::SkillActivateTool;
+pub use skill_manage::SkillManageTool;
 pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 pub use skill_tool::SkillShellTool;
@@ -298,6 +302,8 @@ pub fn all_tools(
         fallback_api_key,
         root_config,
         canvas_store,
+        None,
+        None,
     )
 }
 
@@ -322,6 +328,8 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &daemonclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
+    skill_store: Option<Arc<crate::skills::store::SkillStore>>,
+    observer: Option<Arc<dyn crate::observability::Observer>>,
 ) -> (
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
@@ -430,6 +438,47 @@ pub fn all_tools_with_runtime(
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
         )));
+    }
+
+    // Agent skill tools (SkillStore-backed progressive disclosure)
+    {
+        let skill_store = skill_store.unwrap_or_else(|| {
+            let s = Arc::new(crate::skills::store::SkillStore::new(workspace_dir));
+            let _ = s.ensure_dirs();
+            s
+        });
+        tool_arcs.push(Arc::new(SkillActivateTool::new(skill_store.clone())));
+
+        let mut manage_tool = SkillManageTool::new(skill_store);
+        if root_config.skills.curator.enabled {
+            if let Some(fp) = root_config.providers.fallback_provider() {
+                if let Some(ref api_key) = fp.api_key {
+                    let llm_config = crate::hooks::builtin::background_llm::BackgroundLlmConfig {
+                        provider_name: root_config
+                            .providers
+                            .fallback
+                            .clone()
+                            .unwrap_or_else(|| "openrouter".to_string()),
+                        api_key: Some(api_key.clone()),
+                        model: fp
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
+                        temperature: fp.temperature.unwrap_or(0.7),
+                        runtime_options:
+                            daemonclaw_providers::provider_runtime_options_from_config(root_config),
+                    };
+                    let curator_observer: Arc<dyn crate::observability::Observer> =
+                        observer.clone().unwrap_or_else(|| Arc::new(crate::observability::NoopObserver));
+                    manage_tool = manage_tool.with_curator(
+                        llm_config,
+                        curator_observer,
+                        root_config.skills.curator.min_grade,
+                    );
+                }
+            }
+        }
+        tool_arcs.push(Arc::new(manage_tool));
     }
 
     if browser_config.enabled {

@@ -1057,6 +1057,7 @@ impl DelegateTool {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            agent_skill_catalog: None,
         };
 
         let builder = SystemPromptBuilder::default()

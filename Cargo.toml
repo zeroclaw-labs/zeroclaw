@@ -387,3 +387,6 @@ path = "tests/test_live.rs"
 [[bench]]
 name = "agent_benchmarks"
 harness = false
+
+[patch.crates-io]
+console = { path = "patches/console" }

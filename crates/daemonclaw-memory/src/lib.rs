@@ -58,6 +58,7 @@ pub use response_cache::ResponseCache;
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
+pub use traits::StructuredMemory;
 #[allow(unused_imports)]
 pub use traits::{ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage};
 
@@ -258,6 +259,18 @@ pub fn create_memory_with_storage(
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
     create_memory_with_storage_and_routes(config, &[], storage_provider, workspace_dir, api_key)
+}
+
+/// Create a lightweight `StructuredMemory` backed by the workspace's SQLite database.
+///
+/// This opens the same `brain.db` as the full memory backend but only exposes the
+/// JSON key-value store (no embeddings, no vector search). Used by subsystems that
+/// need structured persistence (e.g. user model store) without the full memory stack.
+pub fn create_structured_memory(
+    workspace_dir: &Path,
+) -> anyhow::Result<Arc<dyn StructuredMemory>> {
+    let mem = SqliteMemory::new(workspace_dir)?;
+    Ok(Arc::new(mem))
 }
 
 /// Factory: create memory with optional storage-provider override and embedding routes.

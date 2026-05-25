@@ -1678,6 +1678,10 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_improvement: SkillImprovementConfig,
+    /// Curator configuration for reviewing agent-created skills.
+    #[serde(default)]
+    #[nested]
+    pub curator: CuratorConfig,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
@@ -5410,6 +5414,20 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// JSONL event log file path. When set, all observer events are written
+    /// to this file in structured JSONL format alongside the primary backend.
+    /// Relative paths are resolved under workspace_dir.
+    #[serde(default)]
+    pub jsonl_log_path: Option<String>,
+
+    /// JSONL event log storage mode: "rolling" (default) | "full".
+    #[serde(default)]
+    pub jsonl_log_mode: Option<String>,
+
+    /// Maximum entries retained when jsonl_log_mode = "rolling".
+    #[serde(default)]
+    pub jsonl_log_max_entries: Option<usize>,
 }
 
 impl Default for ObservabilityConfig {
@@ -5422,6 +5440,9 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            jsonl_log_path: None,
+            jsonl_log_mode: None,
+            jsonl_log_max_entries: None,
         }
     }
 }
@@ -5476,6 +5497,18 @@ pub struct BuiltinHooksConfig {
     #[serde(default)]
     #[nested]
     pub webhook_audit: WebhookAuditConfig,
+    /// Configuration for the skill-autogen hook.
+    #[serde(default)]
+    #[nested]
+    pub skill_autogen: SkillAutogenConfig,
+    /// Configuration for the skill-patcher hook.
+    #[serde(default)]
+    #[nested]
+    pub skill_patcher: SkillPatcherConfig,
+    /// Configuration for the dialectic user-modeling hook.
+    #[serde(default)]
+    #[nested]
+    pub dialectic: DialecticConfig,
 }
 
 /// Configuration for the webhook-audit builtin hook.
@@ -5521,6 +5554,105 @@ impl Default for WebhookAuditConfig {
             tool_patterns: Vec::new(),
             include_args: false,
             max_args_bytes: default_max_args_bytes(),
+        }
+    }
+}
+
+/// Autonomous skill creation hook configuration (`[hooks.builtin.skill_autogen]`).
+///
+/// When enabled, the agent observes completed turns and decides whether
+/// a multi-step task should be captured as a reusable agent skill.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.builtin.skill-autogen"]
+#[serde(default)]
+pub struct SkillAutogenConfig {
+    /// Enable automatic skill creation. Default: `false`.
+    pub enabled: bool,
+    /// Minimum tool calls in a turn before skill creation is considered.
+    /// Default: `5`.
+    pub min_tool_calls: usize,
+}
+
+impl Default for SkillAutogenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_tool_calls: 5,
+        }
+    }
+}
+
+/// Skill self-improvement (patching) hook configuration (`[hooks.builtin.skill_patcher]`).
+///
+/// When enabled, the agent detects when execution deviates from the active
+/// skill's instructions and generates a patch to improve the skill.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.builtin.skill-patcher"]
+#[serde(default)]
+pub struct SkillPatcherConfig {
+    /// Enable automatic skill patching on deviation. Default: `false`.
+    pub enabled: bool,
+}
+
+impl Default for SkillPatcherConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+/// Dialectic user modeling hook configuration (`[hooks.builtin.dialectic]`).
+///
+/// When enabled, the agent builds and maintains a user profile through
+/// background LLM reasoning, writing the result as `USER.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.builtin.dialectic"]
+#[serde(default)]
+pub struct DialecticConfig {
+    /// Enable dialectic user modeling. Default: `false`.
+    pub enabled: bool,
+    /// Turn number at which cold-start profiling fires. Default: `3`.
+    pub cold_start_turn: u64,
+    /// Number of turns between warm-session model updates. Default: `10`.
+    pub update_cadence: u64,
+}
+
+impl Default for DialecticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cold_start_turn: 3,
+            update_cadence: 10,
+        }
+    }
+}
+
+/// Curator configuration for agent-created skill review (`[skills.curator]`).
+///
+/// The curator periodically reviews agent-created skills, grades them,
+/// archives low-quality ones, and consolidates duplicates.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.curator"]
+#[serde(default)]
+pub struct CuratorConfig {
+    /// Enable the curator hand. Default: `false`.
+    pub enabled: bool,
+    /// Cron expression for curator schedule. Default: `"0 3 * * *"` (daily at 3 AM).
+    pub schedule: String,
+    /// Minimum grade (1-5 scale) a skill must receive to survive review.
+    /// Skills graded below this threshold are archived. Default: `2`.
+    pub min_grade: u8,
+}
+
+impl Default for CuratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: "0 3 * * *".into(),
+            min_grade: 2,
         }
     }
 }
@@ -5574,10 +5706,12 @@ pub struct AutonomyConfig {
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
 
-    /// Extra directory roots the agent may read/write outside the workspace.
+    /// Extra directory roots the agent may access outside the workspace.
     /// Supports absolute, `~/...`, and workspace-relative entries.
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
-    #[serde(default)]
+    /// Default includes system paths (`/proc`, `/sys`, `/etc`, `/tmp`, etc.)
+    /// so the agent can read system info and use temp files.
+    #[serde(default = "default_allowed_roots")]
     pub allowed_roots: Vec<String>,
 
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
@@ -5594,6 +5728,22 @@ pub struct AutonomyConfig {
 
 fn default_shell_timeout_secs() -> u64 {
     60
+}
+
+fn default_allowed_roots() -> Vec<String> {
+    vec![
+        "/proc".into(),
+        "/sys".into(),
+        "/dev".into(),
+        "/etc".into(),
+        "/usr".into(),
+        "/bin".into(),
+        "/sbin".into(),
+        "/lib".into(),
+        "/opt".into(),
+        "/var".into(),
+        "/tmp".into(),
+    ]
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5657,31 +5807,35 @@ impl Default for AutonomyConfig {
                 "head".into(),
                 "tail".into(),
                 "date".into(),
+                "df".into(),
+                "du".into(),
+                "uname".into(),
+                "uptime".into(),
+                "hostname".into(),
+                "free".into(),
+                "lscpu".into(),
+                "nproc".into(),
+                "whoami".into(),
+                "id".into(),
                 "python".into(),
                 "python3".into(),
                 "pip".into(),
                 "node".into(),
             ],
             forbidden_paths: vec![
-                "/etc".into(),
+                "/etc/shadow".into(),
+                "/etc/gshadow".into(),
+                "/etc/daemonclaw".into(),
                 "/root".into(),
                 "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
                 "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
                 "~/.ssh".into(),
                 "~/.gnupg".into(),
                 "~/.aws".into(),
                 "~/.config".into(),
+                "~/.daemonclaw/config.toml".into(),
             ],
+            allowed_roots: default_allowed_roots(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -5689,7 +5843,6 @@ impl Default for AutonomyConfig {
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
-            allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
             shell_timeout_secs: default_shell_timeout_secs(),
         }
@@ -11576,7 +11729,7 @@ mod tests {
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+        assert!(a.forbidden_paths.contains(&"/etc/shadow".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
@@ -13533,12 +13686,12 @@ default_temperature = 0.7
         let a = AutonomyConfig::default();
         assert!(a.workspace_only, "Default autonomy must be workspace_only");
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            a.forbidden_paths.contains(&"/etc/shadow".to_string()),
+            "Must block /etc/shadow"
         );
         assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
+            a.forbidden_paths.contains(&"/root".to_string()),
+            "Must block /root"
         );
         assert!(
             a.forbidden_paths.contains(&"~/.ssh".to_string()),

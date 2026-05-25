@@ -1,7 +1,7 @@
 use crate::cli_input::Input;
 use anyhow::{Context, Result, bail};
 use console::style;
-use dialoguer::{Confirm, Select};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -265,18 +265,18 @@ pub struct ProjectContext {
 // ── Banner ───────────────────────────────────────────────────────
 
 const BANNER: &str = r"
-    ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
+    ☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠
 
-    ███████╗███████╗██████╗  ██████╗  ██████╗██╗      █████╗ ██╗    ██╗
-    ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗██╔════╝██║     ██╔══██╗██║    ██║
-      ███╔╝ █████╗  ██████╔╝██║   ██║██║     ██║     ███████║██║ █╗ ██║
-     ███╔╝  ██╔══╝  ██╔══██╗██║   ██║██║     ██║     ██╔══██║██║███╗██║
-    ███████╗███████╗██║  ██║╚██████╔╝╚██████╗███████╗██║  ██║╚███╔███╔╝
-    ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+    ██████╗  █████╗ ███████╗███╗   ███╗ ██████╗ ███╗   ██╗ ██████╗██╗      █████╗ ██╗    ██╗
+    ██╔══██╗██╔══██╗██╔════╝████╗ ████║██╔═══██╗████╗  ██║██╔════╝██║     ██╔══██╗██║    ██║
+    ██║  ██║███████║█████╗  ██╔████╔██║██║   ██║██╔██╗ ██║██║     ██║     ███████║██║ █╗ ██║
+    ██║  ██║██╔══██║██╔══╝  ██║╚██╔╝██║██║   ██║██║╚██╗██║██║     ██║     ██╔══██║██║███╗██║
+    ██████╔╝██║  ██║███████╗██║ ╚═╝ ██║╚██████╔╝██║ ╚████║╚██████╗███████╗██║  ██║╚███╔███╔╝
+    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
 
     Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.
 
-    ⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡
+    ☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠☠
 ";
 
 const LIVE_MODEL_MAX_OPTIONS: usize = 120;
@@ -298,6 +298,21 @@ enum InteractiveOnboardingMode {
 }
 
 pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Config> {
+    // Ensure stdin is connected to /dev/tty. Under sudo or piped invocations
+    // the inherited stdin may not support raw mode (needed by dialoguer::Select).
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::IntoRawFd;
+        if let Ok(tty) = std::fs::File::open("/dev/tty") {
+            let fd = tty.into_raw_fd();
+            // Replace stdin with a fresh /dev/tty fd
+            unsafe {
+                libc::dup2(fd, 0);
+                libc::close(fd);
+            }
+        }
+    }
+
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -483,7 +498,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
             println!();
             println!(
                 "  {} {}",
-                style("⚡").cyan(),
+                style("☠").cyan(),
                 style("Starting channel server...").white().bold()
             );
             println!();
@@ -542,7 +557,7 @@ pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Co
             println!();
             println!(
                 "  {} {}",
-                style("⚡").cyan(),
+                style("☠").cyan(),
                 style("Starting channel server...").white().bold()
             );
             println!();
@@ -612,7 +627,7 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
             println!();
             println!(
                 "  {} {}",
-                style("⚡").cyan(),
+                style("☠").cyan(),
                 style("Starting channel server...").white().bold()
             );
             println!();
@@ -2547,7 +2562,7 @@ fn resolve_interactive_onboarding_mode(
         "Cancel",
     ];
 
-    let mode = Select::new()
+    let mode = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(format!(
             "  Existing config found at {}. Select setup mode",
             config_path.display()
@@ -2631,12 +2646,22 @@ async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         daemonclaw_config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
     print_bullet(&format!(
-        "Default location: {}",
+        "CLI workspace: {}",
         style(default_workspace_dir.display()).green()
     ));
+    println!(
+        "  {} {}",
+        style("·").dim(),
+        style("This is where your config and files live when running daemonclaw directly.").dim()
+    );
+    println!(
+        "  {} {}",
+        style("·").dim(),
+        style("The system service runs from /var/lib/daemonclaw/ independently.").dim()
+    );
 
     let use_default = Confirm::new()
-        .with_prompt("  Use default workspace location?")
+        .with_prompt("  Use this location?")
         .default(true)
         .interact()?;
 
@@ -2672,14 +2697,14 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
-        "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
+        "☠ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, GitHub Copilot)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
-    let tier_idx = Select::new()
+    let tier_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select provider category")
         .items(&tiers)
         .default(0)
@@ -2809,7 +2834,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
     let provider_labels: Vec<&str> = providers.iter().map(|(_, label)| *label).collect();
 
-    let provider_idx = Select::new()
+    let provider_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select your AI provider")
         .items(&provider_labels)
         .default(0)
@@ -3302,7 +3327,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             format!("Curated starter list ({})", model_options.len()),
         ];
 
-        let source_idx = Select::new()
+        let source_idx = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("  Model source")
             .items(&source_options)
             .default(0)
@@ -3330,7 +3355,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         .map(|(model_id, label)| format!("{label} — {}", style(model_id).dim()))
         .collect();
 
-    let model_idx = Select::new()
+    let model_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select your default model")
         .items(&model_labels)
         .default(0)
@@ -3448,7 +3473,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         "Composio (managed OAuth) — 1000+ apps via OAuth, no raw keys shared",
     ];
 
-    let choice = Select::new()
+    let choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select tool mode")
         .items(&options)
         .default(0)
@@ -3550,7 +3575,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         "Other (type manually)",
     ];
 
-    let tz_idx = Select::new()
+    let tz_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Your timezone")
         .items(&tz_options)
         .default(0)
@@ -3586,7 +3611,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         "Custom — write your own style guide",
     ];
 
-    let style_idx = Select::new()
+    let style_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Communication style")
         .items(&style_options)
         .default(1)
@@ -3636,7 +3661,7 @@ fn setup_memory() -> Result<MemoryConfig> {
         .map(|backend| backend.label)
         .collect();
 
-    let choice = Select::new()
+    let choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select memory backend")
         .items(&options)
         .default(0)
@@ -3863,7 +3888,7 @@ fn setup_channels(
             })
             .collect();
 
-        let selection = Select::new()
+        let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("  Connect a channel (or Done to continue)")
             .items(&options)
             .default(options.len() - 1)
@@ -4593,7 +4618,7 @@ fn setup_channels(
                     "DM only",
                     "Specific group ID",
                 ];
-                let scope_choice = Select::new()
+                let scope_choice = Select::with_theme(&ColorfulTheme::default())
                     .with_prompt("  Message scope")
                     .items(scope_options)
                     .default(0)
@@ -4663,7 +4688,7 @@ fn setup_channels(
                     "WhatsApp Web (QR / pair-code, no Meta Business API)",
                     "WhatsApp Business Cloud API (webhook)",
                 ];
-                let mode_idx = Select::new()
+                let mode_idx = Select::with_theme(&ColorfulTheme::default())
                     .with_prompt("  Choose WhatsApp mode")
                     .items(&mode_options)
                     .default(0)
@@ -5486,7 +5511,7 @@ fn setup_channels(
                     }
                 }
 
-                let receive_mode_choice = Select::new()
+                let receive_mode_choice = Select::with_theme(&ColorfulTheme::default())
                     .with_prompt("  Receive Mode")
                     .items([
                         "WebSocket (recommended, no public IP needed)",
@@ -5719,7 +5744,7 @@ fn setup_tunnel() -> Result<daemonclaw_config::schema::TunnelConfig> {
         "Custom — bring your own (bore, frp, ssh, etc.)",
     ];
 
-    let choice = Select::new()
+    let choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("  Select tunnel provider")
         .items(&options)
         .default(0)
@@ -6168,7 +6193,7 @@ fn print_summary(config: &Config) {
     );
     println!(
         "  {}  {}",
-        style("⚡").cyan(),
+        style("☠").cyan(),
         style("DaemonClaw is ready!").white().bold()
     );
     println!(
@@ -6400,7 +6425,7 @@ fn print_summary(config: &Config) {
     println!();
     println!(
         "  {} {}",
-        style("⚡").cyan(),
+        style("☠").cyan(),
         style("Happy hacking! 🦀").white().bold()
     );
     println!();

@@ -360,7 +360,13 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
             | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {}
+            | ObserverEvent::RecoveryCompleted { .. }
+            | ObserverEvent::SkillCreated { .. }
+            | ObserverEvent::SkillPatched { .. }
+            | ObserverEvent::SkillArchived { .. }
+            | ObserverEvent::SkillRestored { .. }
+            | ObserverEvent::UserModelUpdated { .. }
+            | ObserverEvent::CuratorRunCompleted { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,

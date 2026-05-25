@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 use tracing::info;
 
+use daemonclaw_api::agent::TurnResult;
 use daemonclaw_api::channel::ChannelMessage;
 use daemonclaw_api::provider::{ChatMessage, ChatResponse};
 use daemonclaw_api::tool::ToolResult;
@@ -118,6 +119,15 @@ impl HookRunner {
             .handlers
             .iter()
             .map(|h| h.on_heartbeat_tick())
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_turn_complete(&self, result: &TurnResult) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_turn_complete(result))
             .collect();
         join_all(futs).await;
     }

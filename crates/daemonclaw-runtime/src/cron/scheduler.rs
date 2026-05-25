@@ -60,6 +60,40 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
         jobs_with_builtin.push(backup_job);
     }
 
+    if config.skills.curator.enabled {
+        let curator_job = CronJobDecl {
+            id: "__builtin_curator".to_string(),
+            name: Some("Skill curator".to_string()),
+            job_type: "agent".to_string(),
+            schedule: CronScheduleDecl::Cron {
+                expr: config.skills.curator.schedule.clone(),
+                tz: None,
+            },
+            command: None,
+            prompt: Some(
+                "You are the DaemonClaw Skill Curator. Review agent-created skills for quality, \
+                 archive low-quality or unused ones, and consolidate duplicates. \
+                 Do not modify bundled or imported skills. Respect pinned skills."
+                    .to_string(),
+            ),
+            enabled: true,
+            model: None,
+            allowed_tools: Some(vec![
+                "skill_manage".to_string(),
+                "skill_activate".to_string(),
+            ]),
+            uses_memory: false,
+            session_target: None,
+            delivery: None,
+        };
+        tracing::debug!(
+            schedule = %config.skills.curator.schedule,
+            min_grade = config.skills.curator.min_grade,
+            "Synthesizing builtin curator cron job from config.skills.curator"
+        );
+        jobs_with_builtin.push(curator_job);
+    }
+
     match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
             if !jobs_with_builtin.is_empty() {

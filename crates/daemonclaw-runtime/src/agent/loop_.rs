@@ -875,6 +875,10 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
 
+    // Turn-level tracking for post-turn hooks (skill autogen, dialectic, etc.)
+    let mut turn_tool_records: Vec<daemonclaw_api::agent::ToolCallRecord> = Vec::new();
+    let mut turn_active_skill: Option<String> = None;
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -1455,6 +1459,28 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
+
+            // Fire post-turn hooks (skill autogen, dialectic, skill patcher)
+            if let Some(hooks) = hooks {
+                let user_message = history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                let turn_number = history.iter().filter(|m| m.role == "user").count() as u64;
+                let turn_result = daemonclaw_api::agent::TurnResult {
+                    user_message,
+                    tool_call_count: turn_tool_records.len(),
+                    tool_calls: std::mem::take(&mut turn_tool_records),
+                    active_skill: turn_active_skill.take(),
+                    outcome: daemonclaw_api::agent::TurnOutcome::Success,
+                    final_response: display_text.clone(),
+                    turn_number,
+                };
+                hooks.fire_turn_complete(&turn_result).await;
+            }
+
             return Ok(append_receipt_footer(
                 accumulated_display_text,
                 collected_receipts,
@@ -1883,6 +1909,30 @@ pub async fn run_tool_call_loop(
                     v.push(format!("{tool_name}: {receipt}"));
                 }
             }
+            // Record tool call for post-turn hooks
+            let tool_args_for_record = tool_calls
+                .get(result_index)
+                .map(|c| c.arguments.clone())
+                .unwrap_or(serde_json::Value::Null);
+            turn_tool_records.push(daemonclaw_api::agent::ToolCallRecord {
+                name: tool_name.clone(),
+                arguments: tool_args_for_record,
+                result: outcome.output.clone(),
+                success: outcome.success,
+                duration: outcome.duration,
+            });
+
+            // Track active skill from skill_activate calls
+            if tool_name == "skill_activate" && outcome.success {
+                if let Some(activated_name) = tool_calls
+                    .get(result_index)
+                    .and_then(|c| c.arguments.get("name"))
+                    .and_then(|v| v.as_str())
+                {
+                    turn_active_skill = Some(activated_name.to_string());
+                }
+            }
+
             individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -1986,6 +2036,28 @@ pub async fn run_tool_call_loop(
         }),
     );
 
+    // Fire hooks before exiting — the turn produced tool calls even though
+    // we hit the iteration limit.
+    if let Some(hooks) = hooks {
+        let user_message = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let turn_number = history.iter().filter(|m| m.role == "user").count() as u64;
+        let turn_result = daemonclaw_api::agent::TurnResult {
+            user_message,
+            tool_call_count: turn_tool_records.len(),
+            tool_calls: std::mem::take(&mut turn_tool_records),
+            active_skill: turn_active_skill.take(),
+            outcome: daemonclaw_api::agent::TurnOutcome::Interrupted,
+            final_response: accumulated_display_text.clone(),
+            turn_number,
+        };
+        hooks.fire_turn_complete(&turn_result).await;
+    }
+
     // Graceful shutdown: ask the LLM for a final summary without tools
     tracing::warn!(
         max_iterations,
@@ -2076,7 +2148,7 @@ pub async fn run(
     allowed_tools: Option<Vec<String>>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
+    let base_observer = observability::create_observer_with_workspace(&config.observability, &config.workspace_dir);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
@@ -2135,6 +2207,8 @@ pub async fn run(
         &config.agents,
         fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
         &config,
+        None,
+        None,
         None,
     );
 
@@ -2476,6 +2550,92 @@ pub async fn run(
                 ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
             });
 
+    // ── Lifecycle hooks ────────────────────────────────────────────
+    let hook_runner: Option<crate::hooks::HookRunner> = if config.hooks.enabled {
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                config.hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+
+        let needs_bg_llm = config.hooks.builtin.skill_autogen.enabled
+            || config.hooks.builtin.skill_patcher.enabled
+            || config.hooks.builtin.dialectic.enabled;
+
+        if needs_bg_llm {
+            let bg_llm_config = crate::hooks::builtin::BackgroundLlmConfig {
+                provider_name: provider_name.clone(),
+                api_key: fallback_provider_loop
+                    .and_then(|e| e.api_key.as_deref())
+                    .map(String::from),
+                model: model_name.clone(),
+                temperature: 0.3,
+                runtime_options: provider_runtime_options.clone(),
+            };
+
+            if config.hooks.builtin.skill_autogen.enabled
+                || config.hooks.builtin.skill_patcher.enabled
+            {
+                let skill_store = Arc::new(
+                    crate::skills::store::SkillStore::new(&config.workspace_dir),
+                );
+                if let Err(e) = skill_store.ensure_dirs() {
+                    tracing::warn!("skill store init failed: {e}");
+                }
+                if config.hooks.builtin.skill_autogen.enabled {
+                    runner.register(Box::new(
+                        crate::hooks::builtin::SkillAutogenHook::with_threshold(
+                            Arc::clone(&skill_store),
+                            Arc::clone(&observer),
+                            bg_llm_config.clone(),
+                            config.hooks.builtin.skill_autogen.min_tool_calls,
+                        ),
+                    ));
+                }
+                if config.hooks.builtin.skill_patcher.enabled {
+                    runner.register(Box::new(
+                        crate::hooks::builtin::SkillPatcherHook::new(
+                            Arc::clone(&skill_store),
+                            Arc::clone(&observer),
+                            bg_llm_config.clone(),
+                        ),
+                    ));
+                }
+            }
+
+            if config.hooks.builtin.dialectic.enabled {
+                match daemonclaw_memory::create_structured_memory(&config.workspace_dir) {
+                    Ok(structured_mem) => {
+                        let user_model_store = Arc::new(
+                            crate::user_model::UserModelStore::new(structured_mem),
+                        );
+                        runner.register(Box::new(
+                            crate::hooks::builtin::DialecticHook::with_cadence(
+                                user_model_store,
+                                Arc::clone(&observer),
+                                bg_llm_config,
+                                config.workspace_dir.clone(),
+                                config.hooks.builtin.dialectic.cold_start_turn,
+                                config.hooks.builtin.dialectic.update_cadence,
+                            ),
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!("dialectic hook disabled: {e}");
+                    }
+                }
+            }
+        }
+
+        Some(runner)
+    } else {
+        None
+    };
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -2589,7 +2749,7 @@ pub async fn run(
                         config.agent.max_tool_iterations,
                         None,
                         None,
-                        None,
+                        hook_runner.as_ref(),
                         &excluded_tools,
                         &config.agent.tool_call_dedup_exempt,
                         activated_handle.as_ref(),
@@ -2901,7 +3061,7 @@ pub async fn run(
                             config.agent.max_tool_iterations,
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
-                            None,
+                            hook_runner.as_ref(),
                             &excluded_tools,
                             &config.agent.tool_call_dedup_exempt,
                             activated_handle.as_ref(),
@@ -3084,7 +3244,7 @@ pub async fn process_message(
     session_id: Option<&str>,
 ) -> Result<String> {
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::from(observability::create_observer_with_workspace(&config.observability, &config.workspace_dir));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -3130,6 +3290,8 @@ pub async fn process_message(
         &config.agents,
         fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
         &config,
+        None,
+        None,
         None,
     );
     let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {

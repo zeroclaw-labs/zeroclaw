@@ -113,6 +113,25 @@ pub enum ObserverEvent {
     },
     /// Recovery from a failed deployment has completed.
     RecoveryCompleted { deploy_id: String },
+    /// An agent skill was created autonomously.
+    SkillCreated { skill_name: String },
+    /// An agent skill was patched (mid-use update).
+    SkillPatched {
+        skill_name: String,
+        sections_changed: Vec<String>,
+    },
+    /// An agent skill was archived by the curator.
+    SkillArchived { skill_name: String },
+    /// An archived skill was restored.
+    SkillRestored { skill_name: String },
+    /// The structured user model was updated by dialectic reasoning.
+    UserModelUpdated { fields_changed: Vec<String> },
+    /// The skill curator completed a run.
+    CuratorRunCompleted {
+        skills_reviewed: usize,
+        skills_archived: usize,
+        skills_consolidated: usize,
+    },
 }
 
 /// Numeric metrics emitted by the agent runtime.

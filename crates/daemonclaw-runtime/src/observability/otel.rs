@@ -449,6 +449,79 @@ impl Observer for OtelObserver {
             | ObserverEvent::RecoveryCompleted { .. } => {
                 // DORA deployment events: OTel pass-through not yet implemented.
             }
+            ObserverEvent::SkillCreated { skill_name } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("skill.created")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("skill.name", skill_name.clone()),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
+            ObserverEvent::SkillPatched { skill_name, sections_changed } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("skill.patched")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("skill.name", skill_name.clone()),
+                            KeyValue::new("skill.sections_changed", sections_changed.join(",")),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
+            ObserverEvent::SkillArchived { skill_name } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("skill.archived")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("skill.name", skill_name.clone()),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
+            ObserverEvent::SkillRestored { skill_name } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("skill.restored")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("skill.name", skill_name.clone()),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
+            ObserverEvent::UserModelUpdated { fields_changed } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("user_model.updated")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("user_model.fields_changed", fields_changed.join(",")),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
+            ObserverEvent::CuratorRunCompleted {
+                skills_reviewed,
+                skills_archived,
+                skills_consolidated,
+            } => {
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("curator.run_completed")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("curator.skills_reviewed", *skills_reviewed as i64),
+                            KeyValue::new("curator.skills_archived", *skills_archived as i64),
+                            KeyValue::new("curator.skills_consolidated", *skills_consolidated as i64),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+            }
         }
     }
 

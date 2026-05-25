@@ -60,6 +60,8 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Skill store for building a live agent skill catalog on each prompt build.
+    agent_skill_store: Option<Arc<crate::skills::store::SkillStore>>,
 }
 
 pub struct AgentBuilder {
@@ -89,6 +91,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    agent_skill_store: Option<Arc<crate::skills::store::SkillStore>>,
 }
 
 impl Default for AgentBuilder {
@@ -126,6 +129,7 @@ impl AgentBuilder {
             autonomy_level: None,
             activated_tools: None,
             hook_runner: None,
+            agent_skill_store: None,
         }
     }
 
@@ -274,6 +278,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn agent_skill_store(mut self, store: Option<Arc<crate::skills::store::SkillStore>>) -> Self {
+        self.agent_skill_store = store;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -331,6 +340,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            agent_skill_store: self.agent_skill_store,
         })
     }
 }
@@ -373,7 +383,7 @@ impl Agent {
 
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
+            Arc::from(observability::create_observer_with_workspace(&config.observability, &config.workspace_dir));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_config(
@@ -402,6 +412,13 @@ impl Agent {
             None
         };
 
+        let agent_skill_store = Arc::new(
+            crate::skills::store::SkillStore::new(&config.workspace_dir),
+        );
+        if let Err(e) = agent_skill_store.ensure_dirs() {
+            tracing::warn!("agent skill store init failed: {e}");
+        }
+
         let (
             mut tools,
             delegate_handle,
@@ -424,6 +441,8 @@ impl Agent {
             fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
             None,
+            Some(Arc::clone(&agent_skill_store)),
+            Some(Arc::clone(&observer)),
         );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
@@ -549,6 +568,9 @@ impl Agent {
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
+        let observer_for_hooks = Arc::clone(&observer);
+        let model_name_for_hooks = model_name.clone();
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -589,10 +611,71 @@ impl Agent {
                         config.hooks.builtin.webhook_audit.clone(),
                     )));
                 }
+
+                let needs_background_llm = config.hooks.builtin.skill_autogen.enabled
+                    || config.hooks.builtin.skill_patcher.enabled
+                    || config.hooks.builtin.dialectic.enabled;
+
+                if needs_background_llm {
+                    let bg_llm_config = crate::hooks::builtin::BackgroundLlmConfig {
+                        provider_name: provider_name.to_string(),
+                        api_key: fallback_provider_ag
+                            .and_then(|e| e.api_key.as_deref())
+                            .map(String::from),
+                        model: model_name_for_hooks.clone(),
+                        temperature: 0.3,
+                        runtime_options: provider_runtime_options.clone(),
+                    };
+
+                    if config.hooks.builtin.skill_autogen.enabled {
+                        runner.register(Box::new(
+                            crate::hooks::builtin::SkillAutogenHook::with_threshold(
+                                Arc::clone(&agent_skill_store),
+                                Arc::clone(&observer_for_hooks),
+                                bg_llm_config.clone(),
+                                config.hooks.builtin.skill_autogen.min_tool_calls,
+                            ),
+                        ));
+                    }
+                    if config.hooks.builtin.skill_patcher.enabled {
+                        runner.register(Box::new(
+                            crate::hooks::builtin::SkillPatcherHook::new(
+                                Arc::clone(&agent_skill_store),
+                                Arc::clone(&observer_for_hooks),
+                                bg_llm_config.clone(),
+                            ),
+                        ));
+                    }
+
+                    if config.hooks.builtin.dialectic.enabled {
+                        match daemonclaw_memory::create_structured_memory(&config.workspace_dir) {
+                            Ok(structured_mem) => {
+                                let user_model_store = Arc::new(
+                                    crate::user_model::UserModelStore::new(structured_mem),
+                                );
+                                runner.register(Box::new(
+                                    crate::hooks::builtin::DialecticHook::with_cadence(
+                                        user_model_store,
+                                        Arc::clone(&observer_for_hooks),
+                                        bg_llm_config,
+                                        config.workspace_dir.clone(),
+                                        config.hooks.builtin.dialectic.cold_start_turn,
+                                        config.hooks.builtin.dialectic.update_cadence,
+                                    ),
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::warn!("dialectic hook disabled: failed to open structured memory: {e}");
+                            }
+                        }
+                    }
+                }
+
                 Some(Arc::new(runner))
             } else {
                 None
             })
+            .agent_skill_store(Some(agent_skill_store))
             .build()
     }
 
@@ -642,6 +725,8 @@ impl Agent {
 
     fn build_system_prompt(&self) -> Result<String> {
         let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+        let catalog = self.agent_skill_store.as_ref().map(|s| s.build_catalog());
+        let catalog_ref = catalog.as_deref().filter(|c| !c.is_empty());
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
@@ -653,6 +738,7 @@ impl Agent {
             tool_descriptions: self.tool_descriptions.as_ref(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            agent_skill_catalog: catalog_ref,
         };
         self.prompt_builder.build(&ctx)
     }

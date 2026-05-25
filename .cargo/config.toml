@@ -4,7 +4,7 @@ cb = "build -Zcodegen-backend --release"
 
 [build]
 jobs = 8
-rustc-wrapper = "/home/claude-code/.cargo/bin/sccache"
+rustc-wrapper = "sccache"
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]

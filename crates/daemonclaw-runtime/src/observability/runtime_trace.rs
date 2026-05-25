@@ -326,6 +326,9 @@ mod tests {
             runtime_trace_mode: "rolling".to_string(),
             runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
             runtime_trace_max_entries: 3,
+            jsonl_log_path: None,
+            jsonl_log_mode: None,
+            jsonl_log_max_entries: None,
         }
     }
 

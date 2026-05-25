@@ -1,11 +1,12 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, StructuredMemory};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
+use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,6 +233,17 @@ impl SqliteMemory {
         if !schema_sql.contains("superseded_by") {
             conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
         }
+
+        // Migration: structured_memory table for typed JSON documents
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS structured_memory (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                category   TEXT NOT NULL DEFAULT 'default',
+                version    INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );"
+        )?;
 
         Ok(())
     }
@@ -1130,6 +1142,133 @@ impl Memory for SqliteMemory {
             Ok(())
         })
         .await?
+    }
+}
+
+#[async_trait]
+impl StructuredMemory for SqliteMemory {
+    async fn store_json(
+        &self,
+        key: &str,
+        value: &Value,
+        category: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let json_str = serde_json::to_string(value)?;
+        let category = category.to_string();
+        let now = Local::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let guard = conn.lock();
+            guard.execute(
+                "INSERT INTO structured_memory (key, value, category, version, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value,
+                     category = excluded.category,
+                     version = version + 1,
+                     updated_at = excluded.updated_at",
+                params![key, json_str, category, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn get_json(&self, key: &str) -> anyhow::Result<Option<Value>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+            let guard = conn.lock();
+            let mut stmt = guard.prepare(
+                "SELECT value FROM structured_memory WHERE key = ?1"
+            )?;
+            let result = stmt.query_row(params![key], |row| {
+                row.get::<_, String>(0)
+            });
+            match result {
+                Ok(json_str) => Ok(Some(serde_json::from_str(&json_str)?)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await?
+    }
+
+    async fn patch_json(
+        &self,
+        key: &str,
+        patch: &Value,
+        category: &str,
+    ) -> anyhow::Result<Value> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let patch = patch.clone();
+        let category = category.to_string();
+        let now = Local::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            let guard = conn.lock();
+            guard.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> anyhow::Result<Value> {
+                let existing: Option<String> = guard
+                    .prepare("SELECT value FROM structured_memory WHERE key = ?1")?
+                    .query_row(params![key], |row| row.get::<_, String>(0))
+                    .ok();
+                let mut current: Value = match existing {
+                    Some(ref s) => serde_json::from_str(s)?,
+                    None => Value::Object(serde_json::Map::new()),
+                };
+                json_merge_patch(&mut current, &patch);
+                let merged_str = serde_json::to_string(&current)?;
+                guard.execute(
+                    "INSERT INTO structured_memory (key, value, category, version, updated_at)
+                     VALUES (?1, ?2, ?3, 1, ?4)
+                     ON CONFLICT(key) DO UPDATE SET
+                         value = excluded.value,
+                         category = excluded.category,
+                         version = version + 1,
+                         updated_at = excluded.updated_at",
+                    params![key, merged_str, category, now],
+                )?;
+                Ok(current)
+            })();
+            match result {
+                Ok(v) => {
+                    guard.execute_batch("COMMIT")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = guard.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .await?
+    }
+}
+
+/// JSON Merge Patch per RFC 7386.
+fn json_merge_patch(target: &mut Value, patch: &Value) {
+    match patch {
+        Value::Object(patch_map) => {
+            if !target.is_object() {
+                *target = Value::Object(serde_json::Map::new());
+            }
+            let target_map = target.as_object_mut().unwrap();
+            for (k, v) in patch_map {
+                if v.is_null() {
+                    target_map.remove(k);
+                } else {
+                    let entry = target_map
+                        .entry(k.clone())
+                        .or_insert(Value::Null);
+                    json_merge_patch(entry, v);
+                }
+            }
+        }
+        _ => {
+            *target = patch.clone();
+        }
     }
 }
 

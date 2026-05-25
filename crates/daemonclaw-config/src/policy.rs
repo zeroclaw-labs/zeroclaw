@@ -202,6 +202,10 @@ fn default_allowed_commands() -> Vec<String> {
         "uname".into(),
         "uptime".into(),
         "hostname".into(),
+        "lscpu".into(),
+        "nproc".into(),
+        "whoami".into(),
+        "id".into(),
         "python".into(),
         "python3".into(),
         "pip".into(),
@@ -257,24 +261,17 @@ fn default_allowed_commands() -> Vec<String> {
 #[cfg(not(target_os = "windows"))]
 fn default_forbidden_paths() -> Vec<String> {
     vec![
-        "/etc".into(),
+        "/etc/shadow".into(),
+        "/etc/gshadow".into(),
+        "/etc/daemonclaw".into(),
         "/root".into(),
         "/home".into(),
-        "/usr".into(),
-        "/bin".into(),
-        "/sbin".into(),
-        "/lib".into(),
-        "/opt".into(),
         "/boot".into(),
-        "/dev".into(),
-        "/proc".into(),
-        "/sys".into(),
-        "/var".into(),
-        "/tmp".into(),
         "~/.ssh".into(),
         "~/.gnupg".into(),
         "~/.aws".into(),
         "~/.config".into(),
+        "~/.daemonclaw/config.toml".into(),
     ]
 }
 
@@ -881,8 +878,6 @@ impl SecurityPolicy {
                     | "iptables"
                     | "ufw"
                     | "firewall-cmd"
-                    | "curl"
-                    | "wget"
                     | "nc"
                     | "ncat"
                     | "netcat"
@@ -951,6 +946,7 @@ impl SecurityPolicy {
                     )
                 }),
                 "touch" | "mkdir" | "mv" | "cp" | "ln"
+                | "curl" | "wget"
                 // Windows medium-risk equivalents
                 | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename" | "mklink" => true,
                 _ => false,

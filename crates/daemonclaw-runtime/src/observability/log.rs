@@ -130,6 +130,24 @@ impl Observer for LogObserver {
             ObserverEvent::RecoveryCompleted { deploy_id } => {
                 info!(deploy_id = %deploy_id, "recovery.completed");
             }
+            ObserverEvent::SkillCreated { skill_name } => {
+                info!(skill = %skill_name, "skill.created");
+            }
+            ObserverEvent::SkillPatched { skill_name, sections_changed } => {
+                info!(skill = %skill_name, sections = ?sections_changed, "skill.patched");
+            }
+            ObserverEvent::SkillArchived { skill_name } => {
+                info!(skill = %skill_name, "skill.archived");
+            }
+            ObserverEvent::SkillRestored { skill_name } => {
+                info!(skill = %skill_name, "skill.restored");
+            }
+            ObserverEvent::UserModelUpdated { fields_changed } => {
+                info!(fields = ?fields_changed, "user_model.updated");
+            }
+            ObserverEvent::CuratorRunCompleted { skills_reviewed, skills_archived, skills_consolidated } => {
+                info!(reviewed = skills_reviewed, archived = skills_archived, consolidated = skills_consolidated, "curator.run_completed");
+            }
         }
     }
 

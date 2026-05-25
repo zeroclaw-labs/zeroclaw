@@ -30,6 +30,10 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// Pre-rendered agent skill catalog from SkillStore (progressive disclosure).
+    /// When present, injected into the system prompt so the agent can call
+    /// `skill_activate` to load full instructions on demand.
+    pub agent_skill_catalog: Option<&'a str>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -52,6 +56,7 @@ impl SystemPromptBuilder {
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
+                Box::new(AgentSkillCatalogSection),
                 Box::new(WorkspaceSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
@@ -83,6 +88,7 @@ pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
+pub struct AgentSkillCatalogSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
@@ -227,6 +233,19 @@ impl PromptSection for SkillsSection {
     }
 }
 
+impl PromptSection for AgentSkillCatalogSection {
+    fn name(&self) -> &str {
+        "agent_skill_catalog"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        match ctx.agent_skill_catalog {
+            Some(catalog) if !catalog.is_empty() => Ok(catalog.to_string()),
+            _ => Ok(String::new()),
+        }
+    }
+}
+
 impl PromptSection for WorkspaceSection {
     fn name(&self) -> &str {
         "workspace"
@@ -358,6 +377,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let section = IdentitySection;
@@ -389,6 +409,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -427,6 +448,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -469,6 +491,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -497,6 +520,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -538,6 +562,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -572,6 +597,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -607,6 +633,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -634,6 +661,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            agent_skill_catalog: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -669,6 +697,7 @@ mod tests {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            agent_skill_catalog: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();

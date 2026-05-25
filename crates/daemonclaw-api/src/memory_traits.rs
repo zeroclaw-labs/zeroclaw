@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -255,6 +256,38 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
     }
+}
+
+/// Extension trait for structured JSON document storage with atomic
+/// read-modify-write semantics.
+///
+/// Used by the user model engine and other subsystems that need to store
+/// typed JSON documents rather than free-text memories. Implemented
+/// separately from the base `Memory` trait to avoid breaking existing
+/// backends.
+#[async_trait]
+pub trait StructuredMemory: Send + Sync {
+    /// Store a JSON value under the given key and category.
+    async fn store_json(
+        &self,
+        key: &str,
+        value: &Value,
+        category: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Retrieve a JSON value by key, returning None if not found.
+    async fn get_json(&self, key: &str) -> anyhow::Result<Option<Value>>;
+
+    /// Atomic read-modify-write: read the current value, merge the patch
+    /// into it (JSON Merge Patch semantics per RFC 7386), and write back.
+    /// Returns the merged value. If no existing value, the patch becomes
+    /// the initial value.
+    async fn patch_json(
+        &self,
+        key: &str,
+        patch: &Value,
+        category: &str,
+    ) -> anyhow::Result<Value>;
 }
 
 #[cfg(test)]

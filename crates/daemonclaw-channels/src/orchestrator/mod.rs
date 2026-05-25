@@ -5085,7 +5085,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     let observer: Arc<dyn Observer> =
-        Arc::from(observability::create_observer(&config.observability));
+        Arc::from(observability::create_observer_with_workspace(&config.observability, &config.workspace_dir));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
@@ -5142,6 +5142,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .fallback_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
+        None,
+        None,
         None,
     );
 
