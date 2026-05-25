@@ -65,6 +65,7 @@
 - [MCP (Model Context Protocol)](./tools/mcp.md)
 - [Browser automation](./tools/browser.md)
 - [Skills](./tools/skills.md)
+- [Python skills](./tools/python-skills.md)
 
 # Security
 
