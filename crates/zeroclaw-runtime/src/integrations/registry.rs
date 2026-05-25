@@ -2,8 +2,8 @@
 //!
 //! Every entry comes from a schema-side source:
 //! - Channels: `ChannelsConfig::channels()` (each multi-instance V3
-//!   channel field surfaces as one entry; `ChannelConfig::name()` and
-//!   `ChannelConfig::desc()` are the source of display text).
+//!   channel field surfaces as one `ChannelInfo` entry; name and desc
+//!   strings live in `channels()` itself, not in this file).
 //! - Toggle integrations: `Config::integration_descriptors()` (per-struct
 //!   `#[integration(...)]` attribute on `BrowserConfig` /
 //!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
@@ -72,21 +72,20 @@ fn evaluate_model_provider_activation(
 /// Single-loop, schema-driven. Every per-row decision lives on the
 /// schema-side source; this function just concatenates the iterators.
 ///
-/// Channel discovery walks `ChannelsConfig::channels()` so each
-/// channel type's `ChannelConfig::name()` and `ChannelConfig::desc()`
-/// are the single source of display text — no string literal naming
-/// a channel appears in this file's production path. Multi-instance
-/// V3 channels are reported active when any alias is configured.
+/// Channel discovery walks `ChannelsConfig::channels()` which always
+/// returns all known channel types; each `ChannelInfo` carries name,
+/// desc, and a configured flag.  Multi-instance V3 channels are
+/// reported active when any alias is configured.
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
     let channels = config
         .channels
         .channels()
         .into_iter()
-        .map(|(handle, active)| IntegrationEntry {
-            name: handle.name().to_string(),
-            description: handle.desc().to_string(),
+        .map(|info| IntegrationEntry {
+            name: info.name.to_string(),
+            description: info.desc.to_string(),
             category: IntegrationCategory::Chat,
-            status: bool_to_status(active),
+            status: bool_to_status(info.configured),
         });
 
     let toggles = config
@@ -192,32 +191,31 @@ mod tests {
             .iter()
             .filter(|e| e.category == IntegrationCategory::Chat)
             .count();
-        let handles = config.channels.channels();
+        let channel_infos = config.channels.channels();
         assert_eq!(
             channel_count,
-            handles.len(),
-            "every ChannelsConfig::channels() handle should produce exactly one Chat entry",
+            channel_infos.len(),
+            "every ChannelsConfig::channels() entry should produce exactly one Chat entry",
         );
-        for (handle, _active) in &handles {
+        for info in &channel_infos {
             let entry = entries
                 .iter()
-                .find(|e| e.name == handle.name())
+                .find(|e| e.name == info.name)
                 .unwrap_or_else(|| {
                     panic!(
                         "channel {:?} ({:?}) missing from registry",
-                        handle.name(),
-                        handle.desc(),
+                        info.name, info.desc,
                     )
                 });
             assert!(
                 !entry.name.is_empty(),
                 "channel {:?} produced empty display name",
-                handle.name(),
+                info.name,
             );
             assert!(
                 !entry.description.is_empty(),
                 "channel {:?} missing description text",
-                handle.name(),
+                info.name,
             );
         }
     }

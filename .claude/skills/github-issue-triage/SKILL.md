@@ -50,7 +50,7 @@ The protocol encodes operational details from RFC #5577 (governance, stale polic
 | Action | Authority | Condition |
 |---|---|---|
 | Apply labels | Act | Always |
-| Remove labels | Act | Only for labels the agent applied in this session, or `status:stale` when the author has re-engaged. Never remove `no-stale`, `priority:critical`, `status:blocked`, or `type:rfc` — these are protection labels. |
+| Remove labels | Act | Only for labels the agent applied in this session, or `status:stale` when the author has re-engaged. Never remove `status:no-stale`, `priority:critical`, `status:blocked`, or `type:rfc` — these are protection labels. |
 | Comment on an issue | Act | Always |
 | Close — fixed by merged PR | Act (single-issue: present first) | PR confirmed merged; issue explicitly referenced in PR |
 | Close — duplicate | Act (single-issue: present first) | Concrete shared identifier confirmed per §3 Pass 2; primary issue clearly identified |
