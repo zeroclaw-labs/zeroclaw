@@ -50,6 +50,8 @@
 - [Mattermost](./channels/mattermost.md)
 - [LINE](./channels/line.md)
 - [Nextcloud Talk](./channels/nextcloud-talk.md)
+- [Signal](./channels/signal.md)
+- [WhatsApp](./channels/whatsapp.md)
 - [Other chat platforms](./channels/chat-others.md)
 - [Social (Bluesky, Nostr, Twitter, Reddit)](./channels/social.md)
 - [Email](./channels/email.md)
@@ -63,6 +65,7 @@
 - [MCP (Model Context Protocol)](./tools/mcp.md)
 - [Browser automation](./tools/browser.md)
 - [Skills](./tools/skills.md)
+- [Python skills](./tools/python-skills.md)
 
 # Security
 
