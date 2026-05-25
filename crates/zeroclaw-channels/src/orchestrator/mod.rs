@@ -7200,7 +7200,8 @@ fn build_owner_by_channel_key(
     // Legacy fallback mode: when no enabled agent declares channel bindings,
     // channel collection accepts all enabled channels. Those channels must
     // also be routable, so bind collected channel keys to the runtime-active
-    // agent selection.
+    // agent selection (explicit `"default"` alias when present, else
+    // lexicographically-smallest enabled alias).
     // `owner_by_channel_key.is_empty()` means every enabled agent had an
     // empty `agents.<alias>.channels` list; this is the same "legacy mode"
     // signal used by `collect_configured_channels` to accept all enabled
@@ -8819,6 +8820,38 @@ mod tests {
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
         assert!(Arc::ptr_eq(&resolved, &legacy_ctx));
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "zeta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = vec!["alpha".to_string(), "zeta".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("mattermost.default").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
     }
 
     #[test]

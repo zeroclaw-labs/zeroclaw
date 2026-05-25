@@ -3236,8 +3236,9 @@ impl Config {
     /// Resolve the runtime-active agent alias the orchestrator binds
     /// channels to. Mirrors the same selection logic as
     /// `start_channels()` in zeroclaw-channels: prefer the migration-
-    /// synthesized `"default"` agent, fall back to the first enabled
-    /// agent. Returns `None` only when no agent is configured at all.
+    /// synthesized `"default"` agent, otherwise fall back to the
+    /// lexicographically-smallest enabled alias. Returns `None` only
+    /// when no enabled agent is configured.
     ///
     /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
     /// to pick which agent's `tts_provider` / `transcription_provider`
@@ -3249,13 +3250,14 @@ impl Config {
         self.agents
             .keys()
             .find(|k| k.as_str() == "default")
+            .map(String::as_str)
             .or_else(|| {
                 self.agents
                     .iter()
-                    .find(|(_, a)| a.enabled)
-                    .map(|(alias, _)| alias)
+                    .filter(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias.as_str())
+                    .min()
             })
-            .map(String::as_str)
     }
 
     /// Resolve the active storage backend for the memory subsystem.
