@@ -65,6 +65,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// non-string `default` quirks crash the tool-call parser). The check
     /// runs at tool conversion time against the runtime model id.
     local_model_tool_sanitize: bool,
+    /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
+    /// without authentication. Keep the default credential-gated for hosted
+    /// providers so missing credentials still fall through to catalog sources.
+    unauthenticated_model_listing: bool,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -279,6 +283,7 @@ impl OpenAiCompatibleModelProvider {
             models_dev_key: None,
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
+            unauthenticated_model_listing: false,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -289,6 +294,11 @@ impl OpenAiCompatibleModelProvider {
     /// happily serves llama, qwen, etc. without sanitization.
     pub fn with_local_model_tool_sanitize(mut self) -> Self {
         self.local_model_tool_sanitize = true;
+        self
+    }
+
+    pub fn with_unauthenticated_model_listing(mut self) -> Self {
+        self.unauthenticated_model_listing = true;
         self
     }
 
@@ -450,7 +460,9 @@ impl OpenAiCompatibleModelProvider {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
                     "Failed to build proxied timeout client with custom headers: "
                 );
                 Client::new()
@@ -513,7 +525,9 @@ impl OpenAiCompatibleModelProvider {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
                     "Failed to build proxied streaming client with custom headers: "
                 );
                 Client::new()
@@ -528,7 +542,7 @@ impl OpenAiCompatibleModelProvider {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                    .with_attrs(::serde_json::json!({"error": super::format_error_chain(&error)})),
                 "Failed to build proxied streaming client: "
             );
             Client::new()
@@ -1270,7 +1284,9 @@ fn sse_bytes_to_chunks(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1332,7 +1348,9 @@ fn sse_bytes_to_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
@@ -1371,7 +1389,9 @@ fn sse_bytes_to_events_for_contract(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                let _ = tx
+                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .await;
                 return;
             }
         }
@@ -1498,7 +1518,9 @@ fn sse_bytes_to_events_for_contract(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             }
@@ -1973,16 +1995,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
-        // (OpenAI-compatible: GET {base_url}/models).
-        if let Some(credential) = self.credential.as_deref() {
+        // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
+        // servers that explicitly allow unauthenticated listing use the same
+        // path without an Authorization header.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.unauthenticated_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
-                .apply_auth_header(self.http_client().get(&url), Some(credential))
+                .apply_auth_header(self.http_client().get(&url), list_credential)
                 .send()
                 .await
                 .map_err(|e| {
@@ -1994,7 +2020,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                 "model_provider": &self.name,
                                 "url": &url,
                                 "phase": "model_list_request",
-                                "error": format!("{}", e),
+                                "error": super::format_error_chain(&e),
                             })),
                         "compatible: model list request failed"
                     );
@@ -2015,7 +2041,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         .with_attrs(::serde_json::json!({
                             "model_provider": &self.name,
                             "phase": "model_list_parse",
-                            "error": format!("{}", e),
+                            "error": super::format_error_chain(&e),
                         })),
                     "compatible: model list returned invalid JSON"
                 );
@@ -2582,7 +2608,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2719,7 +2747,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -2821,7 +2851,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };

@@ -850,6 +850,7 @@ mod tests {
                 native_tool_calling: self.tools,
                 vision: self.vision,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -1240,6 +1241,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking: None,
             },
             "hint:reasoning",
             Some(0.0),

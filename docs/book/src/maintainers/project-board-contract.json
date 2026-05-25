@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "contract_name": "project-board-planning-contract",
+  "status": "docs_design_input_only",
+  "description": "GitHub Project board fields are planning signals. Fast PR review and mergeability state is derived from native GitHub PR state.",
+  "canonical_sources": {
+    "prose": [
+      "labels.md#ownership-boundaries",
+      "pr-workflow.md#project-board-contract"
+    ],
+    "automation": "none"
+  },
+  "board_owned_planning_signals": {
+    "owner": "project_board",
+    "maintenance": "manual_or_future_automation",
+    "examples": [
+      "issue_readiness",
+      "active_owner",
+      "roadmap_group",
+      "dependency_state",
+      "stale_exemption_reason"
+    ],
+    "guidance": "Use for slower planning questions such as readiness, ownership, roadmap grouping, dependencies, and explicit stale-exemption rationale."
+  },
+  "derived_github_pr_signals": {
+    "owner": "github_pr",
+    "maintenance": "derived_display_only",
+    "examples": [
+      "review_decision",
+      "merge_state",
+      "status_check_rollup",
+      "head_sha",
+      "conflict_state",
+      "stale_approvals",
+      "merge_ready"
+    ],
+    "sources": [
+      "PullRequest.reviewDecision",
+      "PullRequest.mergeStateStatus",
+      "PullRequest.statusCheckRollup",
+      "PullRequest.headRefOid",
+      "branch protection or ruleset required contexts when exact required-check status is needed"
+    ],
+    "guidance": "Display only. Do not maintain native PR review, check, conflict, or merge readiness state as separate board truth."
+  },
+  "label_metadata": {
+    "owner": "github_labels",
+    "maintenance": "manual_or_automation",
+    "examples": [
+      "type",
+      "scope_or_component",
+      "risk",
+      "size",
+      "status",
+      "stale_exemption"
+    ],
+    "guidance": "Use labels for portable classification across issues and PRs."
+  },
+  "non_goals": [
+    "active GitHub Project integration",
+    "CI enforcement",
+    "manual mirror of native PR state"
+  ]
+}

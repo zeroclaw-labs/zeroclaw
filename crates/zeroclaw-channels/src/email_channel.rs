@@ -19,6 +19,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
+use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use std::collections::HashSet;
@@ -345,6 +346,7 @@ impl EmailChannel {
                         _uid: uid,
                         msg_id,
                         sender,
+                        subject,
                         content,
                         timestamp: ts,
                         attachments,
@@ -604,6 +606,7 @@ impl EmailChannel {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: email.attachments,
+                subject: Some(email.subject),
             };
 
             if tx.send(msg).await.is_err() {
@@ -653,6 +656,7 @@ struct ParsedEmail {
     _uid: u32,
     msg_id: String,
     sender: String,
+    subject: String,
     content: String,
     timestamp: u64,
     attachments: Vec<zeroclaw_api::media::MediaAttachment>,
@@ -674,7 +678,17 @@ impl ::zeroclaw_api::attribution::Attributable for EmailChannel {
     }
 }
 
+fn markdown_to_html(md: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(md, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
+}
 #[async_trait]
+
 impl Channel for EmailChannel {
     fn name(&self) -> &str {
         "email"
@@ -695,37 +709,64 @@ impl Channel for EmailChannel {
             (default_subject, message.content.as_str())
         };
 
-        let email = if message.attachments.is_empty() {
-            // Existing plain-text path
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .singlepart(SinglePart::plain(body.to_string()))?
-        } else {
-            // Multipart with attachments
-            let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+        let mut builder = Message::builder()
+            .from(self.config.from_address.parse()?)
+            .to(message.recipient.parse()?)
+            .subject(subject);
+        if let Some(ref reply_id) = message.in_reply_to {
+            builder = builder.in_reply_to(reply_id.clone());
+        }
+        let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
+        for att in &message.attachments {
+            let content_type = att
+                .mime_type
+                .as_deref()
+                .and_then(|m| ContentType::parse(m).ok())
+                .unwrap_or_else(|| {
+                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                });
+            let att_data = if att.data.is_empty() && std::path::Path::new(&att.file_name).exists() {
+                std::fs::read(&att.file_name).map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "failed to read attachment '{}': {}",
+                        att.file_name, e
+                    ))
+                })?
+            } else {
+                att.data.clone()
+            };
+            let att_name = std::path::Path::new(&att.file_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&att.file_name)
+                .to_string();
+            att_parts.push((att_name, att_data, content_type));
+        }
 
-            for att in &message.attachments {
-                let content_type = att
-                    .mime_type
-                    .as_deref()
-                    .and_then(|m| ContentType::parse(m).ok())
-                    .unwrap_or_else(|| {
-                        ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
-                    });
-
-                let attachment =
-                    Attachment::new(att.file_name.clone()).body(att.data.clone(), content_type);
-
-                multipart = multipart.singlepart(attachment);
+        let email = if self.config.html_body {
+            let alt = MultiPart::alternative()
+                .singlepart(SinglePart::plain(body.to_string()))
+                .singlepart(SinglePart::html(markdown_to_html(body)));
+            if att_parts.is_empty() {
+                builder.multipart(alt)?
+            } else {
+                let mut mixed = MultiPart::mixed().multipart(alt);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
             }
-
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .multipart(multipart)?
+        } else {
+            let plain = SinglePart::plain(body.to_string());
+            if att_parts.is_empty() {
+                builder.singlepart(plain)?
+            } else {
+                let mut mixed = MultiPart::mixed().singlepart(plain);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
+            }
         };
 
         let transport = self.create_smtp_transport()?;
@@ -916,6 +957,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
             excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
@@ -943,6 +985,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
             excluded_tools: vec![],
         };
         let cloned = config.clone();
@@ -1191,6 +1234,7 @@ mod tests {
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: vec![],
+            html_body: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1216,7 +1260,7 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
-        assert_eq!(config.default_subject, "ZeroClaw Message"); // default
+        assert_eq!(config.default_subject, "Re: Message"); // default
     }
 
     #[test]

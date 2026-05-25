@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use lru::LruCache;
+use parking_lot::Mutex as SyncMutex;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -13,10 +16,26 @@ use zeroclaw_api::channel::{
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
+/// How many recent inbound messages we remember for the purpose of
+/// addressing outbound reactions back at them. signal-cli's `sendReaction`
+/// is keyed on `(targetAuthor, targetTimestamp)`, but we don't want those
+/// values to leak into the generic `ChannelMessage.id` (which flows into
+/// logs, memory keys, thread roots, and tool args). Instead we mint an
+/// opaque id and remember the mapping channel-locally.
+const RECENT_TARGETS_CAPACITY: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
     Direct(String),
     Group(String),
+}
+
+/// `(targetAuthor, targetTimestamp_ms)` recovered by `add_reaction` /
+/// `remove_reaction` from an opaque inbound id. Held in `recent_targets`.
+#[derive(Debug, Clone)]
+struct ReactionTarget {
+    author: String,
+    timestamp_ms: u64,
 }
 
 /// Signal channel using signal-cli daemon's native JSON-RPC + SSE API.
@@ -46,6 +65,11 @@ pub struct SignalChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
+    /// Opaque inbound message id → `(targetAuthor, targetTimestamp)` so
+    /// outbound reactions can be addressed without embedding the Signal
+    /// sender (E.164 phone number or UUID) in `ChannelMessage.id`. Bounded
+    /// LRU; once a message ages out, reactions against it fail cleanly.
+    recent_targets: Arc<SyncMutex<LruCache<String, ReactionTarget>>>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -112,6 +136,10 @@ impl SignalChannel {
             proxy_url: None,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout_secs: 300,
+            recent_targets: Arc::new(SyncMutex::new(LruCache::new(
+                NonZeroUsize::new(RECENT_TARGETS_CAPACITY)
+                    .expect("RECENT_TARGETS_CAPACITY is a non-zero constant"),
+            ))),
         }
     }
 
@@ -179,6 +207,50 @@ impl SignalChannel {
         } else {
             RecipientTarget::Group(recipient.to_string())
         }
+    }
+
+    /// Build the JSON-RPC params for signal-cli's `sendReaction` method.
+    ///
+    /// `targetAuthor` and `targetTimestamp` are recovered from
+    /// `recent_targets` rather than parsed out of `message_id`, so the
+    /// generic id stays opaque and the Signal sender never leaks into
+    /// the surfaces that consume `ChannelMessage.id`.
+    ///
+    /// Extracted from `add_reaction` / `remove_reaction` so the wire
+    /// shape is unit-testable without a live daemon.
+    fn build_reaction_params(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        remove: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let target = self.recent_targets.lock().get(message_id).cloned().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "no recent inbound Signal message matches id {message_id} — may have been evicted from the lookup cache or never received"
+            ))
+        })?;
+
+        let params = match Self::parse_recipient_target(channel_id) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "emoji": emoji,
+                "targetAuthor": target.author,
+                "targetTimestamp": target.timestamp_ms,
+                "remove": remove,
+                "account": &self.account,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "emoji": emoji,
+                "targetAuthor": target.author,
+                "targetTimestamp": target.timestamp_ms,
+                "remove": remove,
+                "account": &self.account,
+            }),
+        };
+
+        Ok(params)
     }
 
     /// Check whether the message passes the group/DM filter.
@@ -311,8 +383,22 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
+        // Opaque id: timestamp is convenient for debugging, the random
+        // suffix disambiguates two senders that happen to post at the same
+        // millisecond in a group. Crucially, neither component reveals the
+        // sender — that lives only in the channel-local `recent_targets`
+        // map and the `sender` field on `ChannelMessage`.
+        let id = format!("sig_{timestamp}_{}", Self::random_id_suffix());
+        self.recent_targets.lock().put(
+            id.clone(),
+            ReactionTarget {
+                author: sender.clone(),
+                timestamp_ms: timestamp,
+            },
+        );
+
         Some(ChannelMessage {
-            id: format!("sig_{timestamp}"),
+            id,
             sender: sender.clone(),
             reply_target: target,
             content: text.to_string(),
@@ -322,7 +408,17 @@ impl SignalChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
+    }
+
+    fn random_id_suffix() -> String {
+        use rand::RngExt;
+        const CHARSET: &[u8] = b"0123456789abcdef";
+        let mut rng = rand::rng();
+        (0..6)
+            .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+            .collect()
     }
 }
 
@@ -584,6 +680,28 @@ impl Channel for SignalChannel {
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         // signal-cli doesn't have a stop-typing RPC; typing indicators
         // auto-expire after ~15s on the client side.
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let params = self.build_reaction_params(channel_id, message_id, emoji, false)?;
+        self.rpc_request("sendReaction", params).await?;
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let params = self.build_reaction_params(channel_id, message_id, emoji, true)?;
+        self.rpc_request("sendReaction", params).await?;
         Ok(())
     }
 
@@ -1033,6 +1151,21 @@ mod tests {
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
         assert_eq!(msg.content, "Hello from privacy user");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the routing identity must not appear in the
+        // generic message id, which flows into logs, memory keys, and the
+        // LLM-facing tool context.
+        assert!(
+            !msg.id.contains(uuid),
+            "UUID sender must not leak into msg.id: {}",
+            msg.id
+        );
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
 
         // Verify reply routing: UUID sender in DM should route as Direct
         let target = SignalChannel::parse_recipient_target(&msg.reply_target);
@@ -1110,6 +1243,21 @@ mod tests {
         assert_eq!(msg.content, "Hello!");
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the E.164 phone number must not appear in
+        // the generic message id, which flows into logs, memory keys, and
+        // the LLM-facing tool context.
+        assert!(
+            !msg.id.contains("+1111111111"),
+            "E.164 sender must not leak into msg.id: {}",
+            msg.id
+        );
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
     }
 
     #[test]
@@ -1217,6 +1365,98 @@ mod tests {
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_none());
+    }
+
+    #[test]
+    fn process_envelope_group_happy_path() {
+        let dm_only = false;
+        let ignore_attachments = false;
+        let ignore_stories = false;
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            vec!["group_xyz".to_string()],
+            dm_only,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1111111111".into()]),
+            ignore_attachments,
+            ignore_stories,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("group hello".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group_xyz".to_string()),
+                }),
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        assert_eq!(msg.sender, "+1111111111");
+        assert_eq!(msg.reply_target, "group:group_xyz");
+        assert_eq!(msg.content, "group hello");
+        assert_eq!(msg.channel, "signal");
+        assert!(
+            msg.id.starts_with("sig_1700000000000_"),
+            "id should embed timestamp but stay opaque: {}",
+            msg.id
+        );
+        // Privacy regression: the in-group sender must not appear in the
+        // generic message id, even though the group id itself is in
+        // `reply_target` and not sensitive.
+        assert!(
+            !msg.id.contains("+1111111111"),
+            "E.164 sender must not leak into group msg.id: {}",
+            msg.id
+        );
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel_alias.as_deref(), Some("signal_test_alias"));
+    }
+
+    #[test]
+    fn process_envelope_populates_recent_targets() {
+        // The opaque `msg.id` is unusable for `sendReaction` on its own —
+        // signal-cli needs `(targetAuthor, targetTimestamp)`. Confirm the
+        // channel-local lookup is seeded so a later reaction can recover
+        // those values without the id leaking the sender.
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            vec!["group_xyz".to_string()],
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1111111111".into()]),
+            false,
+            false,
+        );
+        let env = Envelope {
+            source: Some("+1111111111".to_string()),
+            source_number: Some("+1111111111".to_string()),
+            data_message: Some(DataMessage {
+                message: Some("group hello".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: Some(GroupInfo {
+                    group_id: Some("group_xyz".to_string()),
+                }),
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        let target = ch
+            .recent_targets
+            .lock()
+            .peek(&msg.id)
+            .cloned()
+            .expect("recent_targets should contain the just-emitted id");
+        assert_eq!(target.author, "+1111111111");
+        assert_eq!(target.timestamp_ms, 1_700_000_000_000);
     }
 
     #[test]
@@ -1335,5 +1575,123 @@ mod tests {
         let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
         sender.send(ChannelApprovalResponse::Approve).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    fn make_reaction_channel() -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            false,
+        )
+    }
+
+    fn seed_reaction_target(ch: &SignalChannel, id: &str, author: &str, ts_ms: u64) {
+        ch.recent_targets.lock().put(
+            id.to_string(),
+            ReactionTarget {
+                author: author.to_string(),
+                timestamp_ms: ts_ms,
+            },
+        );
+    }
+
+    #[test]
+    fn build_reaction_params_dm_includes_recipient() {
+        let ch = make_reaction_channel();
+        seed_reaction_target(
+            &ch,
+            "sig_1700000000000_abcdef",
+            "+2222222222",
+            1_700_000_000_000,
+        );
+        let params = ch
+            .build_reaction_params(
+                "+1111111111",
+                "sig_1700000000000_abcdef",
+                "\u{1F44D}",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            params["recipient"],
+            serde_json::json!(["+1111111111".to_string()])
+        );
+        assert!(params.get("groupId").is_none());
+        assert_eq!(params["emoji"], "\u{1F44D}");
+        assert_eq!(params["targetAuthor"], "+2222222222");
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+        assert_eq!(params["remove"], false);
+        assert_eq!(params["account"], "+1234567890");
+    }
+
+    #[test]
+    fn build_reaction_params_group_includes_group_id_and_remove() {
+        let ch = make_reaction_channel();
+        seed_reaction_target(
+            &ch,
+            "sig_1700000000000_abcdef",
+            "+2222222222",
+            1_700_000_000_000,
+        );
+        let params = ch
+            .build_reaction_params(
+                "group:abc",
+                "sig_1700000000000_abcdef",
+                "\u{2764}\u{FE0F}",
+                true,
+            )
+            .unwrap();
+        assert_eq!(params["groupId"], "abc");
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["emoji"], "\u{2764}\u{FE0F}");
+        assert_eq!(params["targetAuthor"], "+2222222222");
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+        assert_eq!(params["remove"], true);
+        assert_eq!(params["account"], "+1234567890");
+    }
+
+    #[test]
+    fn build_reaction_params_round_trips_uuid_sender_via_lookup() {
+        // The opaque id reveals nothing about the sender, so the
+        // round-trip property — that `sendReaction` ultimately sends the
+        // correct `targetAuthor` — has to come from `process_envelope`
+        // seeding the lookup, not from id parsing.
+        let ch = make_reaction_channel();
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let env = Envelope {
+            source: Some(uuid.to_string()),
+            source_number: None,
+            data_message: Some(DataMessage {
+                message: Some("hi".to_string()),
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        };
+        let msg = ch.process_envelope(&env).unwrap();
+        let params = ch
+            .build_reaction_params(&msg.reply_target, &msg.id, "\u{1F44D}", false)
+            .unwrap();
+        assert_eq!(params["targetAuthor"], uuid);
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_000_u64);
+    }
+
+    #[test]
+    fn build_reaction_params_rejects_unknown_id() {
+        let ch = make_reaction_channel();
+        let err = ch
+            .build_reaction_params("+1111111111", "sig_unknown_id", "\u{1F44D}", false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no recent inbound Signal message"),
+            "unexpected error: {err}"
+        );
     }
 }

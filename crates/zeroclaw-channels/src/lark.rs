@@ -220,6 +220,12 @@ const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
+/// Feishu/Lark API business code returned when a card PATCH (or any draft
+/// message edit) is rate-limited. Treated as a soft-failure: we log a warning
+/// but never propagate to the caller, since the user-visible decision is
+/// already delivered out-of-band via the approval oneshot.
+const LARK_DRAFT_RATE_LIMIT_CODE: i64 = 230_020;
+
 /// Max byte size for a single interactive card's markdown content.
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
@@ -259,6 +265,183 @@ fn build_card_content(markdown: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Build an approval-request interactive card (Card JSON 2.0).
+///
+/// Card 2.0 is required so PATCH-time updates from
+/// `build_resolved_approval_card` can re-render the card on the user's
+/// client. Feishu's IM PATCH endpoint accepts cross-version PATCH
+/// (1.0 send → 2.0 patch) with `code: 0` but does NOT guarantee the
+/// client re-renders; the same schema must be used on both sides.
+///
+/// Each button's `behaviors[0].value.approval_id` round-trips back via
+/// the `card.action.trigger` event, parsed by `handle_card_action_event`.
+fn build_approval_card(
+    approval_id: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+) -> serde_json::Value {
+    let make_button = |label: &str, button_type: &str, decision: &str| {
+        serde_json::json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": label },
+            "type": button_type,
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "approval_id": approval_id,
+                    "decision": decision
+                }
+            }]
+        })
+    };
+
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "template": "orange",
+            "title": {
+                "tag": "plain_text",
+                "content": "🔧 Tool approval required"
+            }
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!("**Tool:** `{tool_name}`\n\n{arguments_summary}")
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "stretch",
+                    "columns": [
+                        { "tag": "column", "elements": [
+                            make_button("✅ Approve", "primary_filled", "approve")
+                        ]},
+                        { "tag": "column", "elements": [
+                            make_button("❌ Deny", "danger_filled", "deny")
+                        ]},
+                        { "tag": "column", "elements": [
+                            make_button("✅✅ Always", "default", "always")
+                        ]}
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+/// Resolved-state rendering of the approval card (no buttons, decision banner).
+///
+/// Uses Card JSON 2.0 schema (matching `build_card_content`) because the
+/// Feishu IM PATCH endpoint accepts Card 1.0 envelopes with `code: 0` but
+/// silently refuses to re-render the client-side card. Using Card 2.0 (the
+/// schema that the production-validated `build_card_content` uses) is what
+/// actually causes the visual update to land on the user's screen.
+fn build_resolved_approval_card(
+    tool_name: &str,
+    arguments_summary: &str,
+    decision: zeroclaw_api::channel::ChannelApprovalResponse,
+) -> serde_json::Value {
+    use zeroclaw_api::channel::ChannelApprovalResponse;
+
+    let (banner_emoji, banner_text, header_template) = match decision {
+        ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
+        ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
+        ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+    };
+
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "template": header_template,
+            "title": {
+                "tag": "plain_text",
+                "content": format!("{banner_emoji} Tool approval — {banner_text}")
+            }
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "**Tool:** `{tool_name}`\n\n{arguments_summary}\n\n---\n\n**{banner_emoji} {banner_text}**"
+                    )
+                }
+            ]
+        }
+    })
+}
+
+/// Build a sanitized copy of a `card.action.trigger` event payload that is
+/// safe to emit to structured logs / dashboards / persisted JSONL.
+///
+/// The raw inbound payload from Lark/Feishu carries tenant-specific
+/// identifiers and a callback verification token. These values are
+/// classified as PII / callback secrets by the project's privacy policy
+/// (see each fixture's `_fixture_note` under `tests/fixtures/lark/` for the
+/// authoritative list of fields that must be redacted before any
+/// persistence).
+///
+/// This function replaces the following with deterministic `REDACTED_*`
+/// placeholder strings:
+///
+/// - top-level `token` (Lark callback verification token)
+/// - `operator.open_id` / `union_id` / `user_id` / `tenant_key`
+/// - `context.open_chat_id` / `context.open_message_id`
+///
+/// Non-sensitive business fields (`action.*`, `host`, etc.) are preserved
+/// verbatim so DEBUG operators can still capture production payload shape
+/// for fixture collection.
+///
+/// The input is borrowed read-only; a fresh owned `Value` is returned. The
+/// regression test `sanitize_card_action_payload_redacts_sensitive_fields`
+/// is the gate that fails if any of those raw values can leak through this
+/// path.
+fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut sanitized = event_payload.clone();
+
+    // Top-level callback verification token.
+    if let Some(token) = sanitized.get_mut("token")
+        && !token.is_null()
+    {
+        *token = Value::String("REDACTED_TOKEN".to_string());
+    }
+
+    // operator.* identifiers — only overwrite keys that are actually present
+    // so the sanitized payload still reflects production shape (don't
+    // invent fields that the real event didn't carry).
+    if let Some(Value::Object(operator)) = sanitized.get_mut("operator") {
+        for (key, placeholder) in [
+            ("open_id", "REDACTED_OPERATOR_OPEN_ID"),
+            ("union_id", "REDACTED_OPERATOR_UNION_ID"),
+            ("user_id", "REDACTED_OPERATOR_USER_ID"),
+            ("tenant_key", "REDACTED_OPERATOR_TENANT_KEY"),
+        ] {
+            if operator.contains_key(key) {
+                operator.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    // context.open_* identifiers.
+    if let Some(Value::Object(context)) = sanitized.get_mut("context") {
+        for (key, placeholder) in [
+            ("open_chat_id", "REDACTED_OPEN_CHAT_ID"),
+            ("open_message_id", "REDACTED_OPEN_MESSAGE_ID"),
+        ] {
+            if context.contains_key(key) {
+                context.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    sanitized
 }
 
 /// Build the full message body for sending an interactive card message.
@@ -375,6 +558,20 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// State carried between sending an approval card and the user's click.
+///
+/// Used to (a) wake the awaiting future via `sender` and (b) re-render
+/// the card after the click so the buttons disappear.
+struct PendingApproval {
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    /// `data.message_id` returned by the send-card POST. Empty string is a
+    /// sentinel meaning "card was sent but message_id was missing from the
+    /// response" — handler will skip the post-click PATCH in that case.
+    message_id: String,
+    tool_name: String,
+    arguments_summary: String,
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -408,6 +605,13 @@ pub struct LarkChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// In-flight approval requests keyed by `approval_id` (UUID v4).
+    /// Populated by `request_approval`, drained by `handle_card_action_event`.
+    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// Seconds to wait for the user's button click before auto-denying.
+    /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
+    /// for per-channel overrides arises.
+    approval_timeout_secs: u64,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -466,6 +670,8 @@ impl LarkChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            approval_timeout_secs: 120,
             #[cfg(test)]
             api_base_override: None,
         }
@@ -568,6 +774,13 @@ impl LarkChannel {
 
     fn send_message_url(&self) -> String {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    /// PATCH endpoint for updating the content of a previously-sent message
+    /// (used to flip an approval card from its interactive state to its
+    /// resolved/banner state after the user clicks a button).
+    fn patch_message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
     }
 
     fn message_reaction_url(&self, message_id: &str) -> String {
@@ -903,7 +1116,25 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "event JSON"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    match event.header.event_type.as_str() {
+                        "im.message.receive_v1" => {}
+                        "card.action.trigger" => {
+                            if let Err(e) = self.handle_card_action_event(&event.event).await {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Dispatch
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                                    "Lark WS: card action dispatch error"
+                                );
+                            }
+                            continue;
+                        }
+                        _ => continue,
+                    }
 
                     let event_payload = event.event;
 
@@ -1049,6 +1280,7 @@ impl LarkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                     attachments: vec![],
+                        subject: None,
                     };
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
@@ -1709,6 +1941,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         }]
     }
 
@@ -1973,6 +2206,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
@@ -2037,6 +2271,389 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        let approval_id = Uuid::new_v4().to_string();
+        let card =
+            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+
+        let token = self.get_tenant_access_token().await?;
+        let url = self.send_message_url();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "receive_id_type": "chat_id",
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&card)?,
+        });
+
+        let response_body = {
+            let (status, resp) = self.send_text_once(&url, &token, &body).await?;
+            if should_refresh_lark_tenant_token(status, &resp) {
+                self.invalidate_token().await;
+                let new_token = self.get_tenant_access_token().await?;
+                let (retry_status, retry_body) =
+                    self.send_text_once(&url, &new_token, &body).await?;
+                ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
+                retry_body
+            } else {
+                ensure_lark_send_success(status, &resp, "approval")?;
+                resp
+            }
+        };
+
+        let message_id = response_body
+            .pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(
+                        module_path!(),
+                        ::zeroclaw_log::Action::Note
+                    )
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                    "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
+                );
+                String::new()
+            });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id,
+                tool_name: request.tool_name.clone(),
+                arguments_summary: request.arguments_summary.clone(),
+            },
+        );
+
+        Ok(Some(self.wait_for_decision(rx, &approval_id).await))
+    }
+}
+
+impl LarkChannel {
+    /// Wait for the user's approval click; on timeout, evict the pending entry
+    /// and synthesize a `Deny` response. Never panics.
+    async fn wait_for_decision(
+        &self,
+        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+        approval_id: &str,
+    ) -> zeroclaw_api::channel::ChannelApprovalResponse {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                self.pending_approvals.lock().await.remove(approval_id);
+                ChannelApprovalResponse::Deny
+            }
+        }
+    }
+
+    /// PATCH an approval card to its resolved state. Soft-fails on every error
+    /// path (transport / token refresh / rate-limited / non-zero code) — never
+    /// propagates to the caller, since the user-visible decision is already
+    /// delivered via the oneshot.
+    async fn patch_approval_card_resolved(
+        &self,
+        message_id: &str,
+        tool_name: &str,
+        arguments_summary: &str,
+        decision: zeroclaw_api::channel::ChannelApprovalResponse,
+    ) {
+        let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
+        let url = self.patch_message_url(message_id);
+        let body = serde_json::json!({
+            "content": card.to_string(),
+        });
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "message_id": message_id,
+                    "decision": format!("{decision:?}"),
+                })),
+            "Lark: approval card PATCH dispatching"
+        );
+
+        let (status, response) = match self.patch_or_send_once(&url, &body, true).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": e.to_string(),
+                        })),
+                    "Lark: approval card PATCH transport error"
+                );
+                return;
+            }
+        };
+
+        let final_body = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            match self.patch_or_send_once(&url, &body, true).await {
+                Ok((retry_status, retry_response)) => {
+                    if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Send
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "body": retry_response.to_string(),
+                            })),
+                            "Lark: approval card PATCH still unauthorized after token refresh"
+                        );
+                        return;
+                    }
+                    retry_response
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "error": e.to_string(),
+                            })),
+                        "Lark: approval card PATCH retry transport error"
+                    );
+                    return;
+                }
+            }
+        } else {
+            response
+        };
+
+        let code = extract_lark_response_code(&final_body).unwrap_or(0);
+        if code == LARK_DRAFT_RATE_LIMIT_CODE {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": LARK_DRAFT_RATE_LIMIT_CODE,
+                    })),
+                "Lark: approval card PATCH rate-limited"
+            );
+        } else if code != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": code,
+                        "status": status.to_string(),
+                        "body": final_body.to_string(),
+                    })),
+                "Lark: approval card PATCH soft-failed"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "status": status.to_string(),
+                    })),
+                "Lark: approval card PATCH succeeded"
+            );
+        }
+    }
+
+    /// Single-shot HTTP request used by `patch_approval_card_resolved`. Builds
+    /// PATCH (when `is_patch=true`) or POST request with current tenant token,
+    /// returns parsed JSON body and the HTTP status. Caller decides whether to
+    /// retry on token refresh.
+    async fn patch_or_send_once(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        is_patch: bool,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let token = self.get_tenant_access_token().await?;
+        let builder = if is_patch {
+            self.http_client().patch(url)
+        } else {
+            self.http_client().post(url)
+        };
+        let resp = builder
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    /// Handle a `card.action.trigger` event: parse `approval_id` + `decision`
+    /// from `event.action.value` (or `event.action.behaviors[0].value` for
+    /// Card 2.0 button click events), resolve the pending oneshot, and
+    /// forward the response. Unknown / expired approval IDs are silently
+    /// dropped (info-log only).
+    async fn handle_card_action_event(
+        &self,
+        event_payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Diagnostic: emit a SANITIZED copy of the inbound payload at DEBUG
+        // so operators can capture real Lark/Feishu `card.action.trigger`
+        // shape evidence for fixture collection WITHOUT leaking
+        // tenant-specific identifiers (token, operator.*, context.open_*)
+        // to runtime logs / dashboards / persisted JSONL.
+        //
+        // `sanitize_card_action_payload` replaces those fields with
+        // deterministic `REDACTED_*` placeholders before the value reaches
+        // `record!`. The regression test
+        // `sanitize_card_action_payload_redacts_sensitive_fields` will fail
+        // if any of those raw values can leak through this path again.
+        //
+        // Default production RUST_LOG (=info) leaves this off, so it costs
+        // nothing at runtime; opt in with:
+        //
+        //   RUST_LOG=info,zeroclaw_log_event=debug
+        //
+        // Captured payloads should land in
+        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed
+        // by the integration test in `tests/lark_approval_live_evidence.rs`.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive).with_attrs(
+                ::serde_json::json!({
+                    "sanitized_payload": sanitize_card_action_payload(event_payload),
+                })
+            ),
+            "card.action.trigger sanitized payload"
+        );
+
+        // Feishu Card 2.0 button click events MAY round-trip the button value at
+        // `event.action.behaviors[0].value` instead of `event.action.value`
+        // (the Card 1.0 path). Both pointers are accepted for forward-compat;
+        // captured fixtures under `tests/fixtures/lark/` lock the shape that
+        // production currently emits.
+        let value = event_payload
+            .pointer("/action/value")
+            .or_else(|| event_payload.pointer("/action/behaviors/0/value"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing event.action.value or event.action.behaviors[0].value"
+                );
+                anyhow::Error::msg(
+                    "card.action.trigger: missing event.action.value or event.action.behaviors[0].value",
+                )
+            })?;
+
+        let approval_id = value
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing approval_id in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing approval_id in value")
+            })?;
+
+        let decision_str = value
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing decision in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing decision in value")
+            })?;
+
+        let decision = match decision_str {
+            "approve" => ChannelApprovalResponse::Approve,
+            "deny" => ChannelApprovalResponse::Deny,
+            "always" => ChannelApprovalResponse::AlwaysApprove,
+            other => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"decision_str": other})),
+                    "Lark: unknown approval decision — treating as deny"
+                );
+                ChannelApprovalResponse::Deny
+            }
+        };
+
+        let pending = self.pending_approvals.lock().await.remove(approval_id);
+        let Some(pending) = pending else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": approval_id,
+                        "decision": format!("{decision:?}"),
+                    })),
+                "Lark: card action for unknown/expired approval_id"
+            );
+            return Ok(());
+        };
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "approval_id": approval_id,
+                    "decision": format!("{decision:?}"),
+                    "message_id": pending.message_id,
+                    "has_message_id": !pending.message_id.is_empty(),
+                })),
+            "Lark: card action received"
+        );
+
+        let _ = pending.sender.send(decision);
+
+        if !pending.message_id.is_empty() {
+            self.patch_approval_card_resolved(
+                &pending.message_id,
+                &pending.tool_name,
+                &pending.arguments_summary,
+                decision,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
 }
 
 impl LarkChannel {
@@ -2077,6 +2694,31 @@ impl LarkChannel {
 
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
+            }
+
+            // Card button click events are not message events — route them
+            // through the approval-card resolver and short-circuit before the
+            // generic message parser sees them.
+            let event_type = payload
+                .pointer("/header/event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if event_type == "card.action.trigger"
+                && let Some(inner) = payload.get("event")
+            {
+                if let Err(e) = state.channel.handle_card_action_event(inner).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Dispatch
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Lark webhook: card action dispatch error"
+                    );
+                }
+                return (StatusCode::OK, "ok").into_response();
             }
 
             // Parse event messages
@@ -4044,6 +4686,315 @@ mod tests {
         assert_eq!(filename, "voice.m4a");
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Card 2.0 approval card tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_approval_card_contains_all_three_buttons() {
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo");
+
+        // Card 2.0 schema lock — guard against future regressions where the
+        // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
+        // silently refuses to re-render after the click).
+        assert_eq!(
+            card.get("schema").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "approval card must use Card JSON 2.0 schema"
+        );
+
+        let columns = card
+            .pointer("/body/elements/1/columns")
+            .and_then(|v| v.as_array())
+            .expect("column_set with columns missing");
+        assert_eq!(
+            columns.len(),
+            3,
+            "expected 3 button columns (Approve/Deny/Always)"
+        );
+
+        let decisions: Vec<&str> = columns
+            .iter()
+            .filter_map(|c| {
+                c.pointer("/elements/0/behaviors/0/value/decision")
+                    .and_then(|d| d.as_str())
+            })
+            .collect();
+        assert_eq!(decisions, vec!["approve", "deny", "always"]);
+    }
+
+    #[test]
+    fn build_approval_card_round_trips_approval_id_in_all_buttons() {
+        let card = build_approval_card("approval-abc-123", "tool", "args");
+        let columns = card["body"]["elements"][1]["columns"]
+            .as_array()
+            .expect("columns array");
+        for column in columns {
+            assert_eq!(
+                column["elements"][0]["behaviors"][0]["value"]["approval_id"],
+                "approval-abc-123"
+            );
+        }
+    }
+
+    #[test]
+    fn build_approval_card_and_resolved_card_share_schema_version() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let send_card = build_approval_card("id", "shell", "args");
+        let patch_card =
+            build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
+
+        let send_schema = send_card.get("schema").and_then(|v| v.as_str());
+        let patch_schema = patch_card.get("schema").and_then(|v| v.as_str());
+
+        assert_eq!(
+            send_schema, patch_schema,
+            "send-time approval card and PATCH-time resolved card MUST use the same Card JSON schema; \
+             Feishu's IM PATCH endpoint silently fails to re-render on the client when send/patch \
+             schema versions differ"
+        );
+        assert_eq!(send_schema, Some("2.0"));
+    }
+
+    #[test]
+    fn build_resolved_approval_card_uses_decision_specific_banner() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        for (decision, expected_template, expected_text_fragment) in [
+            (ChannelApprovalResponse::Approve, "green", "Approved"),
+            (
+                ChannelApprovalResponse::AlwaysApprove,
+                "green",
+                "Approved (always)",
+            ),
+            (ChannelApprovalResponse::Deny, "red", "Denied"),
+        ] {
+            let card = build_resolved_approval_card("shell", "args", decision);
+            assert_eq!(
+                card.pointer("/header/template").and_then(|v| v.as_str()),
+                Some(expected_template),
+                "decision={decision:?} should use header template {expected_template}"
+            );
+            let title = card
+                .pointer("/header/title/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                title.contains(expected_text_fragment),
+                "decision={decision:?} header title `{title}` should contain `{expected_text_fragment}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_sensitive_fields() {
+        let raw = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {
+                    "approval_id": "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7",
+                    "decision": "approve"
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_real_chat_id_LEAKED",
+                "open_message_id": "om_real_msg_id_LEAKED"
+            },
+            "host": "im_message",
+            "operator": {
+                "open_id": "ou_real_user_id_LEAKED",
+                "tenant_key": "real_tenant_key_LEAKED",
+                "union_id": "on_real_union_id_LEAKED",
+                "user_id": "real_user_id_LEAKED"
+            },
+            "token": "c-real_callback_token_LEAKED"
+        });
+
+        let sanitized = sanitize_card_action_payload(&raw);
+        let dumped = serde_json::to_string(&sanitized).expect("sanitized must serialize");
+
+        for forbidden in [
+            "oc_real_chat_id_LEAKED",
+            "om_real_msg_id_LEAKED",
+            "ou_real_user_id_LEAKED",
+            "real_tenant_key_LEAKED",
+            "on_real_union_id_LEAKED",
+            "real_user_id_LEAKED",
+            "c-real_callback_token_LEAKED",
+        ] {
+            assert!(
+                !dumped.contains(forbidden),
+                "sanitized payload must not contain raw value {forbidden:?}; got {dumped}"
+            );
+        }
+
+        assert_eq!(sanitized["token"], "REDACTED_TOKEN");
+        assert_eq!(
+            sanitized["operator"]["open_id"],
+            "REDACTED_OPERATOR_OPEN_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["union_id"],
+            "REDACTED_OPERATOR_UNION_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["user_id"],
+            "REDACTED_OPERATOR_USER_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["tenant_key"],
+            "REDACTED_OPERATOR_TENANT_KEY"
+        );
+        assert_eq!(
+            sanitized["context"]["open_chat_id"],
+            "REDACTED_OPEN_CHAT_ID"
+        );
+        assert_eq!(
+            sanitized["context"]["open_message_id"],
+            "REDACTED_OPEN_MESSAGE_ID"
+        );
+
+        assert_eq!(
+            sanitized["action"]["value"]["approval_id"],
+            "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7"
+        );
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+        assert_eq!(sanitized["action"]["tag"], "button");
+        assert_eq!(sanitized["host"], "im_message");
+
+        assert_eq!(raw["token"], "c-real_callback_token_LEAKED");
+        assert_eq!(raw["operator"]["open_id"], "ou_real_user_id_LEAKED");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_handles_missing_optional_fields() {
+        let raw = serde_json::json!({
+            "action": { "value": { "approval_id": "x", "decision": "approve" } }
+        });
+        let sanitized = sanitize_card_action_payload(&raw);
+        assert!(sanitized.get("token").is_none());
+        assert!(sanitized.get("operator").is_none());
+        assert!(sanitized.get("context").is_none());
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_committed_fixtures() {
+        let fixtures: [(&str, &str); 3] = [
+            (
+                "card_action_approve.json",
+                include_str!("../tests/fixtures/lark/card_action_approve.json"),
+            ),
+            (
+                "card_action_deny.json",
+                include_str!("../tests/fixtures/lark/card_action_deny.json"),
+            ),
+            (
+                "card_action_always.json",
+                include_str!("../tests/fixtures/lark/card_action_always.json"),
+            ),
+        ];
+        for (name, raw_text) in fixtures {
+            let raw: serde_json::Value = serde_json::from_str(raw_text)
+                .unwrap_or_else(|e| panic!("parse fixture {name}: {e}"));
+            let sanitized = sanitize_card_action_payload(&raw);
+            let dumped =
+                serde_json::to_string(&sanitized).expect("sanitized fixture must serialize");
+            for placeholder_field in [
+                "REDACTED_TOKEN",
+                "REDACTED_OPERATOR_OPEN_ID",
+                "REDACTED_OPEN_CHAT_ID",
+            ] {
+                assert!(
+                    dumped.contains(placeholder_field),
+                    "sanitizer output for {name} must contain {placeholder_field}; got {dumped}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_routes_approve_to_pending_sender() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-approval-1".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "value": { "approval_id": approval_id, "decision": "approve" },
+                "tag": "button"
+            }
+        });
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("handler ok");
+        let result = rx.await.expect("oneshot delivered");
+        assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_parses_card_v2_behaviors_value_payload() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Card 2.0 button click events MAY round-trip via
+        // event.action.behaviors[0].value instead of event.action.value.
+        // Verify the dual-pointer fallback.
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let approval_id = "test-v2-approval".to_string();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "behaviors": [{
+                    "type": "callback",
+                    "value": { "approval_id": approval_id, "decision": "always" }
+                }]
+            }
+        });
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("handler ok");
+        let result = rx.await.expect("oneshot delivered");
+        assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn handle_card_action_event_for_unknown_approval_is_not_an_error() {
+        let ch = make_channel();
+        let event = serde_json::json!({
+            "action": {
+                "value": { "approval_id": "never-existed", "decision": "deny" }
+            }
+        });
+        // Unknown approval IDs are dropped silently (info-log only); the
+        // handler must NOT propagate an error to the caller, since stray
+        // clicks (resent after restart) are routine.
+        ch.handle_card_action_event(&event)
+            .await
+            .expect("unknown approval id should not error");
+    }
     async fn mount_lark_token_and_send_mocks(mock_server: &wiremock::MockServer) {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, ResponseTemplate};

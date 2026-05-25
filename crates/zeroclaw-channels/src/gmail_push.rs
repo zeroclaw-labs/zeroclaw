@@ -534,6 +534,7 @@ impl GmailPushChannel {
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
                         attachments: Vec::new(),
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
