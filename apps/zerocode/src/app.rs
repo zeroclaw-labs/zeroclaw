@@ -52,7 +52,7 @@ impl Mode {
         match self {
             Mode::Dashboard => "Dashboard",
             Mode::Config => "Config",
-            Mode::Acp => "ACP",
+            Mode::Acp => "Code",
             Mode::Chat => "Chat",
             Mode::Logs => "Logs",
             Mode::Onboard => "Onboard",
