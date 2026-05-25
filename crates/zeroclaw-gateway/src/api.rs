@@ -2042,6 +2042,13 @@ mod tests {
             model: "test-model".into(),
             temperature: None,
             mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(MockMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),

@@ -1207,22 +1207,22 @@ async fn process_chat_message(
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
-                let mem = state.mem.clone();
+                let memory_strategy = state.memory_strategy.clone();
                 let model_provider = state.model_provider.clone();
                 let model = state.model.clone();
                 let temperature = state.temperature;
                 let user_msg = content.to_string();
                 let assistant_resp = outcome.response.clone();
                 zeroclaw_spawn::spawn!(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        model_provider.as_ref(),
-                        &model,
-                        temperature,
-                        mem.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
+                    if let Err(e) = memory_strategy
+                        .consolidate_turn(
+                            &user_msg,
+                            &assistant_resp,
+                            model_provider.as_ref(),
+                            &model,
+                            temperature,
+                        )
+                        .await
                     {
                         ::zeroclaw_log::record!(
                             DEBUG,
