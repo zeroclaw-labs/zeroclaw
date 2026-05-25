@@ -9,7 +9,7 @@ publish = false
 tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.0", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2.0"
 tauri-plugin-store = "2.0"
 tauri-plugin-single-instance = "2.0"
