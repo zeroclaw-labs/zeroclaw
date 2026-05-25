@@ -146,7 +146,10 @@ Alibaba's enterprise messenger. Same bot shape as WeCom.
 enabled = true
 app_id = "..."
 app_secret = "..."
+# use_feishu = true  # route this Lark-compatible channel to Feishu endpoints
 ```
+
+Build with `channel-lark` for either Lark or Feishu. The root `channel-feishu` feature is an alias for `channel-lark`; runtime selection still happens through `use_feishu = true`.
 
 ## QQ
 

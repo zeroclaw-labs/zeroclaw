@@ -322,6 +322,8 @@ channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
 channel-line = ["zeroclaw-channels/channel-line"]
+# Feishu uses the same channel implementation as Lark; `use_feishu = true`
+# selects Feishu endpoints at runtime.
 channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
