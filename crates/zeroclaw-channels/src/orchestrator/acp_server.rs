@@ -160,7 +160,7 @@ impl AcpServer {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel),
             &format!(
                 "ACP server starting (max_sessions={}, timeout={}s)",
                 self.acp_config.max_sessions, self.acp_config.session_timeout_secs
@@ -178,7 +178,7 @@ impl AcpServer {
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "ACP server writer already started"
                 );
@@ -212,6 +212,7 @@ impl AcpServer {
                                         module_path!(),
                                         ::zeroclaw_log::Action::Note
                                     )
+                                    .with_category(::zeroclaw_log::EventCategory::Channel)
                                     .with_attrs(::serde_json::json!({
                                         "id": id,
                                         "agent_alias": session.agent_alias,
@@ -230,7 +231,7 @@ impl AcpServer {
                 if reaped > 0 {
                     ::zeroclaw_log::record!(
                         DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_attrs(::serde_json::json!({"reaped": reaped})),
                         "Reaped expired session(s)"
                     );
@@ -244,7 +245,7 @@ impl AcpServer {
             if bytes_read == 0 {
                 ::zeroclaw_log::record!(
                     DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel),
                     "ACP server: stdin closed, shutting down"
                 );
                 break;
@@ -269,7 +270,7 @@ impl AcpServer {
     pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel),
             "ACP server starting (WebSocket/framed mode)"
         );
         while let Some(line) = input_rx.recv().await {
@@ -325,7 +326,7 @@ impl AcpServer {
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "Failed to parse JSON-RPC request"
@@ -353,7 +354,7 @@ impl AcpServer {
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"method": request.method})),
                     "ACP method not found"
@@ -373,7 +374,7 @@ impl AcpServer {
                 Err(e) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "method": request.method,
@@ -446,7 +447,7 @@ impl AcpServer {
         if sessions.len() + loading_count >= self.acp_config.max_sessions {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "active": sessions.len(),
@@ -595,7 +596,7 @@ impl AcpServer {
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
@@ -638,7 +639,7 @@ impl AcpServer {
             if sessions.len() + loading.len() >= self.acp_config.max_sessions {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "session_id": session_id,
@@ -660,7 +661,7 @@ impl AcpServer {
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"session_id": session_id})),
                     "ACP session/load rejected: session already active"
@@ -798,7 +799,7 @@ impl AcpServer {
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
@@ -837,7 +838,7 @@ impl AcpServer {
             if sessions.len() + loading.len() >= self.acp_config.max_sessions {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "session_id": session_id,
@@ -859,7 +860,7 @@ impl AcpServer {
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"session_id": session_id})),
                     "ACP session/resume rejected: session already active"
@@ -987,7 +988,7 @@ impl AcpServer {
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
@@ -1030,7 +1031,7 @@ impl AcpServer {
             token.cancel();
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_attrs(::serde_json::json!({"session_id": session_id})),
                 "ACP session/close: cancelled active turn"
             );
@@ -1053,7 +1054,7 @@ impl AcpServer {
         session.agent.channel_handles().unregister_channel("acp");
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
@@ -1138,7 +1139,7 @@ impl AcpServer {
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_attrs(::serde_json::json!({
                     "prompt_len": prompt.len(),
                 })),
@@ -1193,7 +1194,7 @@ impl AcpServer {
                     tool_call_count += 1;
                     ::zeroclaw_log::record!(
                         INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_attrs(::serde_json::json!({
                                 "tool_call_id": id,
                                 "tool": name,
@@ -1205,7 +1206,7 @@ impl AcpServer {
                 TurnEvent::ToolResult { id, name, output } => {
                     ::zeroclaw_log::record!(
                         INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_outcome(::zeroclaw_log::EventOutcome::Success)
                             .with_attrs(::serde_json::json!({
                                 "tool_call_id": id,
@@ -1245,7 +1246,7 @@ impl AcpServer {
         if was_cancelled {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "tool_calls": tool_call_count,
@@ -1259,7 +1260,7 @@ impl AcpServer {
         let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "error": e.to_string(),
@@ -1280,7 +1281,7 @@ impl AcpServer {
         {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "error": e.to_string(),
@@ -1291,7 +1292,7 @@ impl AcpServer {
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "tool_calls": tool_call_count,
@@ -1318,7 +1319,7 @@ impl AcpServer {
         if tokens.contains_key(session_id) {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"session_id": session_id})),
                 "ACP session/prompt rejected: session already has an active turn"
@@ -1432,7 +1433,7 @@ impl AcpServer {
         session.agent.channel_handles().unregister_channel("acp");
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "session_id": session_id,
@@ -1482,7 +1483,7 @@ impl AcpServer {
             token.cancel();
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_attrs(::serde_json::json!({"session_id": session_id})),
                 "ACP session/cancel: fired cancel token for active turn"
             );
@@ -1518,7 +1519,7 @@ impl AcpServer {
 
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel).with_attrs(
                 ::serde_json::json!({"event_type": event_type, "session_id": session_id})
             ),
             "Received session update (type=) for session"
@@ -1585,7 +1586,7 @@ impl AcpServer {
                 if !self.rpc.send_raw(json).await {
                     ::zeroclaw_log::record!(
                         ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                         "ACP writer task closed; dropping outbound message"
                     );
@@ -1594,7 +1595,7 @@ impl AcpServer {
             Err(e) => {
                 ::zeroclaw_log::record!(
                     ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "Failed to serialize JSON-RPC message"
@@ -1613,7 +1614,7 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
         if let Err(e) = stdout.write_all(line.as_bytes()).await {
             ::zeroclaw_log::record!(
                 ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to write to stdout"
@@ -1623,7 +1624,7 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
         if let Err(e) = stdout.write_all(b"\n").await {
             ::zeroclaw_log::record!(
                 ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to write newline to stdout"
@@ -1633,7 +1634,7 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
         if let Err(e) = stdout.flush().await {
             ::zeroclaw_log::record!(
                 ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "Failed to flush stdout"

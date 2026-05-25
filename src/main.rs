@@ -1305,15 +1305,17 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
-    // We also always redirect logs to stderr so stdout remains clean for data.
+    // For the ACP command, allow zeroclaw crates through at INFO so that
+    // structured record!() events reach the LogCaptureLayer and appear in
+    // the TUI log viewer. The fmt layer writes to stderr, not stdout, so
+    // there is no risk of corrupting the stdio JSON protocol. Third-party
+    // crates stay at WARN to avoid noise.
     let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
-        "warn"
+        "warn,zeroclaw=info,zeroclaw_channels=info,zeroclaw_runtime=info,zeroclaw_log=info,zeroclaw_infra=info"
     } else {
         // matrix_sdk crates are suppressed to warn because they are extremely
         // noisy at info level. To restore SDK-level output for Matrix debugging:
         //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
-        // acp_server has to be WARN because INFO injects junk data into the JSON stream.
         "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
     };
 
