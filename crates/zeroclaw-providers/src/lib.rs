@@ -1132,6 +1132,16 @@ fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
     (name, None)
 }
 
+pub(crate) fn moonshot_code_base_url() -> &'static str {
+    <zeroclaw_config::schema::MoonshotEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+        &zeroclaw_config::schema::MoonshotEndpoint::Code,
+    )
+}
+
+fn is_legacy_kimi_code_alias(name: &str) -> bool {
+    matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1160,6 +1170,7 @@ fn create_model_provider_inner(
         }
     }
     let (split_name, split_url) = split_v2_colon_url(raw_name);
+    let legacy_kimi_code = is_legacy_kimi_code_alias(split_name);
     let api_url = api_url.or(split_url);
     let name = canonicalize_v2_model_provider_name(split_name);
 
@@ -1226,6 +1237,17 @@ fn create_model_provider_inner(
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
             });
+
+    if legacy_kimi_code {
+        let base_url = match resolved_url {
+            Some(url) => url,
+            None => moonshot_code_base_url(),
+        };
+        return Ok(factory::apply_compat_options(
+            factory::build_kimi_code_compat(alias, key, base_url),
+            options,
+        ));
+    }
 
     factory::dispatch_family_factory(config, name, alias, key, resolved_url, options)
 }
@@ -1367,7 +1389,22 @@ pub fn create_routed_model_provider_with_options(
                     (!trimmed_key.is_empty()).then_some(trimmed_key)
                 })
             });
-        let key = routed_credential.or(api_key);
+        let key = routed_credential
+            .or_else(|| {
+                name.split_once('.')
+                    .and_then(|(family, alias)| {
+                        config
+                            .providers
+                            .models
+                            .find(family, alias)
+                            .and_then(|cfg| cfg.api_key.as_deref())
+                    })
+                    .and_then(|raw_key| {
+                        let trimmed = raw_key.trim();
+                        (!trimmed.is_empty()).then_some(trimmed)
+                    })
+            })
+            .or(api_key);
         let url = if name == primary_name { api_url } else { None };
         let entry_options = if name == primary_name {
             options.clone()
@@ -2070,7 +2107,65 @@ mod tests {
     }
 
     #[test]
-    fn factory_kimi_code() {}
+    fn factory_kimi_code_supports_vision() {
+        for alias in ["kimi-code", "kimi_coding", "kimi_for_coding"] {
+            let provider = create_model_provider(alias, Some("key"))
+                .expect("legacy kimi-code alias should build");
+            assert!(
+                provider.supports_vision(),
+                "alias `{alias}` should report vision capability"
+            );
+            assert_eq!(
+                moonshot_code_base_url(),
+                "https://api.moonshot.cn/coder/v1",
+                "alias `{alias}` should resolve to the Moonshot code endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn factory_kimi_code_preserves_semantics_with_url_overrides() {
+        let custom_url = "https://proxy.example.test/v1";
+
+        let provider = create_model_provider_with_url("kimi-code", Some("key"), Some(custom_url))
+            .expect("legacy kimi-code alias with custom URL should build");
+        assert!(provider.supports_vision());
+
+        let provider = create_model_provider_with_options(
+            "kimi-code",
+            Some("key"),
+            &ModelProviderRuntimeOptions {
+                provider_api_url: Some(custom_url.to_string()),
+                ..ModelProviderRuntimeOptions::default()
+            },
+        )
+        .expect("legacy kimi-code alias with options URL should build");
+        assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn moonshot_code_endpoint_supports_vision() {
+        use zeroclaw_config::schema::{Config, MoonshotEndpoint, MoonshotModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.moonshot.insert(
+            "code".to_string(),
+            MoonshotModelProviderConfig {
+                endpoint: MoonshotEndpoint::Code,
+                ..MoonshotModelProviderConfig::default()
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "moonshot", "code");
+        assert_eq!(
+            options.provider_api_url.as_deref(),
+            Some(moonshot_code_base_url())
+        );
+
+        let provider =
+            create_model_provider_for_alias(&config, "moonshot", "code", Some("key"), &options)
+                .expect("moonshot code endpoint should build");
+        assert!(provider.supports_vision());
+    }
 
     #[test]
     fn factory_synthetic() {
@@ -2157,6 +2252,7 @@ mod tests {
         assert!(create_model_provider("lmstudio", Some("key")).is_ok());
         assert!(create_model_provider("lmstudio", None).is_ok());
     }
+
     #[test]
     fn factory_llamacpp() {
         assert!(create_model_provider("llamacpp", Some("key")).is_ok());
@@ -2496,6 +2592,125 @@ mod tests {
             Some("https://ollama.com"),
         );
         assert!(model_provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ollama_private_remote_cloud_request_omits_auth_and_preserves_model() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Option<(Option<String>, String)>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *capture.lock().expect("capture lock poisoned") = Some((auth, model));
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let model_provider = create_model_provider_with_url("ollama", None, Some(&base_url))
+            .expect("ollama provider should build");
+        let response = model_provider
+            .chat_with_system(None, "hello", "qwen3:cloud", Some(0.7))
+            .await
+            .expect("chat request should succeed");
+
+        assert_eq!(response, "ok");
+        let (auth, model) = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(auth, None);
+        assert_eq!(model, "qwen3:cloud");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ollama_private_remote_lists_models_without_auth() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::get};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Option<Option<String>>>>;
+
+        async fn capture_models_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> Json<Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            *capture.lock().expect("capture lock poisoned") = Some(auth);
+            Json(json!({
+                "data": [{"id": "qwen3:cloud"}]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/models", get(capture_models_request))
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let model_provider = create_model_provider_with_url("ollama", None, Some(&base_url))
+            .expect("ollama provider should build");
+        let models = model_provider
+            .list_models()
+            .await
+            .expect("model list should succeed");
+
+        assert_eq!(models, vec!["qwen3:cloud".to_string()]);
+        let auth = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(auth, None);
+        server.abort();
     }
 
     #[test]
@@ -2899,5 +3114,150 @@ mod tests {
         assert!(tuning.temperature_override.is_none());
         assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
         assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
+    }
+
+    fn config_with_openai_alias() -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+        let mut config = Config::default();
+        let alias = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                api_key: Some("openai-alias-key".into()),
+                model: Some("gpt-4o".into()),
+                ..ModelProviderConfig::default()
+            },
+        };
+        config
+            .providers
+            .models
+            .openai
+            .insert("alias".to_string(), alias);
+        let agent = AliasedAgentConfig {
+            model_provider: "openai.alias".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("test_agent".to_string(), agent);
+        config
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_uses_route_key_first() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai.alias".into(),
+            model: "gpt-4o".into(),
+            api_key: Some("route-key".into()),
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "route-key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_uses_config_entry_key() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Route has no api_key — should fall back to config entry key "openai-alias-key"
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai.alias".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "config-entry key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_precedence_falls_back_to_api_key_param() {
+        let config = zeroclaw_config::schema::Config::default(); // no entry in config.models
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Neither route nor config entry has api_key — should use the param "fallback-key"
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "fallback-key should succeed: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn routed_model_provider_credential_skips_config_entry_for_non_dotted_name() {
+        let config = zeroclaw_config::schema::Config::default();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        // Non-dotted name "openai" — split_once('.') returns None, so config entry
+        // lookup is skipped entirely. Falls back to api_key param.
+        let routes = [zeroclaw_config::schema::ModelRouteConfig {
+            hint: "test".into(),
+            model_provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai",
+            Some("direct-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "direct-key should succeed: {}",
+            result.err().unwrap()
+        );
     }
 }

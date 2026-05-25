@@ -119,6 +119,7 @@
 # Contributing
 
 - [How to contribute](./contributing/how-to.md)
+- [Architecture and contribution map](./contributing/architecture-map.md)
 - [RFC process](./contributing/rfcs.md)
 - [Communication](./contributing/communication.md)
 - [Privacy & PII discipline](./contributing/privacy.md)

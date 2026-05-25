@@ -20,46 +20,69 @@
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
+#[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
+#[cfg(feature = "channel-bluesky")]
 pub use crate::bluesky::BlueskyChannel;
+#[cfg(feature = "channel-clawdtalk")]
 pub use crate::clawdtalk::ClawdTalkChannel;
+#[cfg(feature = "channel-dingtalk")]
 pub use crate::dingtalk::DingTalkChannel;
+#[cfg(feature = "channel-discord")]
 pub use crate::discord::DiscordChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-imessage")]
 pub use crate::imessage::IMessageChannel;
+#[cfg(feature = "channel-irc")]
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
 #[cfg(feature = "channel-line")]
 pub use crate::line::LineChannel;
+#[cfg(feature = "channel-linq")]
 pub use crate::linq::LinqChannel;
+#[cfg(feature = "channel-mattermost")]
 pub use crate::mattermost::MattermostChannel;
+#[cfg(feature = "channel-mochat")]
 pub use crate::mochat::MochatChannel;
+#[cfg(feature = "channel-nextcloud")]
 pub use crate::nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use crate::nostr::NostrChannel;
+#[cfg(feature = "channel-notion")]
 pub use crate::notion::NotionChannel;
+#[cfg(feature = "channel-qq")]
 pub use crate::qq::QQChannel;
+#[cfg(feature = "channel-reddit")]
 pub use crate::reddit::RedditChannel;
+#[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
+#[cfg(feature = "channel-slack")]
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
+#[cfg(feature = "channel-wati")]
 pub use crate::wati::WatiChannel;
+#[cfg(feature = "channel-webhook")]
 pub use crate::webhook::WebhookChannel;
 #[cfg(feature = "channel-wechat")]
 pub use crate::wechat::WeChatChannel;
+#[cfg(feature = "channel-wecom")]
 pub use crate::wecom::WeComChannel;
+#[cfg(feature = "channel-wecom-ws")]
+pub use crate::wecom_ws::WeComWsChannel;
+#[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
@@ -95,9 +118,9 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -125,7 +148,10 @@ struct ChannelNotifyObserver {
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        if let ObserverEvent::ToolCallStart { tool, arguments } = event {
+        if let ObserverEvent::ToolCallStart {
+            tool, arguments, ..
+        } = event
+        {
             self.tools_used.store(true, Ordering::Relaxed);
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
@@ -454,6 +480,9 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
     };
+    if msg.channel == "wecom_ws" {
+        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+    }
     // reply_target gives per-channel isolation (distinct Discord/Slack
     // channels) and thread_ts gives per-topic isolation in forum groups.
     // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
@@ -475,6 +504,14 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 }
 
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    if msg.channel == "wecom_ws" && msg.reply_target.starts_with("group--") {
+        let channel_scope = match &msg.channel_alias {
+            Some(alias) => format!("{}.{}", msg.channel, alias),
+            None => msg.channel.clone(),
+        };
+        return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+    }
+
     match &msg.interruption_scope_id {
         Some(scope) => format!(
             "{}_{}_{}_{}",
@@ -664,6 +701,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use absolute local paths when sending generated files whenever possible.\n",
         ),
+        "wecom_ws" => Some(
+            "When responding on WeCom AI Bot WebSocket:\n\
+             - Be concise and direct\n\
+             - Use Markdown text; the channel sends progressive draft updates when enabled\n\
+             - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
+        ),
         _ => None,
     }
 }
@@ -679,6 +722,7 @@ fn build_channel_system_prompt_for_message(
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+        &msg.id,
         bot_mention.as_deref(),
     )
 }
@@ -688,6 +732,7 @@ fn build_channel_system_prompt(
     channel_name: &str,
     reply_target: &str,
     sender: &str,
+    message_id: &str,
     bot_mention: Option<&str>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
@@ -751,9 +796,11 @@ fn build_channel_system_prompt(
         };
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}. \
+             reply_target={reply_target}, sender={sender}, message_id={message_id}. \
              The sender field is the platform-specific user ID of the person who sent \
              this message. Use it to distinguish between different users. \
+             The message_id field identifies this incoming message; pass it as the \
+             `message_id` argument when calling the `reaction` tool. \
              When scheduling delayed messages or reminders \
              via cron_add for this conversation, use {delivery_hint} so the message \
              reaches the user.\n\nCalibration note: agents in this system currently err \
@@ -846,7 +893,15 @@ fn strip_tool_summary_prefix(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
+    matches!(
+        channel_name,
+        "telegram" | "discord" | "matrix" | "slack" | "wecom_ws"
+    )
+}
+
+fn is_explicitly_addressed_channel_message(channel_name: &str, content: &str) -> bool {
+    channel_name == "wecom_ws"
+        && content.contains("[WeCom group message addressed to this bot via @")
 }
 
 fn is_matrix_channel_name(channel_name: &str) -> bool {
@@ -2957,6 +3012,23 @@ fn spawn_supervised_listener_with_health_interval(
                         backoff = initial_backoff_secs.max(1);
                     }
                     Err(e) => {
+                        if is_non_retryable_channel_listener_error(ch.name(), &e) {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "channel listener hit non-retryable error; waiting for config change or shutdown"
+                            );
+                            zeroclaw_runtime::health::mark_component_error(&component, e.to_string());
+                            tokio::select! {
+                                () = cancel.cancelled() => return,
+                                () = std::future::pending::<()>() => unreachable!(),
+                            }
+                        }
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -2981,6 +3053,22 @@ fn spawn_supervised_listener_with_health_interval(
         }
         .instrument(span),
     )
+}
+
+fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::Error) -> bool {
+    match channel_name {
+        name if name == "discord" || name.starts_with("discord-") => {
+            #[cfg(feature = "channel-discord")]
+            if error
+                .downcast_ref::<crate::discord::DiscordListenerFatalError>()
+                .is_some()
+            {
+                return true;
+            }
+            zeroclaw_providers::reliable::is_non_retryable(error)
+        }
+        _ => false,
+    }
 }
 
 fn compute_max_in_flight_messages(channel_count: usize) -> usize {
@@ -3474,15 +3562,21 @@ async fn process_channel_message_body(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let classifier_intent = classify_channel_reply_intent(
-        active_model_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let explicit_channel_address =
+        is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
+    let classifier_intent = if explicit_channel_address {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        classify_channel_reply_intent(
+            active_model_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -3829,6 +3923,9 @@ async fn process_channel_message_body(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
+                        ctx.prompt_config
+                            .agent(ctx.agent_alias.as_str())
+                            .is_some_and(|agent| agent.strict_tool_parsing),
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
@@ -4882,6 +4979,7 @@ fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
         #[cfg(feature = "channel-telegram")]
@@ -4909,6 +5007,11 @@ fn build_channel_by_id(
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-telegram"))]
+        "telegram" => {
+            anyhow::bail!("Telegram channel requires the `channel-telegram` feature");
+        }
+        #[cfg(feature = "channel-discord")]
         "discord" => {
             let dc = config
                 .channels
@@ -4942,6 +5045,11 @@ fn build_channel_by_id(
                 .with_approval_timeout_secs(dc.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-discord"))]
+        "discord" => {
+            anyhow::bail!("Discord channel requires the `channel-discord` feature");
+        }
+        #[cfg(feature = "channel-slack")]
         "slack" => {
             let sl = config
                 .channels
@@ -4970,6 +5078,11 @@ fn build_channel_by_id(
                 .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
         }
+        #[cfg(not(feature = "channel-slack"))]
+        "slack" => {
+            anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-mattermost")]
         "mattermost" => {
             let mm = config
                 .channels
@@ -4998,6 +5111,11 @@ fn build_channel_by_id(
                 .with_discover_dms(mm.discover_dms.unwrap_or(true)),
             ))
         }
+        #[cfg(not(feature = "channel-mattermost"))]
+        "mattermost" => {
+            anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
+        }
+        #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
                 .channels
@@ -5023,6 +5141,10 @@ fn build_channel_by_id(
                 )
                 .with_approval_timeout_secs(sg.approval_timeout_secs),
             ))
+        }
+        #[cfg(not(feature = "channel-signal"))]
+        "signal" => {
+            anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -5082,6 +5204,7 @@ fn build_channel_by_id(
                 anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
             }
         }
+        #[cfg(feature = "channel-qq")]
         "qq" => {
             let qq = config
                 .channels
@@ -5100,6 +5223,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-qq"))]
+        "qq" => {
+            anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
         "lark" => {
             #[cfg(feature = "channel-lark")]
@@ -5122,6 +5249,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Lark channel requires the `channel-lark` feature");
             }
         }
+        #[cfg(feature = "channel-dingtalk")]
         "dingtalk" => {
             let dt = config
                 .channels
@@ -5144,6 +5272,11 @@ fn build_channel_by_id(
                 .with_proxy_url(dt.proxy_url.clone()),
             ))
         }
+        #[cfg(not(feature = "channel-dingtalk"))]
+        "dingtalk" => {
+            anyhow::bail!("DingTalk channel requires the `channel-dingtalk` feature");
+        }
+        #[cfg(feature = "channel-wecom")]
         "wecom" => {
             let wc = config
                 .channels
@@ -5161,6 +5294,62 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-wecom"))]
+        "wecom" => {
+            anyhow::bail!("WeCom channel requires the `channel-wecom` feature");
+        }
+        #[cfg(feature = "channel-wecom-ws")]
+        channel_id
+            if channel_id == "wecom_ws"
+                || channel_id == "wecom-ws"
+                || channel_id.starts_with("wecom_ws.")
+                || channel_id.starts_with("wecom-ws.") =>
+        {
+            let alias = channel_id
+                .split_once('.')
+                .map(|(_, alias)| alias)
+                .unwrap_or("default")
+                .to_string();
+            let wc =
+                config.channels.wecom_ws.get(&alias).with_context(|| {
+                    format!("WeCom WebSocket channel '{alias}' is not configured")
+                })?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                let configured_allowed_users = wc.allowed_users.clone();
+                Arc::new(move || {
+                    let config = cfg_arc.read();
+                    let mut peers = configured_allowed_users.clone();
+                    for peer in config.channel_external_peers("wecom-ws", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    for peer in config.channel_external_peers("wecom_ws", &alias) {
+                        if !peers.contains(&peer) {
+                            peers.push(peer);
+                        }
+                    }
+                    peers
+                })
+            };
+            Ok(Arc::new(WeComWsChannel::new_with_alias(
+                wc,
+                alias.clone(),
+                peer_resolver,
+                &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+            )?))
+        }
+        #[cfg(not(feature = "channel-wecom-ws"))]
+        channel_id
+            if channel_id == "wecom_ws"
+                || channel_id == "wecom-ws"
+                || channel_id.starts_with("wecom_ws.")
+                || channel_id.starts_with("wecom-ws.") =>
+        {
+            anyhow::bail!("WeCom WebSocket channel requires the `channel-wecom-ws` feature");
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -5181,7 +5370,7 @@ fn build_channel_by_id(
                     peer_resolver,
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
-                    wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                    wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_persistence(config_arc.clone())
                 .with_workspace_dir(config.data_dir.clone()),
@@ -5191,6 +5380,7 @@ fn build_channel_by_id(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-nextcloud")]
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -5219,6 +5409,11 @@ fn build_channel_by_id(
                 .with_streaming(nc.stream_mode, nc.draft_update_interval_ms),
             ))
         }
+        #[cfg(not(feature = "channel-nextcloud"))]
+        "nextcloud_talk" | "nextcloud-talk" => {
+            anyhow::bail!("Nextcloud Talk channel requires the `channel-nextcloud` feature");
+        }
+        #[cfg(feature = "channel-wati")]
         "wati" => {
             let wati_cfg = config
                 .channels
@@ -5240,6 +5435,11 @@ fn build_channel_by_id(
                 wati_cfg.proxy_url.clone(),
             )))
         }
+        #[cfg(not(feature = "channel-wati"))]
+        "wati" => {
+            anyhow::bail!("WATI channel requires the `channel-wati` feature");
+        }
+        #[cfg(feature = "channel-linq")]
         "linq" => {
             let lq = config
                 .channels
@@ -5258,6 +5458,10 @@ fn build_channel_by_id(
                 alias,
                 peer_resolver,
             )))
+        }
+        #[cfg(not(feature = "channel-linq"))]
+        "linq" => {
+            anyhow::bail!("Linq channel requires the `channel-linq` feature");
         }
         #[cfg(feature = "channel-email")]
         "email" => {
@@ -5278,6 +5482,10 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
         #[cfg(feature = "channel-email")]
         "gmail_push" | "gmail-push" => {
             let gp = config
@@ -5297,6 +5505,11 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(not(feature = "channel-email"))]
+        "gmail_push" | "gmail-push" => {
+            anyhow::bail!("Gmail Push channel requires the `channel-email` feature");
+        }
+        #[cfg(feature = "channel-irc")]
         "irc" => {
             let irc_cfg = config
                 .channels
@@ -5324,6 +5537,11 @@ fn build_channel_by_id(
                 mention_only: irc_cfg.mention_only,
             })))
         }
+        #[cfg(not(feature = "channel-irc"))]
+        "irc" => {
+            anyhow::bail!("IRC channel requires the `channel-irc` feature");
+        }
+        #[cfg(feature = "channel-twitter")]
         "twitter" => {
             let tw = config
                 .channels
@@ -5342,6 +5560,11 @@ fn build_channel_by_id(
                 peer_resolver,
             )))
         }
+        #[cfg(not(feature = "channel-twitter"))]
+        "twitter" => {
+            anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
+        }
+        #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
                 .channels
@@ -5362,6 +5585,11 @@ fn build_channel_by_id(
                 mc.poll_interval_secs,
             )))
         }
+        #[cfg(not(feature = "channel-mochat"))]
+        "mochat" => {
+            anyhow::bail!("Mochat channel requires the `channel-mochat` feature");
+        }
+        #[cfg(feature = "channel-imessage")]
         "imessage" => {
             if !config.channels.imessage.contains_key("default") {
                 anyhow::bail!("iMessage channel is not configured");
@@ -5373,6 +5601,10 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("imessage", &alias))
             };
             Ok(Arc::new(IMessageChannel::new(alias, peer_resolver)))
+        }
+        #[cfg(not(feature = "channel-imessage"))]
+        "imessage" => {
+            anyhow::bail!("iMessage channel requires the `channel-imessage` feature");
         }
         "line" => {
             #[cfg(feature = "channel-line")]
@@ -5416,7 +5648,7 @@ fn build_channel_by_id(
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
+            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
             email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
@@ -5515,6 +5747,7 @@ fn collect_configured_channels(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[allow(unused_mut)]
     let mut channels = Vec::new();
 
     // Shadow `config` with a read guard so the existing body keeps
@@ -5566,6 +5799,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-telegram"))]
+    if !config.channels.telegram.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Telegram channel is configured but this build was compiled without \
+             `channel-telegram`; skipping Telegram."
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
         if !active_channel_aliases.contains(&format!("discord.{alias}")) {
             continue;
@@ -5620,6 +5865,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-discord"))]
+    if !config.channels.discord.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Discord channel is configured but this build was compiled without \
+             `channel-discord`; skipping Discord."
+        );
+    }
+
+    #[cfg(feature = "channel-slack")]
     for (alias, sl) in &config.channels.slack {
         if !active_channel_aliases.contains(&format!("slack.{alias}")) {
             continue;
@@ -5657,6 +5914,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-slack"))]
+    if !config.channels.slack.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Slack channel is configured but this build was compiled without \
+             `channel-slack`; skipping Slack."
+        );
+    }
+
+    #[cfg(feature = "channel-mattermost")]
     for (alias, mm) in &config.channels.mattermost {
         if !active_channel_aliases.contains(&format!("mattermost.{alias}")) {
             continue;
@@ -5692,6 +5961,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-mattermost"))]
+    if !config.channels.mattermost.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Mattermost channel is configured but this build was compiled without \
+             `channel-mattermost`; skipping Mattermost."
+        );
+    }
+
+    #[cfg(feature = "channel-imessage")]
     for (alias, im) in &config.channels.imessage {
         if !active_channel_aliases.contains(&format!("imessage.{alias}")) {
             continue;
@@ -5710,6 +5991,17 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
         });
+    }
+
+    #[cfg(not(feature = "channel-imessage"))]
+    if !config.channels.imessage.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "iMessage channel is configured but this build was compiled without \
+             `channel-imessage`; skipping iMessage."
+        );
     }
 
     #[cfg(feature = "channel-matrix")]
@@ -5768,6 +6060,7 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-signal")]
     for (alias, sig) in &config.channels.signal {
         if !active_channel_aliases.contains(&format!("signal.{alias}")) {
             continue;
@@ -5800,6 +6093,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-signal"))]
+    if !config.channels.signal.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Signal channel is configured but this build was compiled without \
+             `channel-signal`; skipping Signal."
+        );
+    }
+
+    #[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
     for (alias, wa) in &config.channels.whatsapp {
         if !active_channel_aliases.contains(&format!("whatsapp.{alias}")) {
             continue;
@@ -5817,6 +6122,7 @@ fn collect_configured_channels(
         }
         // Runtime negotiation: detect backend type from config
         match wa.backend_type() {
+            #[cfg(feature = "channel-whatsapp-cloud")]
             "cloud" => {
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
@@ -5850,6 +6156,24 @@ fn collect_configured_channels(
                         "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
                     );
                 }
+                #[cfg(not(feature = "channel-whatsapp-cloud"))]
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "WhatsApp Cloud API backend requires 'channel-whatsapp-cloud' feature. Build/run with --features channel-whatsapp-cloud"
+                    );
+                }
+            }
+            #[cfg(not(feature = "channel-whatsapp-cloud"))]
+            "cloud" => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "WhatsApp Cloud API is configured but this build was compiled without `channel-whatsapp-cloud`; skipping WhatsApp Cloud."
+                );
             }
             "web" => {
                 // Web mode: requires session_path
@@ -5904,6 +6228,7 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "channel-linq")]
     for (alias, lq) in &config.channels.linq {
         if !active_channel_aliases.contains(&format!("linq.{alias}")) {
             continue;
@@ -5928,6 +6253,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-linq"))]
+    if !config.channels.linq.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Linq channel is configured but this build was compiled without \
+             `channel-linq`; skipping Linq."
+        );
+    }
+
+    #[cfg(feature = "channel-wati")]
     for (alias, wati_cfg) in &config.channels.wati {
         if !active_channel_aliases.contains(&format!("wati.{alias}")) {
             continue;
@@ -5956,6 +6293,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-wati"))]
+    if !config.channels.wati.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "WATI channel is configured but this build was compiled without \
+             `channel-wati`; skipping WATI."
+        );
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
     for (alias, nc) in &config.channels.nextcloud_talk {
         if !active_channel_aliases.contains(&format!("nextcloud_talk.{alias}")) {
             continue;
@@ -5984,6 +6333,17 @@ fn collect_configured_channels(
                 nc.proxy_url.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-nextcloud"))]
+    if !config.channels.nextcloud_talk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Nextcloud Talk channel is configured but this build was compiled without \
+             `channel-nextcloud`; skipping Nextcloud Talk."
+        );
     }
 
     #[cfg(feature = "channel-email")]
@@ -6034,6 +6394,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-email"))]
+    if !config.channels.email.is_empty() || !config.channels.gmail_push.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Email/Gmail Push channel is configured but this build was compiled without \
+             `channel-email`; skipping Email and Gmail Push."
+        );
+    }
+
+    #[cfg(feature = "channel-irc")]
     for (alias, irc) in &config.channels.irc {
         if !active_channel_aliases.contains(&format!("irc.{alias}")) {
             continue;
@@ -6064,6 +6436,17 @@ fn collect_configured_channels(
                 mention_only: irc.mention_only,
             })),
         });
+    }
+
+    #[cfg(not(feature = "channel-irc"))]
+    if !config.channels.irc.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "IRC channel is configured but this build was compiled without \
+             `channel-irc`; skipping IRC."
+        );
     }
 
     #[cfg(feature = "channel-lark")]
@@ -6134,6 +6517,7 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-dingtalk")]
     for (alias, dt) in &config.channels.dingtalk {
         if !active_channel_aliases.contains(&format!("dingtalk.{alias}")) {
             continue;
@@ -6161,6 +6545,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-dingtalk"))]
+    if !config.channels.dingtalk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "DingTalk channel is configured but this build was compiled without \
+             `channel-dingtalk`; skipping DingTalk."
+        );
+    }
+
+    #[cfg(feature = "channel-qq")]
     for (alias, qq) in &config.channels.qq {
         if !active_channel_aliases.contains(&format!("qq.{alias}")) {
             continue;
@@ -6189,6 +6585,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-qq"))]
+    if !config.channels.qq.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "QQ channel is configured but this build was compiled without \
+             `channel-qq`; skipping QQ."
+        );
+    }
+
+    #[cfg(feature = "channel-twitter")]
     for (alias, tw) in &config.channels.twitter {
         if !active_channel_aliases.contains(&format!("twitter.{alias}")) {
             continue;
@@ -6212,6 +6620,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-twitter"))]
+    if !config.channels.twitter.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "X/Twitter channel is configured but this build was compiled without \
+             `channel-twitter`; skipping X/Twitter."
+        );
+    }
+
+    #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
             continue;
@@ -6237,6 +6657,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-mochat"))]
+    if !config.channels.mochat.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Mochat channel is configured but this build was compiled without \
+             `channel-mochat`; skipping Mochat."
+        );
+    }
+
+    #[cfg(feature = "channel-wecom")]
     for (alias, wc) in &config.channels.wecom {
         if !active_channel_aliases.contains(&format!("wecom.{alias}")) {
             continue;
@@ -6260,6 +6692,84 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-wecom"))]
+    if !config.channels.wecom.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "WeCom channel is configured but this build was compiled without \
+             `channel-wecom`; skipping WeCom."
+        );
+    }
+
+    #[cfg(feature = "channel-wecom-ws")]
+    for (alias, wc_ws) in &config.channels.wecom_ws {
+        if !active_channel_aliases.contains(&format!("wecom_ws.{alias}"))
+            && !active_channel_aliases.contains(&format!("wecom-ws.{alias}"))
+        {
+            continue;
+        }
+        if !wc_ws.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            let configured_allowed_users = wc_ws.allowed_users.clone();
+            Arc::new(move || {
+                let config = cfg_arc.read();
+                let mut peers = configured_allowed_users.clone();
+                for peer in config.channel_external_peers("wecom-ws", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                for peer in config.channel_external_peers("wecom_ws", &alias) {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+                peers
+            })
+        };
+        match WeComWsChannel::new_with_alias(
+            wc_ws,
+            alias.clone(),
+            peer_resolver,
+            &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
+        ) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "WeCom WebSocket",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{err:#}")})),
+                    format!(
+                        "WeCom WebSocket channel configuration is invalid; skipping WeCom WebSocket {matrix_skip_context}"
+                    ),
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-wecom-ws"))]
+    if !config.channels.wecom_ws.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            format!(
+                "WeCom WebSocket channel is configured but this build was compiled without `channel-wecom-ws`; skipping WeCom WebSocket {matrix_skip_context}."
+            ),
+        );
+    }
+
     #[cfg(feature = "channel-wechat")]
     for (alias, wechat) in &config.channels.wechat {
         if !active_channel_aliases.contains(&format!("wechat.{alias}")) {
@@ -6278,7 +6788,7 @@ fn collect_configured_channels(
             peer_resolver,
             wechat.api_base_url.clone(),
             wechat.cdn_base_url.clone(),
-            wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+            wechat.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
         ) {
             Ok(channel) => {
                 channels.push(ConfiguredChannel {
@@ -6312,6 +6822,7 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "channel-clawdtalk")]
     for (alias, ct) in &config.channels.clawdtalk {
         if !active_channel_aliases.contains(&format!("clawdtalk.{alias}")) {
             continue;
@@ -6326,7 +6837,19 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-clawdtalk"))]
+    if !config.channels.clawdtalk.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "ClawdTalk channel is configured but this build was compiled without \
+             `channel-clawdtalk`; skipping ClawdTalk."
+        );
+    }
+
     // Notion database poller channel
+    #[cfg(feature = "channel-notion")]
     if config.notion.enabled && !config.notion.database_id.trim().is_empty() {
         let notion_api_key = config.notion.api_key.trim().to_string();
         if notion_api_key.is_empty() {
@@ -6356,6 +6879,18 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(not(feature = "channel-notion"))]
+    if config.notion.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Notion channel is enabled but this build was compiled without \
+             `channel-notion`; skipping Notion."
+        );
+    }
+
+    #[cfg(feature = "channel-reddit")]
     for (alias, rd) in &config.channels.reddit {
         if !active_channel_aliases.contains(&format!("reddit.{alias}")) {
             continue;
@@ -6377,6 +6912,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-reddit"))]
+    if !config.channels.reddit.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Reddit channel is configured but this build was compiled without \
+             `channel-reddit`; skipping Reddit."
+        );
+    }
+
+    #[cfg(feature = "channel-bluesky")]
     for (alias, bs) in &config.channels.bluesky {
         if !active_channel_aliases.contains(&format!("bluesky.{alias}")) {
             continue;
@@ -6393,6 +6940,17 @@ fn collect_configured_channels(
                 bs.app_password.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-bluesky"))]
+    if !config.channels.bluesky.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Bluesky channel is configured but this build was compiled without \
+             `channel-bluesky`; skipping Bluesky."
+        );
     }
 
     #[cfg(feature = "voice-wake")]
@@ -6414,6 +6972,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "voice-wake"))]
+    if !config.channels.voice_wake.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "VoiceWake channel is configured but this build was compiled without \
+             `voice-wake`; skipping VoiceWake."
+        );
+    }
+
     #[cfg(feature = "channel-voice-call")]
     for (alias, vc) in &config.channels.voice_call {
         if !active_channel_aliases.contains(&format!("voice_call.{alias}")) {
@@ -6429,6 +6998,18 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(not(feature = "channel-voice-call"))]
+    if !config.channels.voice_call.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Voice Call channel is configured but this build was compiled without \
+             `channel-voice-call`; skipping Voice Call."
+        );
+    }
+
+    #[cfg(feature = "channel-webhook")]
     for (alias, wh) in &config.channels.webhook {
         if !active_channel_aliases.contains(&format!("webhook.{alias}")) {
             continue;
@@ -6449,6 +7030,17 @@ fn collect_configured_channels(
                 wh.secret.clone(),
             )),
         });
+    }
+
+    #[cfg(not(feature = "channel-webhook"))]
+    if !config.channels.webhook.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Webhook channel is configured but this build was compiled without \
+             `channel-webhook`; skipping Webhook."
+        );
     }
 
     channels
@@ -6494,6 +7086,20 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
                 ),
             });
+        }
+    }
+
+    #[cfg(not(feature = "channel-nostr"))]
+    {
+        let config = config_arc.read();
+        if !config.channels.nostr.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Nostr channel is configured but this build was compiled without \
+                 `channel-nostr`; skipping Nostr health check."
+            );
         }
     }
 
@@ -6971,6 +7577,12 @@ pub async fn start_channels(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+            native_tools,
+            agent.strict_tool_parsing,
+            &mut tool_descs,
+            &mut deferred_section,
+        );
         let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
             &workspace,
             &model,
@@ -6984,7 +7596,7 @@ pub async fn start_channels(
             agent.compact_context,
             agent.max_system_prompt_chars,
         );
-        if !native_tools {
+        if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 tools_registry.as_ref(),
                 &effective_tool_names,
@@ -7050,6 +7662,16 @@ pub async fn start_channels(
                         .await?,
                     ),
                 });
+            }
+            #[cfg(not(feature = "channel-nostr"))]
+            if !config.channels.nostr.is_empty() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Nostr channel is configured but this build was compiled without \
+                     `channel-nostr`; skipping Nostr."
+                );
             }
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
@@ -7461,6 +8083,7 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
+    let _ = config;
 
     // Scan for credential leaks before delivering
     let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
@@ -7491,6 +8114,7 @@ pub async fn deliver_announcement(
         ))
     })?;
     let channel_type = raw_type.to_ascii_lowercase();
+    #[allow(unused_variables)]
     let not_configured = || {
         ::zeroclaw_log::record!(
             ERROR,
@@ -7515,6 +8139,11 @@ pub async fn deliver_announcement(
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-telegram"))]
+        "telegram" => {
+            anyhow::bail!("Telegram channel requires the `channel-telegram` feature");
+        }
+        #[cfg(feature = "channel-discord")]
         "discord" => {
             let dc = config
                 .channels
@@ -7536,6 +8165,11 @@ pub async fn deliver_announcement(
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-discord"))]
+        "discord" => {
+            anyhow::bail!("Discord channel requires the `channel-discord` feature");
+        }
+        #[cfg(feature = "channel-slack")]
         "slack" => {
             let sl = config
                 .channels
@@ -7555,6 +8189,11 @@ pub async fn deliver_announcement(
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-slack"))]
+        "slack" => {
+            anyhow::bail!("Slack channel requires the `channel-slack` feature");
+        }
+        #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
                 .channels
@@ -7575,6 +8214,10 @@ pub async fn deliver_announcement(
                 sg.ignore_stories,
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-signal"))]
+        "signal" => {
+            anyhow::bail!("Signal channel requires the `channel-signal` feature");
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
@@ -7600,6 +8243,57 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-lark")]
+        "lark" | "feishu" => {
+            // [channels.lark.<alias>] is the single source of truth for both
+            // names (AGENTS.md). from_config selects the endpoint via
+            // use_feishu. Error text names the real config table, not the
+            // cron alias the user wrote.
+            let lk = config.channels.lark.get(alias).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    &format!(
+                        "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                    )
+                );
+                anyhow::Error::msg(format!(
+                    "[channels.lark.{alias}] not configured (cron channel \"{channel_type}.{alias}\")"
+                ))
+            })?;
+            // Asymmetric by design: "feishu"+use_feishu=false is a typo
+            // (hard fail). "lark"+use_feishu=true is a soft compat path
+            // (warn but still deliver via fallback construction).
+            if channel_type == "feishu" && !lk.use_feishu {
+                anyhow::bail!(
+                    "[channels.lark.{alias}] has use_feishu=false but cron channel=\"feishu.{alias}\"; \
+                     use channel=\"lark.{alias}\" or set use_feishu=true"
+                );
+            }
+            if channel_type == "lark" && lk.use_feishu {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "cron channel=\"lark.{alias}\" with [channels.lark.{alias}] use_feishu=true \
+                         falls back to one-shot channel construction; prefer channel=\"feishu.{alias}\" \
+                         to reuse the live Feishu handle from start_channels"
+                    )
+                );
+            }
+            let peers = config.channel_external_peers("lark", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-lark"))]
+        "lark" | "feishu" => {
+            anyhow::bail!("Lark channel requires the `channel-lark` feature");
+        }
+        #[cfg(feature = "channel-webhook")]
         "webhook" => {
             let wh = config
                 .channels
@@ -7617,9 +8311,27 @@ pub async fn deliver_announcement(
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
+        #[cfg(not(feature = "channel-webhook"))]
+        "webhook" => {
+            anyhow::bail!("Webhook channel requires the `channel-webhook` feature");
+        }
+        "wecom_ws" | "wecom-ws" => {
+            let _ = config
+                .channels
+                .wecom_ws
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            anyhow::bail!("wecom_ws channel is not connected");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
+    #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(feature = "channel-wechat")]
+fn expand_tilde_in_path(path: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
 #[cfg(test)]
@@ -8051,6 +8763,20 @@ mod tests {
         assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
         assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
         assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    #[test]
+    fn expand_tilde_in_path_expands_home_prefix() {
+        let expanded = expand_tilde_in_path("~/wechat-state");
+        assert!(!expanded.starts_with("~"));
+        assert!(expanded.ends_with("wechat-state"));
+
+        let absolute = expand_tilde_in_path("/absolute/path");
+        assert_eq!(absolute, PathBuf::from("/absolute/path"));
+
+        let relative = expand_tilde_in_path("relative/path");
+        assert_eq!(relative, PathBuf::from("relative/path"));
     }
 
     #[test]
@@ -12041,6 +12767,49 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn channel_strict_non_native_prompt_hides_text_tool_protocol() {
+        let ws = make_workspace();
+        let mut tool_descs = vec![("shell", "Run commands")];
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+
+        let expose_text_protocol =
+            apply_text_tool_prompt_policy(false, true, &mut tool_descs, &mut deferred_section);
+
+        let mut prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "gpt-4o",
+            &tool_descs,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+        );
+        if expose_text_protocol {
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+            let effective_tool_names: HashSet<&str> =
+                tools_registry.iter().map(|tool| tool.name()).collect();
+            prompt.push_str(&build_tool_instructions_for_names(
+                &tools_registry,
+                &effective_tool_names,
+            ));
+        }
+        if !deferred_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&deferred_section);
+        }
+
+        assert!(!expose_text_protocol);
+        assert!(!prompt.contains("## Tools"));
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(!prompt.contains("<tool_call>"));
+        assert!(!prompt.contains("mcp__example"));
+    }
+
+    #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
@@ -12478,6 +13247,7 @@ BTC is currently around $65,000 based on latest tool output."#
         observer.record_event(
             &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
                 tool: "file_write".to_string(),
+                tool_call_id: None,
                 arguments: Some(payload),
             },
         );
@@ -12607,6 +13377,56 @@ BTC is currently around $65,000 based on latest tool output."#
         let key = conversation_history_key(&msg);
         assert!(key.contains("_root_server"));
         assert!(!key.contains("_reply_server"));
+    }
+
+    #[test]
+    fn wecom_ws_conversation_history_key_uses_reply_target_scope() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_wecom_ws".into(),
+            sender: "zeroclaw_user".into(),
+            reply_target: "group--room-1".into(),
+            content: "hello".into(),
+            channel: "wecom_ws".into(),
+            channel_alias: Some("work".into()),
+            timestamp: 1,
+            thread_ts: Some("req-1".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg),
+            "wecom_ws_work_group--room-1"
+        );
+        assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+    }
+
+    #[test]
+    fn parse_runtime_command_allows_model_switch_for_wecom_ws() {
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("wecom_ws", "/model qwen-max"),
+            Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
+        );
+    }
+
+    #[test]
+    fn explicit_wecom_group_address_bypasses_reply_intent_precheck() {
+        assert!(is_explicitly_addressed_channel_message(
+            "wecom_ws",
+            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
+        ));
+        assert!(!is_explicitly_addressed_channel_message(
+            "wecom_ws",
+            "@danya say hi"
+        ));
+        assert!(!is_explicitly_addressed_channel_message(
+            "telegram",
+            "[WeCom group message addressed to this bot via @danya]\n@danya say hi"
+        ));
     }
 
     #[test]
@@ -13785,6 +14605,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(state, ChannelHealthState::Timeout);
     }
 
+    #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
         let mut config = Config::default();
@@ -13876,6 +14697,12 @@ This is an example JSON object for profile settings."#;
         calls: Arc<AtomicUsize>,
     }
 
+    struct FailOnceChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        err: Mutex<Option<anyhow::Error>>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -13917,6 +14744,18 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for FailOnceChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Discord,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for BlockUntilClosedChannel {
         fn name(&self) -> &str {
@@ -13933,6 +14772,28 @@ This is an example JSON object for profile settings."#;
         ) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for FailOnceChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(err) = self.err.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(err);
+            }
             Ok(())
         }
     }
@@ -14014,6 +14875,176 @@ This is an example JSON object for profile settings."#;
         assert!(join.is_ok(), "listener should stop on cancel");
         assert!(calls.load(Ordering::SeqCst) >= 1);
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_restart_on_non_retryable_discord_http_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(anyhow::Error::msg("401 Unauthorized"))),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert_eq!(component["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("401 Unauthorized")
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn supervised_listener_does_not_restart_on_fatal_discord_rate_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(anyhow::Error::new(
+                crate::discord::DiscordListenerFatalError::new(
+                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                ),
+            ))),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert_eq!(component["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
+        let discord_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let discord_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let healthy_name = format!("test-supervised-sibling-{}", uuid::Uuid::new_v4());
+        let discord_component = format!("channel:{discord_name}");
+        let healthy_component = format!("channel:{healthy_name}");
+
+        let discord_channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: discord_name,
+            calls: Arc::clone(&discord_calls),
+            err: Mutex::new(Some(anyhow::Error::new(
+                crate::discord::DiscordListenerFatalError::new(
+                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                ),
+            ))),
+        });
+        let healthy_channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: healthy_name,
+            calls: Arc::clone(&healthy_calls),
+        });
+
+        let (discord_tx, discord_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (healthy_tx, healthy_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let discord_handle =
+            spawn_supervised_listener(discord_channel, None, discord_tx, 1, 1, cancel.clone());
+        let healthy_handle = spawn_supervised_listener_with_health_interval(
+            healthy_channel,
+            None,
+            healthy_tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let first_last_ok = zeroclaw_runtime::health::snapshot_json()["components"]
+            [&healthy_component]["last_ok"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !first_last_ok.is_empty(),
+            "healthy sibling should report health"
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let discord = &snapshot["components"][&discord_component];
+        let healthy = &snapshot["components"][&healthy_component];
+        let second_last_ok = healthy["last_ok"].as_str().unwrap_or("").to_string();
+        let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+        let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
+            .expect("healthy sibling last_ok should be valid RFC3339");
+
+        assert_eq!(discord_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(discord["status"], "error");
+        assert_eq!(discord["restart_count"].as_u64().unwrap_or(0), 0);
+        assert!(
+            discord["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+        assert_eq!(healthy["status"], "ok");
+        assert!(
+            second > first,
+            "healthy sibling should keep refreshing health"
+        );
+        assert!(healthy_calls.load(Ordering::SeqCst) >= 1);
+
+        drop(discord_rx);
+        drop(healthy_rx);
+        cancel.cancel();
+        let discord_join = tokio::time::timeout(Duration::from_millis(500), discord_handle).await;
+        let healthy_join = tokio::time::timeout(Duration::from_millis(500), healthy_handle).await;
+        assert!(
+            discord_join.is_ok(),
+            "fatal discord listener should stop on cancel"
+        );
+        assert!(
+            healthy_join.is_ok(),
+            "healthy sibling listener should stop on cancel"
+        );
     }
 
     #[test]
@@ -15854,30 +16885,71 @@ Done."#;
             "mattermost",
             "channel123:root456",
             "user_abc123",
+            "msg-xyz789",
             None,
         );
-        assert!(prompt.contains("sender=user_abc123"));
-        assert!(prompt.contains("channel=mattermost"));
-        assert!(prompt.contains("reply_target=channel123:root456"));
+        // Pin the comma-separated tuple in the format string so a refactor
+        // that splits, reorders, or rewords the context block fails loudly
+        // rather than silently.
+        assert!(
+            prompt.contains(
+                "channel=mattermost, reply_target=channel123:root456, \
+                 sender=user_abc123, message_id=msg-xyz789"
+            ),
+            "prompt missing the joint channel-context tuple: {prompt}"
+        );
     }
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt =
-            build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123", None);
+        let prompt = build_channel_system_prompt(
+            "Base prompt.",
+            "mattermost",
+            "",
+            "user_abc123",
+            "msg-xyz789",
+            None,
+        );
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a =
-            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa", None);
-        let prompt_b =
-            build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb", None);
+        let prompt_a = build_channel_system_prompt(
+            "Base.",
+            "mattermost",
+            "ch:thread",
+            "user_aaa",
+            "msg-1",
+            None,
+        );
+        let prompt_b = build_channel_system_prompt(
+            "Base.",
+            "mattermost",
+            "ch:thread",
+            "user_bbb",
+            "msg-1",
+            None,
+        );
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_for_message_propagates_channel_fields() {
+        // The wrapper unpacks ChannelMessage into build_channel_system_prompt
+        // args. Pin the rendered prompt against every msg.* field the LLM
+        // is expected to see so a future refactor adding more fields can't
+        // silently drop existing ones.
+        let msg = channel_message("discord", None);
+        let prompt = build_channel_system_prompt_for_message("Base.", &msg, None);
+        assert!(
+            prompt.contains("channel=discord, reply_target=r1, sender=u1, message_id=m1"),
+            "wrapper did not propagate channel/reply_target/sender/message_id \
+             from ChannelMessage: {prompt}"
+        );
     }
 
     #[test]
@@ -15891,6 +16963,7 @@ Done."#;
             "webhook",
             "agent-chat:agent-1:thread-7",
             "user:abc",
+            "msg-1",
             None,
         );
         assert!(
@@ -15909,7 +16982,8 @@ Done."#;
 
     #[test]
     fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
-        let prompt = build_channel_system_prompt("Base.", "slack", "C12345", "U67890", None);
+        let prompt =
+            build_channel_system_prompt("Base.", "slack", "C12345", "U67890", "msg-1", None);
         assert!(
             prompt.contains("\"to\":\"C12345\""),
             "non-webhook cron hint should keep reply_target as `to`: {prompt}"
@@ -15917,6 +16991,93 @@ Done."#;
         assert!(
             !prompt.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_routes_lark_to_lark_arm() {
+        // Both names must enter the merged lark|feishu arm. Falling through
+        // to `unsupported delivery channel` would mean the schema enum and
+        // the match arm have drifted apart.
+        let config = zeroclaw_config::schema::Config::default();
+
+        for channel in ["lark.default", "feishu.default"] {
+            let err = deliver_announcement(&config, channel, "oc_test_chat", None, "hi")
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("expected {channel} to bail because channel is not configured")
+                });
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("unsupported delivery channel"),
+                "{channel} must route to lark|feishu arm, not fall through; got: {msg}"
+            );
+            assert!(
+                msg.contains("[channels.lark.default] not configured"),
+                "{channel} must report the real config table [channels.lark.default]; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-lark")]
+    async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
+        // Reject (not warn): otherwise the message silently lands on the
+        // Lark endpoint despite the user explicitly naming Feishu.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                use_feishu: false,
+                app_id: "cli_test".to_string(),
+                app_secret: "secret".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "feishu.work", "oc_test_chat", None, "hi")
+            .await
+            .expect_err("expected bail when channel=feishu but use_feishu=false");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("use_feishu=false"),
+            "bail must explain the use_feishu mismatch; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.lark.work]"),
+            "bail must point at the real config table; got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod omitted_feature_tests {
+    /// When `channel-telegram` is not compiled, a configured Telegram entry must
+    /// produce no channel in `collect_configured_channels`. This pins the behaviour
+    /// that selective builds never silently include a channel whose feature was
+    /// omitted, and ensures the `#[cfg(not(feature = "channel-telegram"))]` warn
+    /// path compiles correctly.
+    #[cfg(not(feature = "channel-telegram"))]
+    #[test]
+    fn collect_configured_channels_omits_telegram_when_compiled_out() {
+        use super::*;
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        assert!(
+            channels.iter().all(|c| c.display_name != "Telegram"),
+            "Telegram must be absent from collect_configured_channels when \
+             channel-telegram feature is not compiled in"
         );
     }
 }

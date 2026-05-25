@@ -12,7 +12,8 @@ For anything larger than a typo fix:
 
 1. **Check the issue tracker.** Someone may already be working on it or have filed a related discussion.
 2. **Read `AGENTS.md`.** The repo's root `AGENTS.md` is the canonical source of convention — risk tiers, PR discipline, anti-patterns, and review standards live there.
-3. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
+3. **Use the [Architecture and contribution map](./architecture-map.md)** for anything that touches architecture, config, security, workflow, governance, CI, release behavior, or AI-assisted contribution policy.
+4. **Pick a branch.** PRs target `master`. Fork the repo and branch from there; there's no develop/integration branch to go through.
 
 ## The flow
 
@@ -53,7 +54,21 @@ For the full five-level taxonomy (unit / component / integration / system / live
 - Prose changes go in `docs/book/src/**/*.md` (this mdBook)
 - Rustdoc (`///`) changes update the API reference automatically on deploy
 - Reference pages (`docs/book/src/reference/cli.md`, `config.md`) are generated — don't hand-edit. Run `cargo mdbook refs` and commit the output
-- Localisation — if you change user-facing strings, run `cargo mdbook sync` to refresh the `.po` files
+- Localisation — English markdown is the source of truth. Routine English docs PRs may omit broad generated `.po` churn; use the standard PR-body note in [Building the docs locally](../developing/building-docs.md).
+- Translation-cache PRs, release translation passes, and new locales should run `cargo mdbook sync`, commit the resulting `.po` files, and validate them with `cargo mdbook check`
+
+## Publishing blog or website metadata
+
+When you publish a blog post or otherwise update the public blog metadata, update the hand-maintained feed timestamps in the same PR:
+
+- `web/public/blog/rss.xml` — set `<lastBuildDate>` to the latest post publish time in RFC 2822 / GMT format
+- `web/public/blog/atom.xml` — set `<updated>` to the latest post publish time in ISO 8601 UTC format
+- `web/public/sitemap.xml` — set the `/blog` entry's `<lastmod>` to the latest publish date
+
+Keep feed discovery environment-local:
+
+- `web/index.html` should keep `/blog/rss.xml`, `/blog/atom.xml`, and `/sitemap.xml` as root-relative links
+- `web/public/sitemap.xml` should list the human-facing `/blog` page, not the XML feed files
 
 ## Commit messages
 
@@ -108,5 +123,6 @@ Don't be a jerk. Disagree on ideas; not people. Accept that maintainers will clo
 ## See also
 
 - [RFC process](./rfcs.md) — for anything bigger than a patch
+- [Architecture and contribution map](./architecture-map.md) — which architecture, foundation, and workflow docs to read first
 - [Communication](./communication.md) — how to reach the team
 - [Maintainers → Overview](../maintainers/index.md) — what maintainers do day-to-day

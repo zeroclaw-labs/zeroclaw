@@ -1663,36 +1663,48 @@ async fn main() -> Result<()> {
             max_sessions,
             session_timeout,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig {
-                max_sessions: config.acp.max_sessions,
-                session_timeout_secs: config.acp.session_timeout_secs,
-            };
-            if let Some(max) = max_sessions {
-                acp_config.max_sessions = max;
+            #[cfg(feature = "channel-acp-server")]
+            {
+                let mut acp_config = channels::acp_server::AcpServerConfig {
+                    max_sessions: config.acp.max_sessions,
+                    session_timeout_secs: config.acp.session_timeout_secs,
+                };
+                if let Some(max) = max_sessions {
+                    acp_config.max_sessions = max;
+                }
+                if let Some(timeout) = session_timeout {
+                    acp_config.session_timeout_secs = timeout;
+                }
+                let store =
+                    zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+                        .map(std::sync::Arc::new)
+                        .inspect_err(|e| {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                                "Failed to open ACP session store"
+                            );
+                        })
+                        .ok();
+                let server = if let Some(store) = store {
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
+                        config, acp_config, store,
+                    ))
+                } else {
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
+                };
+                server.run().await
             }
-            if let Some(timeout) = session_timeout {
-                acp_config.session_timeout_secs = timeout;
+            #[cfg(not(feature = "channel-acp-server"))]
+            {
+                let _ = (max_sessions, session_timeout);
+                anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
-            let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
-                .map(std::sync::Arc::new)
-                .inspect_err(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "Failed to open ACP session store"
-                    );
-                })
-                .ok();
-            let server = if let Some(store) = store {
-                std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                    config, acp_config, store,
-                ))
-            } else {
-                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-            };
-            server.run().await
         }
 
         Commands::Gateway { gateway_command } => {
@@ -1972,6 +1984,7 @@ async fn main() -> Result<()> {
                             .await
                         })
                     })),
+                    #[cfg(feature = "channel-mqtt")]
                     mqtt_start: Some(Box::new({
                         use std::sync::{Arc, Mutex};
                         use zeroclaw_config::schema::SopConfig;
@@ -2000,6 +2013,8 @@ async fn main() -> Result<()> {
                             })
                         }
                     })),
+                    #[cfg(not(feature = "channel-mqtt"))]
+                    mqtt_start: None,
                 };
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
@@ -2178,11 +2193,11 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (channel, configured) in config.channels.channels() {
+            for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
                 println!(
                     "  {:9} {}",
-                    channel.name(),
-                    if configured {
+                    entry.name,
+                    if entry.configured {
                         "✅ configured"
                     } else {
                         "❌ not configured"
@@ -2488,31 +2503,38 @@ async fn main() -> Result<()> {
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema { path } => {
-                let schema = schemars::schema_for!(config::Config);
-                let value = match path.as_deref() {
-                    None => {
-                        serde_json::to_value(&schema).context("failed to serialize JSON Schema")?
-                    }
-                    Some(prop_path) => {
-                        let full = serde_json::to_value(&schema)
-                            .context("failed to serialize JSON Schema")?;
-                        // Embed the requested path so consumers see the same hint
-                        // shape that OPTIONS /api/config/prop returns. Per-path
-                        // subtree extraction is a follow-up that walks the schema
-                        // by JSON Pointer; for now we attach the hint and return
-                        // the whole-config schema, mirroring the HTTP behavior.
-                        let mut out = full;
-                        if let serde_json::Value::Object(ref mut map) = out {
-                            map.insert(
-                                "x-zeroclaw-requested-path".into(),
-                                serde_json::Value::String(prop_path.into()),
-                            );
+                #[cfg(feature = "schema-export")]
+                {
+                    let schema = schemars::schema_for!(config::Config);
+                    let value = match path.as_deref() {
+                        None => serde_json::to_value(&schema)
+                            .context("failed to serialize JSON Schema")?,
+                        Some(prop_path) => {
+                            let full = serde_json::to_value(&schema)
+                                .context("failed to serialize JSON Schema")?;
+                            // Embed the requested path so consumers see the same hint
+                            // shape that OPTIONS /api/config/prop returns. Per-path
+                            // subtree extraction is a follow-up that walks the schema
+                            // by JSON Pointer; for now we attach the hint and return
+                            // the whole-config schema, mirroring the HTTP behavior.
+                            let mut out = full;
+                            if let serde_json::Value::Object(ref mut map) = out {
+                                map.insert(
+                                    "x-zeroclaw-requested-path".into(),
+                                    serde_json::Value::String(prop_path.into()),
+                                );
+                            }
+                            out
                         }
-                        out
-                    }
-                };
-                println!("{}", serde_json::to_string_pretty(&value)?);
-                Ok(())
+                    };
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                    Ok(())
+                }
+                #[cfg(not(feature = "schema-export"))]
+                {
+                    let _ = path;
+                    anyhow::bail!("zeroclaw was built without the 'schema-export' feature")
+                }
             }
             ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();

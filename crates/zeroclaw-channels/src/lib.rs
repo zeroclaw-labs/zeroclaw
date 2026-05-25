@@ -8,6 +8,7 @@
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;
+pub mod listing;
 pub mod orchestrator;
 pub mod util;
 
@@ -78,7 +79,9 @@ pub mod webhook;
 pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
-#[cfg(feature = "channel-whatsapp-cloud")]
+#[cfg(feature = "channel-wecom-ws")]
+pub mod wecom_ws;
+#[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;

@@ -152,8 +152,6 @@ gated_actions = [
 ]
 gated_domains = []
 gated_domain_categories = []
-challenge_delivery = "dm"
-challenge_timeout_secs = 120
 challenge_max_attempts = 3
 
 [security.estop]
