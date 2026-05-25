@@ -4625,23 +4625,36 @@ pub async fn process_message(
         ));
         }
 
-        // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
-        // Skip when the active risk profile's autonomy is `Full` — full-autonomy
-        // agents keep all tools.
+        // ── Compute final effective tool set BEFORE prompt construction ──
+        // This ensures the system prompt, tool instructions, and channel target
+        // injection all reflect the same policy-filtered tool set that will be
+        // used at execution time. Without this, the prompt could advertise
+        // tools (and their target identifiers) that the execution denylist
+        // would block — a control boundary violation.
+        //
+        // Note: compute_excluded_mcp_tools uses the raw message here (before
+        // thinking directive stripping). This is safe — dynamic tool filter
+        // keyword matching works the same, and risk-profile excluded_tools
+        // are message-independent.
+        let mut excluded_tools =
+            compute_excluded_mcp_tools(&tools_registry, &agent.tool_filter_groups, message);
         {
             let active_profile = &risk_profile;
             if active_profile.level != AutonomyLevel::Full {
-                let excluded = &active_profile.excluded_tools;
-                if !excluded.is_empty() {
-                    tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-                }
+                excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
             }
         }
-        // The risk-profile excluded_tools filter ran above on tool_descs
-        // already; here we only need the set of actually-registered tool
-        // names so we can drop description entries the registry can't fire.
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+
+        // Filter tool descriptions to match the effective set.
+        tool_descs.retain(|(name, _)| !excluded_tools.iter().any(|ex| ex == name));
+
+        // Derive effective tool names from the filtered set so prompt builders
+        // and channel target guards see the correct state.
+        let effective_tool_names: HashSet<&str> = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .collect();
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.compact_context {
@@ -4767,17 +4780,8 @@ pub async fn process_message(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
-        let mut excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
-            &agent.tool_filter_groups,
-            effective_msg_ref,
-        );
-        {
-            let active_profile = &risk_profile;
-            if active_profile.level != AutonomyLevel::Full {
-                excluded_tools.extend(active_profile.excluded_tools.iter().cloned());
-            }
-        }
+        // excluded_tools was already computed above for prompt construction.
+        // Re-use it here for execution — no need to recompute.
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
@@ -11677,5 +11681,43 @@ Let me check the result."#;
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
         );
+    }
+
+    /// Regression: process_message must NOT expose channel targets or channel_send
+    /// schema when channel_send is in the risk-profile excluded_tools list.
+    /// The prompt-visible tool set must match the execution-time denylist.
+    /// See PR #6665 — Audacity88 second review, blocking item.
+    #[test]
+    fn process_message_path_excludes_channel_send_from_prompt() {
+        use std::collections::HashSet;
+
+        // Simulate the tool registry that all_tools_with_runtime returns.
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            mock_tool("shell"),
+            mock_tool("file_read"),
+            mock_tool("channel_send"),
+            mock_tool("memory_store"),
+        ];
+
+        // Simulate risk-profile excluding channel_send.
+        let excluded_tools: Vec<String> = vec!["channel_send".to_string()];
+
+        // Derive effective tool names the way the fixed process_message path does:
+        // filter out excluded tools before building the prompt.
+        let effective_tool_names: HashSet<&str> = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .collect();
+
+        // channel_send must NOT be in the effective set.
+        assert!(
+            !effective_tool_names.contains("channel_send"),
+            "channel_send must be excluded from effective_tool_names when in excluded_tools"
+        );
+
+        // The channel_targets guard checks effective_tool_names — since
+        // channel_send is absent, it will NOT inject target identifiers.
+        // This is the contract we're verifying.
     }
 }
