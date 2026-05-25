@@ -33,7 +33,11 @@ Search before filing. Duplicates get consolidated; the search box is your friend
 
 ## GitHub Discussions
 
-For design chatter and conceptual conversations that aren't ready to be an issue. Works well for "does anyone else see this" posts and longer-form threads where Discord would scroll away.
+For community-facing threads that need more permanence than Discord but are not yet tracked work. Discussions work well for Q&A, ideas, show-and-tell, project or integration demos, polls, announcements, and "does anyone else see this?" threads where Discord would scroll away.
+
+Treat Discussions as non-urgent community conversation. They are maintained intake only when a steward or review cadence is documented.
+
+Discussions are part of the GitHub handoff system, not a replacement for issues, RFCs, PR comments, or maintainer docs. Move a Discussion into the tracked surface once it produces a concrete bug, feature scope, owner, blocker, validation evidence, policy decision, or docs requirement.
 
 [github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
 
