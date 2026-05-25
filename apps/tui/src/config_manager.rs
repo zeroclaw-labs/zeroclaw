@@ -413,20 +413,38 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Compute the display label for each tab-visible field. Labels are paths
+    /// relative to the current screen prefix so nested fields stay distinct
+    /// (e.g. `tool_receipts.enabled` instead of just `enabled`).
+    fn field_labels_for_tab(&self, tab_indices: &[usize]) -> Vec<String> {
+        let screen_prefix: &str = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix.as_str(),
+            _ => "",
+        };
+        tab_indices
+            .iter()
+            .map(|&i| {
+                let path = self.fields[i].path.as_str();
+                let rel = if !screen_prefix.is_empty() {
+                    path.strip_prefix(screen_prefix)
+                        .and_then(|s| s.strip_prefix('.'))
+                        .unwrap_or(path)
+                } else {
+                    path
+                };
+                if rel.is_empty() {
+                    path.rsplit('.').next().unwrap_or(path).to_string()
+                } else {
+                    rel.to_string()
+                }
+            })
+            .collect()
+    }
+
     /// Helper: visible field count for the regular (non-composite) field list.
     fn visible_field_count(&self) -> usize {
         let tab_indices = self.tab_field_indices();
-        let tab_names: Vec<String> = tab_indices
-            .iter()
-            .map(|&i| {
-                self.fields[i]
-                    .path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&self.fields[i].path)
-                    .to_string()
-            })
-            .collect();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         filter_vis.len()
     }
@@ -496,17 +514,7 @@ impl<'a> App<'a> {
             return self.filter_cursor;
         }
         let tab_indices = self.tab_field_indices();
-        let tab_names: Vec<String> = tab_indices
-            .iter()
-            .map(|&i| {
-                self.fields[i]
-                    .path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&self.fields[i].path)
-                    .to_string()
-            })
-            .collect();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
         visible
@@ -586,17 +594,7 @@ impl<'a> App<'a> {
     /// Helper: set field cursor from visible position.
     fn set_visible_field_cursor(&mut self, pos: usize) {
         let tab_indices = self.tab_field_indices();
-        let tab_names: Vec<String> = tab_indices
-            .iter()
-            .map(|&i| {
-                self.fields[i]
-                    .path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&self.fields[i].path)
-                    .to_string()
-            })
-            .collect();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
         if self.filter.is_some() {
@@ -756,6 +754,43 @@ impl<'a> App<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Refresh field values from the server WITHOUT disturbing UI state
+    /// (active tab, cursor, scroll, filter). Used on tab/pane transitions
+    /// so values stay current after out-of-band edits. Silent on failure —
+    /// retains the previously loaded data so the user sees no flicker.
+    async fn reload_fields_silent(&mut self, prefix: &str) {
+        let Ok(new_fields) = self.rpc.config_list(Some(prefix)).await else {
+            return;
+        };
+        // Preserve the synthesised Settings/composite tab promotion logic
+        // from load_fields(): if a Settings tab exists, retag un-annotated
+        // fields so tab_field_indices() keeps finding them.
+        let has_settings_tab = self.tab_names.contains(&ConfigTab::Settings);
+        let mut new_fields = new_fields;
+        if has_settings_tab {
+            for f in &mut new_fields {
+                if f.tab == ConfigTab::None {
+                    f.tab = ConfigTab::Settings;
+                }
+            }
+        }
+        self.fields = new_fields;
+        // Clamp cursor in case fields shrank.
+        if !self.fields.is_empty() && self.field_cursor >= self.fields.len() {
+            self.field_cursor = self.fields.len() - 1;
+        }
+    }
+
+    /// Convenience: silently reload whichever prefix the current FieldList
+    /// is displaying. No-op when the current screen is not a FieldList.
+    async fn reload_current_field_list_silent(&mut self) {
+        let prefix = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix.clone(),
+            _ => return,
+        };
+        self.reload_fields_silent(&prefix).await;
     }
 
     /// Indices of fields visible under the active tab (all fields when no tabs).
@@ -1152,17 +1187,7 @@ impl<'a> App<'a> {
 
         // Fields visible under active tab, then filtered by `/` query.
         let tab_indices = self.tab_field_indices();
-        let tab_names: Vec<String> = tab_indices
-            .iter()
-            .map(|&i| {
-                self.fields[i]
-                    .path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&self.fields[i].path)
-                    .to_string()
-            })
-            .collect();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         // Map back to original field indices.
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
@@ -1271,6 +1296,10 @@ impl<'a> App<'a> {
 
     /// Called after ←/→ tab switch — loads data for composite tabs.
     async fn on_tab_switched(&mut self, term: &mut Term) -> Result<()> {
+        // Silent refresh of the underlying field list so values stay
+        // current after out-of-band edits — no flicker, no status churn.
+        self.reload_current_field_list_silent().await;
+
         if !self.is_composite_tab() {
             return Ok(());
         }
@@ -1727,6 +1756,55 @@ impl<'a> App<'a> {
             }
         }
 
+        // `risk_profile` / `runtime_profile` inside an agent alias →
+        // present a picker populated from the matching map's aliases.
+        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
+        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
+        if field_path.starts_with("agents.") {
+            let segs: Vec<&str> = field_path.split('.').collect();
+            // Expect agents.<alias>.<field>
+            if segs.len() == 3 {
+                let map_path = match segs[2] {
+                    "risk_profile" => Some("risk_profiles"),
+                    "runtime_profile" => Some("runtime_profiles"),
+                    _ => None,
+                };
+                if let Some(map_path) = map_path {
+                    self.status_msg = Some(format!("Loading {map_path}..."));
+                    let _ = self.draw(term);
+                    match self.rpc.config_list(Some(map_path)).await {
+                        Ok(entries) => {
+                            let prefix = format!("{map_path}.");
+                            let mut aliases: Vec<String> = entries
+                                .iter()
+                                .filter_map(|e| e.path.strip_prefix(&prefix))
+                                .filter_map(|rest| rest.split('.').next())
+                                .map(|s| s.to_string())
+                                .collect();
+                            aliases.sort();
+                            aliases.dedup();
+                            if !aliases.is_empty() {
+                                self.select_cursor = aliases
+                                    .iter()
+                                    .position(|v| v == &field_current)
+                                    .unwrap_or(0);
+                                self.select_items = aliases;
+                                self.status_msg = None;
+                            } else {
+                                self.status_msg = Some(format!(
+                                    "No {map_path} defined — enter manually"
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            self.status_msg =
+                                Some(format!("{map_path} fetch failed — enter manually"));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Screen::FieldList {
             section_idx,
             prefix,
@@ -2011,6 +2089,8 @@ impl<'a> App<'a> {
             ..
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
+            // Silent refresh so values reflect any saves while editing.
+            self.reload_fields_silent(&prefix).await;
             self.screen = Screen::FieldList {
                 section_idx,
                 prefix,
@@ -2028,6 +2108,8 @@ impl<'a> App<'a> {
             field_idx,
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
+            // Silent refresh — preserves cursor below.
+            self.reload_fields_silent(&prefix).await;
             self.field_cursor = field_idx.min(self.fields.len().saturating_sub(1));
             self.screen = Screen::FieldList {
                 section_idx,
@@ -2365,17 +2447,7 @@ impl<'a> App<'a> {
 
         // Fields visible under active tab, then filtered by `/` query.
         let tab_indices = self.tab_field_indices();
-        let tab_names: Vec<String> = tab_indices
-            .iter()
-            .map(|&i| {
-                self.fields[i]
-                    .path
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(&self.fields[i].path)
-                    .to_string()
-            })
-            .collect();
+        let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
 
@@ -2788,6 +2860,63 @@ impl<'a> App<'a> {
             Paragraph::new(Span::styled(hints, theme::dim_style())),
             r.hints,
         );
+    }
+
+    /// Handle a bracketed-paste payload. Routes pasted text into whichever
+    /// text-input surface is currently active (filter, edit buffer, alias
+    /// create, personality/skills editor). Filters out the bracket-paste
+    /// terminator bytes and normalises CRLF.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        // Normalise line endings — bracketed paste can deliver \r, \r\n,
+        // or \n depending on terminal.
+        let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        // Filter active: paste goes into the filter buffer.
+        if let Some(buf) = self.filter.as_mut() {
+            for c in cleaned.chars() {
+                if c == '\n' { continue; } // filter is single-line
+                buf.push(c);
+            }
+            return;
+        }
+
+        match &self.screen {
+            Screen::AliasCreate { .. } => {
+                // Aliases are single-line identifiers.
+                for c in cleaned.chars() {
+                    if c == '\n' { continue; }
+                    self.edit_buf.push(c);
+                }
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                if self.is_select_edit() {
+                    return; // No text input on select screens.
+                }
+                let is_string_array = self
+                    .fields
+                    .get(*field_idx)
+                    .map(|f| f.kind == PropKind::StringArray)
+                    .unwrap_or(false);
+                if is_string_array {
+                    // Preserve newlines so each pasted line becomes a new entry.
+                    self.edit_buf.push_str(&cleaned);
+                } else {
+                    // Scalar fields: strip newlines.
+                    for c in cleaned.chars() {
+                        if c == '\n' { continue; }
+                        self.edit_buf.push(c);
+                    }
+                }
+            }
+            Screen::FieldList { .. } => {
+                if self.personality_active_file.is_some() {
+                    self.personality_content.push_str(&cleaned);
+                } else if self.skills_active.is_some() {
+                    self.skills_body.push_str(&cleaned);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).

@@ -317,6 +317,7 @@ pub async fn run(
                 match mode {
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
+                    Mode::Config => config_app.handle_paste(&text),
                     _ => {}
                 }
             }
