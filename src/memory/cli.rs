@@ -6,6 +6,7 @@ use super::{
 use crate::config::Config;
 use anyhow::{Result, bail};
 use console::style;
+use zeroclaw_runtime::i18n;
 
 /// Handle `zeroclaw memory <subcommand>` CLI commands.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
@@ -215,17 +216,15 @@ async fn handle_clear(
     category: Option<String>,
     yes: bool,
 ) -> Result<()> {
-    let backend = effective_memory_backend_name(
-        &config.memory.backend,
-        Some(&config.storage.provider.config),
-    );
+    let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(
         classify_memory_backend(&backend),
         MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant
     ) {
-        bail!(
-            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
-        );
+        bail!(i18n::get_required_cli_string_with_args(
+            "cli-memory-clear-unsupported-backend",
+            &[("backend", &backend)]
+        ));
     }
     let mem = create_cli_memory(config)?;
 
@@ -386,7 +385,7 @@ mod tests {
     async fn clear_rejects_append_only_markdown_backend() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
+        config.data_dir = tmp.path().to_path_buf();
         config.memory.backend = "markdown".into();
 
         let err = handle_command(
@@ -409,7 +408,7 @@ mod tests {
     async fn clear_rejects_qdrant_backend_constructed_as_markdown() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
+        config.data_dir = tmp.path().to_path_buf();
         config.memory.backend = "qdrant".into();
 
         let err = handle_command(
@@ -429,12 +428,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_rejects_storage_configured_qdrant_backend() {
+    async fn clear_rejects_dotted_qdrant_backend() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
-        config.workspace_dir = tmp.path().to_path_buf();
-        config.memory.backend = "markdown".into();
-        config.storage.provider.config.provider = "qdrant".into();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "qdrant.default".into();
 
         let err = handle_command(
             crate::MemoryCommands::Clear {
