@@ -92,16 +92,22 @@ export default function Canvas() {
     return () => clearInterval(interval);
   }, []);
 
-  // Render content into the iframe
+  // Strip <script> tags and on* event-handler attributes from SVG content.
+  // Defense-in-depth: the sandbox already blocks parent access, but this
+  // prevents script execution even if sandbox flags are ever loosened.
+  const sanitizeSvg = (svg: string): string => {
+    return svg
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<script[^>]*>/gi, '')
+      .replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+  };
+
+  // Render content into the iframe via srcDoc — no allow-same-origin needed,
+  // so scripts inside the frame cannot reach window.parent or localStorage.
   useEffect(() => {
     if (!iframeRef.current || !currentFrame) return;
     if (currentFrame.content_type === 'eval') return; // eval frames are special
 
-    const iframe = iframeRef.current;
-    const doc = iframe.contentDocument;
-    if (!doc) return;
-
-    let html = currentFrame.content;
     const cs = getComputedStyle(document.documentElement);
     const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
     const textPrimary = cs.getPropertyValue('--pc-text-primary').trim() || '#d4d4d8';
@@ -109,25 +115,31 @@ export default function Canvas() {
     const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
     const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
 
+    // CSP for non-html content types: no scripts needed.
+    const noScriptCsp = `<meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none';">`;
+
+    let html: string;
     if (currentFrame.content_type === 'svg') {
-      html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${currentFrame.content}</body></html>`;
+      const sanitized = sanitizeSvg(currentFrame.content);
+      html = `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${sanitized}</body></html>`;
     } else if (currentFrame.content_type === 'markdown') {
       const escaped = currentFrame.content
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
+      html = `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
     } else if (currentFrame.content_type === 'text') {
       const escaped = currentFrame.content
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+      html = `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+    } else {
+      // html content type: scripts are legitimate, no CSP restriction.
+      html = currentFrame.content;
     }
 
-    doc.open();
-    doc.write(html);
-    doc.close();
+    iframeRef.current.srcdoc = html;
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
@@ -259,7 +271,7 @@ export default function Canvas() {
           {currentFrame ? (
             <iframe
               ref={iframeRef}
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts"
               className="w-full h-full border-0"
               title={`Canvas: ${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
