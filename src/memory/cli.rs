@@ -6,6 +6,7 @@ use super::{
 use crate::config::Config;
 use anyhow::{Result, bail};
 use console::style;
+#[cfg(feature = "agent-runtime")]
 use zeroclaw_runtime::i18n;
 
 /// Handle `zeroclaw memory <subcommand>` CLI commands.
@@ -210,6 +211,23 @@ async fn handle_stats(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn unsupported_clear_backend_message(backend: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        return i18n::get_required_cli_string_with_args(
+            "cli-memory-clear-unsupported-backend",
+            &[("backend", backend)],
+        );
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
+        )
+    }
+}
+
 async fn handle_clear(
     config: &Config,
     key: Option<String>,
@@ -221,10 +239,7 @@ async fn handle_clear(
         classify_memory_backend(&backend),
         MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant
     ) {
-        bail!(i18n::get_required_cli_string_with_args(
-            "cli-memory-clear-unsupported-backend",
-            &[("backend", &backend)]
-        ));
+        bail!(unsupported_clear_backend_message(&backend));
     }
     let mem = create_cli_memory(config)?;
 
