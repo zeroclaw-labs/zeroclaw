@@ -2529,6 +2529,100 @@ mod tests {
         SecurityPolicy::default()
     }
 
+    // Platform-specific test paths: Unix uses `/…` paths, Windows uses
+    // `C:\…` paths so that `Path::is_absolute()` returns the correct
+    // value on each platform.
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_ws() -> PathBuf {
+        PathBuf::from("/home/user/.zeroclaw/workspace")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_ws() -> PathBuf {
+        PathBuf::from("C:\\Users\\user\\.zeroclaw\\workspace")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_ws_shared() -> PathBuf {
+        PathBuf::from("/home/user/.zeroclaw/shared")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_ws_shared() -> PathBuf {
+        PathBuf::from("C:\\Users\\user\\.zeroclaw\\shared")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_outside1() -> &'static str {
+        "/home/user/other/file.txt"
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_outside1() -> &'static str {
+        "C:\\Users\\user\\other\\file.txt"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_outside2() -> &'static str {
+        "/tmp/file.txt"
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_outside2() -> &'static str {
+        "C:\\Users\\Public\\file.txt"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_sys() -> &'static str {
+        "/etc"
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_sys() -> &'static str {
+        "C:\\Windows\\System32"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_sys_sub(sub: &str) -> String {
+        format!("/{sub}")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_sys_sub(sub: &str) -> String {
+        format!("C:\\Windows\\{}", sub.replace('/', "\\"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_proj() -> PathBuf {
+        PathBuf::from("/projects")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_proj() -> PathBuf {
+        PathBuf::from("C:\\projects")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_data() -> PathBuf {
+        PathBuf::from("/data")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_data() -> PathBuf {
+        PathBuf::from("C:\\data")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_rw() -> PathBuf {
+        PathBuf::from("/rw-data")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_rw() -> PathBuf {
+        PathBuf::from("C:\\rw-data")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn tp_ro() -> PathBuf {
+        PathBuf::from("/ro-shared")
+    }
+    #[cfg(target_os = "windows")]
+    fn tp_ro() -> PathBuf {
+        PathBuf::from("C:\\ro-shared")
+    }
+
     // ── is_tool_allowed truth table ──────────────────────────
     //
     // None         → unrestricted: every name allowed
@@ -3099,40 +3193,38 @@ mod tests {
     #[test]
     fn absolute_paths_blocked_when_workspace_only() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/etc/passwd"));
-        assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
-        assert!(!p.is_path_allowed("/tmp/file.txt"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("etc/passwd")));
+        assert!(!p.is_path_allowed(&tp_sys_sub("root/.ssh/id_rsa")));
+        assert!(!p.is_path_allowed(tp_outside2()));
     }
 
     #[test]
     fn absolute_path_inside_workspace_allowed_when_workspace_only() {
+        let ws = tp_ws();
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_dir: ws.clone(),
             workspace_only: true,
             ..SecurityPolicy::default()
         };
-        // Absolute path inside workspace should be allowed
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/images/example.png"));
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
-        // Absolute path outside workspace should still be blocked
-        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
-        assert!(!p.is_path_allowed("/tmp/file.txt"));
+        assert!(p.is_path_allowed(&format!("{}/images/example.png", ws.display())));
+        assert!(p.is_path_allowed(&format!("{}/file.txt", ws.display())));
+        assert!(!p.is_path_allowed(tp_outside1()));
+        assert!(!p.is_path_allowed(tp_outside2()));
     }
 
     #[test]
     fn absolute_path_in_allowed_root_permitted_when_workspace_only() {
+        let ws = tp_ws();
+        let shared = tp_ws_shared();
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/home/user/.zeroclaw/workspace"),
+            workspace_dir: ws.clone(),
             workspace_only: true,
-            allowed_roots: vec![PathBuf::from("/home/user/.zeroclaw/shared")],
+            allowed_roots: vec![shared.clone()],
             ..SecurityPolicy::default()
         };
-        // Path in allowed root should be permitted
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/shared/data.txt"));
-        // Path in workspace should still be permitted
-        assert!(p.is_path_allowed("/home/user/.zeroclaw/workspace/file.txt"));
-        // Path outside both should still be blocked
-        assert!(!p.is_path_allowed("/home/user/other/file.txt"));
+        assert!(p.is_path_allowed(&format!("{}/data.txt", shared.display())));
+        assert!(p.is_path_allowed(&format!("{}/file.txt", ws.display())));
+        assert!(!p.is_path_allowed(tp_outside1()));
     }
 
     #[test]
@@ -3151,8 +3243,8 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/etc/passwd"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("etc/passwd")));
+        assert!(!p.is_path_allowed(&tp_sys_sub("root/.bashrc")));
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/pubring.kbx"));
     }
@@ -3243,11 +3335,11 @@ mod tests {
             allowed_roots: vec!["~/Desktop".into(), "shared-data".into()],
             ..crate::schema::RiskProfileConfig::default()
         };
-        let workspace = PathBuf::from("/tmp/test-workspace");
+        let workspace = tp_ws();
         let policy = SecurityPolicy::from_risk_profile(&autonomy_config, &workspace);
 
-        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join("Desktop")
+        let expected_home_root = if let Some(home) = home_dir() {
+            home.join("Desktop")
         } else {
             PathBuf::from("~/Desktop")
         };
@@ -3919,7 +4011,7 @@ mod tests {
     #[test]
     fn path_symlink_style_absolute() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/proc/self/root/etc/passwd"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("proc/self/root/etc/passwd")));
     }
 
     #[test]
@@ -3940,7 +4032,7 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/var/run/docker.sock"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("var/run/docker.sock")));
     }
 
     // ── Edge cases: rate limiter boundary ────────────────────
@@ -4008,8 +4100,8 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/etc/shadow"));
-        assert!(!p.is_path_allowed("/root/.bashrc"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("etc/shadow")));
+        assert!(!p.is_path_allowed(&tp_sys_sub("root/.bashrc")));
     }
 
     #[test]
@@ -4315,8 +4407,8 @@ mod tests {
     #[test]
     fn checklist_root_path_blocked() {
         let p = default_policy();
-        assert!(!p.is_path_allowed("/"));
-        assert!(!p.is_path_allowed("/anything"));
+        assert!(!p.is_path_allowed(tp_sys()));
+        assert!(!p.is_path_allowed(&tp_sys_sub("anything")));
     }
 
     #[test]
@@ -4325,17 +4417,45 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        for dir in [
-            "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
-        ] {
+        #[cfg(not(target_os = "windows"))]
+        {
+            for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == dir),
+                    "Default forbidden_paths must include {dir} on Unix"
+                );
+                assert!(
+                    !p.is_path_allowed(dir),
+                    "System dir should be blocked: {dir}"
+                );
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for dir in [
+                "C:\\Windows",
+                "C:\\Windows\\System32",
+                "C:\\Program Files",
+                "C:\\ProgramData",
+            ] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == dir),
+                    "Default forbidden_paths must include {dir} on Windows"
+                );
+                assert!(
+                    !p.is_path_allowed(dir),
+                    "System dir should be blocked: {dir}"
+                );
+            }
+        }
+        for dot in &["~/.ssh", "~/.gnupg", "~/.aws"] {
             assert!(
-                !p.is_path_allowed(dir),
-                "System dir should be blocked: {dir}"
+                p.forbidden_paths.iter().any(|f| f == dot),
+                "Default forbidden_paths must include {dot}"
             );
             assert!(
-                !p.is_path_allowed(&format!("{dir}/subpath")),
-                "Subpath of system dir should be blocked: {dir}/subpath"
+                !p.is_path_allowed(dot),
+                "Sensitive dotfile dir should be blocked: {dot}"
             );
         }
     }
@@ -4373,7 +4493,7 @@ mod tests {
             workspace_only: true,
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_path_allowed("/any/absolute/path"));
+        assert!(!p.is_path_allowed(&tp_sys_sub("any/absolute/path")));
         assert!(p.is_path_allowed("relative/path.txt"));
     }
 
@@ -4404,15 +4524,30 @@ mod tests {
     #[test]
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
-        // Must contain all critical system dirs
-        for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
-            assert!(
-                p.forbidden_paths.iter().any(|f| f == dir),
-                "Default forbidden_paths must include {dir}"
-            );
+        #[cfg(not(target_os = "windows"))]
+        {
+            for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == dir),
+                    "Default forbidden_paths must include {dir} on Unix"
+                );
+            }
         }
-        // Must contain sensitive dotfiles
-        for dot in ["~/.ssh", "~/.gnupg", "~/.aws"] {
+        #[cfg(target_os = "windows")]
+        {
+            for dir in [
+                "C:\\Windows",
+                "C:\\Windows\\System32",
+                "C:\\Program Files",
+                "C:\\ProgramData",
+            ] {
+                assert!(
+                    p.forbidden_paths.iter().any(|f| f == dir),
+                    "Default forbidden_paths must include {dir} on Windows"
+                );
+            }
+        }
+        for dot in &["~/.ssh", "~/.gnupg", "~/.aws", "~/.config"] {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dot),
                 "Default forbidden_paths must include {dot}"
@@ -4631,26 +4766,26 @@ mod tests {
     #[test]
     fn is_under_allowed_root_matches_allowed_roots() {
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/workspace"),
+            workspace_dir: tp_ws(),
             workspace_only: true,
-            allowed_roots: vec![PathBuf::from("/projects"), PathBuf::from("/data")],
+            allowed_roots: vec![tp_proj(), tp_data()],
             ..SecurityPolicy::default()
         };
-        assert!(p.is_under_allowed_root("/projects/myapp/src/main.rs"));
-        assert!(p.is_under_allowed_root("/data/file.csv"));
-        assert!(!p.is_under_allowed_root("/etc/passwd"));
+        assert!(p.is_under_allowed_root(&format!("{}/myapp/src/main.rs", tp_proj().display())));
+        assert!(p.is_under_allowed_root(&format!("{}/file.csv", tp_data().display())));
+        assert!(!p.is_under_allowed_root(&tp_sys_sub("etc/passwd")));
         assert!(!p.is_under_allowed_root("relative/path"));
     }
 
     #[test]
     fn is_under_allowed_root_returns_false_for_empty_roots() {
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/workspace"),
+            workspace_dir: tp_ws(),
             workspace_only: true,
             allowed_roots: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_under_allowed_root("/any/path"));
+        assert!(!p.is_under_allowed_root(&format!("{}/any/path", tp_proj().display())));
     }
 
     // ── SecurityPolicy read/read-write split ────────────────────────
@@ -4658,51 +4793,43 @@ mod tests {
     #[test]
     fn is_under_read_only_allowed_root_matches_only_read_only_list() {
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/workspace"),
+            workspace_dir: tp_ws(),
             workspace_only: true,
-            allowed_roots: vec![PathBuf::from("/rw-data")],
-            allowed_roots_read_only: vec![PathBuf::from("/ro-shared")],
+            allowed_roots: vec![tp_rw()],
+            allowed_roots_read_only: vec![tp_ro()],
             ..SecurityPolicy::default()
         };
-        // Read-only path resolves through the read-only check.
-        assert!(p.is_under_read_only_allowed_root("/ro-shared/notes.md"));
-        // Read-write path does NOT resolve through the read-only check.
-        assert!(!p.is_under_read_only_allowed_root("/rw-data/file.csv"));
-        // Path under neither list returns false.
-        assert!(!p.is_under_read_only_allowed_root("/etc/passwd"));
-        // Relative paths always return false.
+        assert!(p.is_under_read_only_allowed_root(&format!("{}/notes.md", tp_ro().display())));
+        assert!(!p.is_under_read_only_allowed_root(&format!("{}/file.csv", tp_rw().display())));
+        assert!(!p.is_under_read_only_allowed_root(&tp_sys_sub("etc/passwd")));
         assert!(!p.is_under_read_only_allowed_root("relative"));
     }
 
     #[test]
     fn is_under_any_allowed_root_unions_read_only_and_read_write() {
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/workspace"),
+            workspace_dir: tp_ws(),
             workspace_only: true,
-            allowed_roots: vec![PathBuf::from("/rw-data")],
-            allowed_roots_read_only: vec![PathBuf::from("/ro-shared")],
+            allowed_roots: vec![tp_rw()],
+            allowed_roots_read_only: vec![tp_ro()],
             ..SecurityPolicy::default()
         };
-        // Either list matches.
-        assert!(p.is_under_any_allowed_root("/rw-data/file.csv"));
-        assert!(p.is_under_any_allowed_root("/ro-shared/notes.md"));
-        // Neither list -> false.
-        assert!(!p.is_under_any_allowed_root("/etc/passwd"));
+        assert!(p.is_under_any_allowed_root(&format!("{}/file.csv", tp_rw().display())));
+        assert!(p.is_under_any_allowed_root(&format!("{}/notes.md", tp_ro().display())));
+        assert!(!p.is_under_any_allowed_root(&tp_sys_sub("etc/passwd")));
     }
 
     #[test]
     fn is_under_allowed_root_does_not_see_read_only_entries() {
-        // Read+write tools (file_write, git_operations, shell) call
-        // is_under_allowed_root and must NOT accept read-only roots.
         let p = SecurityPolicy {
-            workspace_dir: PathBuf::from("/workspace"),
+            workspace_dir: tp_ws(),
             workspace_only: true,
             allowed_roots: vec![],
-            allowed_roots_read_only: vec![PathBuf::from("/ro-shared")],
+            allowed_roots_read_only: vec![tp_ro()],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_under_allowed_root("/ro-shared/notes.md"));
-        assert!(p.is_under_any_allowed_root("/ro-shared/notes.md"));
+        assert!(!p.is_under_allowed_root(&format!("{}/notes.md", tp_ro().display())));
+        assert!(p.is_under_any_allowed_root(&format!("{}/notes.md", tp_ro().display())));
     }
 
     // ── SubAgent escalation validator ──────────────────────────────
