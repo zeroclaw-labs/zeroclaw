@@ -74,7 +74,7 @@ path = "src/lib.rs"
 # Internal workspace crates — versions and paths declared once in [workspace.dependencies]
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
-zeroclaw-config.workspace = true
+zeroclaw-config = { workspace = true, features = ["clap"] }
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
@@ -124,8 +124,6 @@ urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
-
-rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -241,6 +239,7 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "default-channels",
     "acp-bridge",
     "gateway",
     "tui-onboarding",
@@ -248,9 +247,9 @@ default = [
     "schema-export",
 ]
 
-# The full agent runtime — agent loop, channels, tools, all subsystems.
+# The core agent runtime — agent loop, tools, persistence subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
-# Gateway and TUI onboarding are opt-in separately (included in `default`).
+# Channels are opt-in via `default-channels` (all) or individual `channel-*` features.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
@@ -258,12 +257,16 @@ agent-runtime = [
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
-    "dep:lettre", "dep:mail-parser", "dep:async-imap",
+]
+
+# All channel features in one bundle. Included in `default` for backward compatibility.
+# For selective builds, use individual `channel-*` features instead.
+default-channels = [
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
-    "channel-twitter", "channel-reddit", "channel-notion",
+    "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
@@ -280,11 +283,11 @@ tui-onboarding = ["dep:zeroclaw-tui"]
 schema-export = ["zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
-# Channels — each forwards directly to zeroclaw-channels (1 hop)
-channel-email = ["zeroclaw-channels/channel-email"]
+# Channels — each forwards to zeroclaw-channels.
+channel-email = ["zeroclaw-channels/channel-email", "dep:lettre", "dep:mail-parser", "dep:async-imap"]
 channel-telegram = ["zeroclaw-channels/channel-telegram"]
 channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
+channel-nostr = ["zeroclaw-channels/channel-nostr", "dep:nostr-sdk"]
 channel-matrix = ["zeroclaw-channels/channel-matrix"]
 channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
@@ -298,6 +301,7 @@ channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
 channel-twitter = ["zeroclaw-channels/channel-twitter"]
 channel-reddit = ["zeroclaw-channels/channel-reddit"]
 channel-notion = ["zeroclaw-channels/channel-notion"]
+channel-mqtt = ["zeroclaw-channels/channel-mqtt"]
 channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
@@ -310,6 +314,8 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+channel-line = ["zeroclaw-channels/channel-line"]
+channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
@@ -339,6 +345,7 @@ metrics = ["observability-prometheus"]
 # CI meta-feature
 ci-all = [
     "agent-runtime",
+    "default-channels",
     "channel-nostr", "channel-matrix", "whatsapp-web",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
