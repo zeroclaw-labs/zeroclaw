@@ -343,7 +343,7 @@ fn build_approval_card(
 fn build_resolved_approval_card(
     tool_name: &str,
     arguments_summary: &str,
-    decision: zeroclaw_api::channel::ChannelApprovalResponse,
+    decision: &zeroclaw_api::channel::ChannelApprovalResponse,
 ) -> serde_json::Value {
     use zeroclaw_api::channel::ChannelApprovalResponse;
 
@@ -351,6 +351,7 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+        ChannelApprovalResponse::DenyWithEdit { .. } => ("❌", "Denied (with edit)", "red"),
     };
 
     serde_json::json!({
@@ -2365,7 +2366,7 @@ impl LarkChannel {
         message_id: &str,
         tool_name: &str,
         arguments_summary: &str,
-        decision: zeroclaw_api::channel::ChannelApprovalResponse,
+        decision: &zeroclaw_api::channel::ChannelApprovalResponse,
     ) {
         let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
         let url = self.patch_message_url(message_id);
@@ -2640,17 +2641,17 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision);
-
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
                 &pending.message_id,
                 &pending.tool_name,
                 &pending.arguments_summary,
-                decision,
+                &decision,
             )
             .await;
         }
+
+        let _ = pending.sender.send(decision);
 
         Ok(())
     }
@@ -4769,8 +4770,15 @@ mod tests {
                 "Approved (always)",
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
+            (
+                ChannelApprovalResponse::DenyWithEdit {
+                    replacement: "x".into(),
+                },
+                "red",
+                "Denied",
+            ),
         ] {
-            let card = build_resolved_approval_card("shell", "args", decision);
+            let card = build_resolved_approval_card("shell", "args", &decision);
             assert_eq!(
                 card.pointer("/header/template").and_then(|v| v.as_str()),
                 Some(expected_template),
