@@ -19,6 +19,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.config': 'Config',
     'nav.cost': '成本追踪',
     'nav.logs': '日志',
+    'nav.nodes': '节点',
     'nav.doctor': '诊断',
     'nav.canvas': '画布',
 
@@ -412,6 +413,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.config': 'Config',
     'nav.cost': 'Cost Tracker',
     'nav.logs': 'Logs',
+    'nav.nodes': 'Nodes',
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
     'nav.onboard': 'Onboard',

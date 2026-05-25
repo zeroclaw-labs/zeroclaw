@@ -12,6 +12,9 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  NodesResponse,
+  DevicesResponse,
+  PairedDeviceInfo,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -1402,5 +1405,25 @@ export function getCliTools(): Promise<CliTool[]> {
   return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) => {
     const result = unwrapField(data, 'cli_tools');
     return Array.isArray(result) ? result : [];
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
+
+export function getNodes(): Promise<NodesResponse> {
+  return apiFetch<NodesResponse>('/api/nodes');
+}
+
+export function getPairedDevices(): Promise<DevicesResponse> {
+  return apiFetch<DevicesResponse>('/api/pairing/devices').catch(() => ({
+    devices: [],
+  }));
+}
+
+export function revokePairedDevice(id: string): Promise<{ revoked: boolean }> {
+  return apiFetch<{ revoked: boolean }>(`/api/devices/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
   });
 }

@@ -12,6 +12,7 @@ import {
   Doctor,
   Integrations,
   Logs,
+  Nodes,
   Onboard,
   Pairing,
   Tools,
@@ -47,6 +48,7 @@ export const Router = () => (
         <Route path="/config/:section/:type/:alias" element={<Config />} />
         <Route path="/setup/:section" element={<Config />} />
         <Route path="/logs" element={<Logs />} />
+        <Route path="/nodes" element={<Nodes />} />
         <Route path="/doctor" element={<Doctor />} />
         <Route path="/pairing" element={<Pairing />} />
         <Route path="/canvas" element={<Canvas />} />

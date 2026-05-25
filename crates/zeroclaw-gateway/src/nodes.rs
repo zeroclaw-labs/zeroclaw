@@ -19,8 +19,9 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
+    routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
@@ -80,7 +81,7 @@ pub struct NodeInvocationResult {
 /// Registry of all connected nodes and their capabilities.
 #[derive(Debug, Default, Clone)]
 pub struct NodeRegistry {
-    nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
+    pub nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
     max_nodes: usize,
 }
 
@@ -223,6 +224,50 @@ fn extract_node_ws_token<'a>(
     }
 
     None
+}
+
+/// GET /api/nodes — list currently connected daemon nodes
+pub async fn list_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Err(e) = super::api::require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let nodes_guard = state.node_registry.nodes.read();
+    let nodes: Vec<serde_json::Value> = nodes_guard
+        .values()
+        .map(|info| {
+            serde_json::json!({
+                "node_id": info.node_id,
+                "capabilities": info.capabilities,
+                "capability_count": info.capabilities.len(),
+                "status": "online"
+            })
+        })
+        .collect();
+    let count = nodes.len();
+    drop(nodes_guard);
+
+    let nodes_cfg = state.config.read().nodes.clone();
+
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        axum::Json(serde_json::json!({
+            "nodes": nodes,
+            "count": count,
+            "policy": {
+                "stale_after_secs": nodes_cfg.stale_after_secs,
+                "offline_after_secs": nodes_cfg.offline_after_secs,
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// GET /ws/nodes — WebSocket upgrade for node connections

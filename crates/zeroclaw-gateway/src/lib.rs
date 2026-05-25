@@ -1481,6 +1481,7 @@ pub async fn run_gateway(
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
+        .route("/api/nodes", get(nodes::list_nodes))
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
