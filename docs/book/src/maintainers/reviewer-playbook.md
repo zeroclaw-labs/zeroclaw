@@ -8,6 +8,8 @@ For the actual fetch sequence and review verdict mechanics, see [PR Review Proto
 
 Use this section to route a review before reading deeper. Each row links to the section that elaborates.
 
+Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this playbook's risk matrix for review depth.
+
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
