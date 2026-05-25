@@ -40,6 +40,13 @@ enum ChatPhase {
         list_state: ListState,
         loading: bool,
     },
+    /// WSS only: user types the remote working directory before session starts.
+    PickCwd {
+        /// The agent alias already chosen.
+        agent_alias: String,
+        /// Text buffer for the CWD path.
+        buf: String,
+    },
     /// Active chat session.
     Active(Box<ChatState>),
     /// Unrecoverable error.
@@ -91,7 +98,8 @@ impl<'a> Chat<'a> {
         }
     }
 
-    /// Fetch agent list. If exactly one enabled agent, auto-start a session.
+    /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
+    /// show the CWD picker first on WSS ACP connections).
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         let agents = match self.rpc.agents_status().await {
             Ok(result) => result
@@ -114,7 +122,7 @@ impl<'a> Chat<'a> {
         }
 
         if agents.len() == 1 {
-            self.start_session(&agents[0]).await;
+            self.pick_or_start_session(&agents[0]).await;
             return Ok(());
         }
 
@@ -128,20 +136,43 @@ impl<'a> Chat<'a> {
         Ok(())
     }
 
-    async fn start_session(&mut self, agent_alias: &str) {
+    /// Decide whether to show the CWD picker (WSS ACP) or start the session
+    /// immediately (Unix, or non-ACP pane).
+    async fn pick_or_start_session(&mut self, agent_alias: &str) {
+        if self.pane_kind == PaneKind::Acp
+            && self.rpc.transport() == crate::client::Transport::Wss
+        {
+            self.phase = ChatPhase::PickCwd {
+                agent_alias: agent_alias.to_string(),
+                buf: String::new(),
+            };
+        } else {
+            self.start_session(agent_alias, None).await;
+        }
+    }
+
+    /// Start the session, optionally with a caller-supplied `cwd`.
+    ///
+    /// - Unix: always passes the local CWD (ignores `cwd_override`).
+    /// - WSS: passes `cwd_override` if provided, otherwise `None`.
+    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
         // Over Unix socket, pass local CWD so the agent works in the
         // directory the TUI was launched from.  Over WSS the server
-        // ignores this and uses the agent's workspace dir.
-        let local_cwd = if self.rpc.transport() == crate::client::Transport::Unix {
-            std::env::current_dir().ok()
-        } else {
-            None
-        };
-        let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
+        // uses the agent's workspace dir unless the user supplies one.
+        let cwd_str: Option<String> =
+            if self.rpc.transport() == crate::client::Transport::Unix {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+            } else {
+                cwd_override
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            };
         let result = if self.pane_kind == PaneKind::Acp {
-            self.rpc.session_new_acp(agent_alias, cwd_str, None).await
+            self.rpc.session_new_acp(agent_alias, cwd_str.as_deref(), None).await
         } else {
-            self.rpc.session_new(agent_alias, cwd_str).await
+            self.rpc.session_new(agent_alias, cwd_str.as_deref()).await
         };
         match result {
             Ok(session) => {
@@ -208,6 +239,9 @@ impl<'a> Chat<'a> {
                     self.pane_kind.name(),
                 );
             }
+            ChatPhase::PickCwd { agent_alias, buf } => {
+                draw_cwd_picker(frame, area, agent_alias, buf, self.pane_kind.name());
+            }
             ChatPhase::Active(state) => {
                 render(frame, state, area);
             }
@@ -250,10 +284,47 @@ impl<'a> Chat<'a> {
                         if let Some(i) = list_state.selected()
                             && let Some(alias) = agents.get(i).cloned()
                         {
-                            self.start_session(&alias).await;
+                            self.pick_or_start_session(&alias).await;
                         }
                     }
                     KeyCode::Char('q') => return true,
+                    _ => {}
+                }
+                return false;
+            }
+            ChatPhase::PickCwd { agent_alias, buf } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        // Clone what we need before consuming self via start_session.
+                        let alias = agent_alias.clone();
+                        let cwd = buf.clone();
+                        let cwd_opt = if cwd.trim().is_empty() {
+                            None
+                        } else {
+                            Some(cwd.trim().to_string())
+                        };
+                        self.start_session(&alias, cwd_opt.as_deref()).await;
+                    }
+                    KeyCode::Esc => {
+                        // Go back to agent picker.
+                        self.phase = ChatPhase::PickAgent {
+                            agents: Vec::new(),
+                            list_state: ListState::default(),
+                            loading: true,
+                        };
+                        // Re-fetch agents asynchronously.
+                        let _ = self.init().await;
+                    }
+                    KeyCode::Char(c) => {
+                        if let ChatPhase::PickCwd { buf, .. } = &mut self.phase {
+                            buf.push(c);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let ChatPhase::PickCwd { buf, .. } = &mut self.phase {
+                            buf.pop();
+                        }
+                    }
                     _ => {}
                 }
                 return false;
@@ -522,22 +593,34 @@ impl<'a> Chat<'a> {
             KeyCode::Char('n')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
             {
-                let local_cwd = if self.rpc.transport() == crate::client::Transport::Unix {
-                    std::env::current_dir().ok()
-                } else {
-                    None
-                };
-                let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
-                let new_session = if self.pane_kind == PaneKind::Acp {
-                    self.rpc.session_new_acp(&state.agent_alias, cwd_str, None).await
-                } else {
-                    self.rpc.session_new(&state.agent_alias, cwd_str).await
-                };
-                if let Ok(s) = new_session {
+                let alias = state.agent_alias.clone();
+                if self.pane_kind == PaneKind::Acp
+                    && self.rpc.transport() == crate::client::Transport::Wss
+                {
+                    // For WSS ACP, go through the CWD picker for new sessions too.
                     let _ = self.rpc.session_close(&state.session_id).await;
-                    state.reset_for_session(s.session_id, None);
-                    if self.pane_kind == PaneKind::Acp {
-                        state.cwd = s.workspace_dir;
+                    self.phase = ChatPhase::PickCwd {
+                        agent_alias: alias,
+                        buf: String::new(),
+                    };
+                } else {
+                    let local_cwd = if self.rpc.transport() == crate::client::Transport::Unix {
+                        std::env::current_dir().ok()
+                    } else {
+                        None
+                    };
+                    let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
+                    let new_session = if self.pane_kind == PaneKind::Acp {
+                        self.rpc.session_new_acp(&alias, cwd_str, None).await
+                    } else {
+                        self.rpc.session_new(&alias, cwd_str).await
+                    };
+                    if let Ok(s) = new_session {
+                        let _ = self.rpc.session_close(&state.session_id).await;
+                        state.reset_for_session(s.session_id, None);
+                        if self.pane_kind == PaneKind::Acp {
+                            state.cwd = s.workspace_dir;
+                        }
                     }
                 }
             }
@@ -730,6 +813,8 @@ impl<'a> Chat<'a> {
     /// like `t`, `j`, `k`, `y`, `?` should work.
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
+            // CWD picker always captures text input.
+            ChatPhase::PickCwd { .. } => true,
             ChatPhase::Active(s) => {
                 // Overlay has its own key handling (Rename captures chars).
                 if matches!(s.session_overlay, SessionOverlay::Rename { .. }) {
@@ -766,6 +851,10 @@ impl<'a> crate::widgets::HelpContext for Chat<'a> {
                     ])
                 }
             }
+            ChatPhase::PickCwd { .. } => HelpNode::entries(vec![
+                E::key("Enter", "Start session (empty = default dir)"),
+                E::key("Esc", "Back to agent picker"),
+            ]),
             ChatPhase::Error(_) => HelpNode::entries(vec![E::key("q", "Quit")]),
             ChatPhase::Active(state) => {
                 match &state.session_overlay {
@@ -876,6 +965,61 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+}
+
+// ── CWD picker rendering ─────────────────────────────────────────
+
+/// Render the working-directory text-input overlay for WSS ACP sessions.
+fn draw_cwd_picker(
+    frame: &mut Frame,
+    area: Rect,
+    agent_alias: &str,
+    buf: &str,
+    tab_title: &str,
+) {
+    // Outer block fills the whole pane area.
+    let block = Block::default()
+        .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
+        .borders(Borders::ALL)
+        .border_style(theme::dim_style());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(6),
+            Constraint::Fill(1),
+        ])
+        .split(inner);
+
+    let dialog_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Min(40),
+            Constraint::Percentage(10),
+        ])
+        .split(chunks[1])[1];
+
+    frame.render_widget(Clear, dialog_area);
+
+    let cursor = "\u{2588}"; // block cursor
+    let display_buf = format!("{buf}{cursor}");
+    let text = format!(
+        "Agent: {agent_alias}\n\nWorking directory (leave blank for default):\n  {display_buf}\n\nEnter=start  Esc=back"
+    );
+    let p = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Set Working Directory ")
+                .style(theme::overlay_border_style()),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(p, dialog_area);
 }
 
 // ── Error rendering ──────────────────────────────────────────────
