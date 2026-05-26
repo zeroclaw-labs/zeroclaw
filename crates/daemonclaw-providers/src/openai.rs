@@ -382,6 +382,11 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens,
         };
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited("OpenAI", model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one("OpenAI", model);
+
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
@@ -393,6 +398,8 @@ impl Provider for OpenAiProvider {
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
+
+        crate::rate_limit::record_from_response("OpenAI", model, response.headers());
 
         let chat_response: ChatResponse = response.json().await?;
 
@@ -426,6 +433,11 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens,
         };
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited("OpenAI", model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one("OpenAI", model);
+
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
@@ -437,6 +449,8 @@ impl Provider for OpenAiProvider {
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
+
+        crate::rate_limit::record_from_response("OpenAI", model, response.headers());
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {
@@ -493,6 +507,11 @@ impl Provider for OpenAiProvider {
             max_tokens: self.max_tokens,
         };
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited("OpenAI", model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one("OpenAI", model);
+
         let response = self
             .http_client()
             .post(format!("{}/chat/completions", self.base_url))
@@ -504,6 +523,8 @@ impl Provider for OpenAiProvider {
         if !response.status().is_success() {
             return Err(super::api_error("OpenAI", response).await);
         }
+
+        crate::rate_limit::record_from_response("OpenAI", model, response.headers());
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {

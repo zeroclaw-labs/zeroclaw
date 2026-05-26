@@ -1769,6 +1769,11 @@ impl Provider for OpenAiCompatibleProvider {
         fallback_messages.push(ChatMessage::user(message));
         let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited(&self.name, model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one(&self.name, model);
+
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -1812,6 +1817,8 @@ impl Provider for OpenAiCompatibleProvider {
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
+
+        crate::rate_limit::record_from_response(&self.name, model, response.headers());
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
@@ -1869,6 +1876,12 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
+
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited(&self.name, model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one(&self.name, model);
+
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -1911,6 +1924,8 @@ impl Provider for OpenAiCompatibleProvider {
 
             return Err(super::api_error(&self.name, response).await);
         }
+
+        crate::rate_limit::record_from_response(&self.name, model, response.headers());
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
@@ -1976,6 +1991,12 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
+
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited(&self.name, model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one(&self.name, model);
+
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
             .send()
@@ -2000,6 +2021,8 @@ impl Provider for OpenAiCompatibleProvider {
         if !response.status().is_success() {
             return Err(super::api_error(&self.name, response).await);
         }
+
+        crate::rate_limit::record_from_response(&self.name, model, response.headers());
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
@@ -2067,6 +2090,12 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let url = self.chat_completions_url();
+
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited(&self.name, model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one(&self.name, model);
+
         let response = match self
             .apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
@@ -2139,6 +2168,8 @@ impl Provider for OpenAiCompatibleProvider {
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
+
+        crate::rate_limit::record_from_response(&self.name, model, response.headers());
 
         let native_response: ApiChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {

@@ -798,11 +798,18 @@ impl Provider for AnthropicProvider {
 
         request = self.apply_auth(request, credential);
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited("Anthropic", model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one("Anthropic", model);
+
         let response = request.send().await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
+
+        crate::rate_limit::record_from_response("Anthropic", model, response.headers());
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
@@ -868,10 +875,17 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
+        crate::rate_limit::global_rate_limiter()
+            .wait_if_limited("Anthropic", model)
+            .await;
+        crate::rate_limit::global_rate_limiter().consume_one("Anthropic", model);
+
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
+
+        crate::rate_limit::record_from_response("Anthropic", model, response.headers());
 
         let native_response: NativeChatResponse = response.json().await?;
         Ok(Self::parse_native_response(native_response))

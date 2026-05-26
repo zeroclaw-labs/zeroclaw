@@ -32,6 +32,7 @@ pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
+pub mod rate_limit;
 pub mod reliable;
 pub mod router;
 pub mod telnyx;
@@ -1293,7 +1294,7 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
+        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
