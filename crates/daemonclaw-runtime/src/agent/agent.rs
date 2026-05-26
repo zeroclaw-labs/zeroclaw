@@ -960,7 +960,14 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        for _ in 0..self.config.max_tool_iterations {
+        let max_iterations = if self.config.max_tool_iterations == 0 {
+            usize::MAX
+        } else {
+            self.config.max_tool_iterations
+        };
+        let mut cumulative_tokens: u64 = 0;
+
+        for _ in 0..max_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
@@ -1023,7 +1030,33 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
+            if let Some(usage) = response.usage.as_ref() {
+                cumulative_tokens +=
+                    usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
+            }
+
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
+
+            if self.config.max_turn_tokens > 0
+                && cumulative_tokens >= self.config.max_turn_tokens
+            {
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                tracing::warn!(
+                    cumulative_tokens,
+                    max_turn_tokens = self.config.max_turn_tokens,
+                    "Turn token budget exceeded",
+                );
+                return Ok(final_text);
+            }
+
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -1072,10 +1105,18 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        if self.config.max_turn_tokens > 0 && cumulative_tokens >= self.config.max_turn_tokens {
+            anyhow::bail!(
+                "Turn token budget exceeded ({} of {} tokens)",
+                cumulative_tokens,
+                self.config.max_turn_tokens
+            )
+        } else {
+            anyhow::bail!(
+                "Agent exceeded maximum tool iterations ({})",
+                max_iterations
+            )
+        }
     }
 
     /// Execute a single agent turn while streaming intermediate events.
@@ -1134,8 +1175,15 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
+        let max_iterations = if self.config.max_tool_iterations == 0 {
+            usize::MAX
+        } else {
+            self.config.max_tool_iterations
+        };
+        let mut cumulative_tokens: u64 = 0;
+
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.max_tool_iterations {
+        for _ in 0..max_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1285,7 +1333,40 @@ impl Agent {
                 }
             };
 
+            if let Some(usage) = response.usage.as_ref() {
+                cumulative_tokens +=
+                    usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
+            }
+
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
+
+            if self.config.max_turn_tokens > 0
+                && cumulative_tokens >= self.config.max_turn_tokens
+            {
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+                if !got_stream && !final_text.is_empty() {
+                    let _ = event_tx
+                        .send(TurnEvent::Chunk {
+                            delta: final_text.clone(),
+                        })
+                        .await;
+                }
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                tracing::warn!(
+                    cumulative_tokens,
+                    max_turn_tokens = self.config.max_turn_tokens,
+                    "Turn token budget exceeded (streamed)",
+                );
+                return Ok(final_text);
+            }
+
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -1363,10 +1444,18 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        if self.config.max_turn_tokens > 0 && cumulative_tokens >= self.config.max_turn_tokens {
+            anyhow::bail!(
+                "Turn token budget exceeded ({} of {} tokens)",
+                cumulative_tokens,
+                self.config.max_turn_tokens
+            )
+        } else {
+            anyhow::bail!(
+                "Agent exceeded maximum tool iterations ({})",
+                max_iterations
+            )
+        }
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

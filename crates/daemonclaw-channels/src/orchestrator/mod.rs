@@ -339,6 +339,7 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
+    max_turn_tokens: u64,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     pending_new_sessions: PendingNewSessionSet,
@@ -3051,6 +3052,7 @@ async fn process_channel_message(
                         Some(msg.reply_target.as_str()),
                         &ctx.multimodal,
                         ctx.max_tool_iterations,
+                        ctx.max_turn_tokens,
                         Some(cancellation_token.clone()),
                         delta_tx.clone(),
                         ctx.hooks.as_deref(),
@@ -5499,6 +5501,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
+        max_turn_tokens: config.agent.max_turn_tokens,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -6088,6 +6091,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -6212,6 +6216,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -6297,6 +6302,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -6397,6 +6403,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -6996,6 +7003,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7088,6 +7096,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7194,6 +7203,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7285,6 +7295,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7386,6 +7397,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7508,6 +7520,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7611,6 +7624,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7726,6 +7740,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7832,6 +7847,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 12,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -7928,6 +7944,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 3,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8150,6 +8167,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8264,6 +8282,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8397,6 +8416,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8527,6 +8547,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8635,6 +8656,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8724,6 +8746,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -8813,6 +8836,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -9608,6 +9632,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -9754,6 +9779,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -9941,6 +9967,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -10061,6 +10088,7 @@ BTC is currently around $65,000 based on latest tool output."#
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -10683,6 +10711,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -10781,6 +10810,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -10913,6 +10943,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -11089,6 +11120,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -11211,6 +11243,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -11325,6 +11358,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -11459,6 +11493,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
@@ -11775,6 +11810,7 @@ This is an example JSON object for profile settings."#;
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),

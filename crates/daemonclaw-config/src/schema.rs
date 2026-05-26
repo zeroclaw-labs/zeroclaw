@@ -1420,9 +1420,15 @@ pub struct AgentConfig {
     #[serde(default)]
     pub compact_context: bool,
     /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// `0` means unlimited (no iteration limit). Both limits are independent.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
+    /// Maximum total tokens (input + output) consumed per agent turn.
+    /// When exceeded the agent stops and summarises progress so far.
+    /// `0` means unlimited (no token limit). Both limits are independent.
+    /// Default: `0`.
+    #[serde(default)]
+    pub max_turn_tokens: u64,
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
@@ -1530,6 +1536,7 @@ impl Default for AgentConfig {
         Self {
             compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
+            max_turn_tokens: 0,
             max_history_messages: default_agent_max_history_messages(),
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
@@ -12493,6 +12500,7 @@ reasoning_effort = "turbo"
         let cfg = AgentConfig::default();
         assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
+        assert_eq!(cfg.max_turn_tokens, 0);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
