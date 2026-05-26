@@ -535,11 +535,6 @@ impl<'a> Logs<'a> {
         let status = Line::from(vec![
             Span::styled(" Logs ", theme::title_style()),
             Span::styled(format!("({}) ", filtered.len()), theme::dim_style()),
-            if self.follow {
-                Span::styled("[follow] ", theme::accent_style())
-            } else {
-                Span::styled("[paused] ", theme::warn_style())
-            },
             if self.loading {
                 Span::styled("[loading] ", theme::warn_style())
             } else if !self.at_end {
@@ -575,6 +570,11 @@ impl<'a> Logs<'a> {
                     format!("{} ", severity_label(self.min_severity)),
                     severity_style(self.min_severity).add_modifier(Modifier::BOLD),
                 ),
+                if self.follow {
+                    Span::styled("[follow] ", theme::accent_style())
+                } else {
+                    Span::styled("[paused] ", theme::warn_style())
+                },
             ];
             if !self.search_query.is_empty() {
                 spans.push(Span::styled(" search: ", theme::dim_style()));
@@ -762,6 +762,7 @@ impl<'a> Logs<'a> {
                 self.move_selection_up();
                 self.detail_scroll = 0;
             }
+            KeyCode::Char('f') => self.follow = !self.follow,
             _ => {}
         }
         false
@@ -955,6 +956,7 @@ impl crate::widgets::HelpContext for Logs<'_> {
                 E::new(vec!["j", "k", "↑↓"], "Move list cursor"),
                 E::new(vec!["J", "K", "Shift+↑↓"], "Scroll detail pane"),
                 E::key("Shift+←→", "Resize detail pane"),
+                E::key("f", "Toggle follow mode"),
                 E::key("/", "Search"),
                 E::key("+ / -", "Raise / lower severity filter"),
                 E::key("c", "Clear search filter"),
