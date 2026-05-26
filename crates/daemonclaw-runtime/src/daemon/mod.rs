@@ -222,13 +222,35 @@ pub async fn run(
     wait_for_shutdown_signal().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
 
+    // Graceful shutdown: write final state before aborting subsystems.
+    // TimeoutStopSec=30s in the service unit gives us a hard deadline.
+    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+
+    // 1. Final health snapshot
+    let mut json = crate::health::snapshot_json();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
+        obj.insert("shutdown".into(), serde_json::json!("clean"));
+    }
+    let state_path = state_file_path(&config);
+    let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
+    let _ = tokio::fs::write(&state_path, data).await;
+
+    // 2. Touch liveness so the watchdog timer doesn't restart us during the stop window
+    crate::health::touch_liveness(&config.workspace_dir);
+
+    // 3. Abort subsystems and wait up to the deadline for them to finish
     for handle in &handles {
         handle.abort();
     }
-    for handle in handles {
-        let _ = handle.await;
-    }
+    let _ = tokio::time::timeout_at(shutdown_deadline, async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    })
+    .await;
 
+    tracing::info!("Graceful shutdown complete");
     Ok(())
 }
 
