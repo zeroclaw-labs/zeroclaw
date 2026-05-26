@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -20,6 +21,27 @@ use crate::theme;
 // ── Types ────────────────────────────────────────────────────────
 
 /// A single entry in the explorer listing.
+impl std::fmt::Debug for FileExplorerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileExplorerState")
+            .field("cwd", &self.cwd)
+            .field("entries", &self.entries)
+            .field("list_state", &self.list_state)
+            .field("selected", &self.selected)
+            .field("show_hidden", &self.show_hidden)
+            .field("error", &self.error)
+            .field("search_query", &self.search_query)
+            .field("searching", &self.searching)
+            .field("dir_picker", &self.dir_picker)
+            .field(
+                "remote_rpc",
+                &self.remote_rpc.as_ref().map(|_| "<RpcClient>"),
+            )
+            .field("last_list_area", &self.last_list_area)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ExplorerEntry {
     pub name: String,
@@ -44,7 +66,6 @@ pub(crate) enum ExplorerAction {
 // ── State ────────────────────────────────────────────────────────
 
 /// State for the file explorer overlay.
-#[derive(Debug)]
 pub(crate) struct FileExplorerState {
     cwd: PathBuf,
     entries: Vec<ExplorerEntry>,
@@ -55,6 +76,7 @@ pub(crate) struct FileExplorerState {
     search_query: String,
     searching: bool,
     dir_picker: bool,
+    remote_rpc: Option<Arc<crate::client::RpcClient>>,
     last_list_area: Rect,
 }
 
@@ -71,6 +93,7 @@ impl FileExplorerState {
             search_query: String::new(),
             searching: false,
             dir_picker: false,
+            remote_rpc: None,
             last_list_area: Rect::default(),
         };
         state.load_entries();
@@ -81,10 +104,17 @@ impl FileExplorerState {
     }
 
     /// Create a new explorer in directory-picker mode.
-    /// Press `c` to confirm the currently-displayed directory as the chosen path.
     pub fn new_dir_picker(start_dir: PathBuf) -> Self {
         let mut state = Self::new(start_dir);
         state.dir_picker = true;
+        state
+    }
+
+    /// Create a directory picker that fetches entries from the remote daemon (WSS).
+    #[allow(dead_code)]
+    pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
+        let mut state = Self::new_dir_picker(start_dir);
+        state.remote_rpc = Some(rpc);
         state
     }
 
@@ -93,6 +123,42 @@ impl FileExplorerState {
         self.entries.clear();
         self.error = None;
 
+        if let Some(rpc) = &self.remote_rpc {
+            // Wire up remote fs/list_dir (WSS ACP case)
+            let path = self.cwd.to_string_lossy().to_string();
+            let show_hidden = self.show_hidden;
+            let rpc = Arc::clone(rpc);
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    rpc.fs_list_dir(std::path::Path::new(&path), show_hidden).await
+                })
+            });
+            match result {
+                Ok(resp) => {
+                    for e in resp.entries {
+                        self.entries.push(ExplorerEntry {
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            size: e.size,
+                            _is_hidden: e.is_hidden,
+                            full_path: std::path::PathBuf::from(e.full_path),
+                        });
+                    }
+                    // keep cwd consistent
+                    if !resp.cwd.is_empty() {
+                        self.cwd = std::path::PathBuf::from(resp.cwd);
+                    }
+                    self.entries.sort_by_key(|a| (!a.is_dir, a.name.to_lowercase()));
+                    return;
+                }
+                Err(e) => {
+                    self.error = Some(format!("Remote list_dir failed: {e}"));
+                    return;
+                }
+            }
+        }
+
+        // Local filesystem path (default / non-WSS case)
         let rd = match std::fs::read_dir(&self.cwd) {
             Ok(rd) => rd,
             Err(e) => {

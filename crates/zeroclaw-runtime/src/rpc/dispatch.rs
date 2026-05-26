@@ -121,6 +121,7 @@ pub enum Method {
 
     // Files
     FileAttach,
+    FsListDir,
 }
 
 impl Method {
@@ -195,6 +196,7 @@ impl Method {
         (Method::TuiList, "tui/list"),
         // Files
         (Method::FileAttach, "file/attach"),
+        (Method::FsListDir, "fs/list_dir"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -442,6 +444,7 @@ impl RpcDispatcher {
 
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
+            Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
         };
 
         if is_notification {

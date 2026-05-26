@@ -59,6 +59,7 @@ pub mod method {
     pub const SESSION_MESSAGES: &str = "session/messages";
     // TUI identity
     pub const TUI_LIST: &str = "tui/list";
+    pub const FS_LIST_DIR: &str = "fs/list_dir";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -221,6 +222,7 @@ pub enum ConnectionState {
 
 // ── Client ───────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
     _read_task: tokio::task::JoinHandle<()>,
@@ -956,14 +958,31 @@ impl RpcClient {
         self.call(method::TUI_LIST, serde_json::json!({})).await
     }
 
+    /// List directory contents on the remote daemon (WSS only).
+    /// Returns the structured response from `fs/list_dir`.
+    pub async fn fs_list_dir(
+        &self,
+        path: &std::path::Path,
+        show_hidden: bool,
+    ) -> Result<zeroclaw_api::jsonrpc::FsListDirResponse> {
+        self.call(
+            method::FS_LIST_DIR,
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "show_hidden": show_hidden,
+            }),
+        )
+        .await
+    }
+
     // ── Test-only constructors ────────────────────────────────────
 
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
     #[cfg(test)]
-    pub fn with_rpc(rpc: Arc<RpcOutbound>) -> Self {
+    pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
-            rpc,
+            rpc: outbound,
             _read_task: zeroclaw_spawn::spawn!(async {}),
             _router_task: zeroclaw_spawn::spawn!(async {}),
             server_version: "test".to_string(),

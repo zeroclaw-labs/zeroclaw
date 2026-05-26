@@ -71,8 +71,8 @@ impl PaneKind {
     }
 }
 
-pub(crate) struct Chat<'a> {
-    rpc: &'a RpcClient,
+pub(crate) struct Chat {
+    rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
     turn_result_tx: mpsc::Sender<anyhow::Result<SessionPromptResult>>,
@@ -81,11 +81,11 @@ pub(crate) struct Chat<'a> {
     pane_kind: PaneKind,
 }
 
-impl<'a> Chat<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient, pane_kind: PaneKind) -> Self {
+impl Chat {
+    pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (turn_result_tx, turn_result_rx) = mpsc::channel(4);
         Self {
-            rpc,
+            rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
             turn_result_tx,
@@ -148,7 +148,10 @@ impl<'a> Chat<'a> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
             self.phase = ChatPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
-                explorer: FileExplorerState::new_dir_picker(start_dir),
+                explorer: FileExplorerState::new_dir_picker_remote(
+                    start_dir,
+                    Arc::clone(&self.rpc),
+                ),
             };
         } else {
             self.start_session(agent_alias, None).await;
@@ -599,7 +602,10 @@ impl<'a> Chat<'a> {
                         .unwrap_or_else(|| std::path::PathBuf::from("/"));
                     self.phase = ChatPhase::PickCwd {
                         agent_alias: alias,
-                        explorer: FileExplorerState::new_dir_picker(start_dir),
+                        explorer: FileExplorerState::new_dir_picker_remote(
+                            start_dir,
+                            Arc::clone(&self.rpc),
+                        ),
                     };
                 } else {
                     let local_cwd = if self.rpc.transport() == crate::client::Transport::Unix {
@@ -854,7 +860,7 @@ impl<'a> Chat<'a> {
     }
 }
 
-impl<'a> crate::widgets::HelpContext for Chat<'a> {
+impl crate::widgets::HelpContext for Chat {
     fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {

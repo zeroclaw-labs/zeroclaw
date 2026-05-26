@@ -105,6 +105,16 @@ pub mod error_codes {
     pub const SESSION_BUSY: i32 = -32002;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+
+    // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
+    pub const FS_NOT_FOUND: i32 = 4001;
+    pub const FS_PERMISSION_DENIED: i32 = 4002;
+    pub const FS_INVALID_PATH: i32 = 4003;
+
+    // String error codes for fs.* methods
+    pub const FS_NOT_FOUND_STR: &str = "fs.not_found";
+    pub const FS_PERMISSION_DENIED_STR: &str = "fs.permission_denied";
+    pub const FS_INVALID_PATH_STR: &str = "fs.invalid_path";
 }
 
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -119,6 +129,7 @@ type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>
 /// All writes go through `writer_tx` so concurrent notifications and
 /// outbound requests cannot interleave bytes. Outbound requests get string
 /// ids (`zc-out-<n>`) disjoint from any client-issued id space.
+#[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
     pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
@@ -231,4 +242,55 @@ impl RpcOutbound {
     pub fn pending_count(&self) -> usize {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+}
+
+// ── Filesystem RPC types ─────────────────────────────────────────
+
+/// Request payload for `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListDirRequest {
+    /// Relative or absolute path within the agent workspace.
+    pub path: String,
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+/// Response for `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListDirResponse {
+    pub entries: Vec<FsEntry>,
+    pub cwd: String,
+}
+
+/// A single directory entry returned by `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
+}
+
+/// Filesystem stat result (success case). Matches FsEntry shape with extra fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsStatResult {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    pub mtime: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+}
+
+/// Filesystem stat error payload (used inside `JsonRpcError.data`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsStatError {
+    pub path: String,
+    pub code: &'static str, // e.g. "fs.not_found"
+    pub message: String,
 }

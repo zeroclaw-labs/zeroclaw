@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 use clap::Parser;
@@ -125,7 +125,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Initial connection (before the terminal is initialized).
-    let mut rpc = match &target {
+    let rpc = match &target {
         ConnectTarget::UnixSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
                 Ok(c) => c,
@@ -144,7 +144,7 @@ async fn run() -> anyhow::Result<()> {
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
-    let result = run_until_exit(&mut rpc, &mut term, &target).await;
+    let result = run_until_exit(Arc::new(rpc), &mut term, &target).await;
 
     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
     config_manager::restore_terminal(&mut term)?;
@@ -154,7 +154,7 @@ async fn run() -> anyhow::Result<()> {
 /// Wraps the reconnect loop with a SIGTERM handler so the TUI exits
 /// cleanly (terminal restored) instead of dying mid-draw.
 async fn run_until_exit(
-    rpc: &mut client::RpcClient,
+    rpc: Arc<client::RpcClient>,
     term: &mut config_manager::Term,
     target: &ConnectTarget,
 ) -> anyhow::Result<()> {
@@ -163,24 +163,24 @@ async fn run_until_exit(
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            r = run_with_reconnect(rpc, term, target) => r,
+            r = run_with_reconnect(Arc::clone(&rpc), term, target) => r,
             _ = sigterm.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        run_with_reconnect(rpc, term, target).await
+        run_with_reconnect(Arc::new(rpc.clone()), term, target).await
     }
 }
 
 async fn run_with_reconnect(
-    rpc: &mut client::RpcClient,
+    rpc: Arc<client::RpcClient>,
     term: &mut config_manager::Term,
     target: &ConnectTarget,
 ) -> anyhow::Result<()> {
     loop {
         let label = target.label();
-        let should_reconnect = match app::run(rpc, term, &label, None).await {
+        let should_reconnect = match app::run(Arc::clone(&rpc), term, &label, None).await {
             Ok(reconnect) => reconnect,
             Err(_) if rpc.is_disconnected() => {
                 // RPC error caused by a dead connection — treat as
@@ -218,8 +218,7 @@ async fn run_with_reconnect(
                     .await
                 }
             };
-            if let Ok(c) = result {
-                *rpc = c;
+            if let Ok(_c) = result {
                 break;
             }
         }

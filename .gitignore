@@ -95,3 +95,4 @@ web/src/lib/api-generated.ts
 # Generated OpenAPI spec (transient handoff for openapi-typescript)
 target/openapi.json
 /v[0-9]*.toml
+.worktrees/

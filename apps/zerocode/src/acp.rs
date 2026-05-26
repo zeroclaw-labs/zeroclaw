@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 
@@ -5,12 +7,12 @@ use crate::chat;
 use crate::client::RpcClient;
 
 /// ACP pane — displayed as "Code" in the UI; internal name kept for historical reasons.
-pub(crate) struct Acp<'a> {
-    inner: chat::Chat<'a>,
+pub(crate) struct Acp {
+    inner: chat::Chat,
 }
 
-impl<'a> Acp<'a> {
-    pub(crate) fn new(rpc: &'a RpcClient) -> Self {
+impl Acp {
+    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
         }
@@ -49,7 +51,7 @@ impl<'a> Acp<'a> {
     }
 }
 
-impl<'a> crate::widgets::HelpContext for Acp<'a> {
+impl crate::widgets::HelpContext for Acp {
     fn help_context(&self) -> crate::widgets::HelpNode {
         self.inner.help_context()
     }
