@@ -446,7 +446,7 @@ impl SecretField for std::collections::HashMap<String, String> {
     }
 
     fn is_set(&self) -> bool {
-        !self.is_empty()
+        self.values().any(|v| !v.is_empty())
     }
 }
 
@@ -486,7 +486,8 @@ impl SecretField for Option<std::collections::HashMap<String, String>> {
     }
 
     fn is_set(&self) -> bool {
-        self.as_ref().is_some_and(|m| !m.is_empty())
+        self.as_ref()
+            .is_some_and(|m| m.values().any(|v| !v.is_empty()))
     }
 }
 
@@ -833,6 +834,30 @@ mod secret_field_tests {
         assert!(!h.is_set());
         let oh: Option<HashMap<String, String>> = Some(HashMap::new());
         assert!(!oh.is_set());
+    }
+
+    #[test]
+    fn hashmap_with_only_empty_values_is_not_set() {
+        // The trait contract for `is_set` is "at least one non-empty inner
+        // string". A map carrying placeholder keys with empty values has no
+        // secret material to encrypt or mask, so it must report not-set —
+        // otherwise the dashboard would render `***MASKED***` over a blank
+        // header row.
+        let h: HashMap<String, String> = HashMap::from([
+            ("Authorization".into(), String::new()),
+            ("X-Trace".into(), String::new()),
+        ]);
+        assert!(!h.is_set());
+
+        let oh: Option<HashMap<String, String>> =
+            Some(HashMap::from([("Authorization".into(), String::new())]));
+        assert!(!oh.is_set());
+
+        let mixed: HashMap<String, String> = HashMap::from([
+            ("Authorization".into(), "Bearer xyz".into()),
+            ("X-Trace".into(), String::new()),
+        ]);
+        assert!(mixed.is_set(), "any non-empty value makes the map set");
     }
 
     #[test]

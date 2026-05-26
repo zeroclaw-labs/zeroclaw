@@ -215,6 +215,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     // section's role in this Config, which is what the operator needs.
     let mut nested_section_help_arms: Vec<proc_macro2::TokenStream> = Vec::new();
 
+    // Static enumeration of every `#[secret]` field's terminal name
+    // reachable from this Configurable type. Direct `#[secret]` fields
+    // push their own snake-case ident; `#[nested]` fields push a
+    // recursive call into the inner type's `secret_field_terminals()`.
+    // The migration crate's raw-TOML encrypt walker uses this allowlist
+    // so map-shaped `#[secret]` fields (e.g. `mcp.servers[*].headers`)
+    // get the same coverage as scalar ones — `prop_fields()` skips
+    // compound types and is not a safe source for that allowlist.
+    let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
@@ -262,6 +273,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     is_set: crate::traits::SecretField::is_set(&self.#field_ident),
                 }
             });
+            // Static terminal name (snake_case, matches the raw TOML key).
+            // Pushed regardless of shape so compound `#[secret]` fields
+            // like `HashMap<String, String>` reach the migration encrypt
+            // walker — they don't surface through `prop_fields()`.
+            let terminal_name = field_ident.to_string();
+            secret_terminal_pushes.push(quote! {
+                out.push(#terminal_name);
+            });
             encrypt_ops.push(quote! {
                 crate::traits::SecretField::encrypt_in_place(
                     &mut self.#field_ident,
@@ -278,12 +297,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             });
 
             // Only string-shaped fields wire into `set_secret` — the
-            // container shapes have no single-string set semantics.
+            // container shapes have no single-string set semantics. Look
+            // through `Option<...>` when checking shape so an annotation
+            // like `Option<HashMap<String, String>> #[secret]` doesn't fall
+            // through to a `self.field = Some(value: String)` arm that
+            // wouldn't type-check.
             let is_option = is_option_type(&field.ty);
-            let is_vec_string = extract_vec_inner(&field.ty)
+            let shape_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
+            let is_vec_string = extract_vec_inner(shape_ty)
                 .map(|inner| inner.to_token_stream().to_string() == "String")
                 .unwrap_or(false);
-            let is_hashmap_string_string = extract_hashmap_value_type(&field.ty)
+            let is_hashmap_string_string = extract_hashmap_value_type(shape_ty)
                 .map(|inner| inner.to_token_stream().to_string() == "String")
                 .unwrap_or(false);
             if !is_vec_string && !is_hashmap_string_string {
@@ -438,6 +462,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 fields.extend(inner.secret_fields());
                             }
                         }
+                    });
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty>::secret_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner_map in self.#field_ident.values_mut() {
@@ -776,6 +803,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         for inner in self.#field_ident.values() {
                             fields.extend(inner.secret_fields());
                         }
+                    });
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#value_ty>::secret_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner in self.#field_ident.values_mut() {
@@ -1119,6 +1149,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty_tokens>::secret_field_terminals());
+                    });
+
                     // Recurse: pull the inner type's map_key_sections + create_map_key.
                     map_key_recurse.push(quote! {
                         out.extend(<#inner_ty_tokens>::map_key_sections());
@@ -1156,6 +1190,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     for inner in self.#field_ident.iter() {
                         fields.extend(inner.secret_fields());
                     }
+                });
+                secret_terminal_recurse.push(quote! {
+                    out.extend(<#vec_inner_ty>::secret_field_terminals());
                 });
                 nested_set.push(quote! {
                     for inner in self.#field_ident.iter_mut() {
@@ -1246,6 +1283,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
                 nested_collect.push(quote! {
                     fields.extend(self.#field_ident.secret_fields());
+                });
+                let plain_field_ty = &field.ty;
+                secret_terminal_recurse.push(quote! {
+                    out.extend(<#plain_field_ty>::secret_field_terminals());
                 });
                 nested_set.push(quote! {
                     if let Ok(()) = self.#field_ident.set_secret(name, value.clone()) {
@@ -1687,6 +1728,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut fields = vec![#(#secret_field_entries),*];
                 #(#nested_collect)*
                 fields
+            }
+
+            /// Static enumeration of every `#[secret]` field's terminal name
+            /// (snake_case, matching the on-disk TOML key) reachable from
+            /// this type via `#[nested]` traversal. Unlike `secret_fields()`,
+            /// this requires no instance — the per-struct codegen literals
+            /// are joined at call time with recursive calls into the inner
+            /// types' own `secret_field_terminals()`.
+            ///
+            /// Used by the migration crate's raw-TOML encrypt walker as the
+            /// secret-key allowlist. `prop_fields()`-derived allowlists skip
+            /// compound (non-Vec) `#[secret]` fields, so this method is the
+            /// authoritative source.
+            pub fn secret_field_terminals() -> Vec<&'static str> {
+                let mut out: Vec<&'static str> = Vec::new();
+                #(#secret_terminal_pushes)*
+                #(#secret_terminal_recurse)*
+                out
             }
 
             /// Encrypt all secret fields in place using the provided store.
