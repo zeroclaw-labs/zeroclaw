@@ -3,9 +3,16 @@
 //! Wraps `Channel::send()` so the daemon/CLI agent loop can push messages
 //! into Telegram, Slack, Discord, etc. The agent receives configured channel
 //! names and target IDs from system prompt injection.
+//!
+//! **Security:** The `to` parameter is optional. When omitted, the configured
+//! `default_target` for the resolved channel key is used. When provided, it
+//! must match the configured `default_target` — arbitrary recipients are
+//! rejected. This ensures the model can only send to operator-configured
+//! destinations.
 
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -21,18 +28,25 @@ pub type PerToolChannelHandle =
 /// Parameters:
 /// - `channel`: Composite channel key (`telegram.default`, `telegram.prod`, etc.) or bare
 ///   type name (`telegram`, `slack`). Bare names resolve to `<type>.default`.
-/// - `to`: Recipient/target ID (chat ID, channel name, etc.)
+/// - `to`: Optional recipient/target ID. When omitted, uses the configured `default_target`.
+///   When provided, must match the configured `default_target` for the resolved channel.
 /// - `body`: Message content to send
 pub struct ChannelSendTool {
     security: Arc<SecurityPolicy>,
     channel_map: PerToolChannelHandle,
+    default_targets: Arc<parking_lot::RwLock<HashMap<String, String>>>,
 }
 
 impl ChannelSendTool {
-    pub fn new(security: Arc<SecurityPolicy>, channel_map: PerToolChannelHandle) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        channel_map: PerToolChannelHandle,
+        default_targets: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    ) -> Self {
         Self {
             security,
             channel_map,
+            default_targets,
         }
     }
 }
@@ -57,14 +71,14 @@ impl Tool for ChannelSendTool {
                 },
                 "to": {
                     "type": "string",
-                    "description": "Recipient ID (chat ID, channel name, etc.)"
+                    "description": "Optional recipient ID. When omitted, uses the configured default_target for the channel. When provided, must match the configured default_target."
                 },
                 "body": {
                     "type": "string",
                     "description": "Message content to send"
                 }
             },
-            "required": ["channel", "to", "body"]
+            "required": ["channel", "body"]
         })
     }
 
@@ -93,14 +107,6 @@ impl Tool for ChannelSendTool {
             .ok_or_else(|| anyhow::Error::msg("Missing 'channel' parameter"))?
             .to_string();
 
-        let to = args
-            .get("to")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow::Error::msg("Missing 'to' parameter"))?
-            .to_string();
-
         let body = args
             .get("body")
             .and_then(|v| v.as_str())
@@ -109,11 +115,23 @@ impl Tool for ChannelSendTool {
             .ok_or_else(|| anyhow::Error::msg("Missing 'body' parameter"))?
             .to_string();
 
-        let channel = {
+        let provided_to = args
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        let (channel, resolved_key) = {
             let channel_map = self.channel_map.read();
 
             // 1. exact composite key
             let channel = channel_map.get(&channel_name).cloned();
+            let resolved_key = if channel.is_some() {
+                channel_name.clone()
+            } else {
+                String::new()
+            };
 
             // 2. bare type → <type>.default
             let channel = channel.or_else(|| {
@@ -124,6 +142,15 @@ impl Tool for ChannelSendTool {
                     None
                 }
             });
+            let resolved_key = if channel.is_some() && resolved_key.is_empty() {
+                if !channel_name.contains('.') {
+                    format!("{channel_name}.default")
+                } else {
+                    resolved_key
+                }
+            } else {
+                resolved_key
+            };
 
             // 3. aliased → fallback to <type>.default
             let channel = channel.or_else(|| {
@@ -138,8 +165,21 @@ impl Tool for ChannelSendTool {
                     None
                 }
             });
+            let resolved_key = if channel.is_some() && resolved_key.is_empty() {
+                if let Some(bare) = channel_name.split('.').next() {
+                    if bare != channel_name {
+                        format!("{bare}.default")
+                    } else {
+                        resolved_key
+                    }
+                } else {
+                    resolved_key
+                }
+            } else {
+                resolved_key
+            };
 
-            channel.ok_or_else(|| {
+            let channel = channel.ok_or_else(|| {
                 // Intentional: enumerating available channel keys in the error
                 // helps the agent correct a wrong channel name. These keys are
                 // operator-configured, not secrets — safe to expose in ToolResult.error.
@@ -148,7 +188,55 @@ impl Tool for ChannelSendTool {
                     "Channel '{}' not found. Available channels: {:?}",
                     channel_name, available
                 ))
-            })?
+            })?;
+
+            (channel, resolved_key)
+        };
+
+        // Resolve the recipient: validate against configured default_target.
+        let to = {
+            let targets = self.default_targets.read();
+            let configured_target = targets.get(&resolved_key).cloned();
+
+            match (provided_to, configured_target) {
+                (Some(provided), Some(configured)) => {
+                    if provided != configured {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Recipient '{}' does not match the configured default_target '{}' for channel '{}'. Arbitrary recipients are not allowed.",
+                                provided, configured, resolved_key
+                            )),
+                        });
+                    }
+                    provided
+                }
+                (None, Some(configured)) => {
+                    // Use the configured default_target.
+                    configured
+                }
+                (Some(provided), None) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "No default_target configured for channel '{}'. Cannot send to arbitrary recipient '{}'.",
+                            resolved_key, provided
+                        )),
+                    });
+                }
+                (None, None) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "No default_target configured for channel '{}'. Either configure a default_target or provide a matching recipient.",
+                            resolved_key
+                        )),
+                    });
+                }
+            }
         };
 
         let message = SendMessage::new(body, &to);
@@ -165,7 +253,7 @@ impl Tool for ChannelSendTool {
             success: true,
             output: format!(
                 "Message sent successfully to channel '{}', recipient '{}'",
-                channel_name, to
+                resolved_key, to
             ),
             error: None,
         })
@@ -216,30 +304,47 @@ mod tests {
         }
     }
 
-    fn make_tool(handles: PerToolChannelHandle) -> ChannelSendTool {
-        ChannelSendTool::new(Arc::new(SecurityPolicy::default()), handles)
+    fn make_tool(
+        handles: PerToolChannelHandle,
+        default_targets: HashMap<String, String>,
+    ) -> ChannelSendTool {
+        ChannelSendTool::new(
+            Arc::new(SecurityPolicy::default()),
+            handles,
+            Arc::new(parking_lot::RwLock::new(default_targets)),
+        )
     }
 
     #[test]
     fn tool_name_and_description() {
-        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let tool = make_tool(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            HashMap::new(),
+        );
         assert_eq!(tool.name(), "channel_send");
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn parameter_schema_has_required_fields() {
-        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let tool = make_tool(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            HashMap::new(),
+        );
         let schema = tool.parameters_schema();
         let required = schema.get("required").unwrap().as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("channel")));
-        assert!(required.iter().any(|v| v.as_str() == Some("to")));
         assert!(required.iter().any(|v| v.as_str() == Some("body")));
+        // 'to' is no longer required
+        assert!(!required.iter().any(|v| v.as_str() == Some("to")));
     }
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let tool = make_tool(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            HashMap::new(),
+        );
         let spec = tool.spec();
         assert_eq!(spec.name, tool.name());
         assert_eq!(spec.description, tool.description());
@@ -247,11 +352,13 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channel_map_returns_error_with_available_list() {
-        let tool = make_tool(Arc::new(parking_lot::RwLock::new(HashMap::new())));
+        let tool = make_tool(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            HashMap::new(),
+        );
         let result = tool
             .execute(serde_json::json!({
                 "channel": "telegram.default",
-                "to": "chat_482910",
                 "body": "hello"
             }))
             .await;
@@ -267,7 +374,9 @@ mod tests {
             "telegram.prod".to_string(),
             Arc::new(StubChannel::new("telegram.prod")),
         );
-        let tool = make_tool(map);
+        let mut targets = HashMap::new();
+        targets.insert("telegram.prod".to_string(), "chat_482910".to_string());
+        let tool = make_tool(map, targets);
         let result = tool
             .execute(serde_json::json!({
                 "channel": "telegram.prod",
@@ -285,7 +394,9 @@ mod tests {
             "telegram.default".to_string(),
             Arc::new(StubChannel::new("telegram.default")),
         );
-        let tool = make_tool(map);
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_482910".to_string());
+        let tool = make_tool(map, targets);
         let result = tool
             .execute(serde_json::json!({
                 "channel": "telegram",
@@ -303,7 +414,9 @@ mod tests {
             "telegram.default".to_string(),
             Arc::new(StubChannel::new("telegram.default")),
         );
-        let tool = make_tool(map);
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_482910".to_string());
+        let tool = make_tool(map, targets);
         let result = tool
             .execute(serde_json::json!({
                 "channel": "telegram.prod",
@@ -312,5 +425,123 @@ mod tests {
             }))
             .await;
         assert!(result.unwrap().success);
+    }
+
+    /// Regression: configured/default target is accepted.
+    #[tokio::test]
+    async fn configured_target_is_accepted() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_123".to_string());
+        let tool = make_tool(map, targets);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "to": "chat_123",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
+    }
+
+    /// Regression: arbitrary different recipient is rejected before Channel::send().
+    #[tokio::test]
+    async fn arbitrary_recipient_is_rejected() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_123".to_string());
+        let tool = make_tool(map, targets);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "to": "chat_999_evil",
+                "body": "hello"
+            }))
+            .await;
+        let result = result.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("does not match"));
+        assert!(result.error.as_ref().unwrap().contains("chat_123"));
+    }
+
+    /// Regression: omitted `to` resolves to configured default_target.
+    #[tokio::test]
+    async fn omitted_to_resolves_to_configured_default() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_123".to_string());
+        let tool = make_tool(map, targets);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
+    }
+
+    /// Regression: no default_target configured and no `to` provided — error.
+    #[tokio::test]
+    async fn no_default_target_and_no_to_returns_error() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let tool = make_tool(map, HashMap::new());
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "body": "hello"
+            }))
+            .await;
+        let result = result.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("No default_target configured")
+        );
+    }
+
+    /// Regression: no default_target configured but `to` provided — error (arbitrary recipient).
+    #[tokio::test]
+    async fn no_default_target_with_to_returns_error() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let tool = make_tool(map, HashMap::new());
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "to": "chat_999",
+                "body": "hello"
+            }))
+            .await;
+        let result = result.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Cannot send to arbitrary recipient")
+        );
     }
 }

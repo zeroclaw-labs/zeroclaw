@@ -962,12 +962,15 @@ pub fn all_tools_with_runtime(
     );
     tool_arcs.push(Arc::new(escalate_tool));
 
-    // Channel send tool — always registered; owns its own late-bound channel map.
+    // Channel send tool — always registered; owns its own late-bound channel map
+    // and a map of configured default targets for recipient enforcement.
     let channel_send_handle: Option<PerToolChannelHandle> =
         Some(Arc::new(RwLock::new(HashMap::new())));
+    let default_targets = crate::channel_targets::build_default_targets_map(root_config);
     let channel_send_tool = ChannelSendTool::new(
         security.clone(),
         channel_send_handle.as_ref().cloned().unwrap(),
+        Arc::new(parking_lot::RwLock::new(default_targets)),
     );
     tool_arcs.push(Arc::new(channel_send_tool));
 
