@@ -2847,6 +2847,31 @@ pub struct AgentRunOverrides {
     pub is_subagent: bool,
 }
 
+/// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
+/// config when `provider_name` is a dotted `<family>.<alias>` reference.
+/// Falls back to `fallback` (the agent's configured provider) for bare family
+/// names or when the alias isn't found.
+///
+/// This prevents `-p openai.shartgpt` (OAuth, no key) from inheriting the
+/// agent's current provider key (e.g. an xai key), which would trigger the
+/// API key prefix-mismatch preflight and block providers that authenticate
+/// via OAuth rather than an explicit API key.
+fn api_key_and_uri_for_provider(
+    config: &zeroclaw_config::schema::Config,
+    provider_name: &str,
+    fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
+) -> (Option<String>, Option<String>) {
+    if let Some((fam, al)) = provider_name.split_once('.') {
+        if let Some(entry) = config.providers.models.find(fam, al) {
+            return (entry.api_key.clone(), entry.uri.clone());
+        }
+    }
+    (
+        fallback.and_then(|e| e.api_key.clone()),
+        fallback.and_then(|e| e.uri.clone()),
+    )
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -3177,12 +3202,18 @@ pub async fn run(
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(&config);
 
+        // Resolve api_key and uri from the actual provider being constructed.
+        // For dotted aliases (e.g. "openai.shartgpt"), look up the alias-specific
+        // config so a -p override does not leak the agent's current provider key
+        // (e.g. an xai key) to a different provider family that doesn't expect it.
+        let (initial_api_key, initial_uri) =
+            api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
                 &provider_name,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
+                initial_api_key.as_deref(),
+                initial_uri.as_deref(),
                 &config.reliability,
                 &config.model_routes,
                 &model_name,
@@ -3611,12 +3642,17 @@ pub async fn run(
                                 )
                             );
 
+                            let (switch_api_key, switch_uri) = api_key_and_uri_for_provider(
+                                &config,
+                                &new_model_provider,
+                                agent_model_provider,
+                            );
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
                                     &config,
                                     &new_model_provider,
-                                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                                    switch_api_key.as_deref(),
+                                    switch_uri.as_deref(),
                                     &config.reliability,
                                     &config.model_routes,
                                     &new_model,
@@ -4004,12 +4040,17 @@ pub async fn run(
                                     )
                                 );
 
+                                let (switch_api_key2, switch_uri2) = api_key_and_uri_for_provider(
+                                    &config,
+                                    &new_model_provider,
+                                    agent_model_provider,
+                                );
                                 model_provider =
                                     zeroclaw_providers::create_routed_model_provider_with_options(
                                         &config,
                                         &new_model_provider,
-                                        agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                                        agent_model_provider.and_then(|e| e.uri.as_deref()),
+                                        switch_api_key2.as_deref(),
+                                        switch_uri2.as_deref(),
                                         &config.reliability,
                                         &config.model_routes,
                                         &new_model,

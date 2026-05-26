@@ -1177,6 +1177,36 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::ModelProviderConfig;
+
+    #[test]
+    fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                requires_openai_auth: true,
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
+            .unwrap();
+        // OpenAiCodexModelProvider reports native_tool_calling; standard OpenAiModelProvider does not
+        assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_factory_routes_to_standard_when_requires_openai_auth_false() {
+        let cfg = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                requires_openai_auth: false,
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
+            .unwrap();
+        assert!(!provider.capabilities().native_tool_calling);
+    }
 
     #[test]
     fn ollama_factory_uses_no_credential_when_key_absent() {
