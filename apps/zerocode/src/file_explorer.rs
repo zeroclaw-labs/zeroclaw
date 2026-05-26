@@ -35,6 +35,8 @@ pub(crate) enum ExplorerAction {
     None,
     /// User confirmed selection. Contains selected file paths.
     Confirm(Vec<PathBuf>),
+    /// User confirmed the current directory (dir-picker mode only).
+    ConfirmDir(PathBuf),
     /// User cancelled the explorer.
     Cancel,
 }
@@ -52,6 +54,7 @@ pub(crate) struct FileExplorerState {
     error: Option<String>,
     search_query: String,
     searching: bool,
+    dir_picker: bool,
     last_list_area: Rect,
 }
 
@@ -67,12 +70,21 @@ impl FileExplorerState {
             error: None,
             search_query: String::new(),
             searching: false,
+            dir_picker: false,
             last_list_area: Rect::default(),
         };
         state.load_entries();
         if !state.entries.is_empty() {
             state.list_state.select(Some(0));
         }
+        state
+    }
+
+    /// Create a new explorer in directory-picker mode.
+    /// Press `c` to confirm the currently-displayed directory as the chosen path.
+    pub fn new_dir_picker(start_dir: PathBuf) -> Self {
+        let mut state = Self::new(start_dir);
+        state.dir_picker = true;
         state
     }
 
@@ -300,6 +312,10 @@ impl FileExplorerState {
                 ExplorerAction::None
             }
 
+            KeyCode::Char('c') if self.dir_picker => {
+                ExplorerAction::ConfirmDir(self.cwd.clone())
+            }
+
             _ => ExplorerAction::None,
         }
     }
@@ -512,6 +528,11 @@ impl FileExplorerState {
                 Style::default().fg(Color::White),
             ));
             footer_spans.push(Span::styled("\u{2588}", Style::default().fg(Color::White)));
+        } else if self.dir_picker {
+            footer_spans.push(Span::styled(
+                " c=choose dir  Enter=open  Backspace=up  /=search  .=hidden  Esc=cancel",
+                theme::dim_style(),
+            ));
         } else {
             footer_spans.push(Span::styled(
                 " Space=select Enter=confirm Esc=cancel /=search .=hidden",
@@ -531,6 +552,17 @@ impl crate::widgets::HelpContext for FileExplorerState {
             HelpNode::entries(vec![
                 E::key("Enter", "Confirm search"),
                 E::key("Esc", "Cancel search"),
+            ])
+        } else if self.dir_picker {
+            HelpNode::entries(vec![
+                E::new(vec!["j", "↓"], "Next entry"),
+                E::new(vec!["k", "↑"], "Prev entry"),
+                E::key("Enter", "Open directory"),
+                E::key("c", "Choose this directory"),
+                E::key("Backspace", "Parent dir"),
+                E::key("/", "Search"),
+                E::key(".", "Toggle hidden"),
+                E::new(vec!["q", "Esc"], "Cancel"),
             ])
         } else {
             HelpNode::entries(vec![
@@ -607,5 +639,38 @@ mod tests {
         let visible = state.visible_entries();
         // Likely empty, but the point is it filters.
         assert!(visible.len() <= state.entries.len());
+    }
+
+    #[test]
+    fn dir_picker_c_key_returns_confirm_dir() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new_dir_picker(tmp.clone());
+        let action = state.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            matches!(action, ExplorerAction::ConfirmDir(ref p) if p == &tmp),
+            "expected ConfirmDir({:?}), got something else",
+            tmp
+        );
+    }
+
+    #[test]
+    fn non_dir_picker_c_key_is_noop() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new(tmp);
+        let action = state.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(action, ExplorerAction::None));
+    }
+
+    #[test]
+    fn dir_picker_enter_on_dir_navigates_not_confirms() {
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new_dir_picker(tmp.clone());
+        // Enter on a directory should navigate into it, not confirm it.
+        // If no subdirs exist in tmp, this just verifies no ConfirmDir is returned.
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            !matches!(action, ExplorerAction::ConfirmDir(_)),
+            "Enter must not return ConfirmDir in dir-picker mode"
+        );
     }
 }

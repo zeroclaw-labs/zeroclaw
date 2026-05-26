@@ -485,6 +485,9 @@ impl InputBarState {
                 ExplorerAction::Cancel => {
                     self.file_explorer = None;
                 }
+                ExplorerAction::ConfirmDir(_) => {
+                    self.file_explorer = None;
+                }
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
@@ -668,6 +671,9 @@ impl InputBarState {
                     self.file_explorer = None;
                 }
                 ExplorerAction::Cancel => {
+                    self.file_explorer = None;
+                }
+                ExplorerAction::ConfirmDir(_) => {
                     self.file_explorer = None;
                 }
                 ExplorerAction::None => {}
