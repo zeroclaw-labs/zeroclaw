@@ -229,11 +229,23 @@ impl McpServer {
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+enum McpInvocation {
+    Tool {
+        server_index: usize,
+        original_tool_name: String,
+    },
+    Method {
+        server_index: usize,
+        method: &'static str,
+    },
+}
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
-    /// prefixed_name → (server_index, original_tool_name)
-    tool_index: HashMap<String, (usize, String)>,
+    /// prefixed_name → MCP invocation route.
+    tool_index: HashMap<String, McpInvocation>,
 }
 
 impl McpRegistry {
@@ -251,7 +263,22 @@ impl McpRegistry {
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
                         let prefixed = format!("{}__{}", config.name, tool.name);
-                        tool_index.insert(prefixed, (server_idx, tool.name.clone()));
+                        tool_index.insert(
+                            prefixed,
+                            McpInvocation::Tool {
+                                server_index: server_idx,
+                                original_tool_name: tool.name.clone(),
+                            },
+                        );
+                    }
+                    for (name, method) in mcp_surface_methods(&config.name) {
+                        tool_index.insert(
+                            name,
+                            McpInvocation::Method {
+                                server_index: server_idx,
+                                method,
+                            },
+                        );
                     }
                     servers.push(server);
                 }
@@ -280,13 +307,20 @@ impl McpRegistry {
 
     /// Tool definition for a given prefixed name (cloned).
     pub async fn get_tool_def(&self, prefixed_name: &str) -> Option<McpToolDef> {
-        let (server_idx, original_name) = self.tool_index.get(prefixed_name)?;
-        let inner = self.servers[*server_idx].inner.lock().await;
-        inner
-            .tools
-            .iter()
-            .find(|t| &t.name == original_name)
-            .cloned()
+        match self.tool_index.get(prefixed_name)? {
+            McpInvocation::Tool {
+                server_index,
+                original_tool_name,
+            } => {
+                let inner = self.servers[*server_index].inner.lock().await;
+                inner
+                    .tools
+                    .iter()
+                    .find(|t| &t.name == original_tool_name)
+                    .cloned()
+            }
+            McpInvocation::Method { method, .. } => mcp_surface_tool_def(prefixed_name, method),
+        }
     }
 
     /// Execute a tool by prefixed name.
@@ -295,7 +329,7 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String> {
-        let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
+        let invocation = self.tool_index.get(prefixed_name).cloned().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -305,9 +339,24 @@ impl McpRegistry {
             );
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
-        let result = self.servers[*server_idx]
-            .call_tool(original_name, arguments)
-            .await?;
+        let result = match invocation {
+            McpInvocation::Tool {
+                server_index,
+                original_tool_name,
+            } => {
+                self.servers[server_index]
+                    .call_tool(&original_tool_name, arguments)
+                    .await?
+            }
+            McpInvocation::Method {
+                server_index,
+                method,
+            } => {
+                self.servers[server_index]
+                    .call_method(method, mcp_surface_params(method, arguments)?)
+                    .await?
+            }
+        };
         serde_json::to_string_pretty(&result)
             .with_context(|| format!("failed to serialize result of MCP tool `{prefixed_name}`"))
     }
@@ -325,6 +374,139 @@ impl McpRegistry {
     }
 }
 
+impl McpServer {
+    async fn call_method(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut inner = self.inner.lock().await;
+        let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = JsonRpcRequest::new(id, method, params);
+
+        let resp = timeout(
+            Duration::from_secs(RECV_TIMEOUT_SECS),
+            inner.transport.send_and_recv(&req),
+        )
+        .await
+        .map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "method": method,
+                        "timeout_secs": RECV_TIMEOUT_SECS,
+                    })),
+                "mcp_client: method call timed out"
+            );
+            anyhow::Error::msg(format!(
+                "MCP server `{}` timed out after {}s during `{method}`",
+                inner.config.name, RECV_TIMEOUT_SECS
+            ))
+        })?
+        .with_context(|| format!("MCP server `{}` error during `{method}`", inner.config.name))?;
+
+        if let Some(err) = resp.error {
+            bail!("MCP method `{method}` error {}: {}", err.code, err.message);
+        }
+        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+fn mcp_surface_methods(server_name: &str) -> [(String, &'static str); 4] {
+    [
+        (
+            format!("{server_name}__mcp_list_resources"),
+            "resources/list",
+        ),
+        (
+            format!("{server_name}__mcp_read_resource"),
+            "resources/read",
+        ),
+        (format!("{server_name}__mcp_list_prompts"), "prompts/list"),
+        (format!("{server_name}__mcp_get_prompt"), "prompts/get"),
+    ]
+}
+
+fn mcp_surface_tool_def(prefixed_name: &str, method: &str) -> Option<McpToolDef> {
+    let (description, input_schema) = match method {
+        "resources/list" => (
+            "List MCP resources exposed by this server.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        "resources/read" => (
+            "Read one MCP resource by URI from this server.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "description": "Resource URI returned by mcp_list_resources."
+                    }
+                },
+                "required": ["uri"]
+            }),
+        ),
+        "prompts/list" => (
+            "List MCP prompts exposed by this server.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        "prompts/get" => (
+            "Get one MCP prompt by name, optionally passing prompt arguments.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Prompt name returned by mcp_list_prompts."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Optional prompt arguments keyed by argument name."
+                    }
+                },
+                "required": ["name"]
+            }),
+        ),
+        _ => return None,
+    };
+
+    Some(McpToolDef {
+        name: prefixed_name.to_string(),
+        description: Some(description.to_string()),
+        input_schema,
+    })
+}
+
+fn mcp_surface_params(method: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
+    match method {
+        "resources/list" | "prompts/list" => Ok(json!({})),
+        "resources/read" => {
+            let uri = required_string_arg(&arguments, "uri")?;
+            Ok(json!({ "uri": uri }))
+        }
+        "prompts/get" => {
+            let name = required_string_arg(&arguments, "name")?;
+            let prompt_arguments = arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Ok(json!({ "name": name, "arguments": prompt_arguments }))
+        }
+        _ => bail!("unsupported MCP method bridge `{method}`"),
+    }
+}
+
+fn required_string_arg(arguments: &serde_json::Value, name: &str) -> Result<String> {
+    let value = arguments
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::Error::msg(format!("missing string argument `{name}`")))?;
+    Ok(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +516,62 @@ mod tests {
     fn tool_name_prefix_format() {
         let prefixed = format!("{}__{}", "filesystem", "read_file");
         assert_eq!(prefixed, "filesystem__read_file");
+    }
+
+    #[test]
+    fn mcp_surface_methods_are_prefixed_per_server() {
+        let names: Vec<_> = mcp_surface_methods("filesystem")
+            .into_iter()
+            .map(|(name, method)| (name, method))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (
+                    "filesystem__mcp_list_resources".to_string(),
+                    "resources/list"
+                ),
+                (
+                    "filesystem__mcp_read_resource".to_string(),
+                    "resources/read"
+                ),
+                ("filesystem__mcp_list_prompts".to_string(), "prompts/list"),
+                ("filesystem__mcp_get_prompt".to_string(), "prompts/get"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_surface_tool_def_exposes_read_resource_schema() {
+        let def = mcp_surface_tool_def("filesystem__mcp_read_resource", "resources/read")
+            .expect("read-resource bridge should have a tool definition");
+        assert_eq!(def.name, "filesystem__mcp_read_resource");
+        assert!(def.description.unwrap().contains("Read one MCP resource"));
+        assert_eq!(def.input_schema["required"], serde_json::json!(["uri"]));
+    }
+
+    #[test]
+    fn mcp_surface_params_validate_required_resource_uri() {
+        let params = mcp_surface_params("resources/read", json!({"uri": "file:///notes.md"}))
+            .expect("valid resource URI should map to MCP params");
+        assert_eq!(params, json!({"uri": "file:///notes.md"}));
+
+        let err = mcp_surface_params("resources/read", json!({}))
+            .expect_err("missing URI must fail before MCP dispatch");
+        assert!(err.to_string().contains("missing string argument `uri`"));
+    }
+
+    #[test]
+    fn mcp_surface_params_support_prompt_arguments() {
+        let params = mcp_surface_params(
+            "prompts/get",
+            json!({"name": "summarize", "arguments": {"topic": "release"}}),
+        )
+        .expect("valid prompt get args should map to MCP params");
+        assert_eq!(
+            params,
+            json!({"name": "summarize", "arguments": {"topic": "release"}})
+        );
     }
 
     #[tokio::test]
