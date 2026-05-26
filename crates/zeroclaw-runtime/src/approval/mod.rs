@@ -273,23 +273,42 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let val = if looks_like_secret_key(k) {
-                        "[redacted]".to_string()
-                    } else {
-                        match v {
-                            serde_json::Value::String(s) => truncate_for_summary(s, 80),
-                            other => {
-                                let s = other.to_string();
-                                truncate_for_summary(&s, 80)
-                            }
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+
+            // Prioritize "path" (used by file_write/file_edit etc.) so approval
+            // popups and audit logs always surface the target file first.
+            if let Some(v) = map.get("path") {
+                let val = if looks_like_secret_key("path") {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        other => {
+                            let s = other.to_string();
+                            truncate_for_summary(&s, 80)
                         }
-                    };
-                    format!("{k}: {val}")
-                })
-                .collect();
+                    }
+                };
+                parts.push(format!("path: {val}"));
+            }
+
+            for (k, v) in map.iter() {
+                if k == "path" {
+                    continue;
+                }
+                let val = if looks_like_secret_key(k) {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        other => {
+                            let s = other.to_string();
+                            truncate_for_summary(&s, 80)
+                        }
+                    }
+                };
+                parts.push(format!("{k}: {val}"));
+            }
             parts.join(", ")
         }
         other => {
@@ -494,6 +513,19 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains("command: ls -la"));
         assert!(summary.contains("cwd: /tmp"));
+    }
+
+    #[test]
+    pub fn summarize_args_puts_path_first_for_file_tools() {
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "old_string": "foo",
+            "new_string": "bar"
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.starts_with("path: src/main.rs"));
+        assert!(summary.contains("old_string: foo"));
+        assert!(summary.contains("new_string: bar"));
     }
 
     #[test]
