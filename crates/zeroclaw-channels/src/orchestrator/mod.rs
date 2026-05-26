@@ -2477,21 +2477,6 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
-fn build_email_reply(msg: &ChannelMessage, content: impl Into<String>) -> SendMessage {
-    let mut sm = SendMessage::new(content, &msg.reply_target)
-        .in_thread(msg.thread_ts.clone())
-        .in_reply_to(Some(msg.id.clone()));
-    if let Some(ref subj) = msg.subject {
-        let reply_subject = if subj.to_ascii_lowercase().starts_with("re:") {
-            subj.clone()
-        } else {
-            format!("Re: {}", subj)
-        };
-        sm = sm.subject(reply_subject);
-    }
-    sm
-}
-
 fn starts_with_visible_tool_call_tag_example(response: &str) -> bool {
     let lower = response.trim_start().to_ascii_lowercase();
     let starts_with_tool_tag = lower.starts_with("<tool_call")
@@ -3381,7 +3366,7 @@ async fn process_channel_message_body(
                 route.model_provider
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&build_email_reply(&msg, message)).await;
+                let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
             }
             return;
         }
@@ -4334,12 +4319,12 @@ async fn process_channel_message_body(
                             "Failed to finalize draft; sending as new message"
                         );
                         let _ = channel
-                            .send(&build_email_reply(&msg, &delivered_response))
+                            .send(&SendMessage::reply_to(&msg, &delivered_response))
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &build_email_reply(&msg, &delivered_response)
+                        &SendMessage::reply_to(&msg, &delivered_response)
                             .with_cancellation(cancellation_token.clone()),
                     )
                     .await
@@ -17161,39 +17146,37 @@ Done."#;
 
     fn email_msg(id: &str, subject: Option<&str>) -> ChannelMessage {
         ChannelMessage {
-            id: id.into(),
-            sender: "user@example.com".into(),
-            reply_target: "user@example.com".into(),
-            content: "Hello".into(),
-            channel: "email".into(),
-            channel_alias: None,
-            timestamp: 0,
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: vec![],
             subject: subject.map(Into::into),
+            ..ChannelMessage::new(
+                id,
+                "user@example.com",
+                "user@example.com",
+                "Hello",
+                "email",
+                0,
+            )
         }
     }
 
     #[test]
-    fn build_email_reply_sets_in_reply_to_and_re_subject() {
+    fn reply_to_sets_in_reply_to_and_re_subject() {
         let msg = email_msg("<abc123@mail.example>", Some("Weekly report"));
-        let sm = build_email_reply(&msg, "Here is the answer");
+        let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert_eq!(sm.subject.as_deref(), Some("Re: Weekly report"));
     }
 
     #[test]
-    fn build_email_reply_does_not_double_re_prefix() {
+    fn reply_to_does_not_double_re_prefix() {
         let msg = email_msg("<abc123@mail.example>", Some("Re: Weekly report"));
-        let sm = build_email_reply(&msg, "Here is the answer");
+        let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.subject.as_deref(), Some("Re: Weekly report"));
     }
 
     #[test]
-    fn build_email_reply_no_subject_still_sets_in_reply_to() {
+    fn reply_to_no_subject_still_sets_in_reply_to() {
         let msg = email_msg("<abc123@mail.example>", None);
-        let sm = build_email_reply(&msg, "Here is the answer");
+        let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
     }
