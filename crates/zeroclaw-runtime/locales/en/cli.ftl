@@ -129,6 +129,7 @@ cli-memory-list-about = List memory entries with optional filters
 cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
@@ -347,3 +348,38 @@ channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured 
 channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
 channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
 channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+
+channel-wecom-ws-stream-bootstrap = Working on it, please wait.
+channel-wecom-ws-stop-ack = Stopped the current message.
+channel-wecom-ws-voice-unavailable = I can't process voice messages right now {$emoji}
+channel-wecom-ws-unsupported-message = This message type is not supported yet.
+channel-wecom-ws-welcome = Hi, welcome to chat with me {$emoji}
+channel-wecom-ws-supplemental-message =
+    [Supplemental message]
+    {$extra}
+channel-wecom-ws-group-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting group messages.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Add an allowed entry to {$allowed_groups_path} or {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-group-access-denied =
+    This group is not allowed to use this bot.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Ask an administrator to add this group to {$allowed_groups_path}, or add your userid to {$allowed_users_path}.
+channel-wecom-ws-dm-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting messages.
+
+    Your userid: {$userid}
+
+    Add an allowed entry to {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-dm-access-denied =
+    You do not have permission to use this bot.
+
+    Your userid: {$userid}
+
+    Ask an administrator to add your userid to {$allowed_users_path}.

@@ -10,7 +10,6 @@ use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2802,6 +2801,11 @@ pub struct AliasedAgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// When true, only native provider tool calls are executable. Text fallback
+    /// parsing remains disabled, so XML/markdown/GLM-looking text is treated as
+    /// final assistant text.
+    #[serde(default)]
+    pub strict_tool_parsing: bool,
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
@@ -2910,6 +2914,7 @@ impl Default for AliasedAgentConfig {
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -5622,6 +5627,9 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
+    #[serde(default)]
+    pub headed: Option<bool>,
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
@@ -5656,6 +5664,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
@@ -9785,23 +9794,6 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
-struct ConfigWrapper<T: ChannelConfig>(std::marker::PhantomData<T>);
-
-impl<T: ChannelConfig> ConfigWrapper<T> {
-    fn new(_: Option<&T>) -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
-    fn name(&self) -> &'static str {
-        T::name()
-    }
-    fn desc(&self) -> &'static str {
-        T::desc()
-    }
-}
-
 /// Top-level channel configurations (`[channels]` section).
 ///
 /// each channel type is a keyed table of named instances (aliases).
@@ -9891,6 +9883,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub wecom: HashMap<String, WeComConfig>,
+    /// WeCom AI Bot WebSocket channel instances (`[channels.wecom_ws.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub wecom_ws: HashMap<String, WeComWsConfig>,
     /// WeChat personal iLink Bot channel instances (`[channels.wechat.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -9907,7 +9903,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mochat: HashMap<String, MochatConfig>,
-    #[cfg(feature = "channel-nostr")]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub nostr: HashMap<String, NostrConfig>,
@@ -9928,7 +9923,6 @@ pub struct ChannelsConfig {
     #[nested]
     pub voice_call: HashMap<String, crate::scattered_types::VoiceCallConfig>,
     /// Voice wake word detection channel instances (`[channels.voice_wake.<alias>]`).
-    #[cfg(feature = "voice-wake")]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_wake: HashMap<String, VoiceWakeConfig>,
@@ -9975,122 +9969,177 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
-    /// get channels' metadata and whether the default alias is configured, except webhook
-    #[rustfmt::skip]
-    pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
+    /// Returns metadata and configuration status for every known channel type.
+    ///
+    /// Always returns the full set of channel types regardless of compile-time
+    /// feature flags — the `configured` flag reflects whether the operator has
+    /// populated that channel's config section.  For a list restricted to only
+    /// the channels compiled into this binary use
+    /// `zeroclaw_channels::listing::compiled_channels` instead.
+    pub fn channels(&self) -> Vec<super::traits::ChannelInfo> {
+        use super::traits::ChannelInfo;
         vec![
-            (
-                Box::new(ConfigWrapper::new(self.telegram.get("default"))),
-                !self.telegram.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.discord.get("default"))),
-                !self.discord.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.slack.get("default"))),
-                !self.slack.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.mattermost.get("default"))),
-                !self.mattermost.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.imessage.get("default"))),
-                !self.imessage.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.matrix.get("default"))),
-                !self.matrix.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.signal.get("default"))),
-                !self.signal.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.whatsapp.get("default"))),
-                !self.whatsapp.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.linq.get("default"))),
-                !self.linq.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wati.get("default"))),
-                !self.wati.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.nextcloud_talk.get("default"))),
-                !self.nextcloud_talk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.email.get("default"))),
-                !self.email.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.gmail_push.get("default"))),
-                !self.gmail_push.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.irc.get("default"))),
-                !self.irc.is_empty()
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.lark.get("default"))),
-                !self.lark.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.dingtalk.get("default"))),
-                !self.dingtalk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wecom.get("default"))),
-                !self.wecom.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.wechat.get("default"))),
-                !self.wechat.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.qq.get("default"))),
-                !self.qq.is_empty()
-            ),
-            #[cfg(feature = "channel-nostr")]
-            (
-                Box::new(ConfigWrapper::new(self.nostr.get("default"))),
-                !self.nostr.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.clawdtalk.get("default"))),
-                !self.clawdtalk.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.reddit.get("default"))),
-                !self.reddit.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.bluesky.get("default"))),
-                !self.bluesky.is_empty(),
-            ),
-            #[cfg(feature = "voice-wake")]
-            (
-                Box::new(ConfigWrapper::new(self.voice_wake.get("default"))),
-                !self.voice_wake.is_empty(),
-            ),
-            (
-                Box::new(ConfigWrapper::new(self.mqtt.get("default"))),
-                !self.mqtt.is_empty(),
-            ),
+            ChannelInfo {
+                name: "Telegram",
+                desc: "connect your bot",
+                configured: !self.telegram.is_empty(),
+            },
+            ChannelInfo {
+                name: "Discord",
+                desc: "connect your bot",
+                configured: !self.discord.is_empty(),
+            },
+            ChannelInfo {
+                name: "Slack",
+                desc: "connect your bot",
+                configured: !self.slack.is_empty(),
+            },
+            ChannelInfo {
+                name: "Mattermost",
+                desc: "connect to your bot",
+                configured: !self.mattermost.is_empty(),
+            },
+            ChannelInfo {
+                name: "iMessage",
+                desc: "macOS only",
+                configured: !self.imessage.is_empty(),
+            },
+            ChannelInfo {
+                name: "Matrix",
+                desc: "self-hosted chat",
+                configured: !self.matrix.is_empty(),
+            },
+            ChannelInfo {
+                name: "Signal",
+                desc: "An open-source, encrypted messaging service",
+                configured: !self.signal.is_empty(),
+            },
+            ChannelInfo {
+                name: "WhatsApp",
+                desc: "Business Cloud API",
+                configured: !self.whatsapp.is_empty(),
+            },
+            ChannelInfo {
+                name: "WhatsApp Web",
+                desc: "native WhatsApp Web (wa-rs)",
+                configured: self.whatsapp.values().any(|c| c.is_web_config()),
+            },
+            ChannelInfo {
+                name: "Linq",
+                desc: "iMessage/RCS/SMS via Linq API",
+                configured: !self.linq.is_empty(),
+            },
+            ChannelInfo {
+                name: "WATI",
+                desc: "WhatsApp via WATI Business API",
+                configured: !self.wati.is_empty(),
+            },
+            ChannelInfo {
+                name: "NextCloud Talk",
+                desc: "NextCloud Talk platform",
+                configured: !self.nextcloud_talk.is_empty(),
+            },
+            ChannelInfo {
+                name: "Email",
+                desc: "Email over IMAP/SMTP",
+                configured: !self.email.is_empty(),
+            },
+            ChannelInfo {
+                name: "Gmail Push",
+                desc: "Gmail Pub/Sub push notifications",
+                configured: !self.gmail_push.is_empty(),
+            },
+            ChannelInfo {
+                name: "IRC",
+                desc: "IRC over TLS",
+                configured: !self.irc.is_empty(),
+            },
+            ChannelInfo {
+                name: "Lark",
+                desc: "Lark Bot",
+                configured: !self.lark.is_empty(),
+            },
+            ChannelInfo {
+                name: "DingTalk",
+                desc: "DingTalk Stream Mode",
+                configured: !self.dingtalk.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeCom",
+                desc: "WeCom Bot Webhook",
+                configured: !self.wecom.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeCom WebSocket",
+                desc: "WeCom AI Bot long connection",
+                configured: !self.wecom_ws.is_empty(),
+            },
+            ChannelInfo {
+                name: "WeChat",
+                desc: "WeChat iLink Bot",
+                configured: !self.wechat.is_empty(),
+            },
+            ChannelInfo {
+                name: "QQ Official",
+                desc: "Tencent QQ Bot",
+                configured: !self.qq.is_empty(),
+            },
+            ChannelInfo {
+                name: "Nostr",
+                desc: "Nostr DMs",
+                configured: !self.nostr.is_empty(),
+            },
+            ChannelInfo {
+                name: "ClawdTalk",
+                desc: "ClawdTalk Channel",
+                configured: !self.clawdtalk.is_empty(),
+            },
+            ChannelInfo {
+                name: "Reddit",
+                desc: "Reddit bot (OAuth2)",
+                configured: !self.reddit.is_empty(),
+            },
+            ChannelInfo {
+                name: "Bluesky",
+                desc: "AT Protocol",
+                configured: !self.bluesky.is_empty(),
+            },
+            ChannelInfo {
+                name: "X/Twitter",
+                desc: "X/Twitter Bot via API v2",
+                configured: !self.twitter.is_empty(),
+            },
+            ChannelInfo {
+                name: "Mochat",
+                desc: "Mochat Customer Service",
+                configured: !self.mochat.is_empty(),
+            },
+            ChannelInfo {
+                name: "LINE",
+                desc: "connect your LINE bot",
+                configured: !self.line.is_empty(),
+            },
+            ChannelInfo {
+                name: "Voice Call",
+                desc: "outbound voice call channel",
+                configured: !self.voice_call.is_empty(),
+            },
+            ChannelInfo {
+                name: "VoiceWake",
+                desc: "voice wake word detection",
+                configured: !self.voice_wake.is_empty(),
+            },
+            ChannelInfo {
+                name: "MQTT",
+                desc: "MQTT SOP Listener",
+                configured: !self.mqtt.is_empty(),
+            },
+            ChannelInfo {
+                name: "Webhook",
+                desc: "HTTP endpoint",
+                configured: !self.webhook.is_empty(),
+            },
         ]
-    }
-
-    pub fn channels(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
-        let mut ret = self.channels_except_webhook();
-        ret.push((
-            Box::new(ConfigWrapper::new(self.webhook.get("default"))),
-            !self.webhook.is_empty(),
-        ));
-        ret
     }
 }
 
@@ -10125,17 +10174,16 @@ impl Default for ChannelsConfig {
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
@@ -11910,6 +11958,96 @@ impl ChannelConfig for WeComConfig {
     }
 }
 
+fn default_wecom_ws_file_retention_days() -> u32 {
+    7
+}
+
+fn default_wecom_ws_max_file_size_mb() -> u64 {
+    20
+}
+
+fn default_wecom_ws_stream_mode() -> StreamMode {
+    StreamMode::Partial
+}
+
+/// WeCom AI Bot WebSocket configuration.
+///
+/// This is distinct from webhook-based [`WeComConfig`] and uses the WeCom AI
+/// Bot long-connection API for inbound messages and active-session replies.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wecom_ws"]
+pub struct WeComWsConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot ID for WeCom WebSocket subscription.
+    pub bot_id: String,
+    /// Secret for WeCom WebSocket subscription authentication.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secret: String,
+    /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// Display name or mention alias of the WeCom AI bot, for example `danya`.
+    ///
+    /// WeCom group text often arrives as plain text such as `@danya say hi`;
+    /// passing this name through lets the generic reply-intent precheck
+    /// recognize that a group message was addressed to the bot.
+    #[serde(default)]
+    pub bot_name: Option<String>,
+    /// File retention days for downloaded WeCom attachments under the workspace cache.
+    #[serde(default = "default_wecom_ws_file_retention_days")]
+    pub file_retention_days: u32,
+    /// Maximum accepted file size in MiB for WeCom attachment download attempts.
+    #[serde(default = "default_wecom_ws_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Streaming mode for progressive draft delivery over the WeCom long connection.
+    #[serde(default = "default_wecom_ws_stream_mode")]
+    pub stream_mode: StreamMode,
+    /// Optional per-channel proxy override. Falls back to the global proxy config when empty.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl Default for WeComWsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_id: String::new(),
+            secret: String::new(),
+            allowed_users: Vec::new(),
+            allowed_groups: Vec::new(),
+            bot_name: None,
+            file_retention_days: default_wecom_ws_file_retention_days(),
+            max_file_size_mb: default_wecom_ws_max_file_size_mb(),
+            stream_mode: default_wecom_ws_stream_mode(),
+            proxy_url: None,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for WeComWsConfig {
+    fn name() -> &'static str {
+        "WeCom WebSocket"
+    }
+    fn desc() -> &'static str {
+        "WeCom AI Bot long connection"
+    }
+}
+
 /// WeChat personal iLink Bot channel configuration.
 ///
 /// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
@@ -12160,7 +12298,6 @@ pub struct VoiceDuplexConfig {
 /// Listens on the default microphone for a configurable wake word,
 /// then captures the following utterance and transcribes it via the
 /// existing transcription API.
-#[cfg(feature = "voice-wake")]
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "voice-wake"]
@@ -12194,27 +12331,22 @@ pub struct VoiceWakeConfig {
     pub excluded_tools: Vec<String>,
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_word() -> String {
     "hey zeroclaw".into()
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_silence_timeout_ms() -> u32 {
     2000
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_energy_threshold() -> f32 {
     0.01
 }
 
-#[cfg(feature = "voice-wake")]
 fn default_voice_wake_max_capture_secs() -> u32 {
     30
 }
 
-#[cfg(feature = "voice-wake")]
 impl Default for VoiceWakeConfig {
     fn default() -> Self {
         Self {
@@ -12228,7 +12360,6 @@ impl Default for VoiceWakeConfig {
     }
 }
 
-#[cfg(feature = "voice-wake")]
 impl ChannelConfig for VoiceWakeConfig {
     fn name() -> &'static str {
         "VoiceWake"
@@ -12239,7 +12370,6 @@ impl ChannelConfig for VoiceWakeConfig {
 }
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
-#[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nostr"]
@@ -12264,7 +12394,6 @@ pub struct NostrConfig {
     pub excluded_tools: Vec<String>,
 }
 
-#[cfg(feature = "channel-nostr")]
 impl ChannelConfig for NostrConfig {
     fn name() -> &'static str {
         "Nostr"
@@ -12274,7 +12403,6 @@ impl ChannelConfig for NostrConfig {
     }
 }
 
-#[cfg(feature = "channel-nostr")]
 pub fn default_nostr_relays() -> Vec<String> {
     vec![
         "wss://relay.damus.io".to_string(),
@@ -12398,7 +12526,9 @@ pub struct JiraConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
     /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`,
+    /// `"list_projects"`, `"myself"`, `"list_transitions"`,
+    /// `"transition_ticket"`, `"create_ticket"`.
     /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
@@ -12865,6 +12995,7 @@ enum ConfigResolutionSource {
     EnvDataDir,
     EnvWorkspaceLegacy,
     DefaultConfigDir,
+    HomebrewConfigDir,
 }
 
 impl ConfigResolutionSource {
@@ -12874,6 +13005,7 @@ impl ConfigResolutionSource {
             Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
             Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
             Self::DefaultConfigDir => "default",
+            Self::HomebrewConfigDir => "homebrew",
         }
     }
 }
@@ -12908,6 +13040,59 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
+async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
+    let parts = exe.iter().collect::<Vec<_>>();
+    let prefix = match parts.as_slice() {
+        [prefix @ .., cellar, formula, _version, bin, exe_name]
+            if *cellar == std::ffi::OsStr::new("Cellar")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            prefix.iter().collect::<PathBuf>()
+        }
+        [prefix @ .., opt, formula, bin, exe_name]
+            if *opt == std::ffi::OsStr::new("opt")
+                && *formula == std::ffi::OsStr::new("zeroclaw")
+                && *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        [prefix @ .., bin, exe_name]
+            if *bin == std::ffi::OsStr::new("bin")
+                && *exe_name == std::ffi::OsStr::new("zeroclaw") =>
+        {
+            let prefix = prefix.iter().collect::<PathBuf>();
+            if !prefix.as_os_str().is_empty()
+                && fs::metadata(prefix.join("Cellar"))
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                prefix
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(prefix.join("var").join("zeroclaw"))
 }
 
 async fn resolve_runtime_config_dirs(
@@ -12995,6 +13180,17 @@ async fn resolve_runtime_config_dirs(
             zeroclaw_dir,
             data_dir,
             ConfigResolutionSource::EnvWorkspaceLegacy,
+        ));
+    }
+
+    if cfg!(target_os = "macos")
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
+    {
+        return Ok((
+            homebrew_config_dir.clone(),
+            homebrew_config_dir.join("workspace"),
+            ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
 
@@ -13096,6 +13292,22 @@ fn is_local_ollama_endpoint(api_url: Option<&str>) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
         .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+}
+
+fn is_official_ollama_cloud_endpoint(api_url: Option<&str>) -> bool {
+    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host.eq_ignore_ascii_case("ollama.com")
+                    || host.eq_ignore_ascii_case("api.ollama.com")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
@@ -13983,27 +14195,26 @@ impl Config {
         }
 
         // Ollama cloud-routing safety checks
-        if let Some(entry) = self
-            .providers
-            .models
-            .ollama
-            .values()
-            .next()
-            .map(|cfg| &cfg.base)
-            .filter(|e| {
-                e.model
-                    .as_deref()
-                    .is_some_and(|m| m.trim().ends_with(":cloud"))
-            })
-        {
+        for (alias, cfg) in &self.providers.models.ollama {
+            let entry = &cfg.base;
+            if !entry
+                .model
+                .as_deref()
+                .is_some_and(|model| model.trim().ends_with(":cloud"))
+            {
+                continue;
+            }
+
             if is_local_ollama_endpoint(entry.uri.as_deref()) {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
+                    "providers.models.ollama.{alias}.model uses ':cloud', but uri is local or unset. Set uri to a remote Ollama endpoint (for example https://ollama.com)."
                 );
             }
-            if !has_ollama_cloud_credential(entry.api_key.as_deref()) {
+            if is_official_ollama_cloud_endpoint(entry.uri.as_deref())
+                && !has_ollama_cloud_credential(entry.api_key.as_deref())
+            {
                 anyhow::bail!(
-                    "default_model uses ':cloud' with model_provider 'ollama', but no API key is configured. Set api_key on [providers.models.ollama.<alias>] (or via the schema-mirror grammar: ZEROCLAW_providers__models__ollama__<alias>__api_key=<value>)."
+                    "providers.models.ollama.{alias}.model uses ':cloud', but no API key is configured. Set api_key on [providers.models.ollama.{alias}] (or via the schema-mirror grammar: ZEROCLAW_providers__models__ollama__{alias}__api_key=<value>)."
                 );
             }
         }
@@ -14352,12 +14563,21 @@ impl Config {
                     "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
                 );
             }
-            let valid_actions = ["get_ticket", "search_tickets", "comment_ticket"];
+            let valid_actions = [
+                "get_ticket",
+                "search_tickets",
+                "comment_ticket",
+                "list_projects",
+                "myself",
+                "list_transitions",
+                "transition_ticket",
+                "create_ticket",
+            ];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket",
+                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
                         action
                     );
                 }
@@ -15847,7 +16067,65 @@ auto_save = true
         assert!(c.cli);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
+        assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+    }
+
+    #[test]
+    async fn wecom_ws_config_serde_defaults_and_secret_metadata() {
+        let toml = r#"
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+            allowed_groups = ["zeroclaw_group"]
+            bot_name = "danya"
+            proxy_url = "http://127.0.0.1:7890"
+        "#;
+        let parsed: WeComWsConfig = toml::from_str(toml).unwrap();
+
+        assert!(parsed.enabled);
+        assert_eq!(parsed.bot_id, "bot-123");
+        assert_eq!(parsed.secret, "sk-test");
+        assert_eq!(parsed.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
+        assert_eq!(parsed.bot_name.as_deref(), Some("danya"));
+        assert_eq!(parsed.file_retention_days, 7);
+        assert_eq!(parsed.max_file_size_mb, 20);
+        assert_eq!(parsed.stream_mode, StreamMode::Partial);
+        assert_eq!(parsed.proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(parsed.excluded_tools.is_empty());
+        assert_eq!(WeComWsConfig::default().file_retention_days, 7);
+        assert_eq!(WeComWsConfig::default().max_file_size_mb, 20);
+        assert_eq!(WeComWsConfig::default().stream_mode, StreamMode::Partial);
+        assert!(WeComWsConfig::default().bot_name.is_none());
+        assert!(WeComWsConfig::default().proxy_url.is_none());
+        assert!(WeComWsConfig::prop_is_secret("channels.wecom_ws.secret"));
+    }
+
+    #[test]
+    async fn config_parses_wecom_ws_separate_from_wecom_webhook() {
+        let toml = r#"
+            [channels.wecom.default]
+            enabled = true
+            webhook_key = "webhook-key"
+
+            [channels.wecom_ws.default]
+            enabled = true
+            bot_id = "bot-123"
+            secret = "sk-test"
+            allowed_users = ["zeroclaw_user"]
+        "#;
+        let parsed: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            parsed.channels.wecom.get("default").unwrap().webhook_key,
+            "webhook-key"
+        );
+        let ws = parsed.channels.wecom_ws.get("default").unwrap();
+        assert_eq!(ws.bot_id, "bot-123");
+        assert_eq!(ws.allowed_users, vec!["zeroclaw_user"]);
+        assert_eq!(ws.stream_mode, StreamMode::Partial);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -15964,18 +16242,17 @@ auto_save = true
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
                 wecom: HashMap::new(),
+                wecom_ws: HashMap::new(),
                 wechat: HashMap::new(),
                 qq: HashMap::new(),
                 twitter: HashMap::new(),
                 mochat: HashMap::new(),
-                #[cfg(feature = "channel-nostr")]
                 nostr: HashMap::new(),
                 clawdtalk: HashMap::new(),
                 reddit: HashMap::new(),
                 bluesky: HashMap::new(),
                 voice_call: HashMap::new(),
                 voice_duplex: HashMap::new(),
-                #[cfg(feature = "voice-wake")]
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
                 message_timeout_secs: 300,
@@ -16369,6 +16646,7 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(!cfg.strict_tool_parsing);
     }
 
     #[test]
@@ -16381,6 +16659,7 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -16392,6 +16671,7 @@ tool_dispatcher = "xml"
         assert_eq!(agent.max_history_messages, 80);
         assert!(agent.parallel_tools);
         assert_eq!(agent.tool_dispatcher, "xml");
+        assert!(agent.strict_tool_parsing);
     }
 
     #[test]
@@ -17194,18 +17474,17 @@ allowed_users = ["@u:matrix.org"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             message_timeout_secs: 300,
@@ -17579,18 +17858,17 @@ allowed_numbers = ["+1", "+2"]
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
+            wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
             twitter: HashMap::new(),
             mochat: HashMap::new(),
-            #[cfg(feature = "channel-nostr")]
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
-            #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             message_timeout_secs: 300,
@@ -17856,6 +18134,7 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
@@ -17874,6 +18153,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
@@ -17893,6 +18173,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
@@ -17909,6 +18190,21 @@ default_temperature = 0.7
         assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
         assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
         assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
+    }
+
+    #[test]
+    async fn browser_config_parses_headed_true() {
+        let parsed: BrowserConfig = toml::from_str(
+            r#"
+backend = "agent_browser"
+headed = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.backend, "agent_browser");
+        assert_eq!(parsed.headed, Some(true));
+        assert!(parsed.native_headless);
     }
 
     #[test]
@@ -18183,7 +18479,51 @@ model = "primary-model"
 
         let error = config.validate().expect_err("expected validation to fail");
         assert!(error.to_string().contains(
-            "default_model uses ':cloud' with model_provider 'ollama', but uri is local or unset"
+            "providers.models.ollama.default.model uses ':cloud', but uri is local or unset"
+        ));
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_accepts_private_remote_without_api_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("http://192.168.1.100:11434".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let result = config.validate();
+        assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_requires_api_key_for_official_endpoint() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "providers.models.ollama.default.model uses ':cloud', but no API key is configured"
         ));
     }
 
@@ -18208,6 +18548,40 @@ model = "primary-model"
 
         let result = config.validate();
         assert!(result.is_ok(), "expected validation to pass: {result:?}");
+    }
+
+    #[test]
+    async fn validate_ollama_cloud_model_checks_each_alias_for_official_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama3".to_string()),
+                    uri: Some("http://192.168.1.100:11434".to_string()),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "cloud".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5:cloud".to_string()),
+                    uri: Some("https://ollama.com/api".to_string()),
+                    api_key: None,
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        let error = config.validate().expect_err("expected validation to fail");
+        assert!(error.to_string().contains(
+            "providers.models.ollama.cloud.model uses ':cloud', but no API key is configured"
+        ));
     }
 
     #[test]
@@ -18299,6 +18673,69 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    async fn create_homebrew_prefix() -> TempDir {
+        let prefix = TempDir::new().expect("homebrew prefix temp dir");
+        fs::create_dir_all(prefix.path().join("Cellar"))
+            .await
+            .expect("create Cellar marker");
+        prefix
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_cellar_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("Cellar")
+            .join("zeroclaw")
+            .join("0.7.0")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_prefix_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_detects_opt_bin_layout() {
+        let prefix = create_homebrew_prefix().await;
+        let exe = prefix
+            .path()
+            .join("opt")
+            .join("zeroclaw")
+            .join("bin")
+            .join("zeroclaw");
+
+        let config_dir = try_resolve_macos_homebrew_config_dir(&exe)
+            .await
+            .expect("expected Homebrew layout");
+
+        assert_eq!(config_dir, prefix.path().join("var").join("zeroclaw"));
+    }
+
+    #[test]
+    async fn try_resolve_macos_homebrew_config_dir_rejects_non_homebrew_layout() {
+        let prefix = TempDir::new().expect("non-homebrew temp dir");
+        let exe = prefix.path().join("bin").join("zeroclaw");
+
+        assert!(try_resolve_macos_homebrew_config_dir(&exe).await.is_none());
     }
 
     #[test]
@@ -18621,14 +19058,8 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    async fn validate_rejects_unpublished_jira_actions() {
-        // Restored from upstream's #6116 (Jira API v2 server mode). The
-        // validation logic at `Config::validate -> jira.allowed_actions`
-        // exists unchanged; this test was dropped during the
-        // upstream/master merge resolution alongside the env_override
-        // tests that were intentionally deleted with `apply_env_overrides()`.
-        // Restoring it here.
-        for action in ["list_projects", "myself"] {
+    async fn validate_rejects_unknown_jira_actions() {
+        for action in ["delete_ticket", "drop_database", ""] {
             let mut config = Config::default();
             config.jira.enabled = true;
             config.jira.base_url = "https://jira.example.test".into();
@@ -18637,11 +19068,36 @@ default_model = "persisted-profile"
 
             let err = config
                 .validate()
-                .expect_err("unpublished Jira action should be rejected")
+                .expect_err("unknown Jira action should be rejected")
                 .to_string();
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
-                "expected Jira allowed action error for {action}, got: {err}"
+                "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_all_published_jira_actions() {
+        for action in [
+            "get_ticket",
+            "search_tickets",
+            "comment_ticket",
+            "list_projects",
+            "myself",
+            "list_transitions",
+            "transition_ticket",
+            "create_ticket",
+        ] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            assert!(
+                config.validate().is_ok(),
+                "published Jira action {action:?} should validate"
             );
         }
     }

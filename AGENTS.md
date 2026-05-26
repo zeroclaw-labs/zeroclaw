@@ -158,11 +158,12 @@ When uncertain, classify as higher risk.
 ## Workflow
 
 1. **Read before write** — inspect existing module, factory wiring, and adjacent tests before editing.
-2. **One concern per PR** — avoid mixed feature+refactor+infra patches.
-3. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
-4. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
-5. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
-6. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
+2. **Map non-trivial changes** — before architecture, config, security, workflow, governance, CI, or agent-assisted contribution changes, read `docs/book/src/contributing/architecture-map.md` to choose the relevant architecture and foundation docs.
+3. **One concern per PR** — avoid mixed feature+refactor+infra patches.
+4. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
+5. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
+6. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
+7. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
@@ -216,6 +217,7 @@ Dev-operational contracts — files consumed by AI coding skills and development
 
 ## Linked References
 
+- `@docs/book/src/contributing/architecture-map.md` — start-here map for humans and coding agents before non-trivial architecture, workflow, config, security, CI, governance, or agent-assisted contribution changes
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template

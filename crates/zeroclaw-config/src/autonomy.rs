@@ -1,4 +1,3 @@
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
 
 /// How much autonomy the agent has.

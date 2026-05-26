@@ -45416,8 +45416,8 @@ msgid ""
 msgstr "被阻止的 PR 会收到一个可操作的清单评论，而不是一系列部分审查。"
 
 #: src/maintainers/pr-workflow.md:102
-msgid "`no-stale` reserved for accepted-but-blocked work."
-msgstr "`no-stale` 保留用于已接受但被阻止的工作。"
+msgid "`status:no-stale` reserved for accepted-but-blocked work."
+msgstr "`status:no-stale` 保留用于已接受但被阻止的工作。"
 
 #: src/maintainers/pr-workflow.md:104
 msgid ""
@@ -45907,8 +45907,8 @@ msgid "Non-actionable noise. Close with a polite pointer."
 msgstr "非可操作噪声。以礼貌的提示关闭。"
 
 #: src/maintainers/reviewer-playbook.md:86 src/maintainers/labels.md:179
-msgid "`no-stale`"
-msgstr "`no-stale`"
+msgid "`status:no-stale`"
+msgstr "`status:no-stale`"
 
 #: src/maintainers/reviewer-playbook.md:86
 msgid ""
@@ -46026,8 +46026,8 @@ msgstr "每周队列清理"
 
 #: src/maintainers/reviewer-playbook.md:122
 msgid ""
-"Walk the stale queue. Apply `no-stale` only to accepted-but-blocked work."
-msgstr "遍历陈旧队列。仅对已接受但被阻塞的工作应用 `no-stale`。"
+"Walk the stale queue. Apply `status:no-stale` only to accepted-but-blocked work."
+msgstr "遍历陈旧队列。仅对已接受但被阻塞的工作应用 `status:no-stale`。"
 
 #: src/maintainers/reviewer-playbook.md:123
 msgid "Prioritize `size: XS/S` bug and security PRs first."
