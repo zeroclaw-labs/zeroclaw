@@ -34,11 +34,22 @@ impl std::fmt::Display for TurnError {
 
 impl std::error::Error for TurnError {}
 
+/// Attribution fields attached to the tracing span for the duration of a turn.
+/// All fields appear on every `record!()` emitted inside the turn.
+#[derive(Clone, Default)]
+pub struct TurnAttribution {
+    pub session_key: Option<String>,
+    pub agent_alias: String,
+    pub model_provider: String,
+    pub model: String,
+    pub channel: &'static str,
+}
+
 pub async fn execute_turn<F, Fut>(
     agent: Arc<Mutex<Agent>>,
     prompt: String,
     cancel: CancellationToken,
-    session_key: Option<String>,
+    attribution: TurnAttribution,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -47,12 +58,25 @@ where
 {
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
+    let session_key = attribution.session_key.clone();
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
-        crate::agent::loop_::scope_session_key(session_key, async {
+        let sk = attribution.session_key.clone();
+        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+            use ::zeroclaw_log::Instrument as _;
+            let span = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                session_key = %sk.as_deref().unwrap_or(""),
+                agent_alias = %attribution.agent_alias,
+                model_provider = %attribution.model_provider,
+                model = %attribution.model,
+                channel = %attribution.channel,
+            );
             guard
                 .turn_streamed(&prompt, event_tx, Some(cancel_clone))
+                .instrument(span)
                 .await
         })
         .await
@@ -65,6 +89,7 @@ where
         }
         on_event(event).await;
     }
+    let _ = session_key; // consumed above
 
     match turn_handle
         .await

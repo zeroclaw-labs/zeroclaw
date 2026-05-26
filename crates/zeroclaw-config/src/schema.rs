@@ -10436,6 +10436,46 @@ impl ChannelsConfig {
             },
         ]
     }
+
+    /// Returns `true` when at least one channel entry across all channel types
+    /// has `enabled = true`. Used by the daemon to decide whether the channels
+    /// supervisor should be started — a config with only `enabled = false`
+    /// entries (e.g. partially-configured or disabled bots) must not start the
+    /// supervisor, otherwise it exits immediately and restarts in a tight loop.
+    pub fn has_any_enabled(&self) -> bool {
+        self.telegram.values().any(|c| c.enabled)
+            || self.discord.values().any(|c| c.enabled)
+            || self.slack.values().any(|c| c.enabled)
+            || self.mattermost.values().any(|c| c.enabled)
+            || self.webhook.values().any(|c| c.enabled)
+            || self.imessage.values().any(|c| c.enabled)
+            || self.matrix.values().any(|c| c.enabled)
+            || self.signal.values().any(|c| c.enabled)
+            || self.whatsapp.values().any(|c| c.enabled)
+            || self.linq.values().any(|c| c.enabled)
+            || self.wati.values().any(|c| c.enabled)
+            || self.nextcloud_talk.values().any(|c| c.enabled)
+            || self.email.values().any(|c| c.enabled)
+            || self.gmail_push.values().any(|c| c.enabled)
+            || self.irc.values().any(|c| c.enabled)
+            || self.lark.values().any(|c| c.enabled)
+            || self.line.values().any(|c| c.enabled)
+            || self.dingtalk.values().any(|c| c.enabled)
+            || self.wecom.values().any(|c| c.enabled)
+            || self.wecom_ws.values().any(|c| c.enabled)
+            || self.wechat.values().any(|c| c.enabled)
+            || self.qq.values().any(|c| c.enabled)
+            || self.twitter.values().any(|c| c.enabled)
+            || self.mochat.values().any(|c| c.enabled)
+            || self.nostr.values().any(|c| c.enabled)
+            || self.clawdtalk.values().any(|c| c.enabled)
+            || self.reddit.values().any(|c| c.enabled)
+            || self.bluesky.values().any(|c| c.enabled)
+            || self.voice_call.values().any(|c| c.enabled)
+            || self.voice_wake.values().any(|c| c.enabled)
+            || self.voice_duplex.values().any(|c| c.enabled)
+            || self.mqtt.values().any(|c| c.enabled)
+    }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {

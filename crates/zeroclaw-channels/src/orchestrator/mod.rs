@@ -7203,11 +7203,11 @@ pub async fn start_channels(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "Channels supervisor exiting: no model configured but \
-             channels are present. Complete browser onboarding at \
-             /onboard (or set [providers.models.<type>.<alias>] model = \"...\" \
-             and reload the daemon) before channels can route messages."
+            "Channels supervisor: no model configured. Waiting for reload \
+             (complete onboarding at /onboard or set \
+             [providers.models.<type>.<alias>] model = \"...\" and reload)."
         );
+        cancel.cancelled().await;
         return Ok(());
     }
 
@@ -7706,7 +7706,13 @@ pub async fn start_channels(
                 .map(|cc| Arc::clone(&cc.channel))
                 .collect();
             if channels.is_empty() {
-                println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "No active channels to supervise (none configured or all disabled). \
+                     Waiting for reload signal."
+                );
+                cancel.cancelled().await;
                 return Ok(());
             }
 

@@ -1936,11 +1936,19 @@ impl ChatState {
                     self.flush_streaming_thought();
                 }
                 self.streaming_text.push_str(&text);
-                self.turn_status = TurnStatus::Responding;
+                // Guard: don't mutate turn_status after commit_turn has already
+                // set us back to Idle. Late-arriving notifications (broadcast
+                // channel lag) can otherwise flip the input bar back to the
+                // working animator even though the turn is done.
+                if self.turn_in_flight {
+                    self.turn_status = TurnStatus::Responding;
+                }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
                 self.streaming_thought.push_str(&text);
-                self.turn_status = TurnStatus::Thinking;
+                if self.turn_in_flight {
+                    self.turn_status = TurnStatus::Thinking;
+                }
             }
             SessionUpdate::ToolCall {
                 tool_call_id,
@@ -1953,7 +1961,9 @@ impl ChatState {
                 // conversation order before the Tool entry.
                 self.flush_streaming_text();
                 self.flush_streaming_thought();
-                self.turn_status = TurnStatus::CallingTool(name.clone());
+                if self.turn_in_flight {
+                    self.turn_status = TurnStatus::CallingTool(name.clone());
+                }
                 self.entries.push(ChatEntry::Tool {
                     tool_call_id,
                     name,
@@ -1992,8 +2002,9 @@ impl ChatState {
                 // Tool finished; we're back in the model's hands. Don't clobber
                 // a more specific status if one has already arrived (chunks can
                 // race the result), so only step down from the matching
-                // CallingTool state.
-                if matches!(self.turn_status, TurnStatus::CallingTool(_)) {
+                // CallingTool state. Also guard against post-commit stale
+                // notifications flipping us out of Idle.
+                if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
                     self.turn_status = TurnStatus::Working;
                 }
             }
@@ -2010,7 +2021,9 @@ impl ChatState {
                     arguments_summary,
                     timeout_secs,
                 });
-                self.turn_status = TurnStatus::WaitingForApproval;
+                if self.turn_in_flight {
+                    self.turn_status = TurnStatus::WaitingForApproval;
+                }
             }
             SessionUpdate::ContextUsage {
                 input_tokens,

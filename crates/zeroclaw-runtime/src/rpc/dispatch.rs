@@ -6,7 +6,7 @@
 
 use super::context::RpcContext;
 use super::transport::RpcTransport;
-use super::turn::{TurnOutcome, execute_turn};
+use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
@@ -753,16 +753,25 @@ impl RpcDispatcher {
         self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
 
-        // Capture max_context_tokens so the Usage notification can include it.
-        let max_ctx = {
-            let agent_alias = self
+        // Capture attribution fields and max_context_tokens for the turn span.
+        let (agent_alias, model_provider, model, max_ctx) = {
+            let alias = self
                 .ctx
                 .sessions
                 .get_agent_alias(sid)
                 .await
                 .unwrap_or_default();
             let cfg = self.ctx.config.read().clone();
-            Some(cfg.effective_max_context_tokens(&agent_alias) as u64)
+            let mp = cfg
+                .agent(&alias)
+                .map(|a| a.model_provider.to_string())
+                .unwrap_or_default();
+            let m = cfg
+                .model_provider_for_agent(&alias)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_default();
+            let max_ctx = Some(cfg.effective_max_context_tokens(&alias) as u64);
+            (alias, mp, m, max_ctx)
         };
 
         let rpc = self.rpc.clone();
@@ -771,7 +780,13 @@ impl RpcDispatcher {
             agent,
             prompt.clone(),
             cancel,
-            Some(format!("rpc_{sid}")),
+            TurnAttribution {
+                session_key: Some(sid.to_string()),
+                agent_alias,
+                model_provider,
+                model,
+                channel: "rpc",
+            },
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();

@@ -1360,19 +1360,12 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For the ACP command, allow zeroclaw crates through at INFO so that
-    // structured record!() events reach the LogCaptureLayer and appear in
-    // the TUI log viewer. The fmt layer writes to stderr, not stdout, so
-    // there is no risk of corrupting the stdio JSON protocol. Third-party
-    // crates stay at WARN to avoid noise.
-    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
-        "warn,zeroclaw=info,zeroclaw_channels=info,zeroclaw_runtime=info,zeroclaw_log=info,zeroclaw_infra=info"
-    } else {
-        // matrix_sdk crates are suppressed to warn because they are extremely
-        // noisy at info level. To restore SDK-level output for Matrix debugging:
-        //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
-        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
+    // Initialize logging - respects RUST_LOG env var.
+    // Ephemeral daemon mode defaults to debug so tool call spans are visible.
+    // All other modes default to info.
+    let default_log_level = match &cli.command {
+        Commands::Daemon { ephemeral: true, .. } => "debug",
+        _ => "info",
     };
 
     zeroclaw_log::install_global_subscriber(default_log_level);

@@ -1095,7 +1095,20 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let mut drop_count = other_messages.len() - max;
+            let initial_drop_count = other_messages.len() - max;
+            let mut drop_count = initial_drop_count;
+
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "total_messages": other_messages.len(),
+                        "max_history": max,
+                        "initial_drop_count": initial_drop_count,
+                    })),
+                "trim_history: dropping oldest messages"
+            );
 
             // Avoid creating orphan ToolResults: if the first message remaining
             // after the drop is a ToolResults, its paired AssistantToolCalls was
@@ -1104,6 +1117,7 @@ impl Agent {
             // has no matching tool_use, causing model_providers (e.g. Anthropic) to
             // reject the request with "messages.0.content.0: unexpected
             // tool_use_id found in tool_result blocks".
+            let before_orphan_tr = drop_count;
             while drop_count < other_messages.len()
                 && matches!(
                     &other_messages[drop_count],
@@ -1112,6 +1126,65 @@ impl Agent {
             {
                 drop_count += 1;
             }
+            if drop_count > before_orphan_tr {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "extra_dropped": drop_count - before_orphan_tr,
+                        })),
+                    "trim_history: dropped orphan ToolResults at head"
+                );
+            }
+
+            // Symmetric guard: avoid orphan AssistantToolCalls at the new head.
+            // If the first kept message is an AssistantToolCalls, the model sees
+            // tool calls it made but never received results for (the paired
+            // ToolResults was already dropped above or fell outside the window).
+            // This corrupts the conversation and causes unpredictable behaviour
+            // — the model may retry tools, hallucinate results, or go off-rails.
+            let before_orphan_ac = drop_count;
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::AssistantToolCalls { .. }
+                )
+            {
+                // Also drop the ToolResults that follows this AC (if present)
+                drop_count += 1;
+                if drop_count < other_messages.len()
+                    && matches!(
+                        &other_messages[drop_count],
+                        ConversationMessage::ToolResults(_)
+                    )
+                {
+                    drop_count += 1;
+                }
+            }
+            if drop_count > before_orphan_ac {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "extra_dropped": drop_count - before_orphan_ac,
+                        })),
+                    "trim_history: dropped orphan AssistantToolCalls at head"
+                );
+            }
+
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "total_dropped": drop_count,
+                        "remaining": other_messages.len() - drop_count,
+                    })),
+                "trim_history: complete"
+            );
 
             other_messages.drain(0..drop_count);
         }
@@ -1316,6 +1389,19 @@ impl Agent {
         let args_json = tool_args.to_string();
         let tool_call_id = call.tool_call_id.clone();
 
+        // Emit invoke log — visible in the TUI Logs pane.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "input": args_json,
+                })),
+            format!("tool call: {tool_name}")
+        );
+
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
@@ -1390,6 +1476,39 @@ impl Agent {
             };
 
         let duration = start.elapsed();
+
+        // Emit result log — visible in the TUI Logs pane.
+        if success {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_duration(duration.as_millis() as u64)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "input": args_json,
+                        "output": result,
+                    })),
+                format!("tool result: {tool_name}")
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_duration(duration.as_millis() as u64)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "input": args_json,
+                        "output": result,
+                    })),
+                format!("tool failed: {tool_name}")
+            );
+        }
 
         // ── Hook: after_tool_call (void) ─────────────────────────
         if let Some(ref hooks) = self.hook_runner {
@@ -4043,6 +4162,148 @@ mod tests {
                     matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }),
                     "ToolResults entry is not preceded by an AssistantToolCalls \
                      entry — pair was split during trim"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trim_history_does_not_leave_orphan_assistant_tool_calls() {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        // Set up so the trim boundary lands between a TR and its following
+        // AC, leaving the AC at the head without a preceding user message
+        // context. More importantly, test the case where after the orphan-TR
+        // guard fires, an AC ends up at position 0.
+        //
+        // History: [user1, AC1, TR1, AC2, TR2, user2, AC3, TR3]
+        // len=8, max=4, drop_count=4 → drops user1, AC1, TR1, AC2
+        // Position 4 = TR2 → orphan-TR guard bumps to 5
+        // Position 5 = user2 → stops (user2 is fine)
+        //
+        // But we want to test the AC-at-head case. So:
+        // History: [user1, AC1, TR1, AC2, TR2, AC3, TR3]
+        // len=7, max=3, drop_count=4 → drops user1, AC1, TR1, AC2
+        // Position 4 = TR2 → orphan-TR guard bumps to 5
+        // Position 5 = AC3 → NEW guard should bump to 6 (drop AC3)
+        // Position 6 = TR3 → NEW guard should bump to 7 (drop TR3)
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            max_history_messages: 3,
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // user1
+        agent.history.push(ConversationMessage::Chat(ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }));
+        // AC1, TR1
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 1".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                name: "tool1".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                content: "result1".into(),
+            }]));
+        // AC2, TR2
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 2".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc2".into(),
+                name: "tool2".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc2".into(),
+                content: "result2".into(),
+            }]));
+        // AC3, TR3
+        agent.history.push(ConversationMessage::AssistantToolCalls {
+            text: Some("Calling tool 3".into()),
+            tool_calls: vec![ToolCall {
+                id: "tc3".into(),
+                name: "tool3".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        });
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc3".into(),
+                content: "result3".into(),
+            }]));
+
+        assert_eq!(agent.history.len(), 7);
+        agent.trim_history();
+
+        // The head must not be an AssistantToolCalls (orphaned from context)
+        if let Some(first) = agent.history.first() {
+            assert!(
+                !matches!(first, ConversationMessage::AssistantToolCalls { .. }),
+                "trim_history left an orphan AssistantToolCalls at the head of \
+                 the history; the model would see tool calls with no results"
+            );
+        }
+
+        // Every ToolResults entry must be immediately preceded by an
+        // AssistantToolCalls entry (no split pairs).
+        for window in agent.history.windows(2) {
+            if matches!(&window[1], ConversationMessage::ToolResults(_)) {
+                assert!(
+                    matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }),
+                    "ToolResults entry is not preceded by an AssistantToolCalls \
+                     entry — pair was split during trim"
+                );
+            }
+        }
+
+        // Every AssistantToolCalls must be immediately followed by ToolResults
+        // (no orphan ACs).
+        for window in agent.history.windows(2) {
+            if matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }) {
+                assert!(
+                    matches!(&window[1], ConversationMessage::ToolResults(_)),
+                    "AssistantToolCalls entry is not followed by a ToolResults \
+                     entry — orphan tool call would confuse the model"
                 );
             }
         }
