@@ -210,6 +210,7 @@ impl HeartbeatEngine {
 
             match self.tick().await {
                 Ok(tasks) => {
+                    crate::health::touch_liveness(&self.workspace_dir);
                     if tasks > 0 {
                         info!("💓 Heartbeat: processed {} tasks", tasks);
                     }

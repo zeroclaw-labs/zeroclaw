@@ -997,6 +997,8 @@ Description=DaemonClaw AI Agent
 Documentation=https://github.com/DeliveryBoyTech/daemonclaw
 After=network-online.target
 Wants=network-online.target
+# Liveness: external staleness check via daemonclaw-watchdog.timer (no sd_notify)
+Wants=daemonclaw-watchdog.timer
 
 [Service]
 Type=simple
@@ -1008,7 +1010,7 @@ ExecStart={target_bin} daemon
 
 Restart=on-failure
 RestartSec=5
-WatchdogSec=120
+TimeoutStopSec=30s
 
 # Hardening
 NoNewPrivileges=true
@@ -1022,7 +1024,7 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+MemoryDenyWriteExecute=false
 SystemCallArchitectures=native
 {syscall_filter}
 # Network: outbound + gateway port only

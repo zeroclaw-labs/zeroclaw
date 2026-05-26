@@ -237,6 +237,7 @@ async fn process_due_jobs(
     .buffer_unordered(max_concurrent);
 
     while let Some((job_id, success, output)) = in_flight.next().await {
+        crate::health::touch_liveness(&config.workspace_dir);
         if !success {
             tracing::warn!("Scheduler job '{job_id}' failed: {output}");
         }

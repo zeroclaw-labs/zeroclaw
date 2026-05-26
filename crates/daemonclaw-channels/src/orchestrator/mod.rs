@@ -3347,6 +3347,7 @@ async fn process_channel_message(
                 });
             }
 
+            daemonclaw_runtime::health::touch_liveness(&ctx.prompt_config.workspace_dir);
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),

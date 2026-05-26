@@ -208,6 +208,8 @@ pub async fn run(
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    crate::health::touch_liveness(&config.workspace_dir);
+
     println!("🧠 DaemonClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");

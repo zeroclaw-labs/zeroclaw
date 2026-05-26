@@ -102,6 +102,21 @@ pub fn snapshot_json() -> serde_json::Value {
     })
 }
 
+/// Touch the liveness file to signal that the daemon is making progress.
+/// Called after agent turn completion, heartbeat tick, cron task execution,
+/// or any other meaningful work boundary.
+pub fn touch_liveness(workspace_dir: &std::path::Path) {
+    let path = workspace_dir.join("last-activity");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    if let Err(e) = std::fs::write(&path, &timestamp) {
+        tracing::warn!(path = %path.display(), error = %e, "Failed to touch liveness file");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +195,23 @@ mod tests {
         assert!(component_json["updated_at"].as_str().is_some());
         assert!(component_json["last_ok"].as_str().is_some());
         assert!(json["uptime_seconds"].as_u64().is_some());
+    }
+
+    #[test]
+    fn touch_liveness_creates_and_updates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last-activity");
+
+        assert!(!path.exists());
+        touch_liveness(dir.path());
+        assert!(path.exists());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let ts: u64 = content.trim().parse().expect("should be a unix timestamp");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now - ts < 5);
     }
 }
