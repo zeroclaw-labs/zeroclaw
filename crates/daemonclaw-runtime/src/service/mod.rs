@@ -547,13 +547,19 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
 fn uninstall_linux(_config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let file = Path::new("/etc/systemd/system/daemonclaw.service");
-            if file.exists() {
-                fs::remove_file(file)
-                    .with_context(|| format!("Failed to remove {}", file.display()))?;
+            for unit in [
+                "/etc/systemd/system/daemonclaw-watchdog.timer",
+                "/etc/systemd/system/daemonclaw-watchdog.service",
+                "/etc/systemd/system/daemonclaw.service",
+            ] {
+                let path = Path::new(unit);
+                if path.exists() {
+                    fs::remove_file(path)
+                        .with_context(|| format!("Failed to remove {}", path.display()))?;
+                }
             }
             let _ = run_checked(Command::new("systemctl").args(["daemon-reload"]));
-            println!("✅ Service uninstalled ({})", file.display());
+            println!("✅ Service uninstalled (daemonclaw + watchdog units)");
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/daemonclaw");
@@ -1065,6 +1071,8 @@ WantedBy=multi-user.target
     let timer_path = Path::new("/etc/systemd/system/daemonclaw-backup.timer");
     let backup_svc_path = Path::new("/etc/systemd/system/daemonclaw-backup.service");
     let tmpfiles_path = Path::new("/etc/tmpfiles.d/daemonclaw-backups.conf");
+    let watchdog_timer_path = Path::new("/etc/systemd/system/daemonclaw-watchdog.timer");
+    let watchdog_svc_path = Path::new("/etc/systemd/system/daemonclaw-watchdog.service");
 
     if dry_run {
         println!("[dry-run] would write systemd units and backup infrastructure");
@@ -1107,11 +1115,39 @@ WantedBy=multi-user.target
         fs::write(tmpfiles_path, &tmpfiles)
             .with_context(|| format!("write {}", tmpfiles_path.display()))?;
 
+        // Watchdog: external staleness checker that restarts the daemon if idle
+        let watchdog_timer = "[Unit]\n\
+             Description=DaemonClaw liveness watchdog\n\
+             BindsTo=daemonclaw.service\n\
+             After=daemonclaw.service\n\n\
+             [Timer]\n\
+             OnUnitActiveSec=2min\n\
+             AccuracySec=30s\n\n\
+             [Install]\n\
+             WantedBy=daemonclaw.service\n";
+        fs::write(watchdog_timer_path, &watchdog_timer)
+            .with_context(|| format!("write {}", watchdog_timer_path.display()))?;
+
+        let watchdog_svc = format!(
+            "[Unit]\n\
+             Description=DaemonClaw liveness check\n\
+             After=daemonclaw.service\n\n\
+             [Service]\n\
+             Type=oneshot\n\
+             ExecStart=/bin/sh -c '{bin} watchdog-check --threshold 600 --state-dir {home}/.daemonclaw || systemctl restart daemonclaw.service'\n",
+            bin = target_bin.display(),
+            home = HOME_DIR,
+        );
+        fs::write(watchdog_svc_path, &watchdog_svc)
+            .with_context(|| format!("write {}", watchdog_svc_path.display()))?;
+
         // Enable units
         run_install_cmd("systemctl", &["daemon-reload"])?;
         run_install_cmd("systemctl", &["enable", "daemonclaw.service"])?;
         run_install_cmd("systemctl", &["enable", "daemonclaw-backup.timer"])?;
         run_install_cmd("systemctl", &["start", "daemonclaw-backup.timer"])?;
+        run_install_cmd("systemctl", &["enable", "daemonclaw-watchdog.timer"])?;
+        run_install_cmd("systemctl", &["start", "daemonclaw-watchdog.timer"])?;
 
         // Copy binary
         if exe.to_string_lossy() != target_bin.to_string_lossy() {

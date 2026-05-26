@@ -643,6 +643,27 @@ Examples:
         install: bool,
     },
 
+    /// Check daemon liveness (used by watchdog timer)
+    #[command(
+        name = "watchdog-check",
+        long_about = "\
+Check whether the daemon is making progress by inspecting the liveness \
+touchfile. Exits 0 if the file is fresh or missing (first boot), exits 1 \
+if the file is stale (older than --threshold seconds).
+
+This command is intended to be called by the daemonclaw-watchdog systemd \
+timer. It does not load config or initialize logging."
+    )]
+    WatchdogCheck {
+        /// Maximum age in seconds before the daemon is considered stale
+        #[arg(long, default_value = "600")]
+        threshold: u64,
+
+        /// Directory containing the last-activity file
+        #[arg(long, default_value = "/var/lib/daemonclaw/.daemonclaw")]
+        state_dir: PathBuf,
+    },
+
     /// Deprecated: use `daemonclaw config` instead
     #[command(hide = true)]
     Props {
@@ -962,6 +983,30 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::WatchdogCheck {
+        threshold,
+        state_dir,
+    } = &cli.command
+    {
+        let activity_file = state_dir.join("last-activity");
+        if !activity_file.exists() {
+            std::process::exit(0);
+        }
+        let metadata = std::fs::metadata(&activity_file)?;
+        let age = metadata
+            .modified()?
+            .elapsed()
+            .unwrap_or_default()
+            .as_secs();
+        if age > *threshold {
+            eprintln!(
+                "daemonclaw-watchdog: last-activity is {age}s old (threshold {threshold}s)"
+            );
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
     // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
     // We also always redirect logs to stderr so stdout remains clean for data.
@@ -1227,7 +1272,7 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     match cli.command {
-        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
+        Commands::Onboard { .. } | Commands::Completions { .. } | Commands::WatchdogCheck { .. } => unreachable!(),
 
         Commands::Agent {
             message,
