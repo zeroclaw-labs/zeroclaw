@@ -587,7 +587,7 @@ impl AcpServer {
         );
 
         if let Some(store) = &self.store
-            && let Err(e) = store.create_session(&session_id, &workspace_dir)
+            && let Err(e) = store.create_session(&session_id, &agent_alias, &workspace_dir)
         {
             // Roll back: remove the session we just inserted and surface the error.
             sessions.remove(&session_id);
@@ -1211,10 +1211,30 @@ impl AcpServer {
         let mut tool_call_count: u32 = 0;
         while let Some(event) = event_rx.recv().await {
             // ACP has no `session/update` shape for token-usage events; the
-            // task-local cost tracker records them out-of-band. Skip before
-            // dispatching to the notification builder so the helper match
-            // can stay exhaustive on the four UI-relevant variants.
-            if matches!(event, TurnEvent::Usage { .. }) {
+            // task-local cost tracker records them out-of-band. We DO use the
+            // event to update the per-session `token_count` so the TUI ctx
+            // bar resumes accurately. Then skip before dispatching to the
+            // notification builder so the helper match can stay exhaustive
+            // on the four UI-relevant variants.
+            if let TurnEvent::Usage { input_tokens, .. } = &event {
+                if let (Some(store), Some(it)) = (&self.store, input_tokens)
+                    && let Err(e) = store.set_token_count(&session_id, *it)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Write,
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "input_tokens": *it,
+                            "error": e.to_string(),
+                        })),
+                        "Failed to persist ACP session token_count"
+                    );
+                }
                 continue;
             }
             // Emit attributable span logs for every tool call and result.
@@ -3089,7 +3109,7 @@ mod tests {
 
         let session_id = "sess-load-test";
         store
-            .create_session(session_id, &cwd.path().to_string_lossy())
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
         store
             .append_turn(
@@ -3185,7 +3205,7 @@ mod tests {
         // Create and load the session once to put it in memory
         let session_id = "sess-already-active";
         store
-            .create_session(session_id, &cwd.path().to_string_lossy())
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
         server
             .handle_session_load(&serde_json::json!({
@@ -3213,7 +3233,7 @@ mod tests {
 
         let session_id = "sess-resume-test";
         store
-            .create_session(session_id, &cwd.path().to_string_lossy())
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
         store
             .append_turn(
@@ -3314,7 +3334,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
         store
-            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -3360,7 +3380,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
         store
-            .create_session(stored_id, &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -3405,7 +3425,7 @@ mod tests {
 
         let session_id = "sess-load-store-err";
         store
-            .create_session(session_id, &cwd.path().to_string_lossy())
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
 
         // Drop the schema via a second connection to force a "no such table"
@@ -3464,7 +3484,7 @@ mod tests {
 
         let session_id = "sess-resume-store-err";
         store
-            .create_session(session_id, &cwd.path().to_string_lossy())
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
             .unwrap();
 
         let db_path = cwd.path().join("sessions/acp-sessions.db");

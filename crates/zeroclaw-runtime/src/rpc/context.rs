@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::schema::Config;
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
@@ -84,6 +85,12 @@ pub struct RpcContext {
     /// Live TUI client registry. Tracks connected TUI sessions by UID.
     /// **Source of truth** for "which TUIs are connected right now."
     pub tui_registry: Arc<TuiRegistry>,
+
+    /// ACP session persistence. Opened (and the DB file created) at
+    /// daemon boot under `<data_dir>/sessions/acp-sessions.db`. `None`
+    /// when the store could not be opened (read-only FS, bad perms) —
+    /// callers must treat persistence as best-effort.
+    pub acp_session_store: Option<Arc<AcpSessionStore>>,
 }
 
 impl RpcContext {
@@ -101,6 +108,7 @@ impl RpcContext {
             reload_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
         })
     }
 }

@@ -80,9 +80,7 @@ pub struct ToolCall {
 ///   already a subset — used directly.
 /// - Anthropic: the API reports three DISJOINT buckets per
 ///   <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>:
-///     total_input = cache_read_input_tokens
-///                 + cache_creation_input_tokens
-///                 + input_tokens
+///   `total_input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens`,
 ///   where Anthropic's `input_tokens` is *only* the tokens after the last
 ///   cache breakpoint. The adapter sums all three to produce the total here.
 ///   `cached_input_tokens` is set to `cache_read_input_tokens` (the

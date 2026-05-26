@@ -392,6 +392,25 @@ pub async fn run(
             }
         };
 
+        // Open the ACP session DB at boot so the file exists from the
+        // moment the daemon is up, not when (if ever) `zeroclaw acp`
+        // runs. Best-effort: on failure, log and continue with `None`.
+        let acp_session_store: Option<std::sync::Arc<
+            zeroclaw_infra::acp_session_store::AcpSessionStore,
+        >> = match zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir) {
+            Ok(s) => Some(std::sync::Arc::new(s)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "Failed to open ACP session store at daemon boot"
+                );
+                None
+            }
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
@@ -404,6 +423,7 @@ pub async fn run(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
             tui_registry,
+            acp_session_store,
         }))
     } else {
         None
