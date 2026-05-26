@@ -62,11 +62,11 @@ impl Mode {
 
     fn key(self) -> &'static str {
         match self {
-            Mode::Dashboard => "F1",
-            Mode::Config => "F2",
-            Mode::Acp => "F3",
-            Mode::Chat => "F4",
-            Mode::Logs => "F5",
+            Mode::Dashboard => "F1/1",
+            Mode::Config => "F2/2",
+            Mode::Acp => "F3/3",
+            Mode::Chat => "F4/4",
+            Mode::Logs => "F5/5",
             Mode::Onboard => "F6",
         }
     }
@@ -147,7 +147,7 @@ pub async fn run(
             // Help modal overlay (drawn last so it sits on top).
             if show_help {
                 let mut node = HelpNode::entries(vec![
-                    HelpEntry::new(vec!["F1–F5"], "Switch mode"),
+                    HelpEntry::new(vec!["F1–F5", "Alt+1–5"], "Switch mode"),
                     HelpEntry::key("Ctrl+C", "Quit"),
                     HelpEntry::spacer(),
                 ]);
@@ -205,25 +205,34 @@ pub async fn run(
                     continue;
                 }
 
-                // Global keys: F1–F6 switch modes
+                // Global keys: F1–F6 or Alt+1–5 switch modes
+                let is_mode_key = |code: KeyCode, f_num: u8, digit: char| -> bool {
+                    match code {
+                        KeyCode::F(n) => n == f_num,
+                        KeyCode::Char(c) if c == digit => {
+                            key.modifiers.contains(KeyModifiers::ALT)
+                        }
+                        _ => false,
+                    }
+                };
                 match key.code {
-                    KeyCode::F(1) => {
+                    c if is_mode_key(c, 1, '1') => {
                         mode = Mode::Dashboard;
                         continue;
                     }
-                    KeyCode::F(2) => {
+                    c if is_mode_key(c, 2, '2') => {
                         mode = Mode::Config;
                         continue;
                     }
-                    KeyCode::F(3) => {
+                    c if is_mode_key(c, 3, '3') => {
                         mode = Mode::Acp;
                         continue;
                     }
-                    KeyCode::F(4) => {
+                    c if is_mode_key(c, 4, '4') => {
                         mode = Mode::Chat;
                         continue;
                     }
-                    KeyCode::F(5) => {
+                    c if is_mode_key(c, 5, '5') => {
                         mode = Mode::Logs;
                         continue;
                     }

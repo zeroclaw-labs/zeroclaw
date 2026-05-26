@@ -47,17 +47,17 @@ impl OnboardPane {
             Line::from(vec![Span::styled("Quick-start", heading_style)]),
             Line::from(vec![
                 Span::styled("  1. ", dim_style),
-                Span::styled("Dashboard (F1)", key_style),
+                Span::styled("Dashboard (F1 / Alt+1)", key_style),
                 Span::styled(" — view connected agents and system status.", normal_style),
             ]),
             Line::from(vec![
                 Span::styled("  2. ", dim_style),
-                Span::styled("Config (F2)  ", key_style),
+                Span::styled("Config (F2 / Alt+2)  ", key_style),
                 Span::styled(" — create or edit agent configurations.", normal_style),
             ]),
             Line::from(vec![
                 Span::styled("  3. ", dim_style),
-                Span::styled("ACP (F3)     ", key_style),
+                Span::styled("ACP (F3 / Alt+3)     ", key_style),
                 Span::styled(
                     " — inspect live agent/channel protocol traffic.",
                     normal_style,
@@ -65,12 +65,12 @@ impl OnboardPane {
             ]),
             Line::from(vec![
                 Span::styled("  4. ", dim_style),
-                Span::styled("Chat (F4)    ", key_style),
+                Span::styled("Chat (F4 / Alt+4)    ", key_style),
                 Span::styled(" — send messages to an agent interactively.", normal_style),
             ]),
             Line::from(vec![
                 Span::styled("  5. ", dim_style),
-                Span::styled("Logs (F5)    ", key_style),
+                Span::styled("Logs (F5 / Alt+5)    ", key_style),
                 Span::styled(" — stream live log output from the daemon.", normal_style),
             ]),
             Line::from(""),
@@ -145,7 +145,7 @@ impl OnboardPane {
         HelpNode::entries(vec![
             HelpEntry::new(vec!["↑ / k", "↓ / j"], "Scroll up / down"),
             HelpEntry::new(vec!["PgUp", "PgDn"], "Scroll by 10 lines"),
-            HelpEntry::key("F1", "Go to Dashboard"),
+            HelpEntry::key("F1 / Alt+1", "Go to Dashboard"),
         ])
     }
 }
