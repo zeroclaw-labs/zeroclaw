@@ -688,6 +688,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -712,6 +713,7 @@ impl WeComWsChannel {
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -736,6 +738,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -820,6 +823,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
         });
@@ -2349,14 +2353,10 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
 fn strip_trailing_provider_sentinels(input: &str) -> String {
     let mut trimmed = input.trim_end();
 
-    loop {
-        let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
-            .iter()
-            .find(|sentinel| trimmed.ends_with(**sentinel))
-        else {
-            break;
-        };
-
+    while let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
+        .iter()
+        .find(|sentinel| trimmed.ends_with(**sentinel))
+    {
         trimmed = trimmed[..trimmed.len() - sentinel.len()].trim_end();
     }
 
@@ -3368,6 +3368,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: Vec::new(),
+            subject: None,
         })
         .await
         .unwrap();
