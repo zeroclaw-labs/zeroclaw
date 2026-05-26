@@ -1220,7 +1220,7 @@ impl AcpServer {
                 TurnEvent::ToolCall { id, name, args } => {
                     tool_call_count += 1;
                     ::zeroclaw_log::record!(
-                        INFO,
+                        DEBUG,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_attrs(::serde_json::json!({
                                 "tool_call_id": id,
@@ -1232,7 +1232,7 @@ impl AcpServer {
                 }
                 TurnEvent::ToolResult { id, name, output } => {
                     ::zeroclaw_log::record!(
-                        INFO,
+                        DEBUG,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
                             .with_outcome(::zeroclaw_log::EventOutcome::Success)
                             .with_attrs(::serde_json::json!({

@@ -100,7 +100,7 @@ pub async fn execute_one_tool(
     // execute() impls add zero logging.
     let _start_guard = tool_span.clone().entered();
     ::zeroclaw_log::record!(
-        INFO,
+        DEBUG,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
             .with_category(::zeroclaw_log::EventCategory::Tool)
             .with_attrs(::serde_json::json!({"input": call_arguments})),
@@ -126,7 +126,7 @@ pub async fn execute_one_tool(
             let duration = start.elapsed();
             if r.success {
                 ::zeroclaw_log::record!(
-                    INFO,
+                    DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                         .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Success)

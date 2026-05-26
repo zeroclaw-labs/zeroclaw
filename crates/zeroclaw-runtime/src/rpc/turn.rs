@@ -50,9 +50,17 @@ where
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
-        crate::agent::loop_::scope_session_key(session_key, async {
+        let session_key_for_scope = session_key.clone();
+        crate::agent::loop_::scope_session_key(session_key, async move {
+            use ::zeroclaw_log::Instrument as _;
+            let span = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                session_key = %session_key_for_scope.as_deref().unwrap_or(""),
+            );
             guard
                 .turn_streamed(&prompt, event_tx, Some(cancel_clone))
+                .instrument(span)
                 .await
         })
         .await

@@ -263,6 +263,13 @@ pub async fn run(
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
+    // Wire the log broadcast hook so every record!() emission reaches the
+    // RPC logs/subscribe stream. Without this, tool calls and agent events
+    // logged via record!() are invisible to the zerocode Logs pane when
+    // connected over the Unix socket (the gateway wires this separately for
+    // its own event_tx; the daemon's RPC event_tx must be wired here).
+    zeroclaw_log::set_broadcast_hook(event_tx.clone());
+
     if config.heartbeat.enabled {
         let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.data_dir)
             .await;
