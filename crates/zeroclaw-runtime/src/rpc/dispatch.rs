@@ -778,7 +778,7 @@ impl RpcDispatcher {
             prompt.clone(),
             cancel,
             TurnAttribution {
-                session_key: Some(format!("rpc_{sid}")),
+                session_key: Some(sid.to_string()),
                 agent_alias,
                 model_provider,
                 model,
