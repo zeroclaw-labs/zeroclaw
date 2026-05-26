@@ -162,6 +162,29 @@ rand = "0.10"
 # Portable atomic fallbacks for targets without native 64-bit atomics
 portable-atomic = "1"
 
+# Complex numbers (quantum module)
+num-complex = { version = "0.4", optional = true }
+
+# Tracing (fork modules use tracing for instrumentation)
+tracing = "0.1"
+
+# Futures combinators (fork modules)
+futures = "0.3"
+
+# EVM wallet (alloy-rs)
+alloy-primitives = { version = "1.5", optional = true, default-features = false }
+alloy-signer = { version = "1.7", optional = true, default-features = false }
+alloy-signer-local = { version = "1.7", optional = true, default-features = false }
+alloy-sol-types = { version = "1.5", optional = true, default-features = false }
+alloy-provider = { version = "1.7", optional = true, default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "1.7", optional = true, default-features = false, features = ["reqwest"] }
+alloy-network = { version = "1.7", optional = true, default-features = false }
+alloy-rpc-types = { version = "1.7", optional = true, default-features = false, features = ["eth"] }
+alloy-consensus = { version = "1.7", optional = true, default-features = false }
+
+# WASM sandbox runtime
+wasmi = { version = "0.40", optional = true }
+
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -257,6 +280,7 @@ agent-runtime = [
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:num-complex",
 ]
 
 # All channel features in one bundle. Included in `default` for backward compatibility.
@@ -336,6 +360,18 @@ probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
+
+# X0 fork features — all fork modules gated behind x0-extended until API porting is done
+x0-extended = [
+    "agent-runtime", "wallet", "quantum", "runtime-wasm",
+]
+wallet = [
+    "dep:alloy-primitives", "dep:alloy-signer", "dep:alloy-signer-local", "dep:alloy-sol-types",
+    "dep:alloy-provider", "dep:alloy-transport-http", "dep:alloy-network",
+    "dep:alloy-rpc-types", "dep:alloy-consensus",
+]
+runtime-wasm = ["dep:wasmi"]
+quantum = ["dep:num-complex"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]

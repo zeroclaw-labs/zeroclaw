@@ -531,6 +531,68 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub escalation: EscalationConfig,
+
+    // --- X0 fork extensions ---
+
+    /// Soul identity and alignment configuration (`[soul]`).
+    #[serde(default)]
+    pub soul: Option<crate::x0_extensions::SoulConfig>,
+
+    /// Replication configuration (`[replication]`).
+    #[serde(default)]
+    pub replication: crate::x0_extensions::ReplicationConfig,
+
+    /// Model strategy / tiered model selection (`[model_strategy]`).
+    #[serde(default)]
+    pub model_strategy: crate::x0_extensions::ModelStrategyConfig,
+
+    /// Wallet configuration (`[wallet]`).
+    #[serde(default)]
+    pub wallet: crate::x0_extensions::WalletConfig,
+
+    /// Treasury configuration (`[treasury]`).
+    #[serde(default)]
+    pub treasury: crate::x0_extensions::TreasuryConfig,
+
+    /// Consciousness module configuration (`[consciousness]`).
+    #[serde(default)]
+    pub consciousness: crate::x0_extensions::ConsciousnessConfig,
+
+    /// Cognitive module configuration (`[cognitive]`).
+    #[serde(default)]
+    pub cognitive: crate::x0_extensions::CognitiveConfig,
+
+    /// Life module configuration (`[life]`).
+    #[serde(default)]
+    pub life: crate::x0_extensions::LifeConfig,
+
+    /// Conscience gate configuration (`[conscience]`).
+    #[serde(default)]
+    pub conscience: crate::x0_extensions::ConscienceConfig,
+
+    /// Cosmic brain configuration (`[cosmic_brain]`).
+    #[serde(default)]
+    pub cosmic_brain: crate::x0_extensions::CosmicBrainConfig,
+
+    /// Task queue configuration (`[taskqueue]`).
+    #[serde(default)]
+    pub taskqueue: crate::x0_extensions::TaskQueueConfig,
+
+    /// SCE configuration (`[sce]`).
+    #[serde(default)]
+    pub sce: crate::x0_extensions::SceConfig,
+
+    /// NVIDIA configuration (`[nvidia]`).
+    #[serde(default)]
+    pub nvidia: crate::x0_extensions::NvidiaConfig,
+
+    /// Bot workspace isolation (`[bots]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bots: Vec<crate::x0_extensions::BotConfig>,
+
+    /// Agent-level config (`[agent]`).
+    #[serde(default)]
+    pub agent: Option<crate::x0_extensions::AgentConfig>,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -12892,6 +12954,22 @@ impl Default for Config {
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
+            // X0 fork extensions
+            soul: None,
+            replication: Default::default(),
+            model_strategy: Default::default(),
+            wallet: Default::default(),
+            treasury: Default::default(),
+            consciousness: Default::default(),
+            cognitive: Default::default(),
+            life: Default::default(),
+            conscience: Default::default(),
+            cosmic_brain: Default::default(),
+            taskqueue: Default::default(),
+            sce: Default::default(),
+            nvidia: Default::default(),
+            bots: Vec::new(),
+            agent: None,
         }
     }
 }

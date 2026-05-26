@@ -29,6 +29,7 @@ pub mod skill_bundles;
 pub mod traits;
 pub mod typed_value;
 pub mod validation_warnings;
+pub mod x0_extensions;
 
 /// Shim module so `Configurable` derive macro's generated `crate::config::*` paths resolve.
 /// The macro was written assuming it runs inside the root crate where `mod config` exists.

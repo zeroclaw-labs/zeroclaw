@@ -103,6 +103,40 @@ pub mod verifiable_intent;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
 
+// --- X0 fork modules (require `x0-extended` feature + API porting) ---
+#[cfg(feature = "x0-extended")]
+pub mod cognitive;
+#[cfg(feature = "x0-extended")]
+pub mod conscience;
+#[cfg(feature = "x0-extended")]
+pub mod consciousness;
+#[cfg(feature = "x0-extended")]
+pub mod continuity;
+#[cfg(feature = "x0-extended")]
+pub mod control;
+#[cfg(feature = "x0-extended")]
+pub mod cosmic;
+#[cfg(feature = "x0-extended")]
+pub mod goals;
+#[cfg(feature = "x0-extended")]
+pub mod life;
+#[cfg(feature = "x0-extended")]
+pub mod onboard;
+#[cfg(feature = "x0-extended")]
+pub mod quantum;
+#[cfg(feature = "x0-extended")]
+pub mod runtime;
+#[cfg(feature = "x0-extended")]
+pub mod sce;
+#[cfg(feature = "x0-extended")]
+pub mod soul;
+#[cfg(feature = "x0-extended")]
+pub mod taskqueue;
+#[cfg(feature = "x0-extended")]
+pub mod turboquant;
+#[cfg(feature = "x0-extended")]
+pub mod wallet;
+
 pub use config::Config;
 
 /// Gateway management subcommands
