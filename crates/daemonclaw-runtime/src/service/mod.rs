@@ -1121,6 +1121,7 @@ WantedBy=multi-user.target
              BindsTo=daemonclaw.service\n\
              After=daemonclaw.service\n\n\
              [Timer]\n\
+             OnActiveSec=2min\n\
              OnUnitActiveSec=2min\n\
              AccuracySec=30s\n\n\
              [Install]\n\
