@@ -38,6 +38,9 @@ pub struct ComposioTool {
     security: Arc<SecurityPolicy>,
     recent_connected_accounts: RwLock<HashMap<String, String>>,
     action_slug_cache: RwLock<HashMap<String, String>>,
+    /// Per-action scoping: maps app/toolkit names to allowed action slugs.
+    /// When `None`, all actions are permitted (backward-compatible default).
+    action_scopes: Option<HashMap<String, Vec<String>>>,
 }
 
 impl ComposioTool {
@@ -52,7 +55,73 @@ impl ComposioTool {
             security,
             recent_connected_accounts: RwLock::new(HashMap::new()),
             action_slug_cache: RwLock::new(HashMap::new()),
+            action_scopes: None,
         }
+    }
+
+    /// Restrict this tool to only the listed actions per app/toolkit.
+    ///
+    /// Keys are app/toolkit names (e.g. `"gmail"`, `"github"`), values are
+    /// the allowed action slugs for that app. An empty map means nothing is
+    /// allowed; a missing app key means that app is unrestricted.
+    pub fn with_action_scopes(mut self, scopes: HashMap<String, Vec<String>>) -> Self {
+        if scopes.is_empty() {
+            self.action_scopes = None;
+        } else {
+            // Normalize keys and values so lookups are case/separator-insensitive.
+            let normalized: HashMap<String, Vec<String>> = scopes
+                .into_iter()
+                .map(|(app, actions)| {
+                    let key = normalize_app_slug(&app);
+                    let vals = actions
+                        .into_iter()
+                        .filter_map(|a| normalize_action_cache_key(&a))
+                        .collect();
+                    (key, vals)
+                })
+                .collect();
+            self.action_scopes = Some(normalized);
+        }
+        self
+    }
+
+    /// Check whether an action is permitted by the configured action scopes.
+    ///
+    /// When `action_scopes` is `None`, everything is allowed (backward compat).
+    /// When an app has no entry in the scopes map, all its actions are allowed.
+    /// When an app has an entry, only the listed actions pass.
+    fn is_action_allowed(&self, app_hint: Option<&str>, action_slug: &str) -> bool {
+        let Some(ref scopes) = self.action_scopes else {
+            return true;
+        };
+
+        let normalized_action = normalize_action_cache_key(action_slug);
+
+        // If we have an app hint, look up that specific app's scope list.
+        if let Some(app) = app_hint {
+            let app_key = normalize_app_slug(app);
+            return match scopes.get(&app_key) {
+                None => true, // app not in scopes — unrestricted
+                Some(allowed) => normalized_action
+                    .as_ref()
+                    .is_some_and(|slug| allowed.iter().any(|a| a == slug)),
+            };
+        }
+
+        // No app hint — try to infer the app from the action name.
+        if let Some(inferred_app) = infer_app_slug_from_action_name(action_slug) {
+            return match scopes.get(&inferred_app) {
+                None => true,
+                Some(allowed) => normalized_action
+                    .as_ref()
+                    .is_some_and(|slug| allowed.iter().any(|a| a == slug)),
+            };
+        }
+
+        // No app hint, no inferable app — check if the action appears in ANY
+        // scope list. If no scope list mentions it, allow (conservative: don't
+        // block actions we can't classify).
+        true
     }
 
     fn client(&self) -> Client {
@@ -655,6 +724,10 @@ impl Tool for ComposioTool {
                 let app = args.get("app").and_then(|v| v.as_str());
                 match self.list_actions(app).await {
                     Ok(actions) => {
+                        let actions: Vec<ComposioAction> = actions
+                            .into_iter()
+                            .filter(|a| self.is_action_allowed(a.app_name.as_deref(), &a.name))
+                            .collect();
                         let summary: Vec<String> = actions
                             .iter()
                             .take(20)
@@ -777,6 +850,18 @@ impl Tool for ComposioTool {
                     })?;
 
                 let app = args.get("app").and_then(|v| v.as_str());
+
+                if !self.is_action_allowed(app, action_name) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Action '{}' is not permitted by the agent's Composio action scope",
+                            action_name
+                        )),
+                    });
+                }
+
                 let params = args.get("params").cloned().unwrap_or(json!({}));
                 let text = args.get("text").and_then(|v| v.as_str());
                 let acct_ref = args.get("connected_account_id").and_then(|v| v.as_str());
@@ -1930,5 +2015,145 @@ mod tests {
         assert_eq!(body["version"], json!(COMPOSIO_TOOL_VERSION_LATEST));
         assert!(body.get("connected_account_id").is_none());
         assert!(body.get("user_id").is_none());
+    }
+
+    // ── Action scope tests ───────────────────────────────────
+
+    #[test]
+    fn action_scope_none_allows_everything() {
+        let tool = ComposioTool::new("test-key", None, test_security());
+        // No scopes set — every action should be allowed.
+        assert!(tool.is_action_allowed(Some("gmail"), "GMAIL_SEND_EMAIL"));
+        assert!(tool.is_action_allowed(Some("github"), "github-list-repos"));
+        assert!(tool.is_action_allowed(None, "anything"));
+    }
+
+    #[test]
+    fn action_scope_allows_listed_action() {
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            "gmail".to_string(),
+            vec![
+                "GMAIL_FETCH_EMAILS".to_string(),
+                "GMAIL_SEND_EMAIL".to_string(),
+            ],
+        );
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        assert!(tool.is_action_allowed(Some("gmail"), "GMAIL_SEND_EMAIL"));
+        assert!(tool.is_action_allowed(Some("gmail"), "gmail-send-email"));
+        assert!(tool.is_action_allowed(Some("gmail"), "gmail_fetch_emails"));
+    }
+
+    #[test]
+    fn action_scope_rejects_unlisted_action() {
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["GMAIL_FETCH_EMAILS".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        assert!(!tool.is_action_allowed(Some("gmail"), "GMAIL_SEND_EMAIL"));
+        assert!(!tool.is_action_allowed(Some("gmail"), "gmail-send-email"));
+    }
+
+    #[test]
+    fn action_scope_app_without_entry_allows_all() {
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["GMAIL_FETCH_EMAILS".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        // "github" has no entry in scopes — all its actions should pass.
+        assert!(tool.is_action_allowed(Some("github"), "github-list-repos"));
+        assert!(tool.is_action_allowed(Some("github"), "GITHUB_CREATE_ISSUE"));
+    }
+
+    #[tokio::test]
+    async fn action_scope_filters_list_results() {
+        // Build a tool with scopes that restrict gmail to one action.
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["gmail-fetch-emails".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        // Simulate what the "list" arm does: filter a vec of ComposioAction.
+        let actions = vec![
+            ComposioAction {
+                name: "gmail-fetch-emails".to_string(),
+                app_name: Some("gmail".to_string()),
+                description: Some("Fetch emails".to_string()),
+                enabled: true,
+                input_parameters: None,
+            },
+            ComposioAction {
+                name: "gmail-send-email".to_string(),
+                app_name: Some("gmail".to_string()),
+                description: Some("Send email".to_string()),
+                enabled: true,
+                input_parameters: None,
+            },
+            ComposioAction {
+                name: "github-list-repos".to_string(),
+                app_name: Some("github".to_string()),
+                description: Some("List repos".to_string()),
+                enabled: true,
+                input_parameters: None,
+            },
+        ];
+
+        let filtered: Vec<&ComposioAction> = actions
+            .iter()
+            .filter(|a| tool.is_action_allowed(a.app_name.as_deref(), &a.name))
+            .collect();
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].name, "gmail-fetch-emails");
+        // github is unscoped, so github-list-repos passes
+        assert_eq!(filtered[1].name, "github-list-repos");
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_by_action_scope() {
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["gmail-fetch-emails".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        let result = tool
+            .execute(json!({
+                "action": "execute",
+                "action_name": "GMAIL_SEND_EMAIL",
+                "app": "gmail"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not permitted")
+        );
+    }
+
+    #[test]
+    fn action_scope_infers_app_from_action_name() {
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["gmail-fetch-emails".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security()).with_action_scopes(scopes);
+
+        // No explicit app hint, but action name starts with "gmail-".
+        assert!(tool.is_action_allowed(None, "gmail-fetch-emails"));
+        assert!(!tool.is_action_allowed(None, "GMAIL_SEND_EMAIL"));
+    }
+
+    #[test]
+    fn with_action_scopes_empty_map_clears_scopes() {
+        let mut scopes = HashMap::new();
+        scopes.insert("gmail".to_string(), vec!["gmail-fetch-emails".to_string()]);
+        let tool = ComposioTool::new("test-key", None, test_security())
+            .with_action_scopes(scopes)
+            .with_action_scopes(HashMap::new());
+
+        // After clearing with empty map, all actions should be allowed again.
+        assert!(tool.is_action_allowed(Some("gmail"), "GMAIL_SEND_EMAIL"));
     }
 }

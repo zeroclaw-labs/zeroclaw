@@ -5436,6 +5436,10 @@ pub struct ComposioConfig {
     /// Default entity ID for multi-user setups
     #[serde(default = "default_entity_id")]
     pub entity_id: String,
+    /// Per-action scoping: maps app/toolkit names to allowed action slugs.
+    /// When empty, all actions are permitted (no restriction).
+    #[serde(default)]
+    pub scopes: HashMap<String, Vec<String>>,
 }
 
 fn default_entity_id() -> String {
@@ -5448,6 +5452,7 @@ impl Default for ComposioConfig {
             enabled: false,
             api_key: None,
             entity_id: default_entity_id(),
+            scopes: HashMap::new(),
         }
     }
 }
@@ -18035,6 +18040,7 @@ default_temperature = 0.7
             enabled: true,
             api_key: Some("comp-key-123".into()),
             entity_id: "user42".into(),
+            scopes: HashMap::new(),
         };
         let toml_str = toml::to_string(&c).unwrap();
         let parsed: ComposioConfig = toml::from_str(&toml_str).unwrap();

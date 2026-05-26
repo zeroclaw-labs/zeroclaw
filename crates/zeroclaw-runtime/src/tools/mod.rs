@@ -924,11 +924,13 @@ pub fn all_tools_with_runtime(
     if let Some(key) = composio_key
         && !key.is_empty()
     {
-        tool_arcs.push(Arc::new(ComposioTool::new(
-            key,
-            composio_entity_id,
-            security.clone(),
-        )));
+        let composio = ComposioTool::new(key, composio_entity_id, security.clone());
+        let composio = if root_config.composio.scopes.is_empty() {
+            composio
+        } else {
+            composio.with_action_scopes(root_config.composio.scopes.clone())
+        };
+        tool_arcs.push(Arc::new(composio));
     }
 
     // Emoji reaction tool — always registered; channel map populated later by start_channels.
