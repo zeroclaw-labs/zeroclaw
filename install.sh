@@ -959,6 +959,8 @@ do_uninstall() {
     run_privileged rm -f /etc/systemd/system/daemonclaw.service
     run_privileged rm -f /etc/systemd/system/daemonclaw-backup.timer
     run_privileged rm -f /etc/systemd/system/daemonclaw-backup.service
+    run_privileged rm -f /etc/systemd/system/daemonclaw-watchdog.timer
+    run_privileged rm -f /etc/systemd/system/daemonclaw-watchdog.service
     run_privileged rm -f /etc/tmpfiles.d/daemonclaw-backups.conf
     run_privileged systemctl daemon-reload 2>/dev/null || true
     step_ok "Removed systemd service files"
