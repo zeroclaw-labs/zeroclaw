@@ -1669,7 +1669,7 @@ pub enum SiliconflowEndpoint {
 impl ModelEndpoint for SiliconflowEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.siliconflow.cn/v1",
+            Self::Default => "https://api.siliconflow.com/v1",
         }
     }
 }
