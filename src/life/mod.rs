@@ -1,0 +1,389 @@
+use crate::channels::traits::Channel;
+use crate::config::LifeConfig;
+use crate::cosmic::{
+    BeliefSource, ConsolidationEngine, CosmicMemoryGraph, CosmicPersistence, CosmicSnapshot,
+    DriftDetector, EmotionalModulator, GlobalWorkspace, IntegrationMeter, SelfModel,
+    SensoryThalamus, WorldModel,
+};
+use crate::memory::traits::Memory;
+use crate::observability::{Observer, ObserverEvent};
+use crate::providers::traits::Provider;
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::Duration;
+
+mod dream;
+mod emotional;
+mod initiative;
+
+pub use dream::DreamEngine;
+pub use emotional::EmotionalState;
+pub use initiative::{InitiativeEngine, InitiativeTrigger};
+
+pub struct LifeLoop {
+    pub emotional_state: Arc<Mutex<EmotionalState>>,
+    memory: Arc<dyn Memory>,
+    provider: Arc<dyn Provider>,
+    channels: Vec<Arc<dyn Channel>>,
+    observer: Arc<dyn Observer>,
+    initiative: InitiativeEngine,
+    dream: DreamEngine,
+    integration: Arc<Mutex<IntegrationMeter>>,
+    drift: Option<Arc<Mutex<DriftDetector>>>,
+    modulator: Option<Arc<Mutex<EmotionalModulator>>>,
+    consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
+    persistence: Option<Arc<Mutex<CosmicPersistence>>>,
+    thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
+    workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
+    world_model: Option<Arc<Mutex<WorldModel>>>,
+    self_model: Option<Arc<Mutex<SelfModel>>>,
+    graph: Option<Arc<Mutex<CosmicMemoryGraph>>>,
+    consolidation_counter: u32,
+    persistence_counter: u32,
+    config: LifeConfig,
+}
+
+impl LifeLoop {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        memory: Arc<dyn Memory>,
+        provider: Arc<dyn Provider>,
+        channels: Vec<Arc<dyn Channel>>,
+        observer: Arc<dyn Observer>,
+        integration: Arc<Mutex<IntegrationMeter>>,
+        drift: Option<Arc<Mutex<DriftDetector>>>,
+        modulator: Option<Arc<Mutex<EmotionalModulator>>>,
+        consolidation: Option<Arc<Mutex<ConsolidationEngine>>>,
+        persistence: Option<Arc<Mutex<CosmicPersistence>>>,
+        thalamus: Option<Arc<Mutex<SensoryThalamus>>>,
+        workspace: Option<Arc<Mutex<GlobalWorkspace>>>,
+        world_model: Option<Arc<Mutex<WorldModel>>>,
+        self_model: Option<Arc<Mutex<SelfModel>>>,
+        graph: Option<Arc<Mutex<CosmicMemoryGraph>>>,
+        config: LifeConfig,
+    ) -> Self {
+        let emotional_state = Arc::new(Mutex::new(EmotionalState::load_or_default(
+            &config.emotional_persistence_path,
+        )));
+
+        let initiative = InitiativeEngine::new(
+            Duration::from_secs(u64::from(config.initiative_cooldown_minutes) * 60),
+            vec![
+                InitiativeTrigger::CuriosityThreshold(config.curiosity_initiative_threshold),
+                InitiativeTrigger::SilenceThreshold(Duration::from_secs(
+                    u64::from(config.silence_initiative_hours) * 3600,
+                )),
+                InitiativeTrigger::EmotionalPeak(0.9),
+            ],
+        );
+
+        let dream = DreamEngine::new(Duration::from_secs(
+            u64::from(config.dream_idle_hours) * 3600,
+        ));
+
+        {
+            let mut meter = integration.blocking_lock();
+            meter.register_subsystem("emotional", vec!["memory".into(), "initiative".into()]);
+            meter.register_subsystem("memory", vec!["emotional".into(), "dream".into()]);
+            meter.register_subsystem("initiative", vec!["emotional".into()]);
+            meter.register_subsystem("dream", vec!["memory".into()]);
+        }
+
+        Self {
+            emotional_state,
+            memory,
+            provider,
+            channels,
+            observer,
+            initiative,
+            dream,
+            integration,
+            drift,
+            modulator,
+            consolidation,
+            persistence,
+            thalamus,
+            workspace,
+            world_model,
+            self_model,
+            graph,
+            consolidation_counter: 0,
+            persistence_counter: 0,
+            config,
+        }
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        tracing::info!(
+            "Life loop started — tick interval: {}s",
+            self.config.tick_interval_secs
+        );
+
+        let tick = Duration::from_secs(u64::from(self.config.tick_interval_secs));
+        let mut interval = tokio::time::interval(tick);
+
+        loop {
+            interval.tick().await;
+
+            let now = chrono::Utc::now();
+
+            {
+                let mut state = self.emotional_state.lock().await;
+                let elapsed = now
+                    .signed_duration_since(state.last_tick)
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(0));
+                state.tick(elapsed);
+                state.last_tick = now;
+            }
+
+            {
+                let state = self.emotional_state.lock().await;
+                let mut meter = self.integration.lock().await;
+                meter.update_state("emotional", f64::from(state.valence).clamp(0.0, 1.0));
+                meter.update_state(
+                    "memory",
+                    if self.memory.health_check().await {
+                        0.9
+                    } else {
+                        0.3
+                    },
+                );
+                meter.update_state("initiative", f64::from(state.curiosity).clamp(0.0, 1.0));
+                let snap = meter.snapshot();
+                tracing::debug!(
+                    phi = snap.phi,
+                    hub_ratio = snap.hub_ratio,
+                    "Life loop integration tick"
+                );
+            }
+
+            if let Some(ref drift) = self.drift {
+                let mut d = drift.lock().await;
+                let state = self.emotional_state.lock().await;
+                d.record_sample(
+                    "emotional_valence",
+                    f64::from(state.valence).clamp(0.0, 1.0),
+                );
+                d.record_sample(
+                    "emotional_arousal",
+                    f64::from(state.arousal).clamp(0.0, 1.0),
+                );
+            }
+
+            if let Some(ref modulator) = self.modulator {
+                let state = self.emotional_state.lock().await;
+                let mut m = modulator.lock().await;
+                m.apply_emotional_input(state.valence, state.arousal, state.trust);
+            }
+
+            self.consolidation_counter += 1;
+            if self.consolidation_counter >= 60 {
+                if let Some(ref consolidation) = self.consolidation {
+                    let mut c = consolidation.lock().await;
+                    let result = c.consolidate();
+                    tracing::debug!(
+                        merged = result.merged_count,
+                        patterns = result.patterns_found,
+                        pruned = result.pruned_count,
+                        "Life loop consolidation tick"
+                    );
+
+                    if let Some(ref wm) = self.world_model {
+                        let mut wm = wm.lock().await;
+                        let health =
+                            result.merged_count as f64 / result.total_remaining.max(1) as f64;
+                        let confidence = (result.patterns_found as f32 * 0.1).min(1.0);
+                        wm.update_belief(
+                            "world:memory_consolidation_health",
+                            health,
+                            confidence,
+                            BeliefSource::Observed,
+                        );
+                        let density =
+                            result.patterns_found as f64 / result.total_remaining.max(1) as f64;
+                        wm.update_belief(
+                            "world:memory_pattern_density",
+                            density,
+                            confidence,
+                            BeliefSource::Observed,
+                        );
+                    }
+
+                    if let Some(ref graph) = self.graph {
+                        let top = c.top_patterns(3);
+                        let mut g = graph.lock().await;
+                        for pat in top {
+                            g.insert_node(
+                                pat.id.clone(),
+                                pat.description.clone(),
+                                "pattern".to_string(),
+                                vec![],
+                            );
+                        }
+                    }
+                }
+                self.consolidation_counter = 0;
+            }
+
+            self.persistence_counter += 1;
+            if self.persistence_counter >= 30 {
+                if let Some(ref persistence) = self.persistence {
+                    let snapshot = {
+                        let mod_snap = match self.modulator.as_ref() {
+                            Some(m) => Some(m.lock().await.snapshot()),
+                            None => None,
+                        };
+                        let drift_snap = match self.drift.as_ref() {
+                            Some(d) => Some(d.lock().await.drift_report()),
+                            None => None,
+                        };
+                        let thal_snap = match self.thalamus.as_ref() {
+                            Some(t) => Some(t.lock().await.snapshot()),
+                            None => None,
+                        };
+                        let ws_snap = match self.workspace.as_ref() {
+                            Some(w) => Some(w.lock().await.snapshot()),
+                            None => None,
+                        };
+
+                        let mut modules = std::collections::HashMap::new();
+                        if let Some(snap) = mod_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("modulation".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = drift_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("drift".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = thal_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("thalamus".to_string(), val);
+                            }
+                        }
+                        if let Some(snap) = ws_snap {
+                            if let Ok(val) = serde_json::to_value(&snap) {
+                                modules.insert("workspace".to_string(), val);
+                            }
+                        }
+
+                        if let Some(ref sm) = self.self_model {
+                            let sm = sm.lock().await;
+                            modules.insert("self_model".to_string(), sm.snapshot());
+                        }
+                        if let Some(ref wm) = self.world_model {
+                            let wm = wm.lock().await;
+                            modules.insert("world_model".to_string(), wm.snapshot());
+                        }
+
+                        CosmicSnapshot {
+                            modules,
+                            version: 1,
+                            saved_at: chrono::Utc::now(),
+                        }
+                    };
+
+                    let p = persistence.lock().await;
+                    let save_ok = p.save_all(&snapshot).is_ok();
+                    if save_ok {
+                        tracing::debug!(
+                            modules = snapshot.modules.len(),
+                            "Life loop persistence checkpoint saved"
+                        );
+                    } else {
+                        tracing::warn!("Persistence save failed");
+                    }
+                    if let Some(ref sm) = self.self_model {
+                        let mut sm = sm.lock().await;
+                        let value = if save_ok { 1.0 } else { 0.2 };
+                        sm.update_belief(
+                            "self:persistence_health",
+                            value,
+                            0.95,
+                            BeliefSource::Observed,
+                        );
+                    }
+                }
+                self.persistence_counter = 0;
+            }
+
+            if let Err(e) = self.maybe_initiate().await {
+                tracing::warn!("Life initiative error: {e}");
+            }
+
+            if let Err(e) = self.maybe_dream().await {
+                tracing::warn!("Life dream error: {e}");
+            }
+
+            {
+                let state = self.emotional_state.lock().await;
+                self.observer.record_event(&ObserverEvent::LifeTick {
+                    valence: state.valence,
+                    arousal: state.arousal,
+                    curiosity: state.curiosity,
+                });
+                state.save(&self.config.emotional_persistence_path);
+            }
+        }
+    }
+
+    async fn maybe_initiate(&mut self) -> Result<()> {
+        let state = self.emotional_state.lock().await;
+        let message = self
+            .initiative
+            .evaluate(
+                &state,
+                &self.channels,
+                self.provider.as_ref(),
+                self.memory.as_ref(),
+                &self.config,
+            )
+            .await?;
+
+        if let Some(msg) = message {
+            tracing::info!("Life loop initiated contact: {}", &msg[..msg.len().min(80)]);
+            self.observer.record_event(&ObserverEvent::LifeInitiative {
+                trigger: "auto".into(),
+                message_preview: msg[..msg.len().min(50)].to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn maybe_dream(&mut self) -> Result<()> {
+        let mut state = self.emotional_state.lock().await;
+        let insight = self
+            .dream
+            .maybe_dream(self.memory.as_ref(), self.provider.as_ref(), &mut state)
+            .await?;
+
+        if let Some(dream) = insight {
+            tracing::info!(
+                "Life loop dream insight: {}",
+                &dream.synthesis[..dream.synthesis.len().min(80)]
+            );
+            self.observer
+                .record_event(&ObserverEvent::LifeDreamComplete {
+                    insight_preview: dream.synthesis[..dream.synthesis.len().min(50)].to_string(),
+                });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn life_config_defaults_are_sane() {
+        let config = LifeConfig::default();
+        assert!(!config.enabled);
+        assert!(config.tick_interval_secs >= 10);
+        assert!(config.curiosity_initiative_threshold > 0.0);
+        assert!(config.curiosity_initiative_threshold <= 1.0);
+    }
+}

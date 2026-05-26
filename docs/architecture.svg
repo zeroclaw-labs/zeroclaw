@@ -1,0 +1,312 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 950" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.15"/>
+    </filter>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="agentGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1e2e"/>
+      <stop offset="100%" stop-color="#1e2436"/>
+    </linearGradient>
+    <linearGradient id="memGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#1e1e36"/>
+    </linearGradient>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3b82f6"/></marker>
+    <marker id="arrowAmber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#f59e0b"/></marker>
+    <marker id="arrowGreen" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#4ade80"/></marker>
+    <marker id="arrowCyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#06b6d4"/></marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#c084fc"/></marker>
+    <marker id="arrowViolet" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#8b5cf6"/></marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="950" rx="12" fill="url(#bgGrad)"/>
+
+  <!-- Title -->
+  <text x="550" y="38" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="700">ZeroClaw Architecture</text>
+  <text x="550" y="58" text-anchor="middle" fill="#7d8590" font-size="12">Zero overhead. Zero compromise. 100% Rust. 100% Agnostic. 8 pluggable traits.</text>
+
+  <!-- ═══════════ LEFT: Chat Apps ═══════════ -->
+  <rect x="20" y="80" width="150" height="310" rx="10" fill="#1c2333" stroke="#3b82f6" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="95" y="105" text-anchor="middle" fill="#93c5fd" font-size="13" font-weight="600">Chat Apps</text>
+
+  <rect x="35" y="120" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="137" text-anchor="middle" fill="#60a5fa" font-size="10">Telegram</text>
+  <rect x="35" y="150" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="167" text-anchor="middle" fill="#818cf8" font-size="10">Discord</text>
+  <rect x="35" y="180" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="197" text-anchor="middle" fill="#a78bfa" font-size="10">Slack</text>
+  <rect x="35" y="210" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="227" text-anchor="middle" fill="#c084fc" font-size="10">iMessage</text>
+  <rect x="35" y="240" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="257" text-anchor="middle" fill="#e879f9" font-size="10">Matrix</text>
+  <rect x="35" y="270" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="287" text-anchor="middle" fill="#f472b6" font-size="10">Webhook</text>
+  <rect x="35" y="300" width="120" height="24" rx="6" fill="#1e293b"/>
+  <text x="95" y="317" text-anchor="middle" fill="#fb923c" font-size="10">CLI</text>
+
+  <text x="95" y="355" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Channel trait</text>
+
+  <!-- Arrow: Chat Apps → Security -->
+  <line x1="170" y1="230" x2="195" y2="230" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+  <!-- ═══════════ CENTER-LEFT: Security Layer ═══════════ -->
+  <rect x="200" y="80" width="190" height="310" rx="10" fill="#1c2333" stroke="#f59e0b" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="295" y="105" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="600">Security Layer</text>
+
+  <!-- Gateway Pairing -->
+  <rect x="213" y="120" width="165" height="50" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="295" y="138" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Gateway Pairing</text>
+  <text x="295" y="153" text-anchor="middle" fill="#a8a29e" font-size="8">6-digit OTP + bearer tokens</text>
+  <text x="295" y="164" text-anchor="middle" fill="#a8a29e" font-size="8">constant-time comparison</text>
+
+  <!-- Auth Gate -->
+  <rect x="213" y="178" width="165" height="45" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="295" y="196" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Auth Gate</text>
+  <text x="295" y="210" text-anchor="middle" fill="#a8a29e" font-size="8">Channel allowlists + webhook_secret</text>
+
+  <!-- Rate Limiter -->
+  <rect x="213" y="230" width="165" height="45" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="295" y="248" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Rate Limiter</text>
+  <text x="295" y="262" text-anchor="middle" fill="#a8a29e" font-size="8">sliding window, cost/day cap</text>
+
+  <!-- Filesystem Sandbox -->
+  <rect x="213" y="282" width="165" height="50" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="295" y="300" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Filesystem Sandbox</text>
+  <text x="295" y="314" text-anchor="middle" fill="#a8a29e" font-size="8">path jail + null byte block</text>
+  <text x="295" y="325" text-anchor="middle" fill="#a8a29e" font-size="8">symlink escape detection</text>
+
+  <!-- Encrypted Secrets -->
+  <rect x="213" y="340" width="165" height="38" rx="8" fill="#292524" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="295" y="358" text-anchor="middle" fill="#fbbf24" font-size="10" font-weight="600">Encrypted Secrets</text>
+  <text x="295" y="372" text-anchor="middle" fill="#a8a29e" font-size="8">XOR + local key file (0600)</text>
+
+  <!-- Arrow: Security → Agent -->
+  <line x1="295" y1="390" x2="295" y2="415" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrowAmber)"/>
+
+  <!-- ═══════════ CENTER: Tunnel ═══════════ -->
+  <rect x="405" y="80" width="180" height="200" rx="10" fill="#1c2333" stroke="#06b6d4" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="495" y="105" text-anchor="middle" fill="#67e8f9" font-size="13" font-weight="600">Agnostic Tunnel</text>
+  <text x="495" y="120" text-anchor="middle" fill="#7d8590" font-size="9">Bring Your Own</text>
+
+  <rect x="418" y="132" width="155" height="22" rx="5" fill="#1e293b"/>
+  <text x="495" y="148" text-anchor="middle" fill="#22d3ee" font-size="10">Cloudflare</text>
+  <rect x="418" y="160" width="155" height="22" rx="5" fill="#1e293b"/>
+  <text x="495" y="176" text-anchor="middle" fill="#22d3ee" font-size="10">Tailscale</text>
+  <rect x="418" y="188" width="155" height="22" rx="5" fill="#1e293b"/>
+  <text x="495" y="204" text-anchor="middle" fill="#22d3ee" font-size="10">ngrok</text>
+  <rect x="418" y="216" width="155" height="22" rx="5" fill="#1e293b"/>
+  <text x="495" y="232" text-anchor="middle" fill="#22d3ee" font-size="10">Custom (bore, frp, ssh...)</text>
+
+  <text x="495" y="265" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Tunnel trait</text>
+
+  <!-- Arrow: Tunnel → Agent -->
+  <line x1="495" y1="280" x2="495" y2="415" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrowCyan)"/>
+
+  <!-- ═══════════ RIGHT: AI Providers ═══════════ -->
+  <rect x="600" y="80" width="480" height="200" rx="10" fill="#1c2333" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="840" y="105" text-anchor="middle" fill="#4ade80" font-size="13" font-weight="600">AI Providers (22+)</text>
+  <text x="840" y="120" text-anchor="middle" fill="#7d8590" font-size="9">Any OpenAI-compatible API</text>
+
+  <!-- Provider grid: 4 columns x 4 rows -->
+  <rect x="615" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="667" y="148" text-anchor="middle" fill="#86efac" font-size="9">OpenRouter</text>
+  <rect x="730" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="782" y="148" text-anchor="middle" fill="#86efac" font-size="9">Anthropic</text>
+  <rect x="845" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="897" y="148" text-anchor="middle" fill="#86efac" font-size="9">OpenAI</text>
+  <rect x="960" y="132" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="1012" y="148" text-anchor="middle" fill="#86efac" font-size="9">Ollama</text>
+
+  <rect x="615" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="667" y="176" text-anchor="middle" fill="#86efac" font-size="9">Venice</text>
+  <rect x="730" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="782" y="176" text-anchor="middle" fill="#86efac" font-size="9">Groq</text>
+  <rect x="845" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="897" y="176" text-anchor="middle" fill="#86efac" font-size="9">Mistral</text>
+  <rect x="960" y="160" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="1012" y="176" text-anchor="middle" fill="#86efac" font-size="9">xAI / Grok</text>
+
+  <rect x="615" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="667" y="204" text-anchor="middle" fill="#86efac" font-size="9">DeepSeek</text>
+  <rect x="730" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="782" y="204" text-anchor="middle" fill="#86efac" font-size="9">Together AI</text>
+  <rect x="845" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="897" y="204" text-anchor="middle" fill="#86efac" font-size="9">Fireworks</text>
+  <rect x="960" y="188" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="1012" y="204" text-anchor="middle" fill="#86efac" font-size="9">Perplexity</text>
+
+  <rect x="615" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="667" y="232" text-anchor="middle" fill="#86efac" font-size="9">Cohere</text>
+  <rect x="730" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="782" y="232" text-anchor="middle" fill="#86efac" font-size="9">Cloudflare AI</text>
+  <rect x="845" y="216" width="105" height="22" rx="5" fill="#1a2e1a"/>
+  <text x="897" y="232" text-anchor="middle" fill="#86efac" font-size="9">Bedrock</text>
+  <rect x="960" y="216" width="105" height="22" rx="5" fill="#1e3a1e" stroke="#4ade80" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="1012" y="232" text-anchor="middle" fill="#4ade80" font-size="9" font-weight="600">custom:URL</text>
+
+  <text x="840" y="262" text-anchor="middle" fill="#7d8590" font-size="9" font-style="italic">+ any Provider trait / custom:URL</text>
+
+  <!-- Arrow: Providers → Agent LLM -->
+  <line x1="840" y1="280" x2="560" y2="440" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowGreen)"/>
+
+  <!-- ═══════════ CENTER: Agent Loop ═══════════ -->
+  <rect x="20" y="420" width="1060" height="130" rx="12" fill="url(#agentGrad)" stroke="#22c55e" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="550" y="445" text-anchor="middle" fill="#4ade80" font-size="14" font-weight="700">Agent Loop</text>
+
+  <!-- Message → LLM → Tools → Response flow -->
+  <rect x="50" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="105" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Message</text>
+  <text x="105" y="495" text-anchor="middle" fill="#86efac" font-size="14">In</text>
+
+  <rect x="200" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="255" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Memory Recall</text>
+  <text x="255" y="495" text-anchor="middle" fill="#86efac" font-size="14">ctx</text>
+
+  <rect x="350" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="405" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">LLM</text>
+  <text x="405" y="495" text-anchor="middle" fill="#86efac" font-size="14">AI</text>
+
+  <rect x="500" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="555" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Tools</text>
+  <text x="555" y="495" text-anchor="middle" fill="#86efac" font-size="14">exec</text>
+
+  <rect x="650" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="705" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Memory Save</text>
+  <text x="705" y="495" text-anchor="middle" fill="#86efac" font-size="14">store</text>
+
+  <rect x="800" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1"/>
+  <text x="855" y="478" text-anchor="middle" fill="#4ade80" font-size="10" font-weight="600">Response</text>
+  <text x="855" y="495" text-anchor="middle" fill="#86efac" font-size="14">Out</text>
+
+  <!-- Composio (optional) -->
+  <rect x="950" y="460" width="110" height="42" rx="8" fill="#1a2e1a" stroke="#4ade80" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="1005" y="478" text-anchor="middle" fill="#4ade80" font-size="9" font-weight="600">Composio</text>
+  <text x="1005" y="493" text-anchor="middle" fill="#7d8590" font-size="8">1000+ OAuth</text>
+
+  <!-- Agent loop arrows -->
+  <line x1="160" y1="481" x2="200" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <line x1="310" y1="481" x2="350" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <line x1="460" y1="481" x2="500" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <line x1="610" y1="481" x2="650" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+  <line x1="760" y1="481" x2="800" y2="481" stroke="#4ade80" stroke-width="1.5" marker-end="url(#arrowGreen)"/>
+
+  <!-- ═══════════ BOTTOM-LEFT: Memory Search Engine ═══════════ -->
+  <rect x="20" y="570" width="530" height="170" rx="10" fill="url(#memGrad)" stroke="#8b5cf6" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="285" y="595" text-anchor="middle" fill="#c4b5fd" font-size="13" font-weight="700">Memory Search Engine (All Custom)</text>
+  <text x="285" y="610" text-anchor="middle" fill="#7d8590" font-size="9">No Pinecone, no Elasticsearch, no LangChain</text>
+
+  <!-- Memory layers: 2 columns -->
+  <rect x="35" y="622" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="45" y="639" fill="#c4b5fd" font-size="9" font-weight="600">Vector DB</text>
+  <text x="157" y="639" text-anchor="middle" fill="#a78bfa" font-size="8">SQLite BLOB + cosine similarity</text>
+
+  <rect x="290" y="622" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="300" y="639" fill="#c4b5fd" font-size="9" font-weight="600">Keyword</text>
+  <text x="412" y="639" text-anchor="middle" fill="#a78bfa" font-size="8">FTS5 virtual tables + BM25</text>
+
+  <rect x="35" y="652" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="45" y="669" fill="#c4b5fd" font-size="9" font-weight="600">Hybrid Merge</text>
+  <text x="157" y="669" text-anchor="middle" fill="#a78bfa" font-size="8">Weighted vector + keyword fusion</text>
+
+  <rect x="290" y="652" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="300" y="669" fill="#c4b5fd" font-size="9" font-weight="600">Embeddings</text>
+  <text x="412" y="669" text-anchor="middle" fill="#a78bfa" font-size="8">OpenAI / custom URL / noop</text>
+
+  <rect x="35" y="682" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="45" y="699" fill="#c4b5fd" font-size="9" font-weight="600">Chunking</text>
+  <text x="157" y="699" text-anchor="middle" fill="#a78bfa" font-size="8">Markdown-aware + heading ctx</text>
+
+  <rect x="290" y="682" width="245" height="24" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="300" y="699" fill="#c4b5fd" font-size="9" font-weight="600">Caching</text>
+  <text x="412" y="699" text-anchor="middle" fill="#a78bfa" font-size="8">embedding_cache + LRU eviction</text>
+
+  <rect x="35" y="712" width="500" height="20" rx="5" fill="#1e1a2e" stroke="#8b5cf6" stroke-width="0.5"/>
+  <text x="285" y="726" text-anchor="middle" fill="#a78bfa" font-size="8">Safe Reindex: rebuild FTS5 + re-embed missing vectors atomically | LIKE fallback | Upsert/Delete/Reindex</text>
+
+  <!-- Arrow: Agent → Memory -->
+  <line x1="255" y1="550" x2="255" y2="570" stroke="#8b5cf6" stroke-width="2" marker-end="url(#arrowViolet)"/>
+
+  <!-- ═══════════ BOTTOM-RIGHT: Sandbox + Heartbeat ═══════════ -->
+  <rect x="570" y="570" width="250" height="170" rx="10" fill="#1c2333" stroke="#ef4444" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="695" y="595" text-anchor="middle" fill="#fca5a5" font-size="13" font-weight="600">Sandbox</text>
+
+  <text x="695" y="618" text-anchor="middle" fill="#ef4444" font-size="9">Command allowlist</text>
+  <text x="695" y="635" text-anchor="middle" fill="#ef4444" font-size="9">Path jail + traversal block</text>
+  <text x="695" y="652" text-anchor="middle" fill="#ef4444" font-size="9">Browser domain allowlist</text>
+  <text x="695" y="669" text-anchor="middle" fill="#ef4444" font-size="9">Null byte + Symlink escape block</text>
+  <text x="695" y="686" text-anchor="middle" fill="#ef4444" font-size="9">System dirs + Dotfiles blocked</text>
+  <text x="695" y="706" text-anchor="middle" fill="#ef4444" font-size="9">Default: Supervised + workspace-only</text>
+  <text x="695" y="726" text-anchor="middle" fill="#ef4444" font-size="9">Levels: ReadOnly / Supervised / Full</text>
+
+  <!-- Arrow: Agent → Sandbox -->
+  <line x1="695" y1="550" x2="695" y2="570" stroke="#ef4444" stroke-width="2"/>
+
+  <rect x="840" y="570" width="240" height="170" rx="10" fill="#1c2333" stroke="#06b6d4" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="960" y="595" text-anchor="middle" fill="#67e8f9" font-size="13" font-weight="600">Heartbeat &amp; Cron</text>
+
+  <text x="960" y="620" text-anchor="middle" fill="#22d3ee" font-size="9">HEARTBEAT.md periodic tasks</text>
+  <text x="960" y="640" text-anchor="middle" fill="#22d3ee" font-size="9">Scheduled actions</text>
+  <text x="960" y="660" text-anchor="middle" fill="#22d3ee" font-size="9">Skills loader (TOML manifests)</text>
+  <text x="960" y="680" text-anchor="middle" fill="#22d3ee" font-size="9">50+ integrations registry</text>
+  <text x="960" y="700" text-anchor="middle" fill="#22d3ee" font-size="9">Observability (noop/log/multi)</text>
+
+  <!-- Arrow: Agent → Heartbeat -->
+  <line x1="960" y1="550" x2="960" y2="570" stroke="#06b6d4" stroke-width="2"/>
+
+  <!-- ═══════════ BOTTOM: Setup Wizard ═══════════ -->
+  <rect x="20" y="760" width="1060" height="170" rx="10" fill="#1c2333" stroke="#f472b6" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="550" y="785" text-anchor="middle" fill="#f9a8d4" font-size="14" font-weight="700">Setup Wizard  --  zeroclaw onboard (quick default | --interactive for full wizard)</text>
+  <text x="550" y="802" text-anchor="middle" fill="#7d8590" font-size="10">7 steps, under 60 seconds | Live connection testing | Secure defaults</text>
+
+  <!-- Wizard steps: 7 -->
+  <rect x="30" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="95" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">1. Workspace</text>
+  <text x="95" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">~/.zeroclaw/</text>
+
+  <rect x="170" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="235" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">2. AI Provider</text>
+  <text x="235" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">22+ or custom URL</text>
+
+  <rect x="310" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="375" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">3. Channels</text>
+  <text x="375" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">7 channels + live test</text>
+
+  <rect x="450" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="515" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">4. Tunnel</text>
+  <text x="515" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">5 providers or skip</text>
+
+  <rect x="590" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="655" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">5. Tool Mode</text>
+  <text x="655" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">Sovereign / Composio</text>
+
+  <rect x="730" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="795" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">6. Personalize</text>
+  <text x="795" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">name, style, timezone</text>
+
+  <rect x="870" y="815" width="130" height="38" rx="8" fill="#2d1f3d" stroke="#c084fc" stroke-width="1"/>
+  <text x="935" y="831" text-anchor="middle" fill="#e9d5ff" font-size="8" font-weight="600">7. Scaffold</text>
+  <text x="935" y="845" text-anchor="middle" fill="#a78bfa" font-size="7">8 workspace MD files</text>
+
+  <!-- Step arrows -->
+  <line x1="160" y1="834" x2="170" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="300" y1="834" x2="310" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="440" y1="834" x2="450" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="580" y1="834" x2="590" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="720" y1="834" x2="730" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+  <line x1="860" y1="834" x2="870" y2="834" stroke="#c084fc" stroke-width="1" marker-end="url(#arrowPurple)"/>
+
+  <!-- Wizard output summary -->
+  <text x="550" y="872" text-anchor="middle" fill="#7d8590" font-size="9">Full summary: Provider, Model, Channels, Tunnel, Composio, Secrets, Gateway, Autonomy, Memory</text>
+
+  <!-- Ready badge -->
+  <rect x="380" y="888" width="340" height="28" rx="14" fill="#166534" stroke="#4ade80" stroke-width="1"/>
+  <text x="550" y="907" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="600">Ready -- zeroclaw agent</text>
+
+  <!-- Footer stats -->
+  <text x="550" y="942" text-anchor="middle" fill="#7d8590" font-size="10">~3.4MB binary  |  &lt;10ms startup  |  1,050 tests  |  22+ providers  |  8 traits  |  18,900+ lines of Rust  |  0 clippy warnings</text>
+</svg>

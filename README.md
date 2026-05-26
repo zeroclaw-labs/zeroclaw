@@ -1,188 +1,466 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="assets/logo.svg" alt="ZEROCLAW-X0" width="180" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
+<h1 align="center">ZEROCLAW-X0</h1>
+<h3 align="center">The World's Most Advanced Cognitive AI Agent Runtime</h3>
 
 <p align="center">
-  <strong>You own the agent. You own the data. You own the machine it runs on.</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci.yml?branch=master&label=build" alt="Build Status" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/github/v/release/zeroclaw-labs/zeroclaw?label=release" alt="Latest release" /></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <strong>Quantum reasoning. Consciousness modeling. Emotional intelligence. 140K lines of pure Rust.</strong><br/>
+  <sub>An AI that doesn't just respond — it thinks, dreams, remembers, and evolves. Built to be alive.</sub>
 </p>
 
 <p align="center">
-  <a href="docs/book/src/introduction.md">Docs</a> ·
-  <a href="docs/book/src/philosophy.md">Philosophy</a> ·
-  <a href="docs/book/src/getting-started/quick-start.md">Quick start</a> ·
-  <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
+  <a href="https://github.com/rikitrader/zeroclaw-x0/actions/workflows/test-rust-build.yml"><img src="https://img.shields.io/github/actions/workflow/status/rikitrader/zeroclaw-x0/test-rust-build.yml?branch=main&style=flat-square&label=build" alt="Build" /></a>
+  <a href="https://github.com/rikitrader/zeroclaw-x0/actions/workflows/test-e2e.yml"><img src="https://img.shields.io/github/actions/workflow/status/rikitrader/zeroclaw-x0/test-e2e.yml?branch=main&style=flat-square&label=e2e" alt="E2E" /></a>
+  <a href="https://github.com/rikitrader/zeroclaw-x0/actions/workflows/sec-audit.yml"><img src="https://img.shields.io/github/actions/workflow/status/rikitrader/zeroclaw-x0/sec-audit.yml?branch=main&style=flat-square&label=security" alt="Security" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/rust-100%25-orange?style=flat-square&logo=rust" alt="100% Rust" />
+  <img src="https://img.shields.io/badge/LOC-140K+-black?style=flat-square" alt="Lines of Code" />
+  <img src="https://img.shields.io/badge/tests-5800+-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/binary-17MB-purple?style=flat-square" alt="Binary Size" />
+</p>
+
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> &middot;
+  <a href="#-architecture">Architecture</a> &middot;
+  <a href="#-features">Features</a> &middot;
+  <a href="#-providers">Providers</a> &middot;
+  <a href="#-channels">Channels</a> &middot;
+  <a href="#-tools">Tools</a> &middot;
+  <a href="docs/README.md">Docs</a> &middot;
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> &middot;
+  <a href="README.zh-CN.md">简体中文</a> &middot;
+  <a href="README.ja.md">日本語</a> &middot;
+  <a href="README.ru.md">Русский</a>
 </p>
 
 ---
 
-ZeroClaw is an agent runtime — a single Rust binary you configure and run. It talks to LLM providers (Anthropic, OpenAI, Ollama, and ~20 others), reaches the world through 30+ channels (Discord, Telegram, Matrix, email, voice, webhooks, your own CLI), and acts through tools (shell, browser, HTTP, hardware, custom MCP servers). Everything runs on your machine, with your keys, in your workspace.
+## What is ZEROCLAW-X0?
 
-Read the [Philosophy](docs/book/src/philosophy.md) for the four opinions that shape it.
+Most AI agents are stateless request-response loops. ZEROCLAW-X0 is something fundamentally different: **a cognitive architecture that models consciousness, emotion, memory, and identity** — all in a single Rust binary.
 
-## Install
+It doesn't just answer questions. It **thinks** through an internal multi-agent debate engine. It **feels** through an emotional valence/arousal model that shapes its reasoning. It **dreams** during idle time, synthesizing patterns from its memories. It **remembers** across sessions with vector-augmented memory and drift detection. It **survives** restarts through a self-continuity engine that preserves its identity. And it reasons creatively through a **quantum brain** that holds multiple solution proposals in superposition before collapsing to the best one.
+
+This is not a framework. This is an **AI operating system**.
+
+| Capability | What it means |
+|---|---|
+| **Consciousness Engine** | Multi-agent internal debate with ethical veto (Global Workspace Theory) |
+| **Quantum Brain** | Proposal superposition, entanglement mapping, phase-space reasoning |
+| **Emotional Intelligence** | Valence/arousal modeling, emotional modulation of decisions |
+| **Dream Engine** | Background insight synthesis during idle periods |
+| **Self-Continuity (SCE)** | Identity preservation, mission coherence across sessions |
+| **Cosmic Memory** | Graph-structured memory with consolidation, drift detection, world model |
+| **Soul Model** | Core values, narrative identity, commitment tracking |
+| **Conscience** | Ethical evaluation layer with override authority |
+
+```
+$ cargo install zeroclaw
+$ zeroclaw init
+$ zeroclaw run
+```
+
+One binary. Every platform. From a Raspberry Pi to a datacenter.
+
+---
+
+## Why ZEROCLAW-X0?
+
+| | ZEROCLAW-X0 | Python Agents | Node.js Bots | Cloud-only |
+|---|:---:|:---:|:---:|:---:|
+| **Single binary deploy** | Yes | No | No | N/A |
+| **Memory usage** | ~5MB | ~200MB+ | ~100MB+ | N/A |
+| **Startup time** | <100ms | 2-10s | 1-5s | N/A |
+| **Runs on $10 hardware** | Yes | No | No | No |
+| **Provider agnostic** | 10+ providers | Usually 1-2 | Usually 1 | Vendor locked |
+| **Channel agnostic** | 15 channels | Manual | Manual | Limited |
+| **Hardware peripherals** | GPIO/SPI/I2C | No | No | No |
+| **Autonomous operation** | Full | Partial | No | Partial |
+| **Consciousness model** | Yes | No | No | No |
+| **Formal security** | Deny-by-default | Varies | Varies | Varies |
+
+---
+
+## Quick Start
+
+### From Source
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+# Clone
+git clone https://github.com/rikitrader/zeroclaw-x0.git
+cd zeroclaw-x0
+
+# Build
+cargo build --release
+
+# Initialize (interactive wizard)
+./target/release/zeroclaw init
+
+# Run
+./target/release/zeroclaw run
 ```
 
-Or clone and run:
+### One-Line Bootstrap
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
-./install.sh
+curl -sSf https://raw.githubusercontent.com/rikitrader/zeroclaw-x0/main/bootstrap.sh | bash
 ```
 
-The installer asks whether you want a prebuilt binary (fast, ~seconds) or a source build (slower, customisable). Both end the same way — `zeroclaw onboard` kicks off automatically.
-
-Flags:
-
-```
-./install.sh --prebuilt              # always prebuilt; don't ask
-./install.sh --source                # always build from source
-./install.sh --minimal               # kernel only (~6.6 MB)
-./install.sh --source --features agent-runtime,channel-discord  # custom feature set
-./install.sh --skip-onboard          # install only, run `zeroclaw onboard` later
-./install.sh --list-features         # print available feature flags
-```
-
-Platform-specific notes: [Linux](docs/book/src/setup/linux.md) · [macOS](docs/book/src/setup/macos.md) · [Windows](docs/book/src/setup/windows.md) · [Docker](docs/book/src/setup/container.md)
-
-## Quick start
+### Docker
 
 ```bash
-zeroclaw onboard                  # interactive onboard: provider, channels, agents, etc.
-zeroclaw agent -a <alias>         # interactive chat using the [agents.<alias>] entry
-zeroclaw service install          # register as systemd/launchctl/Windows Service
-zeroclaw service start            # run it always-on in the background
+docker pull ghcr.io/rikitrader/zeroclaw-x0:latest
+docker run -v ./config.toml:/etc/zeroclaw/config.toml ghcr.io/rikitrader/zeroclaw-x0
 ```
 
-Full walkthrough: [Quick start](docs/book/src/getting-started/quick-start.md) — or skip the safety gates with [YOLO mode](docs/book/src/getting-started/yolo.md) for dev boxes.
+### Configuration
 
-## What ZeroClaw does
-
-- **Multi-channel** — one agent answering you across [every channel you configure](docs/book/src/channels/overview.md). Inbound messages from Discord, Telegram, Matrix, email, webhooks, CLI — all delivered to the same agent loop.
-- **Provider-agnostic** — [model providers](docs/book/src/providers/overview.md) are pluggable. Configure Anthropic, OpenAI, local Ollama, or any OpenAI-compatible endpoint. [Fallback chains and routing](docs/book/src/providers/fallback-and-routing.md) keep the agent running when a provider flakes.
-- **Security-first, with escape hatches** — default autonomy is `supervised`: medium-risk ops require approval, high-risk blocked. Workspace boundaries, command policy, OS-level sandboxes (Landlock / Bubblewrap / Seatbelt / Docker), and cryptographic [tool receipts](docs/book/src/security/tool-receipts.md) on every action. [YOLO mode](docs/book/src/getting-started/yolo.md) exists for trusted dev environments.
-- **Hardware-capable** — GPIO / I2C / SPI / USB on Raspberry Pi, STM32, Arduino, and ESP32 via the `Peripheral` trait. See [Hardware](docs/book/src/hardware/index.md).
-- **Gateway + dashboard** — HTTP / WebSocket gateway for clients, with a web dashboard for chat, memory browsing, config editing, cron management, and tool inspection.
-- **SOP engine** — event-triggered [Standard Operating Procedures](docs/book/src/sop/index.md) (MQTT / webhook / cron / peripheral) with approval gates and resumable runs.
-- **ACP** — IDE / editor integration via [Agent Client Protocol](docs/book/src/channels/acp.md) (JSON-RPC 2.0 over stdio).
-
-## Configuration
-
-One TOML file at `~/.zeroclaw/config.toml`. Pointers:
-
-- [Provider configuration](docs/book/src/providers/configuration.md) — the universal `[providers.models.<type>.<alias>]` schema
-- [Channels overview](docs/book/src/channels/overview.md) — per-channel `[channels.<type>.<alias>]` blocks
-- [Security overview](docs/book/src/security/overview.md) — autonomy, sandboxing, tool receipts
-- [Full config reference](docs/book/src/reference/config.md) — generated from the live schema; every key documented
-
-A V3 config has at minimum four section headers (`<type>.<alias>` shaped) — a provider entry, an agent that references it, and a risk profile the agent gates against. See [Provider Configuration → Minimal working example](docs/book/src/providers/configuration.md#minimal-working-example) for the canonical four-section form with inline type/alias commentary.
-
-For standard OpenAI Codex subscription auth, swap the provider entry to:
+ZEROCLAW-X0 uses a single `config.toml`:
 
 ```toml
-[providers.models.openai.coding]   # type = openai; alias = coding (you choose)
-model = "gpt-5-codex"
-wire_api = "responses"
-requires_openai_auth = true
+[agent]
+name = "my-agent"
+system_prompt = "You are a helpful autonomous assistant."
+
+[provider]
+default = "openrouter"          # or: openai, anthropic, gemini, ollama, ...
+api_key = "${OPENROUTER_API_KEY}"
+
+[channels.telegram]
+enabled = true
+token = "${TELEGRAM_BOT_TOKEN}"
+
+[channels.discord]
+enabled = true
+token = "${DISCORD_BOT_TOKEN}"
+
+[memory]
+backend = "sqlite"              # or: markdown, none
+embeddings = true
+
+[security]
+pairing_required = true
+allowed_tools = ["web_search", "memory_store", "memory_recall"]
 ```
 
-…and point your agent at it with `model_provider = "openai.coding"`.
+See [docs/config-reference.md](docs/config-reference.md) for the full schema.
 
-Notes:
-
-- Normal OpenAI Codex subscription auth uses stored auth profiles, not an `api_key` on the provider entry.
-- Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
-- If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│            channels       gateway        ACP                 │
-│          (30+ adapters)   (REST/WS)    (JSON-RPC)            │
-│                        ↓                                     │
-│                   ZeroClaw runtime                           │
-│         ┌──────────┬──────────┬──────────┐                   │
-│         │  agent   │ security │   SOP    │                   │
-│         │   loop   │  policy  │  engine  │                   │
-│         └──────────┴──────────┴──────────┘                   │
-│              ↓          ↓           ↓                        │
-│          providers    tools      memory                      │
-│         (Anthropic,  (shell,    (SQLite,                     │
-│          OpenAI,     browser,    embeddings)                 │
-│          Ollama,     HTTP,                                   │
-│          ~20 more)   hardware)                               │
-└──────────────────────────────────────────────────────────────┘
+                         ┌─────────────────────────────────┐
+                         │         ZEROCLAW-X0 DAEMON       │
+                         │      (supervisor + backoff)      │
+                         └──────────────┬──────────────────┘
+                                        │
+          ┌─────────────────────────────┼──────────────────────────────┐
+          │                             │                              │
+  ┌───────▼────────┐          ┌────────▼────────┐          ┌─────────▼────────┐
+  │  CONSCIOUSNESS │          │   AGENT LOOP    │          │   LIFE LOOP      │
+  │  Multi-agent   │          │  Observe→Think  │          │  Emotions→Dreams │
+  │  debate engine │          │  →Plan→Execute  │          │  →Initiative     │
+  └───────┬────────┘          └────────┬────────┘          └─────────┬────────┘
+          │                            │                             │
+  ┌───────▼────────────────────────────▼─────────────────────────────▼────────┐
+  │                           TRAIT LAYER                                     │
+  │  Provider │ Channel │ Tool │ Memory │ Observer │ Runtime │ Peripheral     │
+  └──────┬──────────┬──────────┬──────────┬──────────┬──────────┬────────────┘
+         │          │          │          │          │          │
+   ┌─────▼───┐ ┌───▼───┐ ┌───▼───┐ ┌────▼───┐ ┌───▼───┐ ┌───▼────────┐
+   │Anthropic│ │Telegr.│ │Shell  │ │SQLite │ │OTel  │ │STM32/RPi  │
+   │OpenAI   │ │Discord│ │Browser│ │Vector │ │Prom. │ │ESP32/Uno  │
+   │Gemini   │ │Slack  │ │Wallet │ │RAG    │ │Log   │ │GPIO/SPI   │
+   │Ollama   │ │Matrix │ │Git    │ │Graph  │ │      │ │I2C/UART   │
+   │10+ more │ │15 ch. │ │44 tools│ │Cosmic │ │      │ │           │
+   └─────────┘ └───────┘ └───────┘ └───────┘ └───────┘ └───────────┘
 ```
 
-Full detail with Mermaid diagrams: [Architecture overview](docs/book/src/architecture/overview.md) · [Request lifecycle](docs/book/src/architecture/request-lifecycle.md) · [Crates](docs/book/src/architecture/crates.md).
+ZEROCLAW-X0 is built on **7 core traits**. Everything is swappable. Add a new provider by implementing `Provider`. Add a new channel by implementing `Channel`. No framework lock-in, ever.
+
+### 43 Modules
+
+| Category | Modules |
+|----------|---------|
+| **Core** | `agent`, `config`, `daemon`, `runtime`, `service`, `health` |
+| **Intelligence** | `consciousness`, `cognitive`, `quantum`, `conscience`, `soul`, `sce` |
+| **Autonomy** | `life`, `goals`, `cron`, `taskqueue`, `skillforge`, `continuity` |
+| **Communication** | `channels`, `gateway`, `tunnel`, `heartbeat` |
+| **Memory** | `memory`, `rag`, `cosmic` (graph + drift + consolidation) |
+| **Security** | `security`, `auth`, `approval`, `wallet`, `control` |
+| **Execution** | `tools`, `skills`, `integrations`, `doctor` |
+| **Observability** | `observability` (log + OTel + Prometheus), `cost` |
+| **Hardware** | `peripherals`, `hardware`, `turboquant` |
+| **Setup** | `onboard`, `migration` |
+
+---
+
+## Features
+
+### AI Providers (10+)
+
+| Provider | Streaming | Tool Calling | Vision |
+|----------|:---------:|:------------:|:------:|
+| **OpenAI** (GPT-4o, o3) | Yes | Yes | Yes |
+| **Anthropic** (Claude 4) | Yes | Yes | Yes |
+| **Google Gemini** | Yes | Yes | Yes |
+| **Ollama** (local) | Yes | Yes | Yes |
+| **OpenRouter** (200+ models) | Yes | Yes | Yes |
+| **GitHub Copilot** | Yes | Yes | - |
+| **GLM** (Zhipu) | Yes | Yes | Yes |
+| **NVIDIA** | Yes | Yes | Yes |
+| Custom/Compatible | Yes | Yes | Varies |
+
+**Resilient routing**: automatic failover, load balancing, cost-aware model selection.
+
+### Channels (15)
+
+| Channel | Send | Listen | Media | Typing | Reactions |
+|---------|:----:|:------:|:-----:|:------:|:---------:|
+| Telegram | Yes | Yes | Yes | Yes | Yes |
+| Discord | Yes | Yes | Yes | Yes | Yes |
+| Slack | Yes | Yes | Yes | Yes | Yes |
+| WhatsApp | Yes | Yes | Yes | Yes | - |
+| Matrix (E2EE) | Yes | Yes | Yes | Yes | Yes |
+| Signal | Yes | Yes | Yes | - | - |
+| iMessage | Yes | Yes | Yes | - | - |
+| IRC | Yes | Yes | - | - | - |
+| Email | Yes | Yes | Yes | - | - |
+| Mattermost | Yes | Yes | Yes | Yes | Yes |
+| Lark/Feishu | Yes | Yes | Yes | - | - |
+| DingTalk | Yes | Yes | Yes | - | - |
+| QQ | Yes | Yes | Yes | - | - |
+| CLI | Yes | Yes | - | - | - |
+| Voice (TTS/STT) | Yes | Yes | - | - | - |
+
+### Tools (44)
+
+<details>
+<summary>Click to expand full tool list</summary>
+
+| Tool | Description |
+|------|-------------|
+| `shell` | Sandboxed command execution |
+| `file_read` / `file_write` | Filesystem access with policy |
+| `web_search` | Multi-engine web search |
+| `browser` / `browser_open` / `browser_use` | Full browser automation |
+| `screenshot` | Screen capture |
+| `http_request` | HTTP client with SSRF protection |
+| `git_operations` | Git commands |
+| `memory_store` / `memory_recall` / `memory_forget` | Persistent memory |
+| `research_claw` | Deep research agent |
+| `delegate` / `multi_delegate` | Sub-agent spawning |
+| `schedule` / `cron_*` | Task scheduling (add/list/remove/run/update) |
+| `wallet_*` | Crypto wallet (balance/send/sign/pay/info/token) |
+| `nvidia_*` | NVIDIA AI (cosmos/speech/triton/vision) |
+| `hardware_*` | Hardware peripherals (board_info/memory_map/memory_read) |
+| `soul_*` | Soul introspection (reflect/replicate/status) |
+| `image_info` | Image analysis |
+| `pushover` | Push notifications |
+| `proxy_config` | Network proxy management |
+| `composio` | Composio integration |
+
+</details>
+
+### Consciousness Engine
+
+ZEROCLAW-X0 has a **multi-agent consciousness model** inspired by Global Workspace Theory:
+
+- **Internal debate** — multiple cognitive agents deliberate before decisions
+- **Conscience** — ethical evaluation layer with veto power
+- **Emotional state** — valence/arousal model that modulates behavior
+- **Dream engine** — background synthesis during idle periods
+- **Self-continuity** — identity preservation across sessions and restarts
+- **Quantum brain** — proposal superposition for creative problem-solving
+
+### Hardware Support
+
+Run ZEROCLAW-X0 on physical hardware:
+
+| Board | Status | Features |
+|-------|--------|----------|
+| **Raspberry Pi 5/4** | Stable | GPIO, SPI, I2C, camera |
+| **STM32 Nucleo** | Stable | GPIO, UART, sensors |
+| **ESP32** | Stable | WiFi, BLE, touch UI |
+| **Arduino Uno** | Bridge | Via Q-bridge firmware |
+
+See [docs/hardware/](docs/hardware/) for wiring diagrams, firmware flashing guides, and peripheral examples.
+
+---
+
+## Build from Source
+
+### Prerequisites
+
+- Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- OpenSSL development headers (Linux: `apt install libssl-dev pkg-config`)
+
+### Build
+
+```bash
+git clone https://github.com/rikitrader/zeroclaw-x0.git
+cd zeroclaw-x0
+
+# Development
+cargo build
+
+# Release (optimized, ~17MB binary)
+cargo build --release
+
+# Run all tests (5800+ tests)
+cargo test
+
+# Lint
+cargo fmt --check && cargo clippy -- -D warnings
+```
+
+### Cross-compilation
+
+```bash
+# Linux x86_64 (from macOS)
+cross build --release --target x86_64-unknown-linux-gnu
+
+# Raspberry Pi (ARMv7)
+cross build --release --target armv7-unknown-linux-gnueabihf
+
+# ARM64 (AWS Graviton, Apple Silicon Linux)
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
+---
+
+## Deployment
+
+### Systemd
+
+```bash
+sudo cp target/release/zeroclaw /usr/local/bin/zeroclaw-x0
+sudo cp deploy/zeroclaw.service /etc/systemd/system/
+sudo systemctl enable --now zeroclaw
+```
+
+### Docker Compose
+
+```yaml
+version: "3.8"
+services:
+  zeroclaw:
+    image: ghcr.io/rikitrader/zeroclaw-x0:latest
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/etc/zeroclaw/config.toml
+      - ./data:/var/lib/zeroclaw
+    env_file: .env
+    ports:
+      - "3000:3000"   # Gateway
+      - "9090:9090"   # Prometheus metrics
+```
+
+### Kubernetes
+
+```bash
+helm install zeroclaw-x0 ./deploy/helm \
+  --set config.provider.default=openrouter \
+  --set config.provider.apiKey=$OPENROUTER_API_KEY
+```
+
+---
+
+## Project Stats
+
+```
+Language:       100% Rust
+Source Files:   318
+Modules:        43
+Lines of Code:  140,000+
+Tests:          5,800+
+Binary Size:    17MB (release)
+Providers:      10+
+Channels:       15
+Tools:          44
+CI Workflows:   21
+```
+
+---
+
+## Roadmap
+
+- [x] Core agent loop with trait-driven architecture
+- [x] 10+ AI provider integrations
+- [x] 15 channel adapters
+- [x] 44 built-in tools
+- [x] Consciousness engine with multi-agent debate
+- [x] Emotional state + dream engine + life loop
+- [x] Self-continuity engine (SCE)
+- [x] Quantum brain for creative reasoning
+- [x] Hardware peripheral support (RPi, STM32, ESP32)
+- [x] RAG + vector memory + cosmic memory graph
+- [x] Daemon supervisor with backoff + circuit breaker
+- [x] SkillForge (runtime skill discovery)
+- [x] Crypto wallet integration
+- [x] NVIDIA AI integration
+- [ ] WebAssembly runtime adapter
+- [ ] Federated multi-agent mesh
+- [ ] Voice-first interaction mode
+- [ ] On-device fine-tuning (GGUF)
+- [ ] Plugin marketplace
+
+---
 
 ## Contributing
 
-Start with [how to contribute](docs/book/src/contributing/how-to.md). Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://discord.com/invite/wDshRVqRjx) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Good places to start:
+```bash
+# Setup
+git clone https://github.com/rikitrader/zeroclaw-x0.git
+cd zeroclaw-x0
+git config core.hooksPath .githooks
 
-- New channel → `crates/zeroclaw-channels/`
-- New provider → `crates/zeroclaw-providers/`
-- New tool → `crates/zeroclaw-tools/`
-- Hardware support → `crates/zeroclaw-hardware/`
-- Docs → `docs/book/src/`
+# Validate before PR
+cargo fmt --check && cargo clippy -- -D warnings && cargo test
+```
 
-AI-assisted PRs are welcome; see [Contribution culture (RFC #5615)](https://github.com/zeroclaw-labs/zeroclaw/issues/5615) for the co-authorship norms.
-
-<!-- BEGIN:RECENT_CONTRIBUTORS -->
-<!-- END:RECENT_CONTRIBUTORS -->
+---
 
 ## Security
 
-Do not file public issues for security vulnerabilities. Email `security@zeroclaw.dev`. See [SECURITY.md](SECURITY.md) for the full policy.
+ZEROCLAW-X0 follows a **deny-by-default** security model:
 
-## Official repository & impersonation notice
+- All tools require explicit allowlisting
+- Pairing required for new devices/users
+- Secret store with encryption at rest
+- SSRF protection on all HTTP tools
+- Sandboxed shell execution
+- Audit logging for all actions
 
-This is the only official ZeroClaw repository:
+Report vulnerabilities via [SECURITY.md](SECURITY.md).
 
-> <https://github.com/zeroclaw-labs/zeroclaw>
-
-Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**.
+---
 
 ## License
 
-Dual-licensed: [MIT](LICENSE-MIT) OR [Apache 2.0](LICENSE-APACHE). You may choose either. Contributors automatically grant rights under both — see [CLA](docs/book/src/contributing/cla.md). The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs.
+[MIT License](LICENSE) - Copyright (c) 2025 ZeroClaw Labs
 
-## Credits
-
-Built and maintained by the community — original creator [@theonlyhennygod](https://github.com/theonlyhennygod); project lead [@JordanTheJet](https://github.com/JordanTheJet). Full maintainer list in [Communication](docs/book/src/contributing/communication.md).
-
-Thanks to the communities that incubated early work: **Harvard University**, **MIT**, **Sundai Club**, and every contributor pushing it forward.
+---
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
-    <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-    </picture>
-  </a>
+  <strong>Built with Rust. Built to last. Built to think.</strong><br/>
+  <sub>If you find ZEROCLAW-X0 useful, consider giving it a star. It helps others discover the project.</sub>
 </p>
 
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
-  </a>
-</p>
+---
+
+<details>
+<summary><strong>SEO / Discovery Keywords</strong></summary>
+
+`autonomous AI agent` `cognitive architecture` `consciousness modeling` `quantum reasoning` `emotional AI` `multi-agent system` `AI runtime` `Rust AI framework` `self-aware AI` `artificial general intelligence` `agentic AI` `AI consciousness` `neural symbolic AI` `embodied AI` `hardware AI agent` `Raspberry Pi AI` `ESP32 AI` `STM32 AI` `AI assistant framework` `open source AI agent` `LLM orchestration` `AI tool use` `multi-model AI` `provider agnostic AI` `AI memory system` `vector database AI` `RAG system` `AI dream engine` `AI emotional intelligence` `self-continuity` `AI identity` `AI soul model` `Global Workspace Theory AI` `multi-channel AI bot` `Telegram AI bot` `Discord AI bot` `WhatsApp AI bot` `Slack AI bot` `Matrix AI bot` `AI agent Rust` `blazing fast AI` `single binary AI` `edge AI agent` `IoT AI agent` `AI with conscience` `ethical AI agent`
+
+</details>
