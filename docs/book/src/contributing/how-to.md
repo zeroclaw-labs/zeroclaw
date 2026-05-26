@@ -25,7 +25,8 @@ The key checkpoints:
 
 - **PR template** — `.github/pull_request_template.md`. Fill it out. The summary, validation evidence, and compatibility sections are non-negotiable.
 - **CI** — runs on every PR. `ci.yml` is the composite gate; all legs must pass.
-- **Labels** — scope (`scope:providers`, `scope:channels`, etc.) and risk (`risk:low` / `risk:medium` / `risk:high`) are auto-applied by path-labeler. Double-check they match your change. If they look wrong and you cannot edit labels, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
+- **Labels** — maintainers use labels to route review depth. You do not need to know every label family before opening a PR. If labels look obviously wrong and you cannot edit them, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
+- **Review routing** — make the scope, linked issues, validation, and risk/rollback context clear enough that reviewers can choose the right review path quickly.
 - **Review** — maintainers review. Findings use the PR review taxonomy: 🔴 blocking, 🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. Address blockers; warnings should get a response; suggestions are optional.
 
 ## Code style
@@ -92,13 +93,13 @@ Title mirrors the squash commit:
 feat(scope): short description
 ```
 
-Body uses the PR template. **The validation-evidence section is required** — paste the output of `cargo fmt --check`, `cargo clippy`, `cargo test`, plus whatever manual verification you did. "It works on my machine" is not evidence.
+Body uses the PR template. **The validation-evidence section is required** — paste the checks that match the change. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, include `cargo fmt --check`, `cargo clippy`, `cargo test`, plus whatever manual verification you did. "It works on my machine" is not evidence.
 
 Risk labels:
 
-- `risk:low` — rollback is a revert; no user action needed
-- `risk:medium` — users may need to update config / env / CLI usage; rollback plan required
-- `risk:high` — security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
+- `risk: low` — rollback is a revert; no user action needed
+- `risk: medium` — users may need to update config / env / CLI usage; rollback plan required
+- `risk: high` — security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
 
 ## After the PR
 

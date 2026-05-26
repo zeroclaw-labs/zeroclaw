@@ -688,6 +688,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -712,6 +713,7 @@ impl WeComWsChannel {
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -736,6 +738,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
             return;
@@ -820,6 +823,7 @@ impl WeComWsChannel {
                     thread_ts: Some(req_id),
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 })
                 .await;
         });
@@ -3364,6 +3368,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: Vec::new(),
+            subject: None,
         })
         .await
         .unwrap();

@@ -1,7 +1,7 @@
 name: Validate PR title
 
 on:
-  pull_request_target:
+  pull_request:
     types:
       - opened
       - reopened
@@ -9,14 +9,16 @@ on:
       - synchronize
 
 permissions:
-  pull-requests: read
+  contents: read
 
 jobs:
   main:
     runs-on: ubuntu-latest
     steps:
-      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50  # v6.1.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run validator unit tests
+        run: ./scripts/check-pr-title.test.sh
+      - name: Check PR title
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          requireScope: true
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: ./scripts/check-pr-title.sh "$PR_TITLE"

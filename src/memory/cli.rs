@@ -6,6 +6,8 @@ use super::{
 use crate::config::Config;
 use anyhow::{Result, bail};
 use console::style;
+#[cfg(feature = "agent-runtime")]
+use zeroclaw_runtime::i18n;
 
 /// Handle `zeroclaw memory <subcommand>` CLI commands.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
@@ -209,12 +211,36 @@ async fn handle_stats(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn unsupported_clear_backend_message(backend: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        i18n::get_required_cli_string_with_args(
+            "cli-memory-clear-unsupported-backend",
+            &[("backend", backend)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
+        )
+    }
+}
+
 async fn handle_clear(
     config: &Config,
     key: Option<String>,
     category: Option<String>,
     yes: bool,
 ) -> Result<()> {
+    let backend = backend_kind_from_dotted(&config.memory.backend);
+    if matches!(
+        classify_memory_backend(&backend),
+        MemoryBackendKind::Markdown | MemoryBackendKind::Qdrant
+    ) {
+        bail!(unsupported_clear_backend_message(&backend));
+    }
     let mem = create_cli_memory(config)?;
 
     // Single-key deletion (exact or prefix match).
@@ -329,6 +355,7 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_category_known_variants() {
@@ -367,5 +394,74 @@ mod tests {
     #[test]
     fn truncate_content_empty_string() {
         assert_eq!(truncate_content("", 10), "");
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_append_only_markdown_backend() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "markdown".into();
+
+        let err = handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'markdown'"));
+        assert!(msg.contains("switch to a deletable backend"));
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_qdrant_backend_constructed_as_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "qdrant".into();
+
+        let err = handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'qdrant'"));
+        assert!(!msg.contains("or qdrant"));
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_dotted_qdrant_backend() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "qdrant.default".into();
+
+        let err = handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'qdrant'"));
+        assert!(!msg.contains("or qdrant"));
     }
 }

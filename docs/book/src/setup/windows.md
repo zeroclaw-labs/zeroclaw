@@ -19,7 +19,7 @@ Flags:
 | Flag | Behaviour |
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest — no Rust toolchain needed) |
-| `--minimal` | Build core only (no channels, no hardware) |
+| `--minimal` | Build core only (`--no-default-features`; no channels, no hardware) |
 | `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
 | `--full` | Build everything |
 
@@ -27,8 +27,12 @@ The script:
 
 1. Checks for `rustup`; downloads `rustup-init.exe` and installs stable toolchain if missing
 2. Builds (or downloads) the binary
-3. Installs to `%USERPROFILE%\.cargo\bin\zeroclaw.exe`
-4. Runs `zeroclaw onboard` automatically
+3. Installs to `%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe`
+4. Prints mode-specific next steps:
+   - `--prebuilt`, `--standard`, `--full`: run `zeroclaw onboard`
+   - `--minimal`: onboarding is unavailable; configure `%USERPROFILE%\.zeroclaw\config.toml` manually and use the reduced CLI path (`zeroclaw agent ...`)
+
+For source builds, `setup.bat` now prints the exact `cargo build ...` command it executes and reports the installed `zeroclaw.exe` size so command shape and artifact expectations stay visible.
 
 ### Option 2 — Scoop
 
@@ -122,7 +126,10 @@ zeroclaw service uninstall
 Remove the binary:
 
 ```cmd
-:: setup.bat / cargo install
+:: setup.bat
+del "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
+
+:: cargo install
 del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
 
 :: Scoop
