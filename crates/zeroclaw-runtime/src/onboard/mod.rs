@@ -1042,6 +1042,13 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
         let api_key_path = format!("{prefix}.api-key");
         if let Some(api_key) = &flags.api_key {
             persist(cfg, &api_key_path, api_key).await?;
+            // An explicit --api-key flag means the user wants standard API-key
+            // auth. If this alias was previously configured for Codex subscription
+            // auth, clear that flag so runtime dispatch stops routing to
+            // OpenAiCodexModelProvider.
+            if picked == "openai" {
+                persist(cfg, &format!("{prefix}.requires-openai-auth"), "false").await?;
+            }
         }
         if let Some(model) = &flags.model {
             persist(cfg, &format!("{prefix}.model"), model).await?;
@@ -3079,6 +3086,64 @@ mod tests {
             "requires_openai_auth must be false after switching to API key"
         );
         assert_eq!(entry.api_key.as_deref(), Some("sk-test-key"));
+    }
+
+    /// Regression: `zeroclaw onboard --model-provider openai --api-key sk-...` must
+    /// clear `requires_openai_auth` even when the alias was previously configured for
+    /// Codex subscription auth (forced-flag path, no interactive auth phase).
+    #[tokio::test]
+    async fn openai_forced_api_key_flag_clears_codex_auth() {
+        use zeroclaw_config::schema::OpenAIModelProviderConfig;
+
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        // Pre-seed an alias that was previously set up with Codex subscription auth.
+        cfg.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    wire_api: Some(WireApi::Responses),
+                    model: Some("codex-mini-latest".into()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Rerun onboarding with --model-provider openai --api-key sk-... (forced path).
+        // The interactive auth picker is skipped; requires_openai_auth must still be cleared.
+        let flags = Flags {
+            model_provider: Some("openai".into()),
+            api_key: Some("sk-forced-key".into()),
+            model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new();
+
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
+
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default entry should remain configured");
+        assert!(
+            !entry.requires_openai_auth,
+            "requires_openai_auth must be cleared when --api-key flag is used on a Codex alias"
+        );
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("sk-forced-key"),
+            "forced api_key must be persisted"
+        );
     }
 
     #[tokio::test]
