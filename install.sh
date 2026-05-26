@@ -465,7 +465,7 @@ interactive_feature_picker() {
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
-# is on PATH we run `cargo web build --release` from the source root so the
+# is on PATH we run `cargo web build` from the source root so the
 # generated API client is refreshed before TypeScript compiles. Without
 # Node.js we warn — the gateway still starts but the dashboard route
 # returns 404 until `web/dist` is populated.
@@ -475,18 +475,17 @@ build_web_dashboard() {
     warn "Source has no web/ directory; skipping dashboard build."
     return 0
   fi
-  if [ -f "$src_dir/web/dist/index.html" ]; then
-    info "Web dashboard already built at $src_dir/web/dist"
-    return 0
-  fi
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir && cargo web build --release"
+    warn "  cd $src_dir && cargo web build"
     return 0
   fi
-  info "Building web dashboard (cargo web build --release)..."
-  (cd "$src_dir" && cargo web build --release) || {
+  # Always rebuild — a stale dist from a prior revision serves outdated
+  # assets against an updated gateway. Incremental caching keeps no-op
+  # re-runs cheap.
+  info "Building web dashboard (cargo web build)..."
+  (cd "$src_dir" && cargo web build) || {
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
