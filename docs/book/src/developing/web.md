@@ -60,3 +60,13 @@ The gateway loads `web/dist/` from the filesystem at runtime via `static_files.r
 | `cargo`| <https://rustup.rs>                    |
 
 `cargo web` fails fast with an install hint if `npm` is missing.
+
+## Supported browsers (minimum)
+
+The dashboard targets evergreen browsers with support for both `color-mix()`
+and `structuredClone()`.
+
+- Chrome 111+
+- Edge 111+
+- Firefox 113+
+- Safari 16.2+
