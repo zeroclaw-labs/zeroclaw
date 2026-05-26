@@ -2861,10 +2861,10 @@ fn api_key_and_uri_for_provider(
     provider_name: &str,
     fallback: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> (Option<String>, Option<String>) {
-    if let Some((fam, al)) = provider_name.split_once('.') {
-        if let Some(entry) = config.providers.models.find(fam, al) {
-            return (entry.api_key.clone(), entry.uri.clone());
-        }
+    if let Some((fam, al)) = provider_name.split_once('.')
+        && let Some(entry) = config.providers.models.find(fam, al)
+    {
+        return (entry.api_key.clone(), entry.uri.clone());
     }
     (
         fallback.and_then(|e| e.api_key.clone()),
