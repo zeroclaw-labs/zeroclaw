@@ -857,6 +857,18 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Format an error including its full source chain and sanitize the result.
+pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut formatted = String::new();
+    let _ = std::fmt::Write::write_fmt(&mut formatted, format_args!("{error}"));
+    let mut current = error.source();
+    while let Some(source) = current {
+        let _ = std::fmt::Write::write_fmt(&mut formatted, format_args!(": {source}"));
+        current = source.source();
+    }
+    sanitize_api_error(&formatted)
+}
+
 /// Build a sanitized model_provider error from a failed HTTP response.
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
@@ -2810,6 +2822,45 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn format_error_chain_includes_sources_and_sanitizes_output() {
+        #[derive(Debug)]
+        struct ChainError {
+            message: &'static str,
+            source: Option<Box<dyn std::error::Error + 'static>>,
+        }
+
+        impl std::fmt::Display for ChainError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.message)
+            }
+        }
+
+        impl std::error::Error for ChainError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source.as_deref()
+            }
+        }
+
+        let error = ChainError {
+            message: "outer context",
+            source: Some(Box::new(ChainError {
+                message: "middle context",
+                source: Some(Box::new(ChainError {
+                    message: "inner source leaked sk-1234567890abcdef",
+                    source: None,
+                })),
+            })),
+        };
+
+        let result = format_error_chain(&error);
+
+        assert!(result.contains("outer context"));
+        assert!(result.contains("middle context"));
+        assert!(result.contains("inner source leaked [REDACTED]"));
+        assert!(!result.contains("sk-1234567890abcdef"));
+    }
 
     #[test]
     fn sanitize_scrubs_sk_prefix() {

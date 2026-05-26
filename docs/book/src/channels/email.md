@@ -82,11 +82,24 @@ Outbound sends still go via SMTP — configure an `smtp` block in this channel t
 
 Both email channels thread replies using `In-Reply-To` and `References` headers so conversations stay grouped in whatever client the sender uses.
 
+## Outbound body format
+
+Agent replies are sent as `multipart/alternative` with both a plain-text and an HTML part by default. The HTML part is the Markdown-rendered body; the plain-text part is the raw body text. Mail clients that prefer plain text will select the plain-text alternative automatically.
+
+To send plain text only (no HTML part, for clients or setups that prefer it), set:
+
+```toml
+[channels.email.default]
+html_body = false
+```
+
+When attachments are present the body alternatives are wrapped in an outer `multipart/mixed`.
+
 ## Attachment handling
 
 Inbound attachments are stored under `<workspace>/attachments/<conversation>/`. The agent gets file paths in its context and can read them via the `file_read` tool.
 
-Outbound attachments are not supported yet — the agent replies with links to files in the workspace, and the user downloads via whatever tunnel the workspace is exposed through.
+Outbound attachments are resolved from the workspace path provided by the agent and sent as MIME parts. Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter.
 
 ## Rate and volume limits
 

@@ -426,6 +426,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             };
             let _ = tx.send(msg).await;
             Ok(())

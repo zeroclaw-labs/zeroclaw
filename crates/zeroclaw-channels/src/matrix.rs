@@ -1796,6 +1796,7 @@ mod inbound {
             thread_ts: outbound_anchor.clone(),
             interruption_scope_id: outbound_anchor,
             attachments,
+            subject: None,
         };
 
         if let Err(e) = ctx.tx.send(msg).await {
