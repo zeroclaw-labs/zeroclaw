@@ -532,66 +532,37 @@ pub struct Config {
     #[nested]
     pub escalation: EscalationConfig,
 
-    // --- X0 fork extensions ---
+    // --- X0 fork extensions (skipped from Configurable prop system) ---
 
-    /// Soul identity and alignment configuration (`[soul]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub soul: Option<crate::x0_extensions::SoulConfig>,
-
-    /// Replication configuration (`[replication]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub replication: crate::x0_extensions::ReplicationConfig,
-
-    /// Model strategy / tiered model selection (`[model_strategy]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub model_strategy: crate::x0_extensions::ModelStrategyConfig,
-
-    /// Wallet configuration (`[wallet]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub wallet: crate::x0_extensions::WalletConfig,
-
-    /// Treasury configuration (`[treasury]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub treasury: crate::x0_extensions::TreasuryConfig,
-
-    /// Consciousness module configuration (`[consciousness]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub consciousness: crate::x0_extensions::ConsciousnessConfig,
-
-    /// Cognitive module configuration (`[cognitive]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub cognitive: crate::x0_extensions::CognitiveConfig,
-
-    /// Life module configuration (`[life]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub life: crate::x0_extensions::LifeConfig,
-
-    /// Conscience gate configuration (`[conscience]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub conscience: crate::x0_extensions::ConscienceConfig,
-
-    /// Cosmic brain configuration (`[cosmic_brain]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub cosmic_brain: crate::x0_extensions::CosmicBrainConfig,
-
-    /// Task queue configuration (`[taskqueue]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub taskqueue: crate::x0_extensions::TaskQueueConfig,
-
-    /// SCE configuration (`[sce]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub sce: crate::x0_extensions::SceConfig,
-
-    /// NVIDIA configuration (`[nvidia]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub nvidia: crate::x0_extensions::NvidiaConfig,
-
-    /// Bot workspace isolation (`[bots]`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip)]
     pub bots: Vec<crate::x0_extensions::BotConfig>,
-
-    /// Agent-level config (`[agent]`).
-    #[serde(default)]
+    #[serde(skip)]
     pub agent: Option<crate::x0_extensions::AgentConfig>,
 }
 
@@ -16391,6 +16362,22 @@ auto_save = true
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            // X0 extensions
+            soul: None,
+            replication: Default::default(),
+            model_strategy: Default::default(),
+            wallet: Default::default(),
+            treasury: Default::default(),
+            consciousness: Default::default(),
+            cognitive: Default::default(),
+            life: Default::default(),
+            conscience: Default::default(),
+            cosmic_brain: Default::default(),
+            taskqueue: Default::default(),
+            sce: Default::default(),
+            nvidia: Default::default(),
+            bots: Vec::new(),
+            agent: None,
         };
         // ModelProvider fields are now resolved directly — no cache needed.
 
@@ -16988,6 +16975,22 @@ default_temperature = 0.7
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
+            // X0 extensions
+            soul: None,
+            replication: Default::default(),
+            model_strategy: Default::default(),
+            wallet: Default::default(),
+            treasury: Default::default(),
+            consciousness: Default::default(),
+            cognitive: Default::default(),
+            life: Default::default(),
+            conscience: Default::default(),
+            cosmic_brain: Default::default(),
+            taskqueue: Default::default(),
+            sce: Default::default(),
+            nvidia: Default::default(),
+            bots: Vec::new(),
+            agent: None,
         };
 
         // ModelProvider fields are now resolved directly — no cache needed.
