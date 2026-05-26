@@ -520,10 +520,7 @@ mod tests {
 
     #[test]
     fn mcp_surface_methods_are_prefixed_per_server() {
-        let names: Vec<_> = mcp_surface_methods("filesystem")
-            .into_iter()
-            .map(|(name, method)| (name, method))
-            .collect();
+        let names: Vec<_> = mcp_surface_methods("filesystem").into_iter().collect();
         assert_eq!(
             names,
             vec![
