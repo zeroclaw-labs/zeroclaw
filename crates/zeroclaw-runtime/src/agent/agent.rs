@@ -1389,6 +1389,19 @@ impl Agent {
         let args_json = tool_args.to_string();
         let tool_call_id = call.tool_call_id.clone();
 
+        // Emit invoke log — visible in the TUI Logs pane.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "input": args_json,
+                })),
+            format!("tool call: {tool_name}")
+        );
+
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
@@ -1463,6 +1476,39 @@ impl Agent {
             };
 
         let duration = start.elapsed();
+
+        // Emit result log — visible in the TUI Logs pane.
+        if success {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_duration(duration.as_millis() as u64)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "input": args_json,
+                        "output": result,
+                    })),
+                format!("tool result: {tool_name}")
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_duration(duration.as_millis() as u64)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "input": args_json,
+                        "output": result,
+                    })),
+                format!("tool failed: {tool_name}")
+            );
+        }
 
         // ── Hook: after_tool_call (void) ─────────────────────────
         if let Some(ref hooks) = self.hook_runner {
