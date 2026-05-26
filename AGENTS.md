@@ -82,6 +82,13 @@ Full pre-PR validation (recommended):
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
+## Subagents
+
+Subagents (via `spawn_subagent` or cron `JobType::Agent`) inherit the parent's identity and permissions but run in isolated sessions. **Before running any shell commands or filesystem operations, subagents must explicitly set their working directory to the repository root** (the directory containing the top-level `Cargo.toml` and `AGENTS.md`). Do not assume the shell starts at repo root; always `cd` to it first (or use the equivalent in the tool's context).
+
+This guarantees consistent command behavior across parent and child runs.
+
+
 ## Project Snapshot
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
