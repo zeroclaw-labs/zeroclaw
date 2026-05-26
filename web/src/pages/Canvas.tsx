@@ -109,9 +109,12 @@ export default function Canvas() {
     const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
 
     // CSP that blocks all scripts — used for non-interactive content types
-    // and for the inert placeholder.
+    // and for the inert placeholder.  object-src 'none' is required
+    // separately because in the absence of a default-src directive,
+    // object-src would otherwise fall back to * and allow <object>,
+    // <embed>, and <applet> to load external content from these frames.
     const noScriptCsp =
-      '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'">';
+      '<meta http-equiv="Content-Security-Policy" content="script-src \'none\'; object-src \'none\'">';
 
     // Inert placeholder document.  Used for `eval` (where iframe rendering
     // is intentionally a no-op and execution happens out of band) and as
@@ -126,9 +129,15 @@ export default function Canvas() {
     }
 
     if (currentFrame.content_type === 'svg') {
-      // Strip <script> tags and event-handler attributes from SVG to prevent XSS
+      // Strip <script> tags and event-handler attributes from SVG to prevent XSS.
+      // Run the matched-pair strip first; then strip any remaining <script ...>
+      // opener so the void-element / unclosed form (`<script src="..."/>` or
+      // `<script src="...">` with no closing tag) does not survive. The \b
+      // word boundary keeps the patterns from matching tag names that merely
+      // start with "script" (e.g. <scriptlet>, should one ever exist).
       const sanitized = currentFrame.content
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+        .replace(/<script\b[^>]*\/?>/gi, '')
         .replace(/\bon\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, '');
       return `<!DOCTYPE html><html><head>${noScriptCsp}<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${sanitized}</body></html>`;
     }
