@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -18,6 +19,13 @@ use daemonclaw_config::schema::SearchMode;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
+static SQLITE_MEMORY_STARTUP_LOCK: StdMutex<()> = StdMutex::new(());
+
+fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
+    SQLITE_MEMORY_STARTUP_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// SQLite-backed persistent memory — the brain
 ///
@@ -54,6 +62,7 @@ impl SqliteMemory {
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
     pub fn new_named(workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
+        let _startup_guard = acquire_sqlite_startup_lock();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -92,6 +101,7 @@ impl SqliteMemory {
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
+        let _startup_guard = acquire_sqlite_startup_lock();
 
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -159,7 +169,72 @@ impl SqliteMemory {
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
+        fn is_db_locked_error(e: &rusqlite::Error) -> bool {
+            use rusqlite::ffi::ErrorCode;
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(err, _)
+                    if matches!(err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        }
+
+        fn execute_batch_retry(conn: &Connection, sql: &str) -> Result<(), rusqlite::Error> {
+            let mut backoff = Duration::from_millis(10);
+            let max_backoff = Duration::from_millis(250);
+            let max_attempts: usize = 24;
+
+            for attempt in 1..=max_attempts {
+                match conn.execute_batch(sql) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_db_locked_error(&e) && attempt < max_attempts => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Ok(())
+        }
+
+        fn memories_has_column(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let col_name: String = row.get(1)?;
+                if col_name == name {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
+            )
+        }
+
+        fn add_memories_column_if_missing(
+            conn: &Connection,
+            name: &str,
+            alter_sql: &str,
+        ) -> anyhow::Result<()> {
+            if memories_has_column(conn, name)? {
+                return Ok(());
+            }
+
+            match execute_batch_retry(conn, alter_sql) {
+                Ok(()) => Ok(()),
+                Err(e) if is_duplicate_column_error(&e) => Ok(()),
+                Err(e) => Err(e)
+                    .with_context(|| format!("SQLite migration failed adding memories.{name}")),
+            }
+        }
+
+        execute_batch_retry(
+            conn,
             "-- Core memories table
             CREATE TABLE IF NOT EXISTS memories (
                 id          TEXT PRIMARY KEY,
@@ -202,37 +277,42 @@ impl SqliteMemory {
                 accessed_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+        )
+        .with_context(|| "SQLite init_schema failed: core tables")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "session_id",
+            "ALTER TABLE memories ADD COLUMN session_id TEXT;",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_session")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "namespace",
+            "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "importance",
+            "ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;",
         )?;
 
-        // Migration: add session_id column if not present (safe to run repeatedly)
-        let schema_sql: String = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?;
-
-        if !schema_sql.contains("session_id") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN session_id TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
-            )?;
-        }
-
-        // Migration: add namespace column
-        if !schema_sql.contains("namespace") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';
-                 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
-            )?;
-        }
-
-        // Migration: add importance column
-        if !schema_sql.contains("importance") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;")?;
-        }
-
-        // Migration: add superseded_by column
-        if !schema_sql.contains("superseded_by") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
-        }
+        add_memories_column_if_missing(
+            conn,
+            "superseded_by",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
+        )?;
 
         // Migration: structured_memory table for typed JSON documents
         conn.execute_batch(
