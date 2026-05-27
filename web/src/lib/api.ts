@@ -893,9 +893,11 @@ export interface ModelsResponse {
   live: boolean;
 }
 
-export function getCatalogModels(provider: string): Promise<ModelsResponse> {
+export function getCatalogModels(provider: string, alias?: string): Promise<ModelsResponse> {
+  const params = new URLSearchParams({ provider });
+  if (alias) params.set('alias', alias);
   return apiFetch<ModelsResponse>(
-    `/api/onboard/catalog/models?provider=${encodeURIComponent(provider)}`,
+    `/api/onboard/catalog/models?${params.toString()}`,
   );
 }
 

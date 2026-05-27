@@ -65,6 +65,11 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
+    /// Optional configured alias under `providers.models.<provider>.<alias>`.
+    /// When present, the catalog endpoint validates that alias's own URI/auth
+    /// instead of only checking the provider family's default endpoint.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +84,131 @@ pub struct ModelsResponse {
     /// served (or if this model_provider has no remote catalog and the empty list
     /// is the genuine answer).
     pub live: bool,
+}
+
+async fn catalog_models_for_config(
+    cfg: &zeroclaw_config::schema::Config,
+    model_provider: &str,
+    alias: Option<&str>,
+) -> ModelsResponse {
+    let alias = alias.map(str::trim).filter(|alias| !alias.is_empty());
+    let local = model_provider_family_is_local(model_provider);
+
+    let provider_path = if let Some(alias) = alias {
+        let Some(entry) = cfg.providers.models.find(model_provider, alias) else {
+            return ModelsResponse {
+                model_provider: model_provider.to_string(),
+                models: Vec::new(),
+                local,
+                live: false,
+            };
+        };
+        let api_key = entry.api_key.as_deref();
+        let options =
+            zeroclaw_providers::provider_runtime_options_for_alias(cfg, model_provider, alias);
+        let has_alias_endpoint = entry
+            .uri
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|uri| !uri.is_empty())
+            || options
+                .provider_api_url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|uri| !uri.is_empty());
+        let alias_catalog_must_match_alias =
+            has_alias_endpoint || !model_provider_family_has_public_catalog(model_provider);
+        match zeroclaw_providers::create_model_provider_for_alias(
+            cfg,
+            model_provider,
+            alias,
+            api_key,
+            &options,
+        ) {
+            Ok(provider) => match provider.list_models().await {
+                Ok(models) => Some((models, true)),
+                Err(e) => {
+                    record_catalog_models_error(model_provider, Some(alias), &e);
+                    if alias_catalog_must_match_alias {
+                        return ModelsResponse {
+                            model_provider: model_provider.to_string(),
+                            models: Vec::new(),
+                            local,
+                            live: false,
+                        };
+                    }
+                    None
+                }
+            },
+            Err(e) => {
+                record_catalog_models_error(model_provider, Some(alias), &e);
+                if alias_catalog_must_match_alias {
+                    return ModelsResponse {
+                        model_provider: model_provider.to_string(),
+                        models: Vec::new(),
+                        local,
+                        live: false,
+                    };
+                }
+                None
+            }
+        }
+    } else {
+        match zeroclaw_providers::create_model_provider(model_provider, None) {
+            Ok(provider) => match provider.list_models().await {
+                Ok(models) => Some((models, true)),
+                Err(e) => {
+                    record_catalog_models_error(model_provider, None, &e);
+                    None
+                }
+            },
+            Err(e) => {
+                record_catalog_models_error(model_provider, None, &e);
+                None
+            }
+        }
+    };
+
+    let (models, live) = match provider_path {
+        Some((models, live)) => (models, live),
+        None => match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
+            Ok(models) => (models, true),
+            Err(e) => {
+                record_catalog_models_error(model_provider, alias, &e);
+                (Vec::new(), false)
+            }
+        },
+    };
+
+    ModelsResponse {
+        model_provider: model_provider.to_string(),
+        models,
+        local,
+        live,
+    }
+}
+
+fn model_provider_family_has_public_catalog(family: &str) -> bool {
+    match zeroclaw_providers::catalog::catalog_source_for(family) {
+        Some((models_dev_key, openrouter_vendor_prefix)) => {
+            models_dev_key.is_some() || openrouter_vendor_prefix.is_some()
+        }
+        None => false,
+    }
+}
+
+fn record_catalog_models_error(model_provider: &str, alias: Option<&str>, error: &anyhow::Error) {
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "model_provider": model_provider,
+                "alias": alias,
+                "error": format!("{}", error),
+            })
+        ),
+        "model catalog fetch failed"
+    );
 }
 
 /// `GET /api/onboard/catalog/models?model_provider=<name>` — fetch the model list
@@ -98,43 +228,9 @@ pub async fn handle_catalog_models(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let _ = state;
-    let local = model_provider_family_is_local(&q.model_provider);
-
-    // Try provider construction + list_models first (covers credentialed
-    // /models endpoints). Fall back to the family catalog table when
-    // construction or list_models fails — this is the path that covers
-    // onboard mode where the operator hasn't supplied a credential
-    // and the provider has typed required fields (Azure resource,
-    // Bedrock region, …) that haven't been populated yet.
-    let provider_path = match zeroclaw_providers::create_model_provider(&q.model_provider, None) {
-        Ok(h) => match h.list_models().await {
-            Ok(ms) if !ms.is_empty() => Some(ms),
-            _ => None,
-        },
-        Err(_) => None,
-    };
-
-    let (models, live) = match provider_path {
-        Some(ms) => (ms, true),
-        None => {
-            match zeroclaw_providers::catalog::list_models_for_family(&q.model_provider).await {
-                Ok(ms) => (ms, true),
-                Err(e) => {
-                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": q.model_provider, "error": format!("{}", e)})), "model catalog fetch failed");
-                    (Vec::new(), false)
-                }
-            }
-        }
-    };
-
-    axum::Json(ModelsResponse {
-        model_provider: q.model_provider,
-        models,
-        local,
-        live,
-    })
-    .into_response()
+    let cfg = state.config.read().clone();
+    axum::Json(catalog_models_for_config(&cfg, &q.model_provider, q.alias.as_deref()).await)
+        .into_response()
 }
 
 fn error_response(err: ConfigApiError) -> Response {
@@ -1633,6 +1729,122 @@ mod tests {
             section_ready(&cfg, "memory", true),
             "Memory should show checked after the user has advanced through that section"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_models_uses_alias_local_uri() {
+        let base_url =
+            spawn_openai_compatible_models_server(r#"{"data":[{"id":"llama3.2:latest"}]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(resp.live);
+        assert_eq!(resp.models, vec!["llama3.2:latest"]);
+    }
+
+    #[tokio::test]
+    async fn catalog_models_keeps_live_empty_alias_catalog() {
+        let base_url = spawn_openai_compatible_models_server(r#"{"data":[]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(
+            resp.live,
+            "reachable local endpoint with no models is still live"
+        );
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_marks_unreachable_local_alias_not_live() {
+        let cfg = ollama_alias_config("http://127.0.0.1:1");
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_marks_unreachable_hosted_alias_endpoint_not_live() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.moonshot", "default")
+            .unwrap();
+        cfg.set_prop_persistent("providers.models.moonshot.default.api-key", "sk-test")
+            .unwrap();
+        cfg.set_prop_persistent(
+            "providers.models.moonshot.default.uri",
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+
+        let resp = catalog_models_for_config(&cfg, "moonshot", Some("default")).await;
+
+        assert!(!resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_missing_alias_does_not_probe_default_endpoint() {
+        let base_url =
+            spawn_openai_compatible_models_server(r#"{"data":[{"id":"llama3.2:latest"}]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("missing")).await;
+
+        assert!(resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    fn ollama_alias_config(base_url: &str) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.ollama", "default")
+            .unwrap();
+        cfg.set_prop_persistent("providers.models.ollama.default.uri", base_url)
+            .unwrap();
+        cfg
+    }
+
+    async fn spawn_openai_compatible_models_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = [0_u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let response = if request.starts_with("GET /v1/models ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        )
+                    } else {
+                        let body = r#"{"error":"unexpected path"}"#;
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
     }
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {

@@ -372,13 +372,15 @@ export default function Onboard() {
       const onboardingSections = resp.sections.filter((s) => s.is_onboarding);
       setSections(onboardingSections);
       const wizardIssues = firstRunReadinessIssues(onboardingSections);
-      const readyToFinish = !status.needs_onboarding && wizardIssues.length === 0;
+      const providerIssues = await configuredLocalModelProviderStepIssues();
+      const readyToFinish =
+        !status.needs_onboarding && wizardIssues.length === 0 && providerIssues.length === 0;
       setCanFinish(readyToFinish);
       if (!readyToFinish) {
         setIssueTitle('Finish needs a runnable agent first.');
         setFinishIssues(
-          status.missing.length > 0 || wizardIssues.length > 0
-            ? [...status.missing, ...wizardIssues]
+          status.missing.length > 0 || wizardIssues.length > 0 || providerIssues.length > 0
+            ? [...status.missing, ...wizardIssues, ...providerIssues]
             : ['Complete the required setup steps before finishing onboarding.'],
         );
         return;
@@ -806,9 +808,9 @@ function providerTypeForFieldsPrefix(fieldsPrefix: string): string | null {
   return parts[0] === 'providers' && parts[1] === 'models' && parts[2] ? parts[2] : null;
 }
 
-async function hasCustomProviderEndpoint(fieldsPrefix: string): Promise<boolean> {
-  const uri = await getProp(`${fieldsPrefix}.uri`).catch(() => null);
-  return hasTextValue(uri?.value);
+function providerAliasForFieldsPrefix(fieldsPrefix: string): string | null {
+  const parts = fieldsPrefix.split('.');
+  return parts[0] === 'providers' && parts[1] === 'models' && parts[3] ? parts[3] : null;
 }
 
 async function configuredLocalModelProviderStepIssues(): Promise<string[]> {
@@ -846,9 +848,11 @@ async function modelProviderStepIssues(picked: { item: PickerItem; fieldsPrefix:
 
   if (catalogProviderType) {
     try {
-      const catalog = await getCatalogModels(catalogProviderType);
+      const catalog = await getCatalogModels(
+        catalogProviderType,
+        providerAliasForFieldsPrefix(picked.fieldsPrefix) ?? undefined,
+      );
       if (catalog.local) {
-        if (await hasCustomProviderEndpoint(picked.fieldsPrefix)) return [];
         if (!catalog.live) {
           return [
             `Start or configure the local provider for \`${providerRef}\` so ZeroClaw can list its installed models.`,
