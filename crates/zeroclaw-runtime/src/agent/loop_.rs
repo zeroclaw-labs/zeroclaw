@@ -320,6 +320,86 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Elide inlined base64 image data URIs from message content before export.
+/// Keeps `[IMAGE:<path>]` / `[IMAGE:https://…]` markers; replaces only
+/// `[IMAGE:data:…]` payloads (hundreds of KB of base64) with a short placeholder.
+/// (base64 and the data-URI body never contain `]`, so bounding on `]` is safe.)
+///
+/// Only `[IMAGE:data:…]` markers currently carry inline data URIs; other media
+/// markers (`[PHOTO:]`/`[VIDEO:]`/`[DOCUMENT:]`/`[FILE:]`/`[VOICE:]`/`[AUDIO:]`)
+/// carry paths/URLs, not inline bytes (verified against
+/// `prepare_messages_for_provider`). Extend this regex if that ever changes.
+static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[IMAGE:data:[^\]]*\]").unwrap());
+
+fn elide_image_data(content: &str) -> String {
+    IMAGE_DATA_URI_REGEX
+        .replace_all(content, "[IMAGE:<image data elided>]")
+        .into_owned()
+}
+
+/// Best-effort sanitize message content for trace export: elide image bytes, then
+/// run BOTH credential scrubbers. `scrub_secret_patterns` (prefix-based: sk-/ghp_/
+/// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
+/// alone covers free-form content. Residual secrets/PII may remain — this is
+/// disclosed in the PR/docs, not eliminated.
+fn scrub_for_export(content: &str) -> String {
+    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(&elide_image_data(content)))
+}
+
+/// Capture and sanitize the prompt/completion content for one `llm.call` so the
+/// OTel exporter can emit the GenAI message-content attributes.
+///
+/// Returns `None` unless the `observability-otel` feature is active, so non-OTel
+/// builds pay no cloning/scrubbing cost. The system message is split into
+/// `system_instructions`; the rest become `input`. Every string passes through
+/// [`scrub_for_export`] (image elision + dual credential scrub).
+fn capture_llm_messages(
+    messages: &[ChatMessage],
+    output_text: Option<&str>,
+    output_tool_calls: &[ToolCall],
+) -> Option<zeroclaw_api::observability_traits::LlmMessageSnapshot> {
+    if !cfg!(feature = "observability-otel") {
+        return None;
+    }
+
+    use zeroclaw_api::observability_traits::{LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot};
+
+    let system_instructions = messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| scrub_for_export(&m.content));
+
+    let input = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| MessageSnapshot {
+            role: m.role.clone(),
+            content: scrub_for_export(&m.content),
+        })
+        .collect();
+
+    let output_text = output_text
+        .filter(|t| !t.is_empty())
+        .map(scrub_for_export);
+
+    let output_tool_calls = output_tool_calls
+        .iter()
+        .map(|tc| ToolCallSnapshot {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments_json: scrub_for_export(&tc.arguments),
+        })
+        .collect();
+
+    Some(LlmMessageSnapshot {
+        input,
+        output_text,
+        output_tool_calls,
+        system_instructions,
+    })
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -4703,7 +4783,7 @@ mod tests {
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
     use tempfile::tempdir;
-    use zeroclaw_providers::ChatMessage;
+    use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
     zeroclaw_api::mock_tool_attribution!(
@@ -11558,5 +11638,74 @@ Let me check the result."#;
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
         );
+    }
+
+    // ── capture_llm_messages tests ────────────────────────────────
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_splits_system_scrubs_and_maps_output() {
+        // scrub_credentials catches key=value; scrub_secret_patterns catches bare token
+        // prefixes (ghp_, sk-, xoxb-). capture composes both via scrub_for_export, so
+        // assert each field == scrub_for_export(raw) (robust regardless of exact regex).
+        let sys_raw = "You are helpful. api_key=SUPERSECRETVALUE123";
+        let user_raw = "deploy token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let messages = vec![
+            ChatMessage::system(sys_raw),
+            ChatMessage::user(user_raw),
+            ChatMessage::assistant("earlier reply"),
+        ];
+        let tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: r#"{"cmd":"echo api_key=ANOTHERSECRET99"}"#.into(),
+            extra_content: None,
+        }];
+
+        let snap = super::capture_llm_messages(&messages, Some("final answer"), &tool_calls)
+            .expect("Some under observability-otel");
+
+        // System split out and routed through the composed scrubber.
+        assert_eq!(snap.system_instructions.as_deref(), Some(super::scrub_for_export(sys_raw).as_str()));
+        assert_ne!(snap.system_instructions.as_deref(), Some(sys_raw)); // proves scrubbing ran
+
+        // input excludes system, preserves order; bare ghp_ token must be scrubbed.
+        assert_eq!(snap.input.len(), 2);
+        assert!(snap.input.iter().all(|m| m.role != "system"));
+        assert_eq!(snap.input[0].role, "user");
+        assert_eq!(snap.input[0].content, super::scrub_for_export(user_raw));
+        assert_ne!(snap.input[0].content, user_raw); // proves the bare-prefix scrubber fired
+
+        // output text + scrubbed tool-call arguments.
+        assert_eq!(snap.output_text.as_deref(), Some("final answer"));
+        assert_eq!(snap.output_tool_calls.len(), 1);
+        assert_eq!(snap.output_tool_calls[0].name, "shell");
+        assert_eq!(
+            snap.output_tool_calls[0].arguments_json,
+            super::scrub_for_export(r#"{"cmd":"echo api_key=ANOTHERSECRET99"}"#)
+        );
+        assert!(!snap.output_tool_calls[0].arguments_json.contains("ANOTHERSECRET99"));
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_elides_image_data_uris() {
+        let raw = "see [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB] here";
+        let messages = vec![ChatMessage::user(raw)];
+        let snap = super::capture_llm_messages(&messages, None, &[]).expect("Some");
+        let content = &snap.input[0].content;
+        assert!(!content.contains("base64,iVBOR"), "image bytes not elided: {content}");
+        assert!(content.contains("[IMAGE:<image data elided>]"), "placeholder missing: {content}");
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
+    fn capture_llm_messages_empty_output_and_no_system() {
+        let messages = vec![ChatMessage::user("hi")];
+        let snap = super::capture_llm_messages(&messages, Some(""), &[]).expect("Some");
+        assert_eq!(snap.system_instructions, None);
+        assert_eq!(snap.output_text, None); // empty string captured as None
+        assert!(snap.output_tool_calls.is_empty());
+        assert_eq!(snap.input.len(), 1);
     }
 }
