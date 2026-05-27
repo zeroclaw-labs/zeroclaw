@@ -361,17 +361,31 @@ impl Channel for AcpChannel {
             &request.raw_arguments,
             &request.arguments_summary,
         );
+
+        // For edit tools, also surface the new_string (or content) directly so that
+        // "reject-with-edit" can present exactly the proposed replacement for editing,
+        // without the surrounding path/old_string fields and with newlines preserved.
+        let mut tool_call = json!({
+            "toolCallId": tool_call_id,
+            "title": title,
+            "kind": kind,
+            "status": "pending",
+            "rawInput": raw_input,
+            "content": content,
+        });
+        if is_edit_tool {
+            if let Some(args) = &request.raw_arguments {
+                if let Some(new_text) = args.get("new_string").or_else(|| args.get("content")) {
+                    if let Some(s) = new_text.as_str() {
+                        tool_call["proposedEdit"] = json!(s);
+                    }
+                }
+            }
+        }
         let params = json!({
             "sessionId": self.session_id,
             "options": options,
-            "toolCall": {
-                "toolCallId": tool_call_id,
-                "title": title,
-                "kind": kind,
-                "status": "pending",
-                "rawInput": raw_input,
-                "content": content,
-            }
+            "toolCall": tool_call,
         });
 
         let call = self.rpc.request("session/request_permission", params);
