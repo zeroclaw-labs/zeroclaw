@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
@@ -31,6 +31,9 @@ use crate::turn_status::TurnStatus;
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
 const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
+
+/// How often the cwd line re-polls the daemon for the current git branch.
+const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -77,6 +80,11 @@ pub(crate) struct Chat {
     notif_rx: broadcast::Receiver<RpcNotification>,
     turn_result_tx: mpsc::Sender<anyhow::Result<SessionPromptResult>>,
     turn_result_rx: mpsc::Receiver<anyhow::Result<SessionPromptResult>>,
+    /// Background-fetched git branch updates: (session_id, branch).
+    git_branch_tx: mpsc::Sender<(String, Option<String>)>,
+    git_branch_rx: mpsc::Receiver<(String, Option<String>)>,
+    /// In-flight git_branch refresh; gates repeat fetches until result arrives.
+    git_branch_inflight: bool,
     phase: ChatPhase,
     pane_kind: PaneKind,
 }
@@ -84,12 +92,16 @@ pub(crate) struct Chat {
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (turn_result_tx, turn_result_rx) = mpsc::channel(4);
+        let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
             turn_result_tx,
             turn_result_rx,
+            git_branch_tx,
+            git_branch_rx,
+            git_branch_inflight: false,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -233,11 +245,59 @@ impl Chat {
         }
     }
 
+    fn drain_git_branch_results(&mut self) {
+        while let Ok((sid, branch)) = self.git_branch_rx.try_recv() {
+            self.git_branch_inflight = false;
+            if let ChatPhase::Active(ref mut state) = self.phase
+                && state.session_id == sid
+            {
+                state.git_branch = branch;
+                state.git_branch_last_fetch = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Spawn a background `session/git_branch` poll when the cache is stale.
+    /// Gated by `git_branch_inflight` so we never have more than one fetch
+    /// outstanding per Chat — the daemon walks the filesystem each call and
+    /// the user only sees one result at a time anyway.
+    fn maybe_refresh_git_branch(&mut self) {
+        if self.git_branch_inflight {
+            return;
+        }
+        let ChatPhase::Active(ref state) = self.phase else {
+            return;
+        };
+        if state.cwd.is_none() {
+            return;
+        }
+        let due = state
+            .git_branch_last_fetch
+            .is_none_or(|t| t.elapsed() >= GIT_BRANCH_REFRESH_INTERVAL);
+        if !due {
+            return;
+        }
+        self.git_branch_inflight = true;
+        let sid = state.session_id.clone();
+        let rpc = self.rpc.clone();
+        let tx = self.git_branch_tx.clone();
+        tokio::spawn(async move {
+            let branch = rpc
+                .session_git_branch(&sid)
+                .await
+                .ok()
+                .and_then(|r| r.branch);
+            let _ = tx.send((sid, branch)).await;
+        });
+    }
+
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
         self.drain_turn_results();
+        self.drain_git_branch_results();
+        self.maybe_refresh_git_branch();
 
         match &mut self.phase {
             ChatPhase::PickAgent {
@@ -1060,6 +1120,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
 
     // Optional CWD line just above the input bar (bottom of conv_area).
+    // Cwd left-aligned, optional git branch right-aligned.
     let actual_conv = if let Some(ref cwd) = state.cwd {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
@@ -1072,9 +1133,23 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {} ", cwd),
                     theme::dim_style(),
-                ))),
+                )))
+                .alignment(Alignment::Left),
                 cwd_row,
             );
+            // Branch is right-aligned over the same row. Paragraph paints over
+            // the trailing cells; left-aligned cwd above paints first so the
+            // two don't fight unless they overlap (cwd narrower than row).
+            if let Some(ref branch) = state.git_branch {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" ({branch}) "),
+                        theme::dim_style(),
+                    )))
+                    .alignment(Alignment::Right),
+                    cwd_row,
+                );
+            }
             Rect::new(
                 conv_area.x,
                 conv_area.y,
@@ -1699,6 +1774,13 @@ pub struct ChatState {
     session_name: Option<String>,
     /// Working directory for this session (shown above input bar).
     pub cwd: Option<String>,
+    /// Cached git branch for `cwd`, refreshed by the daemon on a polling
+    /// interval (`GIT_BRANCH_REFRESH_INTERVAL`). `None` means either "not a
+    /// git repo" or "not fetched yet".
+    pub git_branch: Option<String>,
+    /// Monotonic timestamp of the last completed `session/git_branch` reply,
+    /// used to throttle re-fetches.
+    pub git_branch_last_fetch: Option<Instant>,
     pub input_bar: InputBarState,
     entries: Vec<ChatEntry>,
     streaming_text: String,
@@ -1747,6 +1829,8 @@ impl ChatState {
             agent_alias,
             session_name: None,
             cwd: None,
+            git_branch: None,
+            git_branch_last_fetch: None,
             input_bar: InputBarState::new(),
             entries: Vec::new(),
             streaming_text: String::new(),
@@ -2175,6 +2259,9 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.browse_cursor = None;
         self.browse_anchor = None;
+        // Reset branch cache: new session may have a different cwd.
+        self.git_branch = None;
+        self.git_branch_last_fetch = None;
         // Context usage is per-session; clear so we don't show stale numbers
         // from the previous session before the first LLM call fires a new
         // ContextUsage event.

@@ -50,6 +50,7 @@ pub enum Method {
     SessionPrompt,
     SessionConfigure,
     SessionCancel,
+    SessionGitBranch,
     SessionList,
     SessionListAcp,
     SessionMessages,
@@ -146,6 +147,7 @@ impl Method {
         (Method::SessionPrompt, "session/prompt"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
+        (Method::SessionGitBranch, "session/git_branch"),
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
@@ -392,6 +394,7 @@ impl RpcDispatcher {
             }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params),
+            Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
             Method::SessionList => self.handle_session_list(&req.params).await,
             Method::SessionListAcp => self.handle_session_list_acp(&req.params).await,
             Method::SessionMessages => self.handle_session_messages(&req.params).await,
@@ -982,6 +985,21 @@ impl RpcDispatcher {
                 "No active turn for this session",
             ))
         }
+    }
+
+    async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let cwd = self
+            .ctx
+            .sessions
+            .get_workspace_dir(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "session not found"))?;
+        let branch = crate::rpc::git::branch_for(std::path::Path::new(&cwd));
+        to_result(SessionGitBranchResult {
+            session_id: req.session_id,
+            branch,
+        })
     }
 
     async fn handle_session_list(&self, params: &Value) -> RpcResult {

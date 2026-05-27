@@ -219,6 +219,14 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionGitBranchResult {
+        pub session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub branch: Option<String>,
+    }
+}
+
+rpc_type! {
     pub struct SessionListParams {
         /// Full-text search query. When present, only sessions whose message
         /// content matches (via FTS5) are returned.

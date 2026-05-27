@@ -5,6 +5,7 @@ pub mod attachments;
 pub mod context;
 pub mod dispatch;
 pub mod fs;
+pub mod git;
 pub mod session;
 pub mod transport;
 pub mod tui_identity;

@@ -44,6 +44,7 @@ pub mod method {
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_RENAME: &str = "session/rename";
     pub const SESSION_CLOSE: &str = "session/close";
@@ -936,6 +937,14 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_git_branch(&self, session_id: &str) -> Result<SessionGitBranchResult> {
+        self.call(
+            method::SESSION_GIT_BRANCH,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
     pub async fn session_approve(
         &self,
         session_id: &str,
@@ -1480,6 +1489,13 @@ pub struct SessionPromptResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionGitBranchResult {
+    #[serde(default)]
+    pub branch: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
