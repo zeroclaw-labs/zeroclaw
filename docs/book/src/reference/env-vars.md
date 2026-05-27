@@ -24,6 +24,9 @@ ZEROCLAW_channels__matrix__homeserver=https://matrix.example.org
 ZEROCLAW_gateway__request_timeout_secs=120
 ZEROCLAW_gateway__long_running_request_timeout_secs=900
 
+# Point the gateway at a built web dashboard (absolute path; no ~ / $HOME)
+ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist
+
 # Inject webhook signing secrets
 ZEROCLAW_channels__whatsapp__home__app_secret=...
 ZEROCLAW_channels__linq__home__signing_secret=...
@@ -42,6 +45,7 @@ The mapping from env-var name to TOML path is mechanical:
 | `[providers.models.anthropic.home] api_key = "..."` | `ZEROCLAW_providers__models__anthropic__home__api_key=...` |
 | `[channels.matrix] homeserver = "..."` | `ZEROCLAW_channels__matrix__homeserver=...` |
 | `[gateway] request_timeout_secs = 120` | `ZEROCLAW_gateway__request_timeout_secs=120` |
+| `[gateway] web_dist_dir = "/srv/zeroclaw/web/dist"` | `ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist` |
 
 The `<alias>` segments above (`home`, `prod_v2`) are operator-chosen — substitute whatever names your `config.toml` actually uses.
 
@@ -53,6 +57,8 @@ Two env vars decide *where* the config file lives, before any `Config` exists. T
 ZEROCLAW_WORKSPACE=/srv/zeroclaw          # workspace root
 ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location
 ```
+
+`ZEROCLAW_WEB_DIST_DIR` is accepted as an uppercase alias for the schema-mirror name `ZEROCLAW_gateway__web_dist_dir` — both spellings resolve to the same `gateway.web_dist_dir` field. The alias is offered for muscle-memory parity with the two bootstrap names above. See [Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full setting reference.
 
 ## Persistence boundary
 
