@@ -622,6 +622,35 @@ impl TelegramChannel {
     }
 
     /// Wire the shared Config handle so `persist_allowed_identity` can
+    /// Pre-seed voice-chat mode from peer-group static preferences.
+    ///
+    /// Iterates `[peer_groups.*]` entries that reference this channel and
+    /// carry `output_modality = "voice"`, then inserts every `external_peers`
+    /// entry into the `voice_chats` set so TTS fires unconditionally for
+    /// those peers — including cron/proactive messages that have no inbound
+    /// voice note to mirror.
+    pub fn with_voice_peer_prefs(
+        self,
+        config: &zeroclaw_config::schema::Config,
+        channel_type: &str,
+        alias: impl AsRef<str>,
+    ) -> Self {
+        use zeroclaw_config::multi_agent::OutputModality;
+        let alias = alias.as_ref();
+        let dotted = format!("{channel_type}.{alias}");
+        if let Ok(mut vc) = self.voice_chats.lock() {
+            for group in config.peer_groups.values() {
+                let matches = group.channel == channel_type || group.channel == dotted;
+                if matches && group.output_modality == OutputModality::Voice {
+                    for peer in &group.external_peers {
+                        vc.insert(peer.to_string());
+                    }
+                }
+            }
+        }
+        self
+    }
+
     /// write a paired user into `peer_groups` and save. The long-running
     /// daemon sets this from the orchestrator; tests and one-shot
     /// callers leave it unset (pairing works at runtime, doesn't persist).
@@ -3847,6 +3876,63 @@ Ensure only one `zeroclaw` process is using this bot token."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_voice_peer_prefs_seeds_voice_chats_for_matching_groups_only() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // Voice group on this channel type — should be seeded.
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("@alice"), PeerUsername::new("@bob")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Voice group on a different channel — must NOT leak into telegram.
+        config.peer_groups.insert(
+            "other".to_string(),
+            PeerGroupConfig {
+                channel: "signal".to_string(),
+                external_peers: vec![PeerUsername::new("@carol")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Mirror group on this channel — not a voice preference, skip.
+        config.peer_groups.insert(
+            "mirrorers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                external_peers: vec![PeerUsername::new("@dave")],
+                output_modality: OutputModality::Mirror,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_prefs(&config, "telegram", "default");
+
+        let vc = ch.voice_chats.lock().unwrap();
+        assert!(vc.contains("@alice"), "voice peer should be seeded");
+        assert!(vc.contains("@bob"), "voice peer should be seeded");
+        assert!(
+            !vc.contains("@carol"),
+            "peers on another channel must not be seeded"
+        );
+        assert!(
+            !vc.contains("@dave"),
+            "mirror-modality peers must not be seeded"
+        );
+    }
 
     #[test]
     fn telegram_channel_name() {

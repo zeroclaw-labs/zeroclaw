@@ -122,6 +122,25 @@ pub struct AgentMemoryConfig {
     pub backend: MemoryBackendKind,
 }
 
+/// Preferred output modality for a peer group.
+///
+/// Controls how the agent delivers replies to peers in this group when no
+/// stronger per-turn signal is present. `Mirror` (default) preserves the
+/// existing input-driven behaviour: voice in → voice out, text in → text out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OutputModality {
+    /// Always reply in kind — voice note if user sent voice, text otherwise.
+    #[default]
+    Mirror,
+    /// Always deliver via TTS as a voice note, regardless of input modality.
+    /// Applies to proactive messages (cron, announces) as well as replies.
+    Voice,
+    /// Always deliver as text, even if user sent a voice note.
+    Text,
+}
+
 /// `[peer_groups.<name>]` — mutual-opt-in peer group on a channel type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -138,6 +157,11 @@ pub struct PeerGroupConfig {
     pub external_peers: Vec<PeerUsername>,
     /// Per-group blocklist; subtracts from the resolved peer set.
     pub ignore: Vec<PeerUsername>,
+    /// Preferred output modality for all peers in this group.
+    /// Defaults to `mirror` (input-driven). Set to `voice` to have the
+    /// agent always reply and deliver proactive messages (cron, announces)
+    /// as TTS voice notes on channels that support audio output.
+    pub output_modality: OutputModality,
 }
 
 #[cfg(test)]
@@ -290,5 +314,40 @@ ignore = ["@known_spammer"]
         assert!(cfg.agents.is_empty());
         assert!(cfg.external_peers.is_empty());
         assert!(cfg.ignore.is_empty());
+        // Default modality preserves the existing input-driven behavior.
+        assert_eq!(cfg.output_modality, OutputModality::Mirror);
+    }
+
+    #[test]
+    fn output_modality_serializes_snake_case() {
+        let cases = [
+            (OutputModality::Mirror, "\"mirror\""),
+            (OutputModality::Voice, "\"voice\""),
+            (OutputModality::Text, "\"text\""),
+        ];
+        for (modality, expected) in cases {
+            let json = serde_json::to_string(&modality).unwrap();
+            assert_eq!(json, expected, "modality={modality:?}");
+            let back: OutputModality = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, modality);
+        }
+    }
+
+    #[test]
+    fn peer_group_output_modality_parses_voice_and_defaults_to_mirror() {
+        let with_voice: PeerGroupConfig = toml::from_str(
+            r#"
+channel = "telegram"
+external_peers = ["@alice"]
+output_modality = "voice"
+"#,
+        )
+        .unwrap();
+        assert_eq!(with_voice.output_modality, OutputModality::Voice);
+        assert_eq!(with_voice.external_peers[0].as_str(), "@alice");
+
+        // Omitting the field falls back to mirror (current behavior).
+        let defaulted: PeerGroupConfig = toml::from_str(r#"channel = "telegram""#).unwrap();
+        assert_eq!(defaulted.output_modality, OutputModality::Mirror);
     }
 }

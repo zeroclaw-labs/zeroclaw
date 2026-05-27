@@ -5116,14 +5116,20 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
             Ok(Arc::new(
-                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_persistence(config_arc.clone())
-                    .with_ack_reactions(ack)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_transcription(config.transcription.clone())
-                    .with_tts(&config)
-                    .with_workspace_dir(config.data_dir.clone())
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                TelegramChannel::new(
+                    tg.bot_token.clone(),
+                    alias.clone(),
+                    peer_resolver,
+                    tg.mention_only,
+                )
+                .with_persistence(config_arc.clone())
+                .with_ack_reactions(ack)
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_transcription(config.transcription.clone())
+                .with_tts(&config)
+                .with_voice_peer_prefs(&config, "telegram", alias)
+                .with_workspace_dir(config.data_dir.clone())
+                .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -5929,6 +5935,7 @@ fn collect_configured_channels(
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
+                .with_voice_peer_prefs(&config, "telegram", alias)
                 .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                 .with_proxy_url(tg.proxy_url.clone())
                 .with_tool_command_specs(tool_specs.to_vec())
