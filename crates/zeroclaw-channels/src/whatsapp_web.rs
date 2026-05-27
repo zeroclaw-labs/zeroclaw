@@ -377,29 +377,25 @@ impl WhatsAppWebChannel {
         candidates
     }
 
-    /// Compute the reply target, converting LID→phone for DMs when necessary.
+    /// Compute the reply target for a chat.
     ///
-    /// LID JIDs (e.g. `76188559093817@lid`) are internal WhatsApp routing
-    /// identifiers that cannot receive messages. For non-group chats with an
-    /// LID-based JID, this converts to a phone JID (`digits@s.whatsapp.net`)
-    /// using `mapped_phone` from the LID→phone lookup. Groups are returned
-    /// unchanged.
+    /// As of whatsapp-rust 0.6+ with PR #636, the library handles LID→PN
+    /// resolution internally and requires consistent LID namespace throughout
+    /// the message stanza. We now pass the chat JID unchanged and let the
+    /// library handle addressing.
+    ///
+    /// Previously (pre-0.6), this function converted LID JIDs to phone JIDs
+    /// because LIDs couldn't receive messages directly. Now the library
+    /// expects LID format when the recipient is LID-addressed.
     #[cfg(feature = "whatsapp-web")]
     fn compute_reply_target(
         chat_jid: &str,
-        is_lid: bool,
-        is_group: bool,
-        mapped_phone: Option<&str>,
+        _is_lid: bool,
+        _is_group: bool,
+        _mapped_phone: Option<&str>,
     ) -> String {
-        if !is_group && is_lid {
-            mapped_phone
-                .map(|p| p.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
-                .filter(|d| !d.is_empty())
-                .map(|digits| format!("{digits}@s.whatsapp.net"))
-                .unwrap_or_else(|| chat_jid.to_string())
-        } else {
-            chat_jid.to_string()
-        }
+        // Pass through unchanged - library handles LID resolution internally
+        chat_jid.to_string()
     }
 
     /// True when the address is a WhatsApp LID JID (not deliverable for outbound).
@@ -2087,8 +2083,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn compute_reply_target_converts_lid_dm_to_phone() {
-        // Non-group LID DM with mapped_phone → phone JID
+    fn compute_reply_target_preserves_lid_dm() {
+        // LID DM → preserved as-is (library handles LID resolution internally)
         let chat_jid = "76188559093817@lid";
         let is_lid = true;
         let is_group = false;
@@ -2099,8 +2095,8 @@ mod tests {
             Some("15551234567"),
         );
         assert_eq!(
-            result, "15551234567@s.whatsapp.net",
-            "LID DM must convert to phone JID for reply delivery"
+            result, chat_jid,
+            "LID DM must be preserved - library handles LID addressing natively"
         );
     }
 
@@ -2116,20 +2112,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn compute_reply_target_lid_dm_without_phone_fallback() {
-        // Non-group LID DM without mapped_phone → falls back to chat JID
-        let chat_jid = "76188559093817@lid";
-        let is_lid = true;
-        let is_group = false;
-        let result = WhatsAppWebChannel::compute_reply_target(chat_jid, is_lid, is_group, None);
-        assert_eq!(
-            result, chat_jid,
-            "LID DM without mapped_phone must fall back to original chat JID"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "whatsapp-web")]
     fn resolve_deliverable_reply_target_converts_lid_with_phone_candidate() {
         let (target, converted) = WhatsAppWebChannel::resolve_deliverable_reply_target(
             "76188559093817@lid",
@@ -2141,8 +2123,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn compute_reply_target_non_lid_dm_unchanged() {
-        // Non-LID DM → original chat JID (no conversion needed)
+    fn compute_reply_target_preserves_pn_dm() {
+        // PN DM → preserved as-is
         let chat_jid = "15551234567@s.whatsapp.net";
         let is_lid = false;
         let is_group = false;
@@ -2152,10 +2134,7 @@ mod tests {
             is_group,
             Some("15551234567"),
         );
-        assert_eq!(
-            result, chat_jid,
-            "Non-LID DM must preserve original chat JID"
-        );
+        assert_eq!(result, chat_jid, "PN DM must preserve original chat JID");
     }
 
     #[test]
@@ -2170,8 +2149,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn compute_reply_target_group_unchanged() {
-        // Group chat → original chat JID (groups don't need conversion)
+    fn compute_reply_target_preserves_group() {
+        // Group chat → preserved as-is
         let chat_jid = "120363012345678901@g.us";
         let is_lid = false;
         let is_group = true;
