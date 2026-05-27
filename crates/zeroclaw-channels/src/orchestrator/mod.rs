@@ -12007,6 +12007,54 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Model provider used by `message_dispatch_processes_messages_in_parallel`
+    /// to observe concurrent in-flight calls directly instead of inferring
+    /// parallelism from wall-clock elapsed time.
+    ///
+    /// Each `chat_with_system` invocation increments `in_flight` on entry,
+    /// records the running peak into `peak_in_flight`, then decrements on
+    /// exit. After the dispatch loop returns, the test asserts
+    /// `peak_in_flight >= 2`, which directly proves two messages were being
+    /// processed at the same time. This replaces the original
+    /// `elapsed < 700ms` assertion (issue #6813), which flaked on slow
+    /// runners because it depended on machine speed rather than on
+    /// observable concurrency.
+    struct ConcurrencyTrackingProvider {
+        delay: Duration,
+        in_flight: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ConcurrencyTrackingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(format!("echo: {message}"))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ConcurrencyTrackingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ConcurrencyTrackingProvider"
+        }
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -12015,10 +12063,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(SlowModelProvider {
+            model_provider: Arc::new(ConcurrencyTrackingProvider {
                 delay: Duration::from_millis(250),
+                in_flight: in_flight.clone(),
+                peak_in_flight: peak_in_flight.clone(),
             }),
             default_model_provider: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
@@ -12114,14 +12167,23 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
         drop(tx);
 
-        let started = Instant::now();
         run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
-        let elapsed = started.elapsed();
 
+        // Deterministic concurrency check: the dispatcher should have processed
+        // both messages in parallel, so the peak number of simultaneously
+        // in-flight model calls must reach at least 2. This observes parallelism
+        // directly rather than inferring it from wall-clock elapsed time, which
+        // flaked on slow runners (issue #6813).
+        let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
-            elapsed < Duration::from_millis(700),
-            "expected parallel dispatch with precheck (<700ms), got {:?}",
-            elapsed
+            peak >= 2,
+            "expected at least 2 concurrent in-flight dispatches, got peak {}",
+            peak
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "all in-flight dispatches should have completed",
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
