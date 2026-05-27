@@ -109,6 +109,18 @@ ACP mode (the `zeroclaw acp` subprocess and the `zeroclaw-acp-bridge` editor bri
 
 - New multi-agent architecture page and setup walkthrough (#6272 P14); SubAgents page derived from code; rewritten provider docs for the typed-family schema; fresh `[cost.rates.*]` cost-tracking guide; logging docs rewritten from source; V1/V2 holdovers scrubbed from operator docs.
 
+### Observability
+
+- **Observability:** `llm.call` spans now carry `gen_ai.input.messages`,
+  `gen_ai.output.messages`, and `gen_ai.system_instructions` (OTel GenAI semantic
+  conventions) so Langfuse/Tempo Input/Output/System panes populate with prompt and
+  completion content. Behind the `observability-otel` feature. Content is sanitized
+  at capture — inline image data is elided and credentials are best-effort scrubbed
+  (`scrub_secret_patterns` + `scrub_credentials`); this does NOT guarantee removal of
+  all secrets or PII from free-form content. Capture cost is O(prompt size) per agent
+  loop iteration, and full text grows trace payload proportionally — on per-byte
+  backends apply exporter-side truncation. (zeroclaw-labs/zeroclaw#6642)
+
 ### Improvements
 
 - Every `anyhow!` site routed through `record!`; `tracing::*` / `log::*` macros banned workspace-wide in favor of the unified macro; one canonical, dependency-ordered config Section list driving every wizard surface.

@@ -52,6 +52,20 @@ works without further configuration.
 stream (dashboard SSE) and the typed `Observer` bridge still receive
 events; only the JSONL writer is gated.
 
+### GenAI span attributes (`observability-otel`)
+
+`llm.call` spans carry the OTel GenAI message-content attributes
+`gen_ai.input.messages`, `gen_ai.output.messages`, and `gen_ai.system_instructions`
+(JSON-string encoded), which populate the Input/Output/System panes in Langfuse/Tempo.
+
+> **Privacy & cost.** Captured content is sanitized best-effort: inline image data is
+> elided and known credential shapes (key=value, bearer, and `sk-`/`ghp_`/`xoxb-`-style
+> prefixes) are redacted. This does NOT guarantee removal of all secrets or PII — prefer
+> an access-controlled trace backend if conversations may be sensitive. Capture cost is
+> O(prompt size) **per agent-loop iteration** (the growing history is re-scanned each
+> round), and full text grows per-span payload proportionally. On per-byte backends,
+> apply exporter-side truncation rather than dropping the attributes.
+
 ## On-disk format
 
 JSONL: one event per line, UTF-8, `0o600` permissions on Unix. Every
