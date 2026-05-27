@@ -964,8 +964,8 @@ mod tests {
     async fn shell_tui_env_is_passed_to_subprocess() {
         // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
-            .with_tui_env(Some({
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
                 m.insert("ZC_TUI_TEST_VAR".to_string(), "tui_injected".to_string());
                 m
@@ -987,7 +987,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_without_tui_env_does_not_inject_extra_vars() {
         // Without tui_env, a non-safe var must NOT appear.
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
             .execute(json!({"command": "env"}))
@@ -1007,23 +1007,32 @@ mod tests {
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
         let _guard = EnvGuard::set("HOME", "/daemon-home");
 
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
-            .with_tui_env(Some({
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
                 m.insert("HOME".to_string(), "/tui-home".to_string());
                 m
             }));
 
         let result = tool
-            .execute(json!({"command": "echo $HOME"}))
+            .execute(json!({"command": "env"}))
             .await
-            .expect("echo $HOME should succeed");
+            .expect("env command should succeed");
 
-        assert!(result.success);
         assert!(
-            result.output.trim() == "/tui-home",
-            "tui_env HOME should override daemon HOME, got: {:?}",
-            result.output.trim()
+            result.success,
+            "env should succeed, got output={:?} error={:?}",
+            result.output, result.error
+        );
+        assert!(
+            result.output.contains("HOME=/tui-home"),
+            "tui_env HOME should override daemon HOME, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("HOME=/daemon-home"),
+            "daemon HOME must not leak through when tui_env overrides it, got:\n{}",
+            result.output
         );
     }
 
@@ -1031,8 +1040,7 @@ mod tests {
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
         // only SAFE_ENV_VARS + passthrough reach the subprocess.
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
-            .with_tui_env(None);
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
             .execute(json!({"command": "env"}))
@@ -1051,8 +1059,8 @@ mod tests {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
         // in SAFE_ENV_VARS.
-        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
-            .with_tui_env(Some({
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
                 m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
                 m

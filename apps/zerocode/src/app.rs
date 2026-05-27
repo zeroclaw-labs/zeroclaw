@@ -80,21 +80,21 @@ pub async fn run(
     let mut content_area = Rect::default();
     let mut disconnect_since: Option<std::time::Instant> = None;
 
-    let mut dashboard_pane = dashboard::Dashboard::new(&*rpc, connect_label);
+    let mut dashboard_pane = dashboard::Dashboard::new(&rpc, connect_label);
     dashboard_pane.init().await?;
-    let mut config_app = config_manager::App::new(&*rpc);
+    let mut config_app = config_manager::App::new(&rpc);
     config_app.init().await?;
     let rpc_arc = rpc.clone();
     let mut acp_pane = acp::Acp::new(Arc::clone(&rpc_arc));
     acp_pane.init().await?;
     let mut chat_pane = chat::Chat::new(Arc::clone(&rpc_arc), chat::PaneKind::Chat);
     chat_pane.init().await?;
-    let mut logs_pane = logs::Logs::new(&*rpc);
+    let mut logs_pane = logs::Logs::new(&rpc);
     logs_pane.init().await?;
 
     loop {
         // Draw
-        let conn_state = (&*rpc).connection_state();
+        let conn_state = rpc.connection_state();
         term.draw(|frame| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -153,7 +153,7 @@ pub async fn run(
         if !event::poll(TICK)? {
             // Re-read live connection state — the snapshot from draw time
             // may be stale if the read task detected EOF since then.
-            let live_state = (&*rpc).connection_state();
+            let live_state = rpc.connection_state();
             if matches!(live_state, ConnectionState::Disconnected { .. }) {
                 // Keep the UI alive for a few seconds so the user sees the
                 // disconnect reason, then hand off to the caller to reconnect.

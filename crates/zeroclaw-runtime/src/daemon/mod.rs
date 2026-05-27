@@ -1916,8 +1916,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         count.store(0, Ordering::Relaxed);
 
-        // Wait partway through grace period, then reconnect.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Reconnect partway through the grace period — must be strictly
+        // less than EPHEMERAL_GRACE_SECS so the daemon hasn't already
+        // exited. With the 1s grace window we sleep ~200ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         count.store(1, Ordering::Relaxed);
 
         // Should NOT shut down while client is connected.

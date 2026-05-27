@@ -467,10 +467,9 @@ fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_mar
             .iter()
             .any(|field| field.name.starts_with("storage.")),
         Some(Section::Memory) => completed_marker,
-        Some(Section::Agents) => cfg
-            .agents
-            .iter()
-            .any(|(alias, agent)| quickstart_agent_missing_requirements(cfg, alias, agent).is_empty()),
+        Some(Section::Agents) => cfg.agents.iter().any(|(alias, agent)| {
+            quickstart_agent_missing_requirements(cfg, alias, agent).is_empty()
+        }),
         _ => completed_marker,
     }
 }

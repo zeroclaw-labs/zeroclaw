@@ -227,11 +227,12 @@ pub async fn apply_with_surface(
         })?;
     ::zeroclaw_log::record!(
         INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(merge_attrs(
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            merge_attrs(
                 ctx.base_attrs(),
                 serde_json::json!({"flag": "quickstart_completed"}),
-            )),
+            )
+        ),
         "quickstart: completion flag flipped"
     );
 
@@ -239,11 +240,12 @@ pub async fn apply_with_surface(
     let write_started = std::time::Instant::now();
     ::zeroclaw_log::record!(
         DEBUG,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
-            .with_attrs(merge_attrs(
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write).with_attrs(
+            merge_attrs(
                 ctx.base_attrs(),
                 serde_json::json!({"dirty_path_count": dirty_count}),
-            )),
+            )
+        ),
         "quickstart: persist start"
     );
     let write_result = config.save_dirty().await;
@@ -332,7 +334,6 @@ pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<Quicks
     );
 }
 
-
 /// `onboard_state.quickstart_completed` is false **and** no
 /// `agents.*` entries exist. Returning users with existing agents
 /// never see the auto-trigger even if the flag was never flipped.
@@ -347,7 +348,12 @@ fn apply_into(
     ctx: Option<&RunCtx>,
 ) -> Option<AppliedAgent> {
     let provider_ref = apply_model_provider(config, &submission.model_provider, errors)?;
-    emit_selector_pick(ctx, "model_provider", selector_mode(&submission.model_provider), &provider_ref);
+    emit_selector_pick(
+        ctx,
+        "model_provider",
+        selector_mode(&submission.model_provider),
+        &provider_ref,
+    );
 
     let risk_alias = apply_named_preset(
         config,
@@ -357,7 +363,12 @@ fn apply_into(
         write_risk_preset,
         errors,
     )?;
-    emit_selector_pick(ctx, "risk_profile", selector_mode(&submission.risk_profile), &risk_alias);
+    emit_selector_pick(
+        ctx,
+        "risk_profile",
+        selector_mode(&submission.risk_profile),
+        &risk_alias,
+    );
 
     let runtime_alias = apply_named_preset(
         config,
@@ -367,23 +378,34 @@ fn apply_into(
         write_runtime_preset,
         errors,
     )?;
-    emit_selector_pick(ctx, "runtime_profile", selector_mode(&submission.runtime_profile), &runtime_alias);
+    emit_selector_pick(
+        ctx,
+        "runtime_profile",
+        selector_mode(&submission.runtime_profile),
+        &runtime_alias,
+    );
 
     let memory_backend = apply_memory(config, &submission.memory, errors)?;
-    emit_selector_pick(ctx, "memory", selector_mode(&submission.memory), &memory_backend);
+    emit_selector_pick(
+        ctx,
+        "memory",
+        selector_mode(&submission.memory),
+        &memory_backend,
+    );
 
     let channel_refs = apply_channels(config, &submission.channels, errors);
     if let Some(ctx) = ctx {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(merge_attrs(
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                merge_attrs(
                     ctx.base_attrs(),
                     serde_json::json!({
                         "selector": "channels",
                         "count": channel_refs.len(),
                     }),
-                )),
+                )
+            ),
             "quickstart: selector channels"
         );
     }
@@ -426,15 +448,16 @@ fn emit_selector_pick(ctx: Option<&RunCtx>, selector: &str, mode: &str, value: &
     let Some(ctx) = ctx else { return };
     ::zeroclaw_log::record!(
         DEBUG,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(merge_attrs(
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            merge_attrs(
                 ctx.base_attrs(),
                 serde_json::json!({
                     "selector": selector,
                     "mode": mode,
                     "value": value,
                 }),
-            )),
+            )
+        ),
         "quickstart: selector pick"
     );
 }

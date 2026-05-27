@@ -7860,7 +7860,7 @@ pub async fn start_channels(
             model: Arc::new(model.clone()),
             temperature,
             auto_save_memory: config.memory.auto_save,
-            max_tool_iterations: config.effective_max_tool_iterations(&agent_alias),
+            max_tool_iterations: config.effective_max_tool_iterations(agent_alias.as_str()),
             min_relevance_score: config.memory.min_relevance_score,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),

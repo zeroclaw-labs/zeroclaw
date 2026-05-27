@@ -860,7 +860,6 @@ enum DeprecatedPropsCommands {
     Any(Vec<String>),
 }
 
-
 #[cfg(feature = "agent-runtime")]
 fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
     match name {
@@ -937,11 +936,34 @@ async fn run_quickstart_cli(
     };
     use zeroclaw_runtime::quickstart::{Surface, apply_with_surface};
 
-    let provider_type = model_provider.ok_or_else(|| {
-        anyhow::anyhow!("--model-provider is required (anthropic / openai / openrouter / ollama)")
-    })?;
-    let model =
-        model.ok_or_else(|| anyhow::anyhow!("--model is required (e.g. claude-sonnet-4-5)"))?;
+    let provider_type = match model_provider {
+        Some(v) => v,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing_flag": "model-provider"})),
+                "quickstart cli: missing --model-provider"
+            );
+            anyhow::bail!(
+                "--model-provider is required (anthropic / openai / openrouter / ollama)"
+            );
+        }
+    };
+    let model = match model {
+        Some(v) => v,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing_flag": "model"})),
+                "quickstart cli: missing --model"
+            );
+            anyhow::bail!("--model is required (e.g. claude-sonnet-4-5)");
+        }
+    };
     let agent_alias = agent.unwrap_or_else(|| sanitize_alias(&provider_type));
 
     let submission = BuilderSubmission {
@@ -964,8 +986,8 @@ async fn run_quickstart_cli(
     };
 
     let _dirs = crate::config::schema::resolve_runtime_dirs().await?;
-    let mut cfg = crate::config::schema::Config::load_or_init().await?;
-    match apply_with_surface(submission, &mut cfg, Surface::Cli).await {
+    let mut cfg = Box::pin(crate::config::schema::Config::load_or_init()).await?;
+    match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
         Ok(applied) => {
             println!("Quickstart complete. Created agent `{}`.", applied.alias);
             println!();
@@ -1430,7 +1452,6 @@ async fn main() -> Result<()> {
 
     zeroclaw_log::install_global_subscriber(default_log_level);
 
-
     // `zeroclaw onboard` is deprecated. The legacy section-by-section
     // wizard is gone; new installs run `zeroclaw quickstart`. Any old
     // flags (`--api-key`, `--model-provider`, `--quick`, `--<section>-only`,
@@ -1642,7 +1663,7 @@ async fn main() -> Result<()> {
             api_key,
             agent,
         } => {
-            run_quickstart_cli(model_provider, model, api_key, agent).await?;
+            Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
             return Ok(());
         }
 

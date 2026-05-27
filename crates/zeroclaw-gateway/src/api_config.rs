@@ -19,9 +19,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
-use zeroclaw_config::traits::MaskSecrets;
 use zeroclaw_config::field_visibility;
 use zeroclaw_config::sections::section_for_path;
+use zeroclaw_config::traits::MaskSecrets;
 
 use super::AppState;
 use super::api::require_auth;
@@ -765,7 +765,7 @@ pub async fn handle_list(
                 is_secret: is_sensitive,
                 is_env_overridden,
                 enum_variants,
-                section: section,
+                section,
             }
         })
         .collect();

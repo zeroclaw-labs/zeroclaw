@@ -11,7 +11,7 @@ Don't ask permission. Just do it.
 
 ## Memory System
 
-Persistent memory is not available in this session type.
+Persistent memory is disabled in this session type (`memory.backend = "none"`).
 No daily notes, MEMORY.md, or memory tools will be created or injected.
 Session context comes from the conversation history, which persists across
 resumes. Do not write memory files or attempt to use memory tools.

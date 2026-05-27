@@ -437,9 +437,8 @@ impl ConfigFieldEntry {
             Some(serde_json::Value::String(info.display_value))
         };
         let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
-        let section =
-            crate::sections::Section::from_key(info.name.split('.').next().unwrap_or(""))
-                .map(|s| s.as_str().to_string());
+        let section = crate::sections::Section::from_key(info.name.split('.').next().unwrap_or(""))
+            .map(|s| s.as_str().to_string());
 
         Self {
             path: info.name,

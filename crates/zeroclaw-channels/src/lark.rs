@@ -4773,7 +4773,7 @@ mod tests {
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
         ] {
-            let card = build_resolved_approval_card("shell", "args", decision);
+            let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(
                 card.pointer("/header/template").and_then(|v| v.as_str()),
                 Some(expected_template),
