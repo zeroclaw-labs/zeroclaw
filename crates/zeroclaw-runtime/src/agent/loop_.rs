@@ -1750,6 +1750,7 @@ pub async fn run_tool_call_loop(
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
+                    messages: None,
                 });
 
                 // Record cost via task-local tracker (no-op when not scoped)
@@ -1906,6 +1907,7 @@ pub async fn run_tool_call_loop(
                     error_message: Some(safe_error.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    messages: None,
                 });
                 ::zeroclaw_log::record!(
                     WARN,
