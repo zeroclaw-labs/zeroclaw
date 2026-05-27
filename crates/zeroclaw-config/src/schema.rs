@@ -3830,8 +3830,15 @@ pub struct TtsProviderConfig {
     pub language_code: Option<String>,
     /// Path to backend binary (edge-tts subprocess; piper local server).
     pub binary_path: Option<String>,
-    /// Endpoint URI for HTTP-based backends (piper local server). Renamed
-    /// from `api_url` for parity with `ModelProviderConfig.uri`.
+    /// Audio response format sent to the TTS backend (e.g. `"opus"`, `"mp3"`,
+    /// `"wav"`). Defaults to `"opus"` for the OpenAI family. Override to
+    /// `"wav"` for Orpheus-class models (e.g. `canopylabs/orpheus-v1-english`
+    /// on Groq) or `"mp3"` for broader compatibility.
+    pub response_format: Option<String>,
+    /// Endpoint URI for HTTP-based backends. Overrides the family default
+    /// when pointing at a compatible third-party API (Groq, Azure, self-hosted
+    /// proxies). Set to the **full** URL — there is no separate path-suffix
+    /// field. Renamed from `api_url` for parity with `ModelProviderConfig.uri`.
     #[serde(alias = "api_url")]
     pub uri: Option<String>,
 }

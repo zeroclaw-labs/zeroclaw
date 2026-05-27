@@ -45,6 +45,13 @@ pub struct OpenAiTtsProvider {
     api_key: String,
     model: String,
     speed: f64,
+    /// Full endpoint URL. Defaults to the OpenAI production endpoint; can be
+    /// overridden via `[providers.tts.openai.<alias>].uri` to point at any
+    /// OpenAI-compatible TTS backend (Groq, Azure, self-hosted proxies).
+    base_url: String,
+    /// Audio response format. Defaults to `"opus"`; override to `"wav"` for
+    /// Orpheus-class models or `"mp3"` for broader compatibility.
+    response_format: String,
     client: reqwest::Client,
 }
 
@@ -74,6 +81,16 @@ impl OpenAiTtsProvider {
                 .filter(|m| !m.trim().is_empty())
                 .unwrap_or_else(|| "tts-1".to_string()),
             speed: config.speed.unwrap_or(1.0),
+            base_url: config
+                .uri
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1/audio/speech".to_string()),
+            response_format: config
+                .response_format
+                .clone()
+                .filter(|f| !f.trim().is_empty())
+                .unwrap_or_else(|| "opus".to_string()),
             client: reqwest::Client::builder()
                 .timeout(TTS_HTTP_TIMEOUT)
                 .build()
@@ -94,12 +111,12 @@ impl TtsProvider for OpenAiTtsProvider {
             "input": text,
             "voice": voice,
             "speed": self.speed,
-            "response_format": "opus",
+            "response_format": self.response_format,
         });
 
         let resp = self
             .client
-            .post("https://api.openai.com/v1/audio/speech")
+            .post(&self.base_url)
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
