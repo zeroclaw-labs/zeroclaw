@@ -2441,6 +2441,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_http_client_trusts_both_webpki_and_native_roots() {
+        let _client = reqwest::Client::builder()
+            .tls_built_in_webpki_certs(true)
+            .tls_built_in_native_certs(true)
+            .build()
+            .expect("client builder should succeed with both root sets enabled");
+    }
+
+    #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
