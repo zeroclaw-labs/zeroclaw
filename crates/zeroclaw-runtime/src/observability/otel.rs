@@ -508,9 +508,9 @@ fn message_attrs(messages: &Option<LlmMessageSnapshot>) -> Vec<KeyValue> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::traits::{LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot};
     use super::*;
     use std::time::Duration;
-    use super::super::traits::{LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot};
 
     fn attr_value(attrs: &[opentelemetry::KeyValue], key: &str) -> Option<String> {
         attrs
@@ -522,7 +522,10 @@ mod tests {
     #[test]
     fn message_attrs_emits_genai_semconv() {
         let snap = LlmMessageSnapshot {
-            input: vec![MessageSnapshot { role: "user".into(), content: "hi".into() }],
+            input: vec![MessageSnapshot {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             output_text: Some("hello".into()),
             output_tool_calls: vec![ToolCallSnapshot {
                 id: "c1".into(),

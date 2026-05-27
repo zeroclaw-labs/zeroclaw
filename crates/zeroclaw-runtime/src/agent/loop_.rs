@@ -344,7 +344,9 @@ fn elide_image_data(content: &str) -> String {
 /// alone covers free-form content. Residual secrets/PII may remain — this is
 /// disclosed in the PR/docs, not eliminated.
 fn scrub_for_export(content: &str) -> String {
-    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(&elide_image_data(content)))
+    scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
+        &elide_image_data(content),
+    ))
 }
 
 /// Capture and sanitize the prompt/completion content for one `llm.call` so the
@@ -363,7 +365,9 @@ fn capture_llm_messages(
         return None;
     }
 
-    use zeroclaw_api::observability_traits::{LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot};
+    use zeroclaw_api::observability_traits::{
+        LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot,
+    };
 
     let system_instructions = messages
         .iter()
@@ -379,9 +383,7 @@ fn capture_llm_messages(
         })
         .collect();
 
-    let output_text = output_text
-        .filter(|t| !t.is_empty())
-        .map(scrub_for_export);
+    let output_text = output_text.filter(|t| !t.is_empty()).map(scrub_for_export);
 
     let output_tool_calls = output_tool_calls
         .iter()
@@ -11670,7 +11672,10 @@ Let me check the result."#;
             .expect("Some under observability-otel");
 
         // System split out and routed through the composed scrubber.
-        assert_eq!(snap.system_instructions.as_deref(), Some(super::scrub_for_export(sys_raw).as_str()));
+        assert_eq!(
+            snap.system_instructions.as_deref(),
+            Some(super::scrub_for_export(sys_raw).as_str())
+        );
         assert_ne!(snap.system_instructions.as_deref(), Some(sys_raw)); // proves scrubbing ran
 
         // input excludes system, preserves order; bare ghp_ token must be scrubbed.
@@ -11688,7 +11693,11 @@ Let me check the result."#;
             snap.output_tool_calls[0].arguments_json,
             super::scrub_for_export(r#"{"cmd":"echo api_key=ANOTHERSECRET99"}"#)
         );
-        assert!(!snap.output_tool_calls[0].arguments_json.contains("ANOTHERSECRET99"));
+        assert!(
+            !snap.output_tool_calls[0]
+                .arguments_json
+                .contains("ANOTHERSECRET99")
+        );
     }
 
     #[cfg(feature = "observability-otel")]
@@ -11698,8 +11707,14 @@ Let me check the result."#;
         let messages = vec![ChatMessage::user(raw)];
         let snap = super::capture_llm_messages(&messages, None, &[]).expect("Some");
         let content = &snap.input[0].content;
-        assert!(!content.contains("base64,iVBOR"), "image bytes not elided: {content}");
-        assert!(content.contains("[IMAGE:<image data elided>]"), "placeholder missing: {content}");
+        assert!(
+            !content.contains("base64,iVBOR"),
+            "image bytes not elided: {content}"
+        );
+        assert!(
+            content.contains("[IMAGE:<image data elided>]"),
+            "placeholder missing: {content}"
+        );
     }
 
     #[cfg(feature = "observability-otel")]
