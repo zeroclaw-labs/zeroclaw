@@ -488,7 +488,15 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
     // after a restart; otherwise hydration loads sessions under the on-disk
     // (sanitized) name while lookup keeps producing the un-sanitized form.
-    let raw = match &msg.thread_ts {
+    let thread_scope = match msg.thread_ts.as_deref() {
+        // Matrix root events can be self-anchored when `reply_in_thread`
+        // is enabled so outbound replies open a thread. That anchor is a
+        // delivery detail, not a conversation-history boundary; otherwise
+        // every top-level Matrix message becomes a fresh session.
+        Some(tid) if is_matrix_channel_name(&msg.channel) && tid == msg.id => None,
+        other => other,
+    };
+    let raw = match thread_scope {
         Some(tid) => format!("{channel_scope}_{}_{tid}_{}", msg.reply_target, msg.sender),
         None => format!("{channel_scope}_{}_{}", msg.reply_target, msg.sender),
     };
@@ -13387,6 +13395,36 @@ BTC is currently around $65,000 based on latest tool output."#
             id: "$second:server".into(),
             content: "send it again".into(),
             timestamp: 2,
+            ..first.clone()
+        };
+
+        let key = conversation_history_key(&first);
+        assert_eq!(key, conversation_history_key(&second));
+        assert!(!key.contains("$first:server"));
+        assert!(!key.contains("$second:server"));
+    }
+
+    #[test]
+    fn matrix_self_anchored_root_history_key_omits_event_id() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "$first:server".into(),
+            sender: "@alice:server".into(),
+            reply_target: "!room:server".into(),
+            content: "call me boss".into(),
+            channel: "matrix".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("$first:server".into()),
+            interruption_scope_id: Some("$first:server".into()),
+            attachments: vec![],
+            subject: None,
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "$second:server".into(),
+            content: "hello".into(),
+            timestamp: 2,
+            thread_ts: Some("$second:server".into()),
+            interruption_scope_id: Some("$second:server".into()),
             ..first.clone()
         };
 
