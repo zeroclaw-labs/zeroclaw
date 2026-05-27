@@ -64,8 +64,14 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 /// Returns the number of messages removed.
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     // Pass 1: Remove assistant(tool_calls) + their tool_results when the
-    // assistant is preceded by another assistant. Normalization would merge
-    // them, destroying structured tool_use blocks and orphaning the results.
+    // assistant is preceded by another assistant that ALSO has structured
+    // tool_calls. Normalization would merge them, destroying structured
+    // tool_use blocks and orphaning the results.
+    //
+    // Only fire when BOTH consecutive assistants have tool_calls — if the
+    // predecessor is a collapsed summary (plain text from prune_history
+    // Phase 1) there is no merge risk and removing the successor would
+    // create an infinite orphan/rebuild loop.
     let mut removed = 0usize;
     let mut i = 0;
     while i < messages.len() {
@@ -73,6 +79,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
             && extract_assistant_tool_call_ids(&messages[i].content).is_some()
             && i > 0
             && messages[i - 1].role == "assistant"
+            && extract_assistant_tool_call_ids(&messages[i - 1].content).is_some()
         {
             let doomed_ids =
                 extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
@@ -704,35 +711,52 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_assistant_with_tool_calls_stripped() {
-        // When poisoned turn removal leaves an assistant(text) followed by
-        // assistant(tool_calls), the second assistant and its tool_results
-        // must be removed — normalization would merge them, destroying the
-        // structured tool_use blocks and orphaning the results at the API.
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+    fn consecutive_assistant_both_with_tool_calls_stripped() {
+        // When two consecutive assistants BOTH have structured tool_calls
+        // (e.g. after the first assistant's tool results were already
+        // dropped), the second one and its tool_results must be removed —
+        // normalization would merge them, destroying structured tool_use
+        // blocks and orphaning the results at the API.
+        let tool_calls_1 = r#"{"content":"first","tool_calls":[{"id":"toolu_AAA","name":"file_read","arguments":"{}"}]}"#;
+        let tool_calls_2 = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
-            msg("assistant", "Here are the results."),
-            msg("assistant", tool_calls_assistant),
+            msg("assistant", tool_calls_1),
+            msg("assistant", tool_calls_2),
             msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
             msg("assistant", "The provider returned an empty response."),
         ];
         let removed = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
             removed, 2,
-            "should remove assistant(tool_calls) + tool_result"
+            "should remove assistant(tool_calls) + tool_result when preceded by assistant with tool_calls"
         );
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "Here are the results.");
+        assert_eq!(messages[2].content, tool_calls_1);
         assert_eq!(messages[3].role, "assistant");
+    }
+
+    #[test]
+    fn collapsed_summary_followed_by_tool_calls_not_stripped() {
+        // Regression: prune_history Phase 1 collapses old tool groups into
+        // plain-text assistant summaries. The new assistant+tool group that
+        // follows must NOT be stripped by Pass 1 — the collapsed summary has
+        // no structured tool_calls, so there is no merge risk.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "do something"),
+            msg("assistant", "[Tool exchange: 2 tool call(s) — results collapsed]"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", r#"{"content":"result","tool_call_id":"toolu_LIVE"}"#),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
         assert_eq!(
-            messages[3].content,
-            "The provider returned an empty response."
+            removed, 0,
+            "tool group after collapsed summary must be preserved"
         );
+        assert_eq!(messages.len(), 5);
     }
 
     #[test]
