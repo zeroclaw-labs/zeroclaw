@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use daemonclaw_api::provider::{ChatMessage, Provider};
 use daemonclaw_memory::traits::Memory;
+use daemonclaw_providers::multimodal;
 
 pub use daemonclaw_config::scattered_types::ContextCompressionConfig;
 
@@ -315,7 +316,11 @@ impl ContextCompressor {
 
         // Build transcript from the middle section
         let middle = &history[start..end];
-        let transcript = build_transcript(middle, self.config.source_max_chars);
+        let transcript = build_summarizer_transcript(
+            middle,
+            self.config.source_max_chars,
+            provider.supports_vision(),
+        );
 
         if transcript.is_empty() {
             return Ok(false);
@@ -496,6 +501,20 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     }
 }
 
+fn build_summarizer_transcript(
+    messages: &[ChatMessage],
+    max_chars: usize,
+    supports_vision: bool,
+) -> String {
+    let transcript = build_transcript(messages, max_chars);
+    if supports_vision {
+        return transcript;
+    }
+
+    let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
+    if refs.is_empty() { transcript } else { cleaned }
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -517,11 +536,45 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+        }
+    }
+
+    struct CaptureSummarizerProvider {
+        supports_vision: bool,
+        seen_messages: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureSummarizerProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.seen_messages.lock().push(message.to_string());
+            Ok("summary".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: daemonclaw_api::provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<daemonclaw_api::provider::ChatResponse> {
+            unreachable!("context compressor uses chat_with_system")
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.supports_vision
         }
     }
 
@@ -686,6 +739,25 @@ mod tests {
     }
 
     #[test]
+    fn test_build_summarizer_transcript_strips_image_markers_for_non_vision_provider() {
+        let messages = vec![msg(
+            "user",
+            "Describe this photo [IMAGE:/tmp/test.png]\nKeep the caption",
+        )];
+        let transcript = build_summarizer_transcript(&messages, 10_000, false);
+        assert!(!transcript.contains("[IMAGE:"));
+        assert!(transcript.contains("Describe this photo"));
+        assert!(transcript.contains("Keep the caption"));
+    }
+
+    #[test]
+    fn test_build_summarizer_transcript_keeps_image_markers_for_vision_provider() {
+        let messages = vec![msg("user", "Describe this photo [IMAGE:/tmp/test.png]")];
+        let transcript = build_summarizer_transcript(&messages, 10_000, true);
+        assert!(transcript.contains("[IMAGE:/tmp/test.png]"));
+    }
+
+    #[test]
     fn test_truncate_chars() {
         assert_eq!(truncate_chars("hello world", 5), "hello...");
         assert_eq!(truncate_chars("hi", 10), "hi");
@@ -722,6 +794,38 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.protect_first_n, 5);
         assert_eq!(config.max_passes, 1);
+    }
+
+    #[tokio::test]
+    async fn compress_if_needed_strips_image_markers_before_non_vision_summarization() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            threshold_ratio: 0.01,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 64);
+        let provider = CaptureSummarizerProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let mut history = vec![
+            msg("system", "sys"),
+            msg("user", "Earlier question [IMAGE:/tmp/example.png]"),
+            msg("assistant", "Earlier answer"),
+            msg("user", "Newest question"),
+        ];
+
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model")
+            .await
+            .expect("compression should succeed");
+
+        assert!(result.compressed);
+        let seen = provider.seen_messages.lock();
+        let prompt = seen.last().expect("summarizer should be invoked");
+        assert!(!prompt.contains("[IMAGE:"));
+        assert!(!prompt.contains("/tmp/example.png"));
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────────
