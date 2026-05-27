@@ -69,9 +69,9 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-    load_interactive_session_history, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, emergency_history_trim, estimate_history_tokens,
+    fast_trim_tool_results, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -958,6 +958,7 @@ pub async fn run_tool_call_loop(
         // or session history reloading.  Without this, providers like MiniMax
         // reject the request with "tool result's tool id not found" (bug #5743).
         crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1924,16 +1925,14 @@ pub async fn run_tool_call_loop(
                     crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                     crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
-                        // Inject a system nudge so the LLM adjusts strategy.
-                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                        append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
                         tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
-                        // Replace the tool output with the block message.
-                        // We still continue the loop so the LLM sees the block feedback.
-                        history.push(ChatMessage::system(format!(
-                            "[Loop Detection — BLOCKED] {msg}"
-                        )));
+                        append_or_merge_system_message(
+                            history,
+                            format!("[Loop Detection — BLOCKED] {msg}"),
+                        );
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
                         runtime_trace::record_event(
