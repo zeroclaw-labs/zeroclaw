@@ -13,9 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 
-use zeroclaw_api::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use zeroclaw_config::sections::SectionShape;
-use zeroclaw_config::traits::ConfigFieldEntry;
+use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
+use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
 
 // ── Wire method names used by the TUI ────────────────────────────
 
@@ -188,7 +187,7 @@ pub fn spawn_notification_router(
     mut bcast_rx: broadcast::Receiver<RpcNotification>,
     update_tx: mpsc::Sender<SessionUpdate>,
 ) -> tokio::task::JoinHandle<()> {
-    zeroclaw_spawn::spawn!(async move {
+    tokio::spawn(async move {
         loop {
             match bcast_rx.recv().await {
                 Ok(notif) => {
@@ -261,7 +260,7 @@ impl RpcClient {
         let (read_half, write_half) = stream.into_split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        zeroclaw_spawn::spawn!(async move {
+        tokio::spawn(async move {
             let mut w = write_half;
             while let Some(mut line) = writer_rx.recv().await {
                 if !line.ends_with('\n') {
@@ -281,7 +280,7 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
-        let read_task = zeroclaw_spawn::spawn!(async move {
+        let read_task = tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
             let mut buf = String::new();
             loop {
@@ -403,7 +402,7 @@ impl RpcClient {
         let (mut sink, mut stream) = ws_stream.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        zeroclaw_spawn::spawn!(async move {
+        tokio::spawn(async move {
             while let Some(line) = writer_rx.recv().await {
                 if sink.send(Message::Text(line.into())).await.is_err() {
                     break;
@@ -419,7 +418,7 @@ impl RpcClient {
         let conn_state_for_reader = conn_state.clone();
 
         let rpc_for_reader = rpc.clone();
-        let read_task = zeroclaw_spawn::spawn!(async move {
+        let read_task = tokio::spawn(async move {
             loop {
                 match stream.next().await {
                     Some(Ok(Message::Text(text))) => {
@@ -826,7 +825,7 @@ impl RpcClient {
 
     pub async fn quickstart_validate(
         &self,
-        submission: &zeroclaw_config::presets::BuilderSubmission,
+        submission: &crate::wire::BuilderSubmission,
     ) -> Result<QuickstartValidateResult> {
         self.call(
             method::QUICKSTART_VALIDATE,
@@ -837,7 +836,7 @@ impl RpcClient {
 
     pub async fn quickstart_apply(
         &self,
-        submission: &zeroclaw_config::presets::BuilderSubmission,
+        submission: &crate::wire::BuilderSubmission,
     ) -> Result<QuickstartApplyResult> {
         self.call(
             method::QUICKSTART_APPLY,
@@ -1043,7 +1042,7 @@ impl RpcClient {
         &self,
         path: &std::path::Path,
         show_hidden: bool,
-    ) -> Result<zeroclaw_api::jsonrpc::FsListDirResponse> {
+    ) -> Result<FsListDirResponse> {
         self.call(
             method::FS_LIST_DIR,
             serde_json::json!({
@@ -1062,8 +1061,8 @@ impl RpcClient {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             rpc: outbound,
-            _read_task: zeroclaw_spawn::spawn!(async {}),
-            _router_task: zeroclaw_spawn::spawn!(async {}),
+            _read_task: tokio::spawn(async {}),
+            _router_task: tokio::spawn(async {}),
             server_version: "test".to_string(),
             notifications_bcast: notif_tx,
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
@@ -1652,9 +1651,8 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = zeroclaw_spawn::spawn!(async move {
-            client.session_new("my-agent", Some("/tmp/work")).await
-        });
+        let task =
+            tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
         let line = write_rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1678,7 +1676,7 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = zeroclaw_spawn::spawn!(async move { client.session_cancel("s1").await });
+        let task = tokio::spawn(async move { client.session_cancel("s1").await });
 
         let line = write_rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1695,7 +1693,7 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = zeroclaw_spawn::spawn!(async move {
+        let task = tokio::spawn(async move {
             client
                 .session_approve("s1", "req-1", ApprovalDecision::AllowOnce)
                 .await

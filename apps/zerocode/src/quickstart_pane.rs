@@ -11,15 +11,15 @@ use ratatui::{
 };
 use std::sync::Arc;
 
-use zeroclaw_config::presets::{
-    AgentIdentity, BuilderSubmission, ChannelQuickStart, ModelProviderChoice, SelectorChoice,
-};
-
 use crate::client::{
     QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor, QuickstartFieldSection,
     QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
 };
 use crate::widgets::{HelpEntry, HelpNode};
+use crate::wire::{
+    AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryBackendKind as MemoryKind,
+    ModelProviderChoice, SelectorChoice,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selector {
@@ -223,11 +223,6 @@ fn channel_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<PickerO
         })
         .collect()
 }
-
-// Memory backend list is the schema's `MemoryBackendKind`. The TUI
-// never defines its own enum — adding a backend in the schema lights
-// up here automatically through the `BuilderSubmission::memory` field.
-use zeroclaw_config::multi_agent::MemoryBackendKind as MemoryKind;
 
 #[derive(Debug, Clone)]
 struct ChannelDraft {

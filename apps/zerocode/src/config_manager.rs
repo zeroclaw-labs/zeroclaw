@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 
+use crate::wire::{ConfigFieldEntry, ConfigTab, PropKind, SectionShape};
 use anyhow::Result;
 use crossterm::{
     event::{
@@ -18,8 +19,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use zeroclaw_config::sections::SectionShape;
-use zeroclaw_config::traits::{ConfigFieldEntry, ConfigTab, PropKind};
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
 use crate::theme;

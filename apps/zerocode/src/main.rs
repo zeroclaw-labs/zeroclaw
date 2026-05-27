@@ -1,3 +1,12 @@
+// `apps/zerocode` is a standalone TUI client, not daemon-path code.
+// It speaks JSON-RPC to whatever ZeroClaw daemon is at the configured
+// address; the daemon owns attribution, the TUI owns its session id.
+// Bare `tokio::spawn` is the right primitive here — the workspace-wide
+// `zeroclaw_spawn::spawn!` rule is daemon-path only (see
+// `clippy.toml`'s commentary; this matches the `robot-kit/src/safety.rs`
+// exemption pattern).
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{
@@ -19,12 +28,14 @@ mod dashboard;
 mod diff;
 mod file_explorer;
 mod input_bar;
+mod jsonrpc;
 mod logs;
 mod mouse;
 mod quickstart_pane;
 mod theme;
 mod turn_status;
 mod widgets;
+mod wire;
 
 const DAEMON_CONNECT_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

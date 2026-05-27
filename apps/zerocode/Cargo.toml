@@ -11,9 +11,6 @@ name = "zerocode"
 path = "src/main.rs"
 
 [dependencies]
-zeroclaw-api = { workspace = true }
-zeroclaw-spawn = { workspace = true }
-zeroclaw-config = { workspace = true, default-features = true }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
@@ -41,3 +38,10 @@ libc = "0.2"
 
 [dev-dependencies]
 toml = "1.0"
+# Dev-only: drift-test edge to the canonical workspace types so the
+# wire mirrors in `src/wire.rs` cannot silently fall out of sync with
+# what the daemon emits. Production builds of `zerocode` do not link
+# any `zeroclaw-*` crate.
+zeroclaw-api = { workspace = true }
+zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-runtime = { workspace = true }

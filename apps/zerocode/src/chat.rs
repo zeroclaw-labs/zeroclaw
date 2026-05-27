@@ -23,10 +23,10 @@ use crate::client::{
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
+use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
-use zeroclaw_api::jsonrpc::RpcOutbound;
 
 // Height of the approval popup anchored to the bottom of the content area.
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
@@ -462,7 +462,7 @@ impl Chat {
                     let rpc_arc = self.rpc_out.clone();
                     let tx = self.turn_result_tx.clone();
                     let transport = self.rpc.transport();
-                    zeroclaw_spawn::spawn!(async move {
+                    tokio::spawn(async move {
                         let mut params = serde_json::json!({
                             "session_id": sid,
                             "prompt": prompt,

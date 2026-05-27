@@ -13798,7 +13798,7 @@ dependencies = [
  "two-face",
  "zeroclaw-api",
  "zeroclaw-config",
- "zeroclaw-spawn",
+ "zeroclaw-runtime",
 ]
 
 [[package]]
