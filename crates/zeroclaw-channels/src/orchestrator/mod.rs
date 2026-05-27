@@ -7526,9 +7526,9 @@ pub async fn start_channels(
         let (
             mut built_tools,
             delegate_handle_ch,
-            reaction_handle_ch,
-            _channel_map_handle,
             ask_user_handle_ch,
+            reaction_handle_ch,
+            _poll_handle_ch,
             escalate_handle_ch,
             channel_send_handle_ch,
         ) = tools::all_tools_with_runtime(
@@ -7922,8 +7922,8 @@ pub async fn start_channels(
 
         // Wire this agent's reaction / ask_user / escalate tool handles
         // into the shared `channels_by_name` map.
-        if let Some(ref handle) = reaction_handle_ch {
-            let mut map = handle.write();
+        {
+            let mut map = reaction_handle_ch.write();
             for (name, ch) in channels_by_name.as_ref() {
                 map.insert(name.clone(), Arc::clone(ch));
             }
