@@ -142,8 +142,9 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(DEL_BG).fg(DEL_FG))]
                             });
+                        let lineno = change.old_index().map(|n| format!("{} | ", n + 1)).unwrap_or_else(|| "  | ".to_string());
                         let mut spans = vec![Span::styled(
-                            "- ".to_string(),
+                            lineno + "- ",
                             Style::default()
                                 .bg(DEL_BG)
                                 .fg(DEL_FG)
@@ -160,8 +161,9 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(ADD_BG).fg(ADD_FG))]
                             });
+                        let lineno = change.new_index().map(|n| format!("{} | ", n + 1)).unwrap_or_else(|| "  | ".to_string());
                         let mut spans = vec![Span::styled(
-                            "+ ".to_string(),
+                            lineno + "+ ",
                             Style::default()
                                 .bg(ADD_BG)
                                 .fg(ADD_FG)
@@ -170,10 +172,13 @@ pub fn diff_lines(old: &str, new: &str, lang: Option<&str>) -> Vec<Line<'static>
                         spans.extend(content);
                         Line::from(spans).style(Style::default().bg(ADD_BG))
                     }
-                    ChangeTag::Equal => Line::from(Span::styled(
-                        format!("  {text}"),
-                        Style::default().fg(CTX_FG),
-                    )),
+                    ChangeTag::Equal => {
+                        let lineno = change.old_index().map(|n| format!("{} | ", n + 1)).unwrap_or_else(|| "  | ".to_string());
+                        Line::from(Span::styled(
+                            format!("{}  {}", lineno, text),
+                            Style::default().fg(CTX_FG),
+                        ))
+                    }
                 };
                 out.push(line);
             }
@@ -214,7 +219,7 @@ pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
                 )]
             });
         let mut spans = vec![Span::styled(
-            "+ ".to_string(),
+            format!("{} | + ", i + 1),
             Style::default()
                 .bg(ADD_BG)
                 .fg(ADD_FG)
@@ -287,7 +292,7 @@ mod tests {
         let lines = diff_lines("old line\n", "new line\n", None);
         let del_line = lines
             .iter()
-            .find(|l| l.spans.first().map(|s| s.content.as_ref()).unwrap_or("") == "- ")
+            .find(|l| l.spans.first().map(|s| s.content.as_ref().ends_with("- ")).unwrap_or(false))
             .expect("should have a delete line");
         assert_eq!(del_line.style.bg, Some(DEL_BG));
     }
@@ -297,7 +302,7 @@ mod tests {
         let lines = diff_lines("old line\n", "new line\n", None);
         let ins_line = lines
             .iter()
-            .find(|l| l.spans.first().map(|s| s.content.as_ref()).unwrap_or("") == "+ ")
+            .find(|l| l.spans.first().map(|s| s.content.as_ref().ends_with("+ ")).unwrap_or(false))
             .expect("should have an insert line");
         assert_eq!(ins_line.style.bg, Some(ADD_BG));
     }
@@ -311,12 +316,25 @@ mod tests {
         // multiple spans (keyword, space, identifier, …) rather than one.
         let del = lines
             .iter()
-            .find(|l| l.spans.first().map(|s| s.content.as_ref()).unwrap_or("") == "- ")
+            .find(|l| l.spans.first().map(|s| s.content.as_ref().ends_with("- ")).unwrap_or(false))
             .expect("delete line");
         assert!(
             del.spans.len() > 2,
             "expected multiple spans from syntax highlighting, got {}",
             del.spans.len()
         );
+    }
+
+    #[test]
+    fn test_diff_lines_shows_left_aligned_line_numbers() {
+        let old = "line one\nline two\n";
+        let new = "line one\nline three\n";
+        let lines = diff_lines(old, new, None);
+        // First changed line should start with a number prefix
+        let first = lines.iter().find(|l| l.spans.iter().any(|s| s.content.contains("three"))).unwrap();
+        assert!(first.spans[0].content.starts_with(|c: char| c.is_ascii_digit()), "expected left-aligned line number");
+
+        let write_lines = write_lines("first\nsecond\nthird", None);
+        assert!(write_lines[0].spans[0].content.starts_with("1 | + "));
     }
 }
