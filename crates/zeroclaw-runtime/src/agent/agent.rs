@@ -1436,6 +1436,13 @@ impl Agent {
 
             let prepared_messages = self.prepare_provider_messages(&messages).await?;
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let response = match self
                 .model_provider
                 .chat(
@@ -1453,8 +1460,36 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let (resp_input_tokens, resp_output_tokens) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
+                    });
+                    resp
+                }
+                Err(err) => {
+                    let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(safe_error),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.parse_response_for_effective_tools(&response);
@@ -1637,6 +1672,13 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
                 self.model_provider.supports_streaming(),
             );
@@ -1818,9 +1860,36 @@ impl Agent {
                 };
                 match chat_result {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            model_provider: self.model_provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(safe_error),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
+                        return Err(err);
+                    }
                 }
             };
+
+            let (resp_input_tokens, resp_output_tokens) = response
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((None, None));
+            self.observer.record_event(&ObserverEvent::LlmResponse {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                duration: llm_started_at.elapsed(),
+                success: true,
+                error_message: None,
+                input_tokens: resp_input_tokens,
+                output_tokens: resp_output_tokens,
+            });
 
             // Forward per-call token usage so the WS gateway (and any other
             // consumer) can include aggregated usage in the final done frame
