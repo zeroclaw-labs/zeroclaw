@@ -1336,7 +1336,6 @@ max_concurrent = 4
 
 [agent]
 compact_context = true
-max_tool_iterations = 100
 max_history_messages = 150
 max_context_tokens = 200000
 parallel_tools = false

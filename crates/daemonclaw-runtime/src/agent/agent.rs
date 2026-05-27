@@ -960,14 +960,9 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        let max_iterations = if self.config.max_tool_iterations == 0 {
-            usize::MAX
-        } else {
-            self.config.max_tool_iterations
-        };
         let mut cumulative_tokens: u64 = 0;
 
-        for _ in 0..max_iterations {
+        for _ in 0usize.. {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
@@ -1111,12 +1106,8 @@ impl Agent {
                 cumulative_tokens,
                 self.config.max_turn_tokens
             )
-        } else {
-            anyhow::bail!(
-                "Agent exceeded maximum tool iterations ({})",
-                max_iterations
-            )
         }
+        anyhow::bail!("Agent loop ended unexpectedly")
     }
 
     /// Execute a single agent turn while streaming intermediate events.
@@ -1175,15 +1166,10 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
-        let max_iterations = if self.config.max_tool_iterations == 0 {
-            usize::MAX
-        } else {
-            self.config.max_tool_iterations
-        };
         let mut cumulative_tokens: u64 = 0;
 
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..max_iterations {
+        for _ in 0usize.. {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1450,12 +1436,8 @@ impl Agent {
                 cumulative_tokens,
                 self.config.max_turn_tokens
             )
-        } else {
-            anyhow::bail!(
-                "Agent exceeded maximum tool iterations ({})",
-                max_iterations
-            )
         }
+        anyhow::bail!("Agent loop ended unexpectedly")
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

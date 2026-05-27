@@ -448,39 +448,8 @@ async fn turn_handles_multi_step_tool_chain() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. Max-iteration bailout
+// 4. (Removed: max-iteration bailout — iteration limit replaced by token budget)
 // ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn turn_bails_out_at_max_iterations() {
-    // Create more tool calls than max_tool_iterations allows.
-    let max_iters = 3;
-    let mut responses = Vec::new();
-    for i in 0..max_iters + 5 {
-        responses.push(tool_response(vec![ToolCall {
-            id: format!("tc{i}"),
-            name: "echo".into(),
-            arguments: r#"{"message": "loop"}"#.into(),
-        }]));
-    }
-
-    let provider = Box::new(ScriptedProvider::new(responses));
-
-    let config = AgentConfig {
-        max_tool_iterations: max_iters,
-        ..AgentConfig::default()
-    };
-
-    let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
-
-    let result = agent.turn("infinite loop").await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("maximum tool iterations"),
-        "Expected max iterations error, got: {err}"
-    );
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. Unknown tool name recovery

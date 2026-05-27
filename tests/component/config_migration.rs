@@ -181,10 +181,6 @@ schema_version = 0
 api_key = "sk-test"          # my API key
 default_provider = "openrouter"
 
-# Agent tuning
-[agent]
-max_tool_iterations = 5  # keep it tight
-
 # Matrix channel
 [channels_config.matrix]
 homeserver = "https://matrix.org"  # production server

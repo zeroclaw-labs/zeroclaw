@@ -180,7 +180,7 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 /// Used as fallback when not configured in channels_config.message_timeout_secs.
 #[cfg(test)]
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
-/// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
+/// Cap timeout scaling to avoid unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
@@ -214,23 +214,18 @@ fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
 #[cfg(test)]
 fn channel_message_timeout_budget_secs(
     message_timeout_secs: u64,
-    max_tool_iterations: usize,
 ) -> u64 {
     channel_message_timeout_budget_secs_with_cap(
         message_timeout_secs,
-        max_tool_iterations,
         CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP,
     )
 }
 
 fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs: u64,
-    max_tool_iterations: usize,
     scale_cap: u64,
 ) -> u64 {
-    let iterations = max_tool_iterations.max(1) as u64;
-    let scale = iterations.min(scale_cap);
-    message_timeout_secs.saturating_mul(scale)
+    message_timeout_secs.saturating_mul(scale_cap)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,7 +333,6 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
-    max_tool_iterations: usize,
     max_turn_tokens: u64,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
@@ -3013,7 +3007,6 @@ async fn process_channel_message(
         .unwrap_or(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
     let timeout_budget_secs = channel_message_timeout_budget_secs_with_cap(
         ctx.message_timeout_secs,
-        ctx.max_tool_iterations,
         scale_cap,
     );
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
@@ -3051,7 +3044,6 @@ async fn process_channel_message(
                         msg.channel.as_str(),
                         Some(msg.reply_target.as_str()),
                         &ctx.multimodal,
-                        ctx.max_tool_iterations,
                         ctx.max_turn_tokens,
                         Some(cancellation_token.clone()),
                         delta_tx.clone(),
@@ -3512,8 +3504,8 @@ async fn process_channel_message(
         }
         LlmExecutionResult::Completed(Err(_)) => {
             let timeout_msg = format!(
-                "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+                "LLM response timed out after {}s (base={}s, scale_cap={})",
+                timeout_budget_secs, ctx.message_timeout_secs, scale_cap
             );
             runtime_trace::record_event(
                 "channel_message_timeout",
@@ -5500,7 +5492,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
-        max_tool_iterations: config.agent.max_tool_iterations,
         max_turn_tokens: config.agent.max_turn_tokens,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -6090,7 +6081,6 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
@@ -6215,7 +6205,6 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -6301,7 +6290,6 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
@@ -6402,7 +6390,6 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
@@ -7002,7 +6989,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7095,7 +7081,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7202,7 +7187,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7294,7 +7278,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7396,7 +7379,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7519,7 +7501,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7623,7 +7604,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7739,7 +7719,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -7822,207 +7801,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 .unwrap_or_else(|e| e.into_inner())
                 .as_slice(),
             &["hot-reloaded-model".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_respects_configured_max_tool_iterations_above_default() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(IterativeToolProvider {
-                required_tool_iterations: 11,
-            }),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 12,
-            max_turn_tokens: 0,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(daemonclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: daemonclaw_providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(daemonclaw_config::schema::Config::default()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
-            multimodal: daemonclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: daemonclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: daemonclaw_config::schema::TranscriptionConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: daemonclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &daemonclaw_config::schema::AutonomyConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: daemonclaw_config::schema::PacingConfig {
-                loop_detection_enabled: false,
-                ..daemonclaw_config::schema::PacingConfig::default()
-            },
-            max_tool_result_chars: 0,
-            context_token_budget: 0,
-            debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
-        });
-
-        process_channel_message(
-            runtime_ctx,
-            daemonclaw_api::channel::ChannelMessage {
-                id: "msg-iter-success".to_string(),
-                sender: "alice".to_string(),
-                reply_target: "chat-iter-success".to_string(),
-                content: "Loop until done".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 1,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(!sent_messages.is_empty());
-        let reply = sent_messages.last().unwrap();
-        assert!(reply.starts_with("chat-iter-success:"));
-        assert!(reply.contains("Completed after 11 tool iterations."));
-        assert!(!reply.contains("⚠️ Error:"));
-    }
-
-    #[tokio::test]
-    async fn process_channel_message_reports_configured_max_tool_iterations_limit() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let mut channels_by_name = HashMap::new();
-        channels_by_name.insert(channel.name().to_string(), channel);
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            provider: Arc::new(IterativeToolProvider {
-                required_tool_iterations: 20,
-            }),
-            default_provider: Arc::new("test-provider".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            max_tool_iterations: 3,
-            max_turn_tokens: 0,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(daemonclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: daemonclaw_providers::ProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(daemonclaw_config::schema::Config::default()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
-            multimodal: daemonclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: daemonclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: daemonclaw_config::schema::TranscriptionConfig::default(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: daemonclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            session_store: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &daemonclaw_config::schema::AutonomyConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: daemonclaw_config::schema::PacingConfig {
-                loop_detection_enabled: false,
-                ..daemonclaw_config::schema::PacingConfig::default()
-            },
-            max_tool_result_chars: 0,
-            context_token_budget: 0,
-            debouncer: Arc::new(daemonclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
-        });
-
-        process_channel_message(
-            runtime_ctx,
-            daemonclaw_api::channel::ChannelMessage {
-                id: "msg-iter-fail".to_string(),
-                sender: "bob".to_string(),
-                reply_target: "chat-iter-fail".to_string(),
-                content: "Loop forever".to_string(),
-                channel: "test-channel".to_string(),
-                timestamp: 2,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-            },
-            CancellationToken::new(),
-        )
-        .await;
-
-        let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(!sent_messages.is_empty());
-        let reply = sent_messages.last().unwrap();
-        assert!(reply.starts_with("chat-iter-fail:"));
-        // After Phase 9, the agent attempts a graceful summary instead of erroring.
-        // The mock provider returns a tool call payload as text, which the agent
-        // returns as its "summary". The key invariant: the loop terminates and
-        // produces a response (not hanging forever).
-        assert!(
-            reply.contains("⚠️ Error: Agent exceeded maximum tool iterations (3)")
-                || reply.len() > "chat-iter-fail:".len(),
-            "Expected either an error message or a graceful summary response"
         );
     }
 
@@ -8166,7 +7944,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8281,7 +8058,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8415,7 +8191,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8546,7 +8321,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8655,7 +8429,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8745,7 +8518,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -8835,7 +8607,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -9631,7 +9402,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -9778,7 +9548,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -9966,7 +9735,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -10087,7 +9855,6 @@ BTC is currently around $65,000 based on latest tool output."#
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
@@ -10710,7 +10477,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -10809,7 +10575,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -10942,7 +10707,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -11119,7 +10883,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -11242,7 +11005,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -11357,7 +11119,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -11492,7 +11253,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 5,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
@@ -11809,7 +11569,6 @@ This is an example JSON object for profile settings."#;
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
-            max_tool_iterations: 10,
             max_turn_tokens: 0,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(

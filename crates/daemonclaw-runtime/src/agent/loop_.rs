@@ -67,10 +67,6 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Rolling window size for detecting streamed tool-call payload markers.
 const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 
-/// Default maximum agentic tool-use iterations per user message.
-#[cfg(test)]
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
-
 // History management moved to `super::history`.
 pub use super::history::{
     emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
@@ -644,7 +640,6 @@ pub async fn agent_turn(
     channel_name: &str,
     channel_reply_target: Option<&str>,
     multimodal_config: &daemonclaw_config::schema::MultimodalConfig,
-    max_tool_iterations: usize,
     max_turn_tokens: u64,
     approval: Option<&ApprovalManager>,
     excluded_tools: &[String],
@@ -666,7 +661,6 @@ pub async fn agent_turn(
         channel_name,
         channel_reply_target,
         multimodal_config,
-        max_tool_iterations,
         max_turn_tokens,
         None,
         None,
@@ -789,7 +783,7 @@ fn maybe_inject_channel_delivery_defaults(
 // full conversation so far (system prompt + user messages + prior tool
 // results). The loop exits when:
 //   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
+//   • the turn token budget is exceeded, or
 //   • the cancellation token fires (external abort).
 
 /// Append a receipt footer to the response text if any receipts were collected.
@@ -834,7 +828,6 @@ pub async fn run_tool_call_loop(
     channel_name: &str,
     channel_reply_target: Option<&str>,
     multimodal_config: &daemonclaw_config::schema::MultimodalConfig,
-    max_tool_iterations: usize,
     max_turn_tokens: u64,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
@@ -851,12 +844,6 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
-    let max_iterations = if max_tool_iterations == 0 {
-        usize::MAX
-    } else {
-        max_tool_iterations
-    };
-
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
     let loop_ignore_tools: HashSet<&str> = pacing
@@ -885,7 +872,7 @@ pub async fn run_tool_call_loop(
     let mut turn_tool_records: Vec<daemonclaw_api::agent::ToolCallRecord> = Vec::new();
     let mut turn_active_skill: Option<String> = None;
 
-    for iteration in 0..max_iterations {
+    for iteration in 0usize.. {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
         if cancellation_token
@@ -1986,7 +1973,7 @@ pub async fn run_tool_call_loop(
         // This avoids false-positive aborts on long-running browser/research
         // workflows while keeping aggressive protection for quick tasks.
         // When not configured, identical-output detection is disabled (preserving
-        // existing behavior where only max_iterations prevents runaway loops).
+        // existing behavior where only loop detection prevents runaway loops).
         let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
             Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
             None => false, // disabled when not configured (backwards compatible)
@@ -2062,14 +2049,9 @@ pub async fn run_tool_call_loop(
         }
     }
 
-    let exceeded_by_tokens = max_turn_tokens > 0 && cumulative_tokens >= max_turn_tokens;
-    let reason = if exceeded_by_tokens {
-        format!(
-            "turn token budget exceeded ({cumulative_tokens} of {max_turn_tokens} tokens used)"
-        )
-    } else {
-        format!("agent exceeded maximum tool iterations ({max_iterations})")
-    };
+    let reason = format!(
+        "turn token budget exceeded ({cumulative_tokens} of {max_turn_tokens} tokens used)"
+    );
 
     runtime_trace::record_event(
         "tool_loop_exhausted",
@@ -2080,10 +2062,8 @@ pub async fn run_tool_call_loop(
         Some(false),
         Some(&reason),
         serde_json::json!({
-            "max_iterations": max_iterations,
             "cumulative_tokens": cumulative_tokens,
             "max_turn_tokens": max_turn_tokens,
-            "exceeded_by_tokens": exceeded_by_tokens,
         }),
     );
 
@@ -2110,19 +2090,12 @@ pub async fn run_tool_call_loop(
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
-    tracing::warn!(reason = %reason, "Turn limit reached, requesting final summary");
-    let limit_msg = if exceeded_by_tokens {
-        format!(
-            "You have reached the turn token budget ({cumulative_tokens} of {max_turn_tokens} tokens). \
-             Please provide your best answer based on the work completed so far. \
-             Summarize what you accomplished and what remains to be done."
-        )
-    } else {
-        "You have reached the maximum number of tool iterations. \
+    tracing::warn!(reason = %reason, "Turn token budget reached, requesting final summary");
+    let limit_msg = format!(
+        "You have reached the turn token budget ({cumulative_tokens} of {max_turn_tokens} tokens). \
          Please provide your best answer based on the work completed so far. \
          Summarize what you accomplished and what remains to be done."
-            .to_string()
-    };
+    );
     history.push(ChatMessage::user(limit_msg));
 
     let summary_request = daemonclaw_providers::ChatRequest {
@@ -2133,7 +2106,7 @@ pub async fn run_tool_call_loop(
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
-                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+                anyhow::bail!("Turn token budget exceeded ({cumulative_tokens} of {max_turn_tokens} tokens)")
             }
             accumulated_display_text.push_str(&text);
             Ok(append_receipt_footer(
@@ -2143,7 +2116,7 @@ pub async fn run_tool_call_loop(
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            anyhow::bail!("Turn token budget exceeded ({cumulative_tokens} of {max_turn_tokens} tokens)")
         }
     }
 }
@@ -2801,7 +2774,6 @@ pub async fn run(
                         channel_name,
                         None,
                         &config.multimodal,
-                        config.agent.max_tool_iterations,
                         config.agent.max_turn_tokens,
                         None,
                         None,
@@ -3114,7 +3086,6 @@ pub async fn run(
                             channel_name,
                             None,
                             &config.multimodal,
-                            config.agent.max_tool_iterations,
                             config.agent.max_turn_tokens,
                             Some(cancel_token.clone()),
                             Some(delta_tx.clone()),
@@ -3638,7 +3609,6 @@ pub async fn process_message(
         "daemon",
         None,
         &config.multimodal,
-        config.agent.max_tool_iterations,
         config.agent.max_turn_tokens,
         Some(&approval_manager),
         &excluded_tools,
@@ -4771,7 +4741,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -4830,7 +4799,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -4883,7 +4851,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -4935,7 +4902,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -4994,7 +4960,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5053,7 +5018,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5113,7 +5077,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5171,7 +5134,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5229,7 +5191,6 @@ mod tests {
             "cli",
             None,
             &multimodal,
-            3,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5370,7 +5331,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5451,7 +5411,6 @@ mod tests {
             "telegram",
             Some("chat-42"),
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5524,7 +5483,6 @@ mod tests {
             "telegram",
             Some("chat-42"),
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5592,7 +5550,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5673,7 +5630,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5744,7 +5700,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5835,7 +5790,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5900,7 +5854,6 @@ mod tests {
             "cli",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             None,
@@ -5992,7 +5945,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -6061,7 +6013,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -6133,7 +6084,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            5,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -6212,7 +6162,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            5,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -6300,7 +6249,6 @@ mod tests {
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -6393,7 +6341,6 @@ mod tests {
                 "daemon",
                 None,
                 &daemonclaw_config::schema::MultimodalConfig::default(),
-                4,
             0, // max_turn_tokens: disabled
                 None,
                 &[],
@@ -6774,8 +6721,6 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     const _: () = {
-        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
-        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };
@@ -7401,7 +7346,6 @@ Let me check the result."#;
             "telegram",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            4,
             0, // max_turn_tokens: disabled
             None,
             Some(tx),
@@ -7564,7 +7508,6 @@ Let me check the result."#;
                     "test",
                     None,
                     &daemonclaw_config::schema::MultimodalConfig::default(),
-                    2,
             0, // max_turn_tokens: disabled
                     None,
                     None,
@@ -7653,7 +7596,6 @@ Let me check the result."#;
                     "test",
                     None,
                     &daemonclaw_config::schema::MultimodalConfig::default(),
-                    2,
             0, // max_turn_tokens: disabled
                     None,
                     None,
@@ -7715,7 +7657,6 @@ Let me check the result."#;
             "test",
             None,
             &daemonclaw_config::schema::MultimodalConfig::default(),
-            2,
             0, // max_turn_tokens: disabled
             None,
             None,

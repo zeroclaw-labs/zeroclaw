@@ -1164,7 +1164,6 @@ impl DelegateTool {
                 "delegate",
                 None,
                 &self.multimodal_config,
-                agent_config.max_iterations,
                 0, // max_turn_tokens: disabled for subagents
                 None,
                 None,

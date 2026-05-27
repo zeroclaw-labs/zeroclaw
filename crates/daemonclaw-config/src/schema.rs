@@ -1419,13 +1419,9 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// `0` means unlimited (no iteration limit). Both limits are independent.
-    #[serde(default = "default_agent_max_tool_iterations")]
-    pub max_tool_iterations: usize,
     /// Maximum total tokens (input + output) consumed per agent turn.
     /// When exceeded the agent stops and summarises progress so far.
-    /// `0` means unlimited (no token limit). Both limits are independent.
+    /// `0` means unlimited (no token limit).
     /// Default: `0`.
     #[serde(default)]
     pub max_turn_tokens: u64,
@@ -1511,10 +1507,6 @@ fn default_keep_tool_context_turns() -> usize {
     2
 }
 
-fn default_agent_max_tool_iterations() -> usize {
-    10
-}
-
 fn default_agent_max_history_messages() -> usize {
     50
 }
@@ -1535,7 +1527,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             compact_context: true,
-            max_tool_iterations: default_agent_max_tool_iterations(),
             max_turn_tokens: 0,
             max_history_messages: default_agent_max_history_messages(),
             max_context_tokens: default_agent_max_context_tokens(),
@@ -1588,7 +1579,7 @@ pub struct PacingConfig {
 
     /// Override for the hardcoded timeout scaling cap (default: 4).
     /// The channel message timeout budget is computed as:
-    ///   `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)`
+    ///   `message_timeout_secs * message_timeout_scale_max`
     /// Raising this value lets long multi-step tasks with slow local models
     /// receive a proportionally larger budget without inflating the base timeout.
     #[serde(default)]
@@ -12499,7 +12490,6 @@ reasoning_effort = "turbo"
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_turn_tokens, 0);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
@@ -12512,14 +12502,12 @@ reasoning_effort = "turbo"
 default_temperature = 0.7
 [agent]
 compact_context = true
-max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
 "#;
         let parsed = parse_test_config(raw);
         assert!(parsed.agent.compact_context);
-        assert_eq!(parsed.agent.max_tool_iterations, 20);
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");

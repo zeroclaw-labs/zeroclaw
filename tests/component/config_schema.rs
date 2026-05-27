@@ -386,7 +386,6 @@ fn config_empty_toml_uses_default_temperature() {
 #[test]
 fn config_minimal_toml_with_temperature_uses_defaults() {
     let config = migrate("default_temperature = 0.7\ndefault_provider = \"test\"\n");
-    assert_eq!(config.agent.max_tool_iterations, 10);
     assert_eq!(config.gateway.port, 42617);
 }
 
@@ -403,7 +402,6 @@ fn config_only_temperature_parses() {
             .abs()
             < f64::EPSILON
     );
-    assert_eq!(config.agent.max_tool_iterations, 10);
 }
 
 #[test]
