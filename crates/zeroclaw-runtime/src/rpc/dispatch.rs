@@ -2904,8 +2904,16 @@ mod tests {
 
     /// Mint a config with `providers.models.anthropic.default` so we can
     /// poke its `#[secret]` `api-key` field through `config/set`.
-    fn make_secret_test_config() -> zeroclaw_config::schema::Config {
-        let mut cfg = zeroclaw_config::schema::Config::default();
+    ///
+    /// IMPORTANT: pins `config_path` and `data_dir` into the supplied tempdir
+    /// so that `flush_config()` → `save_dirty()` never falls through to
+    /// `default_config_and_data_dirs()` and clobbers `~/.zeroclaw/config.toml`.
+    fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
         cfg.create_map_key("providers.models.anthropic", "default")
             .expect("create anthropic.default");
         cfg
@@ -2913,7 +2921,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_set_writes_real_secret_through_set_prop() {
-        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
         let params = json!({
             "prop": "providers.models.anthropic.default.api-key",
             "value": "sk-real-test-key"
@@ -2936,7 +2945,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_set_rejects_masked_secret_value() {
-        let mut cfg = make_secret_test_config();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
         cfg.providers
             .models
             .anthropic
@@ -2974,7 +2984,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_set_non_secret_field_still_uses_set_prop() {
-        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
         let params = json!({
             "prop": "providers.models.anthropic.default.model",
             "value": "claude-sonnet-4-5"
