@@ -119,63 +119,40 @@ impl Tool for CronRunTool {
             Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
-
-        if job.delivery.mode.eq_ignore_ascii_case("announce")
-            && let (Some(channel), Some(target)) =
-                (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-            && let Err(e) = cron::scheduler::deliver_announcement(
-                &self.config,
-                channel,
-                target,
-                job.delivery.thread_id.as_deref(),
-                &output,
-            )
-            .await
-        {
-            if job.delivery.best_effort {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
-                        ),
-                    "cron_run delivery failed (best_effort)"
-                );
-            } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
-                        ),
-                    "cron_run delivery failed"
-                );
-                success = false;
-            }
-        }
-
-        let status = if success { "ok" } else { "error" };
+        let outcome = cron::scheduler::deliver_and_classify_run_result(
+            &self.config,
+            &job,
+            success,
+            output,
+            cron::scheduler::CronDeliveryContext::ToolManual,
+        )
+        .await;
+        success = outcome.success;
 
         let _ = cron::record_run(
             &self.config,
             &job.id,
             started_at,
             finished_at,
-            status,
-            Some(&output),
+            &outcome.status,
+            Some(&outcome.output),
             duration_ms,
         );
-        let _ = cron::record_last_run(&self.config, &job.id, finished_at, success, &output);
+        let _ = cron::record_last_run_with_status(
+            &self.config,
+            &job.id,
+            finished_at,
+            &outcome.status,
+            &outcome.output,
+        );
 
         Ok(ToolResult {
             success,
             output: serde_json::to_string_pretty(&json!({
                 "job_id": job.id,
-                "status": status,
+                "status": outcome.status,
                 "duration_ms": duration_ms,
-                "output": output
+                "output": outcome.output
             }))?,
             error: if success {
                 None
@@ -265,6 +242,88 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn best_effort_delivery_failure_records_degraded_history() {
+        cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            None,
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo run-now",
+            Some(cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let response: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(response["status"], "degraded");
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
     }
 
     #[tokio::test]

@@ -315,7 +315,7 @@ function isOptionalArray(typeHint: string): boolean {
   return compact.startsWith('Option<Vec<') || compact.startsWith('Option<HashSet<');
 }
 
-// Per-provider catalog cache. Cleared via clearFieldFormCatalogCaches() on
+// Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
 // nav so a new model alias added under (say) `anthropic` shows up the next
 // time the user opens an agent form without a hard refresh.
 let modelsCache: Record<string, { models: string[]; live: boolean; local: boolean }> = {};
@@ -989,22 +989,23 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
 
   useEffect(() => {
     if (!isProviderModelField) return;
-    const provider = entry.path.split('.')[2];
-    if (!provider) return;
-    const cached = modelsCache[provider];
+    const [, , provider, alias] = entry.path.split('.');
+    if (!provider || !alias) return;
+    const cacheKey = `${provider}.${alias}`;
+    const cached = modelsCache[cacheKey];
     if (cached) {
       setProviderModels(cached.models);
       setModelsFetchFailed(!cached.live && cached.models.length === 0);
       return;
     }
-    void getCatalogModels(provider)
+    void getCatalogModels(provider, alias)
       .then((r) => {
-        modelsCache[provider] = { models: r.models, live: r.live, local: r.local };
+        modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
         setProviderModels(r.models);
         setModelsFetchFailed(!r.live && r.models.length === 0);
       })
       .catch(() => {
-        modelsCache[provider] = {
+        modelsCache[cacheKey] = {
           models: [],
           live: false,
           local: isLocalModelProviderName(provider),

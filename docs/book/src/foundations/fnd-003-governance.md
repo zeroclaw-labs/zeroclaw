@@ -1,8 +1,9 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
-### Starting v0.7.0 · Type: Governance · Rev. 4
+Starting v0.7.0 · Type: Governance · Rev. 5
 
-> **Canonical reference** · Ratified by the team · Rev. 4
-> Discussion thread and full revision history: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
+> **Canonical reference** · Ratified by the team · Rev. 5
+> Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
+> Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
 
 ---
@@ -22,6 +23,7 @@
 | 2 | 2026-04-09 | Added §6.4 Architectural Compliance: Human Review, AI Support; added Discussion Question on AI automation of architecture reviews |
 | 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
 | 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
+| 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
 
 ---
 
@@ -30,7 +32,9 @@
 1. [The Coordination Problem](#1-the-coordination-problem)
 2. [The Three-Part System](#2-the-three-part-system)
 3. [GitHub Projects: The Work Pipeline](#3-github-projects-the-work-pipeline)
-4. [GitHub Discussions: The Ideas Parking Lot](#4-github-discussions-the-ideas-parking-lot)
+   - [3.6 Work Lanes and State Ownership](#36-work-lanes-and-state-ownership)
+4. [GitHub Discussions: Community Discussion and Handoff](#4-github-discussions-community-discussion-and-handoff)
+   - [4.5 Discussions Stewardship And Discord-to-GitHub Handoff](#45-discussions-stewardship-and-discord-to-github-handoff)
 5. [Team Tiers and Contribution Authority](#5-team-tiers-and-contribution-authority)
 6. [CODEOWNERS and Branch Protection](#6-codeowners-and-branch-protection)
    - [6.4 Architectural Compliance: Human Review, AI Support](#64-architectural-compliance-human-review-ai-support)
@@ -58,7 +62,7 @@ This is not a criticism of anyone's effort. It is a description of what happens 
 ZeroClaw needs three things:
 
 1. **A pipeline** for turning ideas into shipped code, with visible stages and clear gates at each transition
-2. **A parking lot** for capturing ideas that are not ready for the pipeline yet, without losing them or cluttering the active work
+2. **A maintained discussion lane** for community questions, ideas, showcases, and early exploration that are not ready for the pipeline yet, without losing them or cluttering the active work
 3. **A governance model** that defines who can decide what, how architectural decisions get made, and how the team grows
 
 These are three distinct concerns. Conflating them — putting everything in one board, or relying on informal chat for decisions — is what creates the chaos the team is trying to escape.
@@ -70,10 +74,25 @@ These are three distinct concerns. Conflating them — putting everything in one
 | Concern | Tool | Why This Tool |
 |---|---|---|
 | Work pipeline (backlog → release) | **GitHub Projects v2** | Custom fields, multiple views, Kanban + roadmap, built-in automation, milestone tracking |
-| Ideas parking lot | **GitHub Discussions** | Community-votable, no PR required, separates "maybe someday" from committed work, converts to issues when ready |
+| Community discussion and idea incubation | **GitHub Discussions** | Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface |
 | Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Already partially established via `docs/proposals/`; needs formalization and close loop |
 
-The key principle: **the Project board contains only work the team has committed to thinking about.** Ideas that have not been evaluated live in Discussions. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
+The key principle: **the Project board contains only work the team has committed to thinking about.** Early community discussion, ideas, Q&A, and showcases can live in Discussions when the lane is maintained. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
+
+FND-003 is the durable governance source for work-lane and contribution-pipeline policy. RFC #6808 was the staging discussion for feature-facing work lanes, label governance, issue triage, and maintainer routing; after its policy slices are promoted, their durable rules live in this foundation document plus the maintainer operational pages linked below. Do not treat the RFC issue as a competing governance document after its policy has been promoted here.
+
+Operational details intentionally live close to the workflow that uses them:
+
+| Durable decision | Operational home |
+|---|---|
+| Project board purpose and stage gates | This document |
+| PR lanes and merge/review queue discipline | [Maintainer PR workflow](../maintainers/pr-workflow.md) |
+| Label definitions, ownership boundaries, and cleanup protocol | [Maintainer labels guide](../maintainers/labels.md) |
+| Reviewer intake, risk depth, issue triage, and queue hygiene | [Reviewer playbook](../maintainers/reviewer-playbook.md) |
+| Mechanical issue-triage procedure and stale pass details | [Maintainer skills guide](../maintainers/skills.md#issue-triage-workflow) and [Reviewer playbook](../maintainers/reviewer-playbook.md#issue-triage) |
+| Contributor-facing filing and PR mechanics | Issue templates, PR template, and [How to contribute](../contributing/how-to.md) |
+| Contributor communication, Discussions stewardship, and Discord-to-GitHub handoff | [Communication](../contributing/communication.md) and §4.5 below |
+| RFC-shaped contribution routing before implementation | [Architecture and contribution map](../contributing/architecture-map.md) and [RFC process](../contributing/rfcs.md) |
 
 ---
 
@@ -103,6 +122,8 @@ Plus one terminal state that can be reached from anywhere:
 🚫 Won't Do  ← explicit decision not to pursue; never silently closed
 ```
 
+The board-level `Won't Do` state is a durable closure decision. Current closure-label spelling and replacement-process rules live in the [maintainer label guide](../maintainers/labels.md#resolution-labels) and [superseding guide](../maintainers/superseding.md).
+
 ### 3.2 The Gate Questions
 
 Every transition has a gate question. The question must be answered "yes" before the item moves forward. This is the project board made operational — the Vision → Architecture → Design → Implementation → Testing → Documentation hierarchy becomes a checklist at each stage.
@@ -117,6 +138,16 @@ Every transition has a gate question. The question must be answered "yes" before
 | Any → Won't Do | Has the decision not to pursue been explained in the item's comments? | Core Team |
 
 **Why explicit gates matter for a student team:** Without gates, cards move because someone feels done, not because done has a definition. This is the single most common source of "done" work that is not actually done. The gates make the definition visible and shared.
+
+These gate questions are governance prompts, not another checklist to duplicate in every PR body or issue comment. The operational forms live in the artifacts that maintainers already touch:
+
+- issue templates collect the report, user value, reproduction, architecture impact, and risk hints needed for first triage;
+- the PR template collects scope boundary, validation evidence, security/privacy impact, compatibility, rollback, labels, and linked issues;
+- the maintainer PR workflow defines Definition of Ready, Definition of Done, PR lanes, and merge checks;
+- the labels guide defines durable classification, stale-policy labels, and cleanup sequence;
+- the reviewer playbook defines intake, review depth, issue triage, automation override, and queue hygiene.
+
+If an old FND-003 gate question seems missing, first check those operational homes before adding another copy here.
 
 ### 3.3 Custom Fields
 
@@ -184,61 +215,65 @@ GitHub allows up to six pinned issues per repository. Use them for high-signal, 
 
 Pinned issues are a promise to the community: these are the things that matter most right now. Update them when priorities shift.
 
+### 3.6 Work Lanes and State Ownership
+
+Work-lane policy keeps the board, labels, PRs, and issues from trying to answer the same question in different places.
+
+Use this split:
+
+| Surface | Owns | Does not own |
+|---|---|---|
+| Labels | durable classification: type, scope, risk, size, contributor tier, stale/triage policy | per-push review state, active CI status, personal task lists |
+| Project board | planning state: readiness, active owner, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
+| Native PR state | review decision, required checks, branch freshness, conflicts, mergeability, draft/ready state | long-term roadmap ownership |
+| Issues/RFCs | durable discussion record, acceptance state, user need, linked implementation trail | live replacement for maintainer docs after policy promotion |
+
+PR lanes, contributor-pickup labels, stale-exemption labels, and label migration are durable governance concepts, but their exact operational criteria live in maintainer docs. FND-003 owns the split: labels classify durable work, project boards plan work, native PR state owns live review and merge state, and issues/RFCs preserve decisions. The [Maintainer PR workflow](../maintainers/pr-workflow.md#pr-lanes) owns PR lane definitions, the [Labels guide](../maintainers/labels.md) owns exact label meanings and cleanup rules, and the [Reviewer playbook](../maintainers/reviewer-playbook.md#issue-triage) owns how reviewers apply those signals during triage and review. Treat live label migration as a separate maintainer-approved cleanup, not ordinary PR review.
+
+Stale exemptions are governance exceptions, not permanent label shields. The target policy is that `status:no-stale` is valid only when the lane's operational source records both why the issue is exempt and who owns it. The maintainer docs define where those facts live and how stale automation or stale sweeps enforce the rule.
+
 ---
 
-## 4. GitHub Discussions: The Ideas Parking Lot
+## 4. GitHub Discussions: Community Discussion and Handoff
 
-### 4.1 Enable Discussions and Create Categories
+### 4.1 Maintained Discussions Lane
 
-Enable GitHub Discussions on the repository. Create the following categories:
+Treat GitHub Discussions as a maintained community surface. Discussions are useful for questions, ideas, polls, announcements, showcases, project or integration demos, and exploratory threads that need more permanence than Discord but are not yet tracked work.
 
-| Category | Format | Purpose |
-|---|---|---|
-| 📣 **Announcements** | Announcement | Core team posts; community cannot create, only react and comment |
-| 💡 **Ideas** | Open-ended discussion | Community feature requests and suggestions; the ideas parking lot |
-| 🏗️ **Architecture** | Open-ended discussion | Questions and proposals about system design; feeds the RFC process |
-| ❓ **Q&A** | Question/Answer | How do I do X? Answered by contributors and core team |
-| 🐛 **Bug Reports (pre-triage)** | Open-ended discussion | For bug reports that need more information before becoming issues |
-| 🌐 **Translations** | Open-ended discussion | Community-maintained translations and localization coordination |
-| 🎉 **Show and Tell** | Open-ended discussion | What are you building with ZeroClaw? Community showcases |
+Exact categories, category descriptions, and steward cadence are operational details. They belong in the contributor communication guide and maintainer stewardship docs, and they may evolve without revising this foundation document.
 
-### 4.2 The Idea-to-Issue Promotion Process
+### 4.2 Promotion From Discussion To Tracked Work
 
-Discussions in the **Ideas** category follow a lightweight promotion process:
+Discussions do not become backlog work just because a thread exists. Promote a Discussion when it produces a concrete tracked outcome. Contributor-facing trigger examples live in [Communication](../contributing/communication.md).
 
-```
-Community member posts an idea in Discussions → Ideas
-         ↓
-Community votes with 👍 reactions
-         ↓
-Threshold: 5 👍 from Contributors or Core Team members
-         ↓
-Core Team member converts to Issue using GitHub's
-"Create issue from discussion" feature
-         ↓
-Issue enters Project board as 💡 Idea status
-         ↓
-Discussion is marked Answered with a link to the new issue
-```
+The target depends on the result. Confirmed bugs and accepted feature scopes move to issues. Architecture decisions move through the RFC process. PR-specific details move to PR comments. Durable operating rules move to maintainer or contributor docs.
 
-The threshold of five votes from Contributors or Core Team (not anonymous community members) prevents low-signal requests from flooding the backlog while still giving the community a real voice. Reactions from unaffiliated accounts count as community sentiment data but not toward the threshold.
-
-**Why this process matters:** It separates signal from noise. Not every idea is a good idea, and not every good idea is the right idea for now. The Discussions layer lets the community express what they want without creating the false expectation that every request becomes a ticket.
+Close the loop in the originating Discussion. If the category supports answers, mark the summary or tracked-work link as the answer when that is appropriate. If it does not, add a final summary comment with the issue, RFC, PR, or docs link.
 
 ### 4.3 Ideas That Should Not Wait for Votes
 
-Some items bypass the Discussions promotion process and enter the backlog directly:
+Some items bypass Discussions and enter the tracked surface directly:
 
 - Security vulnerabilities (via private security report, never public)
 - Confirmed bugs with reproduction steps (go directly to Bug Report issue template)
 - RFC-accepted architecture items (spawned directly from the RFC close loop)
 - Items from the project roadmap (placed directly by Core Team)
 
-### 4.4 The Architecture Category
+### 4.4 Architecture Exploration
 
-The **Architecture** Discussions category is specifically for questions and proposals that are not yet ready to be formal RFCs. A contributor who notices a problem with the current design or wants to explore an idea can open an Architecture discussion before committing to writing a full RFC. This lowers the barrier to raising concerns.
+Architecture exploration can start in Discussions when the question is community-facing and not yet ready for a formal RFC. This lowers the barrier to raising design concerns without turning every early thought into tracked policy.
 
-If an Architecture discussion develops sufficient detail and consensus, a Core Team member can promote it to a formal RFC by moving the content to `docs/proposals/` and opening an RFC issue.
+When the thread reaches a concrete architecture proposal, open the RFC issue and move the durable proposal into the RFC surface. The Discussion can then link to the RFC and stop being the source of truth.
+
+### 4.5 Discussions Stewardship And Discord-to-GitHub Handoff
+
+Discord is for fast conversation. GitHub is the durable record. Discussions are one maintained GitHub surface for community-facing conversation that needs more permanence than Discord but is not yet tracked work.
+
+Discussions are active only when someone owns the lane. That ownership can be a named steward or a documented review cadence. Without ownership, Discussions are a passive archive, not a required intake path.
+
+Use Discussions for exploratory, community-facing, or broad-feedback threads. Use an issue, RFC issue, PR comment, or maintainer doc when the outcome is already concrete or authoritative. The contributor-facing trigger list and category examples live in [Communication](../contributing/communication.md).
+
+The handoff does not need to copy the whole chat. Capture the outcome and enough context for another maintainer to continue. If a Discussion later produces tracked work or durable policy, promote that result into the surface that owns it.
 
 ---
 
@@ -252,7 +287,7 @@ The three tiers reflect increasing demonstrated commitment to the project:
 
 ---
 
-**Tier 1: Community**
+#### Tier 1: Community
 
 Anyone. No approval required.
 
@@ -271,7 +306,7 @@ Anyone. No approval required.
 
 ---
 
-**Tier 2: Contributor**
+#### Tier 2: Contributor
 
 Community members who have had at least two PRs merged into the `master` branch.
 
@@ -292,7 +327,7 @@ Community members who have had at least two PRs merged into the `master` branch.
 
 ---
 
-**Tier 3: Core Team**
+#### Tier 3: Core Team
 
 Contributors who have demonstrated consistent, high-quality contributions over time and have been invited by existing Core Team members.
 
@@ -877,14 +912,14 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
 | `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
-| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption with a recorded reason, for accepted or otherwise long-lived work not already protected by another exclusion |
+| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and active owner in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
 | `status:discussion` | `#a78bfa` Purple | Needs team discussion before work begins |
-| `status:wont-fix` | `#9ca3af` Gray | Explicitly decided not to pursue |
-| `status:duplicate` | `#9ca3af` Gray | Duplicate of another issue |
 
 The live community-pickup labels are the unprefixed `good first issue` and `help wanted`; the `status:*` pickup rows above are historical taxonomy. Current operational risk labels also distinguish issue risk (likely fix blast radius from the report) from PR risk (the actual diff under review). See the [maintainer label guide](../maintainers/labels.md) for the live policy.
+
+Terminal closure labels are operational policy, not part of the historical `status:*` taxonomy in this foundation document. Use the [maintainer label guide](../maintainers/labels.md#resolution-labels) for current resolution labels and the [superseding guide](../maintainers/superseding.md) for replacement-process rules.
 
 ### `rfc:` — RFC-specific status
 
@@ -958,7 +993,7 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (`.github/workflows/stale.yml`):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, `status:no-stale`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The maintainer label guide and issue-triage protocol carry the current operational details.
+Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and the active owner. The maintainer label guide and issue-triage protocol carry the current operational details.
 
 **PR size labeling (`.github/workflows/pr-size.yml`):**
 
@@ -988,7 +1023,7 @@ The minimum viable governance setup. Gets the team coordinating immediately.
 
 - [ ] Create the GitHub Project with Status, Type, Priority, and Milestone fields
 - [ ] Create the four Project views (Roadmap, Board, Backlog, My Work)
-- [ ] Enable GitHub Discussions with the seven categories defined in Section 4.1
+- [ ] Enable GitHub Discussions with maintained categories documented in the contributor communication and maintainer stewardship docs
 - [ ] Create the three RFC issues for the existing proposals (Section 8.4)
 - [ ] Add the six issue templates (Section 7)
 - [ ] Create the `CODEOWNERS` file (Section 6.1)
@@ -1045,7 +1080,6 @@ By v1.0.0, the governance model should be self-sustaining — the team should no
 **Success signal:** The last six months of development history shows consistent use of the pipeline. Issues are triaged within 3 days. PRs are reviewed within 5 days. The CHANGELOG is updated on every merge.
 
 ---
-
 
 ## Appendix A: Glossary
 

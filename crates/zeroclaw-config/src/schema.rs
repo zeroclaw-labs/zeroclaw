@@ -471,6 +471,11 @@ pub struct Config {
     #[nested]
     pub image_gen: ImageGenConfig,
 
+    /// Standalone file upload tool configuration (`[file_upload]`).
+    #[serde(default)]
+    #[nested]
+    pub file_upload: FileUploadConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
@@ -1669,7 +1674,7 @@ pub enum SiliconflowEndpoint {
 impl ModelEndpoint for SiliconflowEndpoint {
     fn uri(&self) -> &'static str {
         match self {
-            Self::Default => "https://api.siliconflow.cn/v1",
+            Self::Default => "https://api.siliconflow.com/v1",
         }
     }
 }
@@ -3236,8 +3241,9 @@ impl Config {
     /// Resolve the runtime-active agent alias the orchestrator binds
     /// channels to. Mirrors the same selection logic as
     /// `start_channels()` in zeroclaw-channels: prefer the migration-
-    /// synthesized `"default"` agent, fall back to the first enabled
-    /// agent. Returns `None` only when no agent is configured at all.
+    /// synthesized `"default"` agent, otherwise fall back to the
+    /// lexicographically-smallest enabled alias. Returns `None` only
+    /// when no enabled agent is configured.
     ///
     /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
     /// to pick which agent's `tts_provider` / `transcription_provider`
@@ -3249,13 +3255,14 @@ impl Config {
         self.agents
             .keys()
             .find(|k| k.as_str() == "default")
+            .map(String::as_str)
             .or_else(|| {
                 self.agents
                     .iter()
-                    .find(|(_, a)| a.enabled)
-                    .map(|(alias, _)| alias)
+                    .filter(|(_, a)| a.enabled)
+                    .map(|(alias, _)| alias.as_str())
+                    .min()
             })
-            .map(String::as_str)
     }
 
     /// Resolve the active storage backend for the memory subsystem.
@@ -6803,6 +6810,77 @@ impl Default for ImageGenConfig {
             enabled: false,
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
+        }
+    }
+}
+
+// ── File Upload ─────────────────────────────────────────────────
+
+/// Standalone file upload tool configuration (`[file_upload]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_upload` tool that
+/// POSTs files from the agent's local filesystem to the configured endpoint
+/// using `multipart/form-data`. The LLM provides only a file path; the host
+/// reads the bytes and uploads them without ever including file content in
+/// the model context.
+///
+/// When `url` is `None` or empty, the tool is not registered.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "file-upload"]
+pub struct FileUploadConfig {
+    /// Upload endpoint URL. Tool is disabled when this is `None` or empty.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// HTTP method. Only `POST` (default) and `PUT` are accepted.
+    #[serde(default = "default_file_upload_method")]
+    pub method: String,
+
+    /// Multipart form-field name for the file part. Default: `file`.
+    #[serde(default = "default_file_upload_field_name")]
+    pub field_name: String,
+
+    /// Maximum file size in bytes. Larger files are rejected before any
+    /// bytes hit the network. Default: 25 MiB.
+    #[serde(default = "default_file_upload_max_size_bytes")]
+    pub max_file_size_bytes: u64,
+
+    /// Request timeout in seconds. Default: 60.
+    #[serde(default = "default_file_upload_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Static HTTP headers attached to every upload request. Same shape as
+    /// `[mcp.servers.*.headers]`.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_file_upload_method() -> String {
+    "POST".into()
+}
+
+fn default_file_upload_field_name() -> String {
+    "file".into()
+}
+
+fn default_file_upload_max_size_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn default_file_upload_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for FileUploadConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            method: default_file_upload_method(),
+            field_name: default_file_upload_field_name(),
+            max_file_size_bytes: default_file_upload_max_size_bytes(),
+            timeout_secs: default_file_upload_timeout_secs(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -12935,6 +13013,7 @@ impl Default for Config {
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -16354,6 +16433,7 @@ auto_save = true
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -16951,6 +17031,7 @@ default_temperature = 0.7
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
+            file_upload: FileUploadConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),

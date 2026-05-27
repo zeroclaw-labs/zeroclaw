@@ -3216,10 +3216,12 @@ pub async fn run(
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────
-        let agent_provider_type = agent_provider_resolved.as_ref().map(|(ty, _, _)| *ty);
+        let agent_provider_ref = agent_provider_resolved
+            .as_ref()
+            .map(|(ty, alias, _)| format!("{ty}.{alias}"));
         let mut provider_name = provider_override
             .as_deref()
-            .or(agent_provider_type)
+            .or(agent_provider_ref.as_deref())
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -3257,8 +3259,13 @@ pub async fn run(
             span.record("model", model_name.as_str());
         }
 
-        let provider_runtime_options =
+        let provider_runtime_options_base =
             zeroclaw_providers::provider_runtime_options_from_config(&config);
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &provider_name,
+            &provider_runtime_options_base,
+        );
 
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
@@ -3713,7 +3720,11 @@ pub async fn run(
                                     &config.reliability,
                                     &config.model_routes,
                                     &new_model,
-                                    &provider_runtime_options,
+                                    &zeroclaw_providers::options_for_provider_ref(
+                                        &config,
+                                        &new_model_provider,
+                                        &provider_runtime_options_base,
+                                    ),
                                 )?;
 
                             provider_name = new_model_provider;
@@ -4106,7 +4117,11 @@ pub async fn run(
                                         &config.reliability,
                                         &config.model_routes,
                                         &new_model,
-                                        &provider_runtime_options,
+                                        &zeroclaw_providers::options_for_provider_ref(
+                                            &config,
+                                            &new_model_provider,
+                                            &provider_runtime_options_base,
+                                        ),
                                     )?;
 
                                 provider_name = new_model_provider;
@@ -4331,7 +4346,7 @@ pub async fn process_message(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let (provider_name, _provider_alias, agent_model_provider) = match config
+        let (provider_name, provider_alias, agent_model_provider) = match config
             .resolved_model_provider_for_agent(agent_alias)
         {
             Some(resolved) => (resolved.0, resolved.1.to_string(), Some(resolved.2.clone())),
@@ -4523,12 +4538,15 @@ pub async fn process_message(
              `model` set. Configure [model_providers.{provider_name}.<alias>] model = \"...\"."
             ),
         };
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(&config);
+        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+            &config,
+            provider_name,
+            provider_alias.as_str(),
+        );
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
-                provider_name,
+                &format!("{provider_name}.{provider_alias}"),
                 agent_model_provider
                     .as_ref()
                     .and_then(|e| e.api_key.as_deref()),

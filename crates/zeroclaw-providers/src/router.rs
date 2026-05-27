@@ -308,6 +308,25 @@ impl ModelProvider for RouterModelProvider {
             .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
     }
 
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider.stream_chat_with_system(
+            system_prompt,
+            message,
+            &resolved_model,
+            temperature,
+            options,
+        )
+    }
+
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
@@ -505,6 +524,16 @@ mod tests {
                 response,
             }
         }
+
+        fn stream_response(&self, model: &str) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_stream_model.lock() = model.to_string();
+            let chunks = vec![
+                Ok(StreamChunk::delta(self.response)),
+                Ok(StreamChunk::final_chunk()),
+            ];
+            futures_util::stream::iter(chunks).boxed()
+        }
     }
 
     #[async_trait]
@@ -523,6 +552,17 @@ mod tests {
             true
         }
 
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_response(model)
+        }
+
         fn stream_chat_with_history(
             &self,
             _messages: &[ChatMessage],
@@ -530,13 +570,7 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-            self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_stream_model.lock() = model.to_string();
-            let chunks = vec![
-                Ok(StreamChunk::delta(self.response)),
-                Ok(StreamChunk::final_chunk()),
-            ];
-            futures_util::stream::iter(chunks).boxed()
+            self.stream_response(model)
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for StreamingMockModelProvider {
@@ -1154,6 +1188,50 @@ mod tests {
         );
 
         assert!(router.supports_streaming());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_system_routes_hint_to_correct_provider_and_model() {
+        let streaming = Arc::new(StreamingMockModelProvider::new("streamed system response"));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        let mut stream = router.stream_chat_with_system(
+            Some("system"),
+            "hello",
+            "hint:reasoning",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+
+        let mut collected = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream chunk should be ok");
+            collected.push_str(&chunk.delta);
+        }
+
+        assert_eq!(collected, "streamed system response");
+        assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
     }
 
     #[tokio::test]

@@ -5761,6 +5761,23 @@ fn find_channel_for_message<'a>(
         .and_then(|(base, _)| channels.get(base))
 }
 
+/// Active `<type>.<alias>` channel references from enabled agents.
+///
+/// An empty set means no enabled agent declared channel bindings, so
+/// collection falls back to legacy behavior and accepts all enabled channels.
+struct ActiveChannelAliases {
+    /// Set of `<type>.<alias>` channel references from enabled agents.
+    aliases: HashSet<String>,
+}
+
+impl ActiveChannelAliases {
+    /// Returns true when `channel_ref` is explicitly bound, or when there are
+    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    fn contains(&self, channel_ref: &str) -> bool {
+        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+    }
+}
+
 /// Build `channel_key → Arc<dyn Channel>` map from config.
 ///
 /// Constructs channel instances without starting listen loops.
@@ -5831,12 +5848,14 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases: std::collections::HashSet<String> = config
-        .agents
-        .values()
-        .filter(|a| a.enabled)
-        .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-        .collect();
+    let active_channel_aliases = ActiveChannelAliases {
+        aliases: config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect(),
+    };
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -7224,6 +7243,67 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn build_owner_by_channel_key(
+    config: &Config,
+    enabled_agents: &[String],
+    collected_channel_keys: &[String],
+) -> HashMap<String, String> {
+    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
+    // backward-compat with cron callers / singleton channels) → agent_alias.
+    // Built from each enabled agent's `agents.<alias>.channels` list — the
+    // schema treats this as the source of truth for channel ownership.
+    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
+    for alias_str in enabled_agents {
+        let Some(agent_cfg) = config.agents.get(alias_str) else {
+            debug_assert!(
+                false,
+                "enabled agent alias missing from config.agents: {}",
+                alias_str
+            );
+            continue;
+        };
+        for ch in &agent_cfg.channels {
+            let ch_str: &str = ch.as_ref();
+            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
+            if let Some((bare, _)) = ch_str.split_once('.') {
+                owner_by_channel_key
+                    .entry(bare.to_string())
+                    .or_insert_with(|| alias_str.clone());
+            }
+        }
+    }
+
+    // Legacy fallback mode: when no enabled agent declares channel bindings,
+    // channel collection accepts all enabled channels. Those channels must
+    // also be routable, so bind collected channel keys to the runtime-active
+    // agent selection (explicit `"default"` alias when present, else
+    // lexicographically-smallest enabled alias).
+    // `owner_by_channel_key.is_empty()` means every enabled agent had an
+    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
+    // signal used by `collect_configured_channels` to accept all enabled
+    // channel blocks.
+    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+        let fallback_owner = config
+            .resolved_runtime_agent_alias()
+            .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
+            .map(ToString::to_string)
+            .or_else(|| enabled_agents.first().cloned());
+
+        if let Some(owner_alias) = fallback_owner {
+            for channel_key in collected_channel_keys {
+                owner_by_channel_key.insert(channel_key.clone(), owner_alias.clone());
+                if let Some((bare, _)) = channel_key.split_once('.') {
+                    owner_by_channel_key
+                        .entry(bare.to_string())
+                        .or_insert_with(|| owner_alias.clone());
+                }
+            }
+        }
+    }
+
+    owner_by_channel_key
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -7332,6 +7412,7 @@ pub async fn start_channels(
     // Subsequent iterations reuse `channels_by_name_shared` to populate
     // their tool handles and to seed their `ChannelRuntimeContext`.
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
+    let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
@@ -7771,6 +7852,7 @@ pub async fn start_channels(
                 .iter()
                 .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
                 .collect();
+            collected_channel_keys = channel_labels.clone();
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
@@ -8032,25 +8114,8 @@ pub async fn start_channels(
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
-    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
-    // backward-compat with cron callers / singleton channels) → agent_alias.
-    // Built from each enabled agent's `agents.<alias>.channels` list — the
-    // schema treats this as the source of truth for channel ownership.
-    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
-    for (alias_str, agent_cfg) in &config.agents {
-        if !agent_cfg.enabled {
-            continue;
-        }
-        for ch in &agent_cfg.channels {
-            let ch_str: &str = ch.as_ref();
-            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
-            if let Some((bare, _)) = ch_str.split_once('.') {
-                owner_by_channel_key
-                    .entry(bare.to_string())
-                    .or_insert_with(|| alias_str.clone());
-            }
-        }
-    }
+    let owner_by_channel_key =
+        build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
 
     // Hydrate persisted session histories into the owning agent's
     // `conversation_histories` LRU. Sessions whose channel has no enabled
@@ -8813,6 +8878,64 @@ mod tests {
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
         assert!(Arc::ptr_eq(&resolved, &notion_agent_ctx));
+    }
+
+    #[test]
+    fn agent_router_multi_resolves_fallback_loaded_channel_to_legacy_agent() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        let enabled_agents = vec!["legacy".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        let legacy_ctx = router_test_ctx();
+        let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+        by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
+        let router = AgentRouter::multi(by_agent, owners);
+
+        let msg = channel_message("mattermost", Some("default"));
+        let resolved = router.resolve(&msg).expect("fallback owner resolves");
+        assert!(Arc::ptr_eq(&resolved, &legacy_ctx));
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "zeta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = vec!["alpha".to_string(), "zeta".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("mattermost.default").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
     }
 
     #[test]
@@ -14765,6 +14888,50 @@ This is an example JSON object for profile settings."#;
             channels
                 .iter()
                 .any(|entry| entry.channel.name() == "mattermost")
+        );
+    }
+
+    #[cfg(feature = "channel-mattermost")]
+    #[test]
+    fn collect_configured_channels_falls_back_when_agent_bindings_missing() {
+        let mut config = Config::default();
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                url: "https://mattermost.example.com".to_string(),
+                bot_token: Some("test-token".to_string()),
+                login_id: None,
+                password: None,
+                channel_ids: vec!["channel-1".to_string()],
+                team_ids: vec![],
+                discover_dms: None,
+                thread_replies: Some(true),
+                mention_only: Some(false),
+                interrupt_on_new_message: false,
+                proxy_url: None,
+                excluded_tools: vec![],
+                default_target: None,
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Mattermost"),
+            "enabled channels should still load when no enabled agent declares channel bindings"
         );
     }
 
