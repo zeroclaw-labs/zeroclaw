@@ -2,9 +2,7 @@ package zeroclaw:plugin@0.1.0;
 
 /// Plugin interface for a single callable tool exposed to the ZeroClaw agent loop.
 interface tool {
-    /// Semantic alias: a JSON-encoded string value.
-    /// Callers must produce valid JSON; receivers must parse it as JSON.
-    type json-string = string;
+    use types.{json-string};
 
     /// Result returned by a tool execution.
     record tool-result {
