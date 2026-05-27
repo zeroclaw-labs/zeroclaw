@@ -314,12 +314,16 @@ impl ContextCompressor {
             return Ok(false);
         }
 
+        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
+        let preserve_media_markers =
+            self.config.summary_model.is_none() && provider.supports_vision();
+
         // Build transcript from the middle section
         let middle = &history[start..end];
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            provider.supports_vision(),
+            preserve_media_markers,
         );
 
         if transcript.is_empty() {
@@ -327,7 +331,6 @@ impl ContextCompressor {
         }
 
         let message_count = end - start;
-        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
 
         let identifier_note = if self.config.identifier_policy == "strict" {
             "\nIMPORTANT: Preserve all identifiers exactly as they appear."
@@ -487,32 +490,36 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
+fn build_full_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
         let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
     }
-
-    if transcript.len() > max_chars {
-        truncate_chars(&transcript, max_chars)
-    } else {
-        transcript
-    }
+    transcript
 }
 
 fn build_summarizer_transcript(
     messages: &[ChatMessage],
     max_chars: usize,
-    supports_vision: bool,
+    preserve_media_markers: bool,
 ) -> String {
-    let transcript = build_transcript(messages, max_chars);
-    if supports_vision {
-        return transcript;
+    let transcript = build_full_transcript(messages);
+    if preserve_media_markers {
+        return truncate_owned_if_needed(transcript, max_chars);
     }
 
     let (cleaned, refs) = multimodal::parse_image_markers(&transcript);
-    if refs.is_empty() { transcript } else { cleaned }
+    let stripped = if refs.is_empty() { transcript } else { cleaned };
+    truncate_owned_if_needed(stripped, max_chars)
+}
+
+fn truncate_owned_if_needed(s: String, max: usize) -> String {
+    if s.len() > max {
+        truncate_chars(&s, max)
+    } else {
+        s
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -726,7 +733,7 @@ mod tests {
     #[test]
     fn test_build_transcript() {
         let messages = vec![msg("user", "hello"), msg("assistant", "hi there")];
-        let t = build_transcript(&messages, 10_000);
+        let t = build_full_transcript(&messages);
         assert!(t.contains("USER: hello"));
         assert!(t.contains("ASSISTANT: hi there"));
     }
@@ -734,7 +741,7 @@ mod tests {
     #[test]
     fn test_build_transcript_truncates() {
         let messages = vec![msg("user", &"x".repeat(1000))];
-        let t = build_transcript(&messages, 100);
+        let t = truncate_owned_if_needed(build_full_transcript(&messages), 100);
         assert!(t.len() <= 103); // 100 + "..."
     }
 
@@ -755,6 +762,29 @@ mod tests {
         let messages = vec![msg("user", "Describe this photo [IMAGE:/tmp/test.png]")];
         let transcript = build_summarizer_transcript(&messages, 10_000, true);
         assert!(transcript.contains("[IMAGE:/tmp/test.png]"));
+    }
+
+    #[test]
+    fn test_build_summarizer_transcript_strips_media_markers_before_truncation() {
+        let long_path = format!(
+            "/private/tmp/daemonclaw/signal_inbound/{}",
+            "nested-directory/".repeat(12)
+        );
+        let messages = vec![msg(
+            "user",
+            &format!("Please summarize [IMAGE:{long_path}photo.png] after text"),
+        )];
+
+        let transcript = build_summarizer_transcript(&messages, 64, false);
+
+        assert!(
+            !transcript.contains("[IMAGE:"),
+            "non-vision transcript should not retain a split image marker: {transcript}"
+        );
+        assert!(
+            !transcript.contains("/private/tmp"),
+            "non-vision transcript should not leak local path fragments: {transcript}"
+        );
     }
 
     #[test]
