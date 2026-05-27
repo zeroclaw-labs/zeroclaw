@@ -5710,6 +5710,10 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Private/internal hosts explicitly allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -5720,6 +5724,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            allowed_private_hosts: vec![],
         }
     }
 }
@@ -15742,6 +15747,24 @@ mod tests {
         assert_eq!(cfg.max_response_size, 1_000_000);
         assert!(cfg.enabled);
         assert_eq!(cfg.allowed_domains, vec!["*".to_string()]);
+        assert!(!cfg.allow_private_hosts);
+        assert!(cfg.allowed_private_hosts.is_empty());
+    }
+
+    #[test]
+    async fn http_request_config_deserializes_allowed_private_hosts() {
+        let c = parse_test_config(
+            r#"
+[http_request]
+allowed_domains = ["example.com"]
+allowed_private_hosts = ["localhost", "10.0.0.1"]
+"#,
+        );
+
+        assert_eq!(
+            c.http_request.allowed_private_hosts,
+            vec!["localhost".to_string(), "10.0.0.1".to_string()]
+        );
     }
 
     #[test]
