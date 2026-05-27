@@ -15214,35 +15214,31 @@ This is an example JSON object for profile settings."#;
     }
 
     #[tokio::test]
-    async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
-        let discord_calls = Arc::new(AtomicUsize::new(0));
+    async fn non_retryable_listener_error_does_not_stop_other_listener_health() {
+        let failing_calls = Arc::new(AtomicUsize::new(0));
         let healthy_calls = Arc::new(AtomicUsize::new(0));
-        let discord_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let failing_name = format!("discord-{}", uuid::Uuid::new_v4());
         let healthy_name = format!("test-supervised-sibling-{}", uuid::Uuid::new_v4());
-        let discord_component = format!("channel:{discord_name}");
+        let failing_component = format!("channel:{failing_name}");
         let healthy_component = format!("channel:{healthy_name}");
 
-        let discord_channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
-            name: discord_name,
-            calls: Arc::clone(&discord_calls),
-            err: Mutex::new(Some(anyhow::Error::new(
-                crate::discord::DiscordListenerFatalError::new(
-                    "discord gateway closed with fatal code 4014: disallowed intent(s)",
-                ),
-            ))),
+        let failing_channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: failing_name,
+            calls: Arc::clone(&failing_calls),
+            err: Mutex::new(Some(anyhow::Error::msg("401 Unauthorized"))),
         });
         let healthy_channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
             name: healthy_name,
             calls: Arc::clone(&healthy_calls),
         });
 
-        let (discord_tx, discord_rx) =
+        let (failing_tx, failing_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
         let (healthy_tx, healthy_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let discord_handle =
-            spawn_supervised_listener(discord_channel, None, discord_tx, 1, 1, cancel.clone());
+        let failing_handle =
+            spawn_supervised_listener(failing_channel, None, failing_tx, 1, 1, cancel.clone());
         let healthy_handle = spawn_supervised_listener_with_health_interval(
             healthy_channel,
             None,
@@ -15268,7 +15264,7 @@ This is an example JSON object for profile settings."#;
         tokio::time::sleep(Duration::from_millis(70)).await;
 
         let snapshot = zeroclaw_runtime::health::snapshot_json();
-        let discord = &snapshot["components"][&discord_component];
+        let failing = &snapshot["components"][&failing_component];
         let healthy = &snapshot["components"][&healthy_component];
         let second_last_ok = healthy["last_ok"].as_str().unwrap_or("").to_string();
         let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
@@ -15276,14 +15272,14 @@ This is an example JSON object for profile settings."#;
         let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
             .expect("healthy sibling last_ok should be valid RFC3339");
 
-        assert_eq!(discord_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(discord["status"], "error");
-        assert_eq!(discord["restart_count"].as_u64().unwrap_or(0), 0);
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing["status"], "error");
+        assert_eq!(failing["restart_count"].as_u64().unwrap_or(0), 0);
         assert!(
-            discord["last_error"]
+            failing["last_error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("fatal code 4014")
+                .contains("401 Unauthorized")
         );
         assert_eq!(healthy["status"], "ok");
         assert!(
@@ -15292,14 +15288,14 @@ This is an example JSON object for profile settings."#;
         );
         assert!(healthy_calls.load(Ordering::SeqCst) >= 1);
 
-        drop(discord_rx);
+        drop(failing_rx);
         drop(healthy_rx);
         cancel.cancel();
-        let discord_join = tokio::time::timeout(Duration::from_millis(500), discord_handle).await;
+        let failing_join = tokio::time::timeout(Duration::from_millis(500), failing_handle).await;
         let healthy_join = tokio::time::timeout(Duration::from_millis(500), healthy_handle).await;
         assert!(
-            discord_join.is_ok(),
-            "fatal discord listener should stop on cancel"
+            failing_join.is_ok(),
+            "non-retryable listener should stop on cancel"
         );
         assert!(
             healthy_join.is_ok(),
