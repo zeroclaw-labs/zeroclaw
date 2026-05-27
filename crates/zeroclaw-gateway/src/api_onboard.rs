@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+use zeroclaw_config::sections::Section;
 
 use super::AppState;
 use super::api::require_auth;
@@ -293,6 +294,21 @@ pub struct SectionsResponse {
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OnboardRepairItem {
+    /// Stable machine-readable reason. The web UI uses this for targeted
+    /// onboarding repair controls without parsing localized copy.
+    pub code: &'static str,
+    /// Human-readable repair instruction for the current non-localized UI.
+    pub message: String,
+    /// Onboarding section that contains the repair surface.
+    pub section: &'static str,
+    /// Optional config prefix the UI can open directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OnboardStatusResponse {
     /// `true` when no agent is dispatchable yet. The dashboard uses this
     /// signal to redirect first-load visits from `/` to `/onboard`.
@@ -308,6 +324,9 @@ pub struct OnboardStatusResponse {
     /// Human-readable readiness failures. When onboarding cannot finish, the
     /// UI shows these directly so the operator knows exactly what is missing.
     pub missing: Vec<String>,
+    /// Structured repair checklist for half-configured installs. Mirrors
+    /// `missing` but keeps stable codes and targets for UI routing.
+    pub repair_items: Vec<OnboardRepairItem>,
 }
 
 /// Pure derivation of the onboard-status response from a config snapshot.
@@ -318,8 +337,12 @@ pub struct OnboardStatusResponse {
 /// that state.
 #[must_use]
 pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResponse {
-    let missing = onboard_missing_requirements(cfg);
-    let ready = missing.is_empty();
+    let repair_items = onboard_repair_items(cfg);
+    let missing: Vec<String> = repair_items
+        .iter()
+        .map(|item| item.message.clone())
+        .collect();
+    let ready = repair_items.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
         || cfg.providers.models.iter_entries().next().is_some()
         || !cfg.risk_profiles.is_empty()
@@ -337,87 +360,201 @@ pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardSt
         reason,
         has_partial_state,
         missing,
+        repair_items,
     }
 }
 
-fn onboard_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
-    let mut missing = Vec::new();
+fn onboard_repair_items(cfg: &zeroclaw_config::schema::Config) -> Vec<OnboardRepairItem> {
+    let mut items = Vec::new();
     if cfg.providers.models.iter_entries().next().is_none() {
-        missing.push("Add a model provider.".to_string());
+        items.push(repair_item(
+            "model_provider_missing",
+            "Add a model provider.",
+            Section::ModelProviders,
+            None,
+        ));
     }
     if cfg.agents.is_empty() {
-        missing.push("Create an agent.".to_string());
-        return missing;
+        items.push(repair_item(
+            "agent_missing",
+            "Create an agent.",
+            Section::Agents,
+            None,
+        ));
+        return items;
     }
 
     let mut agent_aliases: Vec<&String> = cfg.agents.keys().collect();
     agent_aliases.sort();
-    let mut has_dispatchable_agent = false;
+    if agent_aliases
+        .iter()
+        .any(|alias| onboard_agent_is_dispatchable(cfg, alias, &cfg.agents[*alias]))
+    {
+        return Vec::new();
+    }
     for alias in agent_aliases {
-        let agent_missing = onboard_agent_missing_requirements(cfg, alias, &cfg.agents[alias]);
-        if agent_missing.is_empty() {
-            has_dispatchable_agent = true;
-            break;
-        }
-        missing.extend(agent_missing);
+        items.extend(onboard_agent_repair_items(cfg, alias, &cfg.agents[alias]));
     }
-    if has_dispatchable_agent {
-        missing.clear();
-    }
-    missing
+    items
 }
 
-fn onboard_agent_missing_requirements(
+fn onboard_agent_repair_items(
     cfg: &zeroclaw_config::schema::Config,
     alias: &str,
     agent: &zeroclaw_config::schema::AliasedAgentConfig,
-) -> Vec<String> {
-    let mut missing = Vec::new();
+) -> Vec<OnboardRepairItem> {
+    let agent_focus = Some(format!("agents.{alias}"));
+    let mut items = Vec::new();
     if !agent.enabled {
-        missing.push(format!("Enable agent `{alias}`."));
+        items.push(repair_item(
+            "agent_disabled",
+            format!("Enable agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
     }
 
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
-        missing.push(format!("Set a model provider for agent `{alias}`."));
-    } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
+        items.push(repair_item(
+            "agent_model_provider_missing",
+            format!("Set a model provider for agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
+    } else if let Some((family, provider_alias, provider)) =
+        cfg.resolved_model_provider_for_agent(alias)
+    {
         let has_model = provider
             .model
             .as_deref()
             .map(str::trim)
             .is_some_and(|m| !m.is_empty());
+        let provider_focus = model_provider_focus(family, provider_alias);
         if !has_model {
-            missing.push(format!("Choose a model for model provider `{model_ref}`."));
+            items.push(repair_item(
+                "model_provider_model_missing",
+                format!("Choose a model for model provider `{model_ref}`."),
+                Section::ModelProviders,
+                provider_focus,
+            ));
         } else if !model_provider_alias_usable(provider, model_provider_family_is_local(family)) {
-            missing.push(format!(
-                "Set credential/auth for model provider `{model_ref}`."
+            items.push(repair_item(
+                "model_provider_auth_missing",
+                format!("Set credential/auth for model provider `{model_ref}`."),
+                Section::ModelProviders,
+                provider_focus,
             ));
         }
     } else {
-        missing.push(format!(
-            "Fix agent `{alias}` model provider `{model_ref}`; it does not resolve to a configured provider."
+        items.push(repair_item(
+            "agent_model_provider_unresolved",
+            format!(
+                "Fix agent `{alias}` model provider `{model_ref}`; it does not resolve to a configured provider."
+            ),
+            Section::Agents,
+            agent_focus.clone(),
         ));
     }
 
     let risk_ref = agent.risk_profile.trim();
     if risk_ref.is_empty() {
-        missing.push(format!("Set a risk profile for agent `{alias}`."));
+        items.push(repair_item(
+            "agent_risk_profile_missing",
+            format!("Set a risk profile for agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
     } else if !cfg.risk_profiles.contains_key(risk_ref) {
-        missing.push(format!(
-            "Fix agent `{alias}` risk profile `{risk_ref}`; it does not resolve to a configured profile."
+        items.push(repair_item(
+            "agent_risk_profile_unresolved",
+            format!(
+                "Fix agent `{alias}` risk profile `{risk_ref}`; it does not resolve to a configured profile."
+            ),
+            Section::Agents,
+            agent_focus.clone(),
         ));
     }
 
     let runtime_ref = agent.runtime_profile.trim();
     if runtime_ref.is_empty() {
-        missing.push(format!("Set a runtime profile for agent `{alias}`."));
+        items.push(repair_item(
+            "agent_runtime_profile_missing",
+            format!("Set a runtime profile for agent `{alias}`."),
+            Section::Agents,
+            agent_focus,
+        ));
     } else if !cfg.runtime_profiles.contains_key(runtime_ref) {
-        missing.push(format!(
-            "Fix agent `{alias}` runtime profile `{runtime_ref}`; it does not resolve to a configured profile."
+        items.push(repair_item(
+            "agent_runtime_profile_unresolved",
+            format!(
+                "Fix agent `{alias}` runtime profile `{runtime_ref}`; it does not resolve to a configured profile."
+            ),
+            Section::Agents,
+            agent_focus,
         ));
     }
 
-    missing
+    items
+}
+
+fn repair_item(
+    code: &'static str,
+    message: impl Into<String>,
+    section: Section,
+    focus: Option<String>,
+) -> OnboardRepairItem {
+    OnboardRepairItem {
+        code,
+        message: message.into(),
+        section: section.as_str(),
+        focus,
+    }
+}
+
+fn model_provider_focus(family: &str, alias: &str) -> Option<String> {
+    if alias.trim().is_empty() {
+        return None;
+    }
+    let section = Section::ModelProviders;
+    let config_family = typed_family_config_key(section, family);
+    let section_key = section.as_str();
+    Some(format!("{section_key}.{config_family}.{alias}"))
+}
+
+fn onboard_agent_is_dispatchable(
+    cfg: &zeroclaw_config::schema::Config,
+    alias: &str,
+    agent: &zeroclaw_config::schema::AliasedAgentConfig,
+) -> bool {
+    if !agent.enabled {
+        return false;
+    }
+    let model_ref = agent.model_provider.trim();
+    if model_ref.is_empty() {
+        return false;
+    }
+    let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) else {
+        return false;
+    };
+    let has_model = provider
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|m| !m.is_empty());
+    if !has_model || !model_provider_alias_usable(provider, model_provider_family_is_local(family))
+    {
+        return false;
+    }
+    let risk_ref = agent.risk_profile.trim();
+    if risk_ref.is_empty() || !cfg.risk_profiles.contains_key(risk_ref) {
+        return false;
+    }
+    let runtime_ref = agent.runtime_profile.trim();
+    if runtime_ref.is_empty() || !cfg.runtime_profiles.contains_key(runtime_ref) {
+        return false;
+    }
+    true
 }
 
 /// `GET /api/onboard/status` — boolean signal for the dashboard's
@@ -669,7 +806,7 @@ fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_mar
         Some(Section::Agents) => cfg
             .agents
             .iter()
-            .any(|(alias, agent)| onboard_agent_missing_requirements(cfg, alias, agent).is_empty()),
+            .any(|(alias, agent)| onboard_agent_is_dispatchable(cfg, alias, agent)),
         _ => completed_marker,
     }
 }
@@ -1699,6 +1836,50 @@ mod tests {
             "completed_sections marker without a dispatchable agent must NOT flip the redirect"
         );
         assert_eq!(resp.reason, "incomplete_agent");
+    }
+
+    #[test]
+    fn derive_onboard_status_returns_structured_repair_items_for_half_configured_agent() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.atomic-chat", "local")
+            .unwrap();
+        cfg.create_map_key("risk-profiles", "default").unwrap();
+        cfg.create_map_key("agents", "default").unwrap();
+        let agent = cfg.agents.get_mut("default").unwrap();
+        agent.enabled = true;
+        agent.model_provider = "atomic_chat.local".into();
+        agent.risk_profile = "default".into();
+
+        let resp = derive_onboard_status(&cfg);
+
+        assert!(resp.needs_onboarding);
+        assert_eq!(resp.reason, "incomplete_agent");
+        let provider_item = resp
+            .repair_items
+            .iter()
+            .find(|item| item.code == "model_provider_model_missing")
+            .expect("model repair item");
+        assert_eq!(provider_item.section, "providers.models");
+        assert_eq!(
+            provider_item.focus.as_deref(),
+            Some("providers.models.atomic-chat.local")
+        );
+        assert_eq!(
+            provider_item.message,
+            "Choose a model for model provider `atomic_chat.local`."
+        );
+        let runtime_item = resp
+            .repair_items
+            .iter()
+            .find(|item| item.code == "agent_runtime_profile_missing")
+            .expect("runtime repair item");
+        assert_eq!(runtime_item.section, "agents");
+        assert_eq!(runtime_item.focus.as_deref(), Some("agents.default"));
+        assert!(
+            resp.missing
+                .iter()
+                .any(|item| item == "Set a runtime profile for agent `default`.")
+        );
     }
 
     #[test]

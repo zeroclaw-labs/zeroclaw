@@ -31,6 +31,7 @@ import {
   patchConfig,
   reloadDaemon,
   selectSectionItem,
+  type OnboardRepairItem,
   type PickerItem,
   type SectionInfo,
 } from '../../lib/api';
@@ -74,6 +75,7 @@ export default function Onboard() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [canFinish, setCanFinish] = useState(false);
   const [finishIssues, setFinishIssues] = useState<string[] | null>(null);
+  const [repairItems, setRepairItems] = useState<OnboardRepairItem[]>([]);
   const [issueTitle, setIssueTitle] = useState('Complete this step before continuing.');
   const [applyIssue, setApplyIssue] = useState<string | null>(null);
   const [editingProfile, setEditingProfile] = useState(false);
@@ -91,6 +93,7 @@ export default function Onboard() {
       const status = await getOnboardStatus();
       const readyToFinish = !status.needs_onboarding && firstRunRequiredSectionsReady(onboardingSections);
       setCanFinish(readyToFinish);
+      setRepairItems(status.repair_items ?? []);
       if (readyToFinish) setFinishIssues(null);
       const agents = await getMapKeys('agents').catch(() => null);
       const onlyAgent = agents?.keys.length === 1 ? agents.keys[0] : null;
@@ -376,6 +379,7 @@ export default function Onboard() {
       const readyToFinish =
         !status.needs_onboarding && wizardIssues.length === 0 && providerIssues.length === 0;
       setCanFinish(readyToFinish);
+      setRepairItems(status.repair_items ?? []);
       if (!readyToFinish) {
         setIssueTitle('Finish needs a runnable agent first.');
         setFinishIssues(
@@ -400,6 +404,47 @@ export default function Onboard() {
     } finally {
       setFinishing(false);
     }
+  };
+
+  const openRepairItem = (item: OnboardRepairItem) => {
+    setFinishIssues(null);
+    setApplyIssue(null);
+    setPickedType(null);
+    setEditingProfile(false);
+    setActiveKey(item.section);
+
+    const focus = item.focus ?? '';
+    const parts = focus.split('.');
+    if (item.section === 'agents' && parts[0] === 'agents' && parts[1]) {
+      setSelectedAgentAlias(parts[1]);
+      setPicked({
+        item: { key: parts[1], label: parts[1] },
+        fieldsPrefix: focus,
+      });
+      return;
+    }
+
+    if (item.section === 'providers.models' && parts[0] === 'providers' && parts[1] === 'models') {
+      const providerType = parts[2];
+      const providerAlias = parts[3];
+      if (providerType && providerAlias) {
+        setPicked({
+          item: { key: providerType, label: providerType },
+          fieldsPrefix: focus,
+        });
+        return;
+      }
+    }
+
+    if ((item.section === 'risk-profiles' || item.section === 'runtime-profiles') && parts[1]) {
+      setPicked({
+        item: { key: parts[1], label: parts[1] },
+        fieldsPrefix: focus,
+      });
+      return;
+    }
+
+    setPicked(null);
   };
 
   if (loading) {
@@ -612,7 +657,9 @@ export default function Onboard() {
                 <FirstRunCompleteActions
                   canFinish={canFinish}
                   finishing={finishing}
+                  repairItems={repairItems}
                   onFinish={() => void finishOnboarding()}
+                  onOpenRepairItem={openRepairItem}
                   onAdvanced={() => {
                     setShowAdvanced(true);
                     if (advancedSections[0]) goToSection(advancedSections[0].key);
@@ -1010,12 +1057,16 @@ function isAgentFirstRunPath(prefix: string, path: string): boolean {
 function FirstRunCompleteActions({
   canFinish,
   finishing,
+  repairItems,
   onFinish,
+  onOpenRepairItem,
   onAdvanced,
 }: {
   canFinish: boolean;
   finishing: boolean;
+  repairItems: OnboardRepairItem[];
   onFinish: () => void;
+  onOpenRepairItem: (item: OnboardRepairItem) => void;
   onAdvanced: () => void;
 }) {
   return (
@@ -1060,7 +1111,48 @@ function FirstRunCompleteActions({
           Continue advanced setup
         </button>
       </div>
+      {!canFinish && repairItems.length > 0 && (
+        <RepairChecklist items={repairItems} onOpen={onOpenRepairItem} />
+      )}
     </div>
+  );
+}
+
+function RepairChecklist({
+  items,
+  onOpen,
+}: {
+  items: OnboardRepairItem[];
+  onOpen: (item: OnboardRepairItem) => void;
+}) {
+  return (
+    <ul className="flex flex-col gap-2">
+      {items.map((item) => (
+        <li
+          key={`${item.code}:${item.focus ?? item.section}:${item.message}`}
+          className="rounded-lg border px-3 py-2 flex items-center justify-between gap-3"
+          style={{
+            borderColor: 'var(--pc-border)',
+            background: 'var(--pc-bg-surface)',
+          }}
+        >
+          <div className="min-w-0">
+            <p style={{ color: 'var(--pc-text-primary)' }}>{item.message}</p>
+            <code className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+              {item.focus ?? item.section}
+            </code>
+          </div>
+          <button
+            type="button"
+            onClick={() => onOpen(item)}
+            className="btn-secondary text-xs px-2.5 py-1.5 inline-flex items-center gap-1 flex-shrink-0"
+          >
+            Fix
+            <ChevronRight className="h-3 w-3" />
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 

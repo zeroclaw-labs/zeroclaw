@@ -174,34 +174,22 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
 }
 
 /// Set of TOML terminal key names whose string leaves are treated as
-/// secrets by [`encrypt_secret_strings`]. Derived once from the typed
-/// schema by migrating the comprehensive V1 fixture and collecting the
-/// terminal segment of every `prop_fields()` entry with `is_secret =
-/// true`. The set is schema-driven — adding a new `#[secret]`
-/// annotation anywhere in the schema automatically extends encryption
-/// coverage with no companion edit in this module.
+/// secrets by [`encrypt_secret_strings`]. Sourced from
+/// `Config::secret_field_terminals()`, the macro-emitted static
+/// enumeration of every `#[secret]` field reachable from the schema.
+/// The set is schema-driven — adding a new `#[secret]` annotation
+/// anywhere in the schema automatically extends encryption coverage
+/// with no companion edit in this module.
+///
+/// `secret_field_terminals()` (vs. the older `prop_fields().filter(is_secret)`
+/// approach) covers compound shapes like `HashMap<String, String>`
+/// — `prop_fields()` intentionally skips non-Vec compound types, which
+/// would silently drop e.g. `mcp.servers[*].headers` from the allowlist.
 fn secret_key_names() -> &'static std::collections::HashSet<&'static str> {
     use std::collections::HashSet;
     use std::sync::OnceLock;
     static CACHE: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let cfg = migrate_to_current(V1_FIXTURE)
-            .expect("V1 fixture migrates cleanly — this is also asserted in tests");
-        cfg.prop_fields()
-            .into_iter()
-            .filter(|f| f.is_secret)
-            .filter_map(|f| {
-                // The macro emits names in kebab form
-                // (`channels.matrix.access-token`); TOML keys at
-                // runtime use the raw field ident (snake). Take the
-                // terminal segment, snake-ify, then leak to satisfy
-                // the &'static str lifetime needed by the cached set.
-                let terminal = f.name.rsplit('.').next()?.to_string();
-                let snake = terminal.replace('-', "_");
-                Some(Box::leak(snake.into_boxed_str()) as &'static str)
-            })
-            .collect()
-    })
+    CACHE.get_or_init(|| Config::secret_field_terminals().into_iter().collect())
 }
 
 /// Walk a TOML tree and encrypt every string leaf whose terminal key
@@ -251,6 +239,13 @@ fn encrypt_walk(
 /// a table containing strings — using the given store. Non-string leaves
 /// (numbers, bools) are left alone; the operator presumably annotated a
 /// non-secret field with a secret-shaped name and we don't second-guess.
+///
+/// When the slot is a Table (e.g. `headers = { Authorization = "Bearer
+/// ...", X-Tenant = "..." }`), every leaf in the subtree is encrypted —
+/// the parent key matched the secret allowlist, so every value below it
+/// inherits the secret marker. This is the contract for `HashMap<String,
+/// String>`-shaped `#[secret]` fields where individual keys are
+/// user-supplied and can't be checked against a static allowlist.
 fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore) -> Result<()> {
     match value {
         toml::Value::String(s)
@@ -265,9 +260,8 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
             }
         }
         toml::Value::Table(table) => {
-            let names = secret_key_names();
             for (_, child) in table.iter_mut() {
-                encrypt_walk(child, store, names)?;
+                encrypt_in_place(child, store)?;
             }
         }
         _ => {}
