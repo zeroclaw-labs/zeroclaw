@@ -1,0 +1,280 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Plugin interface for a memory persistence backend.
+interface memory {
+    // ── Types ─────────────────────────────────────────────────────────────────
+
+    /// Classification of a memory entry.
+    variant memory-category {
+        /// Long-term facts, preferences, decisions.
+        core,
+        /// Daily session logs.
+        daily,
+        /// Conversation context.
+        conversation,
+        /// User-defined category; the string value is the category name.
+        custom(string),
+    }
+
+    /// A single stored memory entry.
+    record memory-entry {
+        id: string,
+        key: string,
+        content: string,
+        category: memory-category,
+        /// RFC 3339 creation timestamp.
+        timestamp: string,
+        session-id: option<string>,
+        /// Retrieval relevance score (0.0–1.0); absent for non-vector recall.
+        score: option<f64>,
+        /// Namespace for isolation between agents or contexts.
+        namespace: string,
+        /// Importance weight (0.0–1.0) for prioritized retrieval.
+        importance: option<f64>,
+        /// ID of the entry that superseded this one, if any.
+        superseded-by: option<string>,
+        /// Human-readable agent alias (e.g. `"clamps"`). Use for display/routing.
+        agent-alias: option<string>,
+        /// Raw storage-layer agent identifier. Use for scope equality checks.
+        agent-id: option<string>,
+    }
+
+    /// Filter criteria for bulk export (GDPR Art. 20 data portability).
+    record export-filter {
+        namespace: option<string>,
+        session-id: option<string>,
+        category: option<memory-category>,
+        /// RFC 3339 lower bound (inclusive) on `timestamp`.
+        since: option<string>,
+        /// RFC 3339 upper bound (inclusive) on `timestamp`.
+        until: option<string>,
+    }
+
+    /// A single message in a conversation trace for procedural memory.
+    record procedural-message {
+        role: string,
+        content: string,
+        name: option<string>,
+    }
+
+    /// Agent scope selector for `recall-for-agents`.
+    ///
+    /// The runtime maps the Rust `&[&str]` slice as follows:
+    ///   empty slice  →  `all`   (no agent filter; return entries for every agent)
+    ///   non-empty    →  `some`  (restrict to the listed agent IDs)
+    variant agent-filter {
+        /// Return entries regardless of agent attribution.
+        all,
+        /// Return only entries whose `agent-id` matches one of the listed IDs.
+        some(list<string>),
+    }
+
+    /// Bitmask of optional capabilities this plugin implements.
+    ///
+    /// The runtime calls `get-memory-capabilities` once at load time. For each
+    /// unset flag it uses the Rust trait default instead of calling the plugin:
+    ///   `get-for-agent`           → host composes `get` + agent-id equality filter
+    ///   `purge-namespace` /
+    ///   `purge-session` /
+    ///   `purge-session-for-agent` /
+    ///   `purge-agent`             → host returns "not supported"
+    ///   `reindex`                 → host returns 0
+    ///   `store-procedural`        → host no-ops
+    ///   `ensure-agent-uuid`       → host echoes the alias unchanged
+    ///   `recall-namespaced`       → host calls `recall` and post-filters by namespace
+    ///   `export-entries`          → host calls `list-entries` and post-filters
+    ///   `store-with-metadata`     → host delegates to `store` (drops namespace/importance)
+    ///
+    /// All corresponding functions must still be exported by the plugin
+    /// (stub implementations are sufficient); the runtime simply never calls
+    /// them when the flag is absent.
+    flags memory-capabilities {
+        get-for-agent,
+        purge-namespace,
+        purge-session,
+        purge-session-for-agent,
+        purge-agent,
+        reindex,
+        store-procedural,
+        ensure-agent-uuid,
+        recall-namespaced,
+        export-entries,
+        store-with-metadata,
+    }
+
+    // ── Required methods ──────────────────────────────────────────────────────
+
+    /// Backend name.
+    name: func() -> string;
+
+    /// Return the set of optional capabilities this plugin implements.
+    /// Called once by the runtime at plugin load time.
+    get-memory-capabilities: func() -> memory-capabilities;
+
+    /// Store a memory entry, optionally scoped to a session.
+    store: func(
+        key: string,
+        content: string,
+        category: memory-category,
+        session-id: option<string>,
+    ) -> result<_, string>;
+
+    /// Recall memories matching a query, optionally scoped to a session and
+    /// time range.
+    ///
+    /// An empty or bare-`*` `query` value returns the most recent entries
+    /// (time-only recall). Time bounds are RFC 3339 strings, inclusive.
+    recall: func(
+        query: string,
+        limit: u64,
+        session-id: option<string>,
+        since: option<string>,
+        until: option<string>,
+    ) -> result<list<memory-entry>, string>;
+
+    /// Get a specific memory entry by key. Returns `none` if not found.
+    ///
+    /// When multiple rows share a key (one per agent), an arbitrary matching
+    /// row is returned; use `get-for-agent` for an agent-scoped lookup.
+    get: func(key: string) -> result<option<memory-entry>, string>;
+
+    /// List all memory entries, optionally filtered by category and/or session.
+    ///
+    /// The name of this function in the trait is `list` but that is a reserved
+    /// keyword in wit.
+    list-entries: func(
+        category: option<memory-category>,
+        session-id: option<string>,
+    ) -> result<list<memory-entry>, string>;
+
+    /// Remove all rows matching `key`, regardless of agent attribution.
+    /// Returns `true` if at least one row was deleted.
+    forget: func(key: string) -> result<bool, string>;
+
+    /// Remove the row matching `(key, agent-id)`. Sibling rows for other agents
+    /// are untouched. Returns `true` if a row was deleted.
+    forget-for-agent: func(key: string, agent-id: string) -> result<bool, string>;
+
+    /// Count total stored memory entries.
+    count: func() -> result<u64, string>;
+
+    /// Return `true` if the backend is reachable and operational.
+    health-check: func() -> bool;
+
+    /// Store a memory entry with full metadata and explicit agent attribution.
+    store-with-agent: func(
+        key: string,
+        content: string,
+        category: memory-category,
+        session-id: option<string>,
+        namespace: option<string>,
+        importance: option<f64>,
+        agent-id: option<string>,
+    ) -> result<_, string>;
+
+    /// Recall entries scoped to the agent set described by `agents`.
+    /// See `agent-filter` for how the runtime maps the Rust `&[&str]` slice.
+    recall-for-agents: func(
+        agents: agent-filter,
+        query: string,
+        limit: u64,
+        session-id: option<string>,
+        since: option<string>,
+        until: option<string>,
+    ) -> result<list<memory-entry>, string>;
+
+    // ── Capability-gated methods ──────────────────────────────────────────────
+    // The runtime only calls these when the corresponding flag is set in the
+    // value returned by `get-memory-capabilities`. Export a stub returning the
+    // Rust trait default value for any capability you do not implement.
+
+    /// Get the memory row matching `(key, agent-id)`. Siblings for other agents
+    /// are invisible.
+    /// Stub: return `err("not-supported")`.
+    get-for-agent: func(key: string, agent-id: string) -> result<option<memory-entry>, string>;
+
+    /// Remove all entries whose `namespace` field equals `namespace`.
+    /// Returns the number of deleted entries.
+    /// Stub: return `err("not-supported")`.
+    purge-namespace: func(namespace: string) -> result<u64, string>;
+
+    /// Remove all entries in a session.
+    /// Returns the number of deleted entries.
+    /// Stub: return `err("not-supported")`.
+    purge-session: func(session-id: string) -> result<u64, string>;
+
+    /// Remove all entries in a session for one agent.
+    /// Returns the number of deleted entries.
+    /// Stub: return `err("not-supported")`.
+    purge-session-for-agent: func(session-id: string, agent-id: string) -> result<u64, string>;
+
+    /// Remove every entry attributed to `agent-alias`.
+    /// Returns the number of deleted entries.
+    /// Stub: return `err("not-supported")`.
+    purge-agent: func(agent-alias: string) -> result<u64, string>;
+
+    /// Rebuild indexes (FTS tables, embedding vectors).
+    /// Returns the number of entries re-processed.
+    /// Stub: return `ok(0)`.
+    reindex: func() -> result<u64, string>;
+
+    /// Store a conversation trace as procedural memory.
+    /// Stub: return `ok(())` (no-op).
+    store-procedural: func(
+        messages: list<procedural-message>,
+        session-id: option<string>,
+    ) -> result<_, string>;
+
+    /// Look up or create the backend identifier for `alias`.
+    ///
+    /// SQL backends return a UUID, inserting a row if absent.
+    /// Non-SQL backends echo `alias` unchanged.
+    /// Stub: return `ok(alias)`.
+    ensure-agent-uuid: func(alias: string) -> result<string, string>;
+
+    /// Recall memories scoped to a specific namespace.
+    ///
+    /// Backends with native namespace support should override for efficiency.
+    /// Stub: return `err("not-supported")`.
+    recall-namespaced: func(
+        namespace: string,
+        query: string,
+        limit: u64,
+        session-id: option<string>,
+        since: option<string>,
+        until: option<string>,
+    ) -> result<list<memory-entry>, string>;
+
+    /// Bulk-export memories matching the given filter criteria.
+    ///
+    /// Intended for GDPR Art. 20 data portability. Returns entries ordered by
+    /// creation time ascending; embeddings are excluded.
+    /// Backends with native query support should override for efficiency.
+    /// Stub: return `err("not-supported")`.
+    ///
+    /// The name of this function in the trait is `export` but that is a reserved
+    /// keyword in wit.
+    export-entries: func(filter: export-filter) -> result<list<memory-entry>, string>;
+
+    /// Store a memory entry with namespace and importance metadata.
+    ///
+    /// Backends with native namespace/importance support should override.
+    /// Stub: return `err("not-supported")`.
+    store-with-metadata: func(
+        key: string,
+        content: string,
+        category: memory-category,
+        session-id: option<string>,
+        namespace: option<string>,
+        importance: option<f64>,
+    ) -> result<_, string>;
+}
+
+/// A component that exports `memory` is a memory-backend plugin.
+///
+/// The runtime calls `get-memory-capabilities` once at load time to determine
+/// which optional methods are live. The default trait implementation is used
+/// for optional methods which are not enabled.
+world memory-plugin {
+    export memory;
+}
