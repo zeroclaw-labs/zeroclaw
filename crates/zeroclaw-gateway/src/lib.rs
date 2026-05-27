@@ -502,7 +502,8 @@ pub async fn run_gateway(
     let fallback = boot_entry;
     let model_provider_name = boot_family.as_str();
     let model_provider: Arc<dyn ModelProvider> = Arc::from(
-        zeroclaw_providers::create_resilient_model_provider_with_options(
+        zeroclaw_providers::create_resilient_model_provider_from_ref(
+            &config,
             model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),

@@ -948,6 +948,7 @@ impl Agent {
             ),
         };
 
+        let provider_ref = format!("{provider_name}.{provider_alias}");
         let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
             config,
             provider_name,
@@ -957,7 +958,7 @@ impl Agent {
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 config,
-                provider_name,
+                &provider_ref,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
                 agent_model_provider.and_then(|e| e.uri.as_deref()),
                 &config.reliability,
@@ -3431,6 +3432,57 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn from_config_accepts_openai_alias_with_requires_openai_auth() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig, WireApi,
+        };
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5.4".to_string()),
+                    requires_openai_auth: true,
+                    wire_api: Some(WireApi::Responses),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                risk_profile: "test-profile".to_string(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let result = Agent::from_config(&config, "test-agent").await;
+
+        assert!(
+            result.is_ok(),
+            "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
+            result.err().unwrap()
+        );
     }
 
     #[test]
