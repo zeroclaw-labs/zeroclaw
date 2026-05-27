@@ -55,6 +55,9 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     // 8. Version sanity
     results.push(check_version());
 
+    // 9. gateway.web_dist_dir is a literal path (no shell-style expansion)
+    results.push(check_web_dist_dir(config));
+
     Ok(results)
 }
 
@@ -245,6 +248,41 @@ fn check_version() -> CheckResult {
     CheckResult::pass("version", format!("v{version}"))
 }
 
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw self-test`
+/// time instead of at runtime.
+fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
+    match config.gateway.web_dist_dir.as_deref() {
+        None => CheckResult::pass("web_dist_dir", "not set (using auto-detect)"),
+        Some(value) => match web_dist_dir_expansion_issue(value) {
+            None => CheckResult::pass("web_dist_dir", format!("{value} (literal path)")),
+            Some(reason) => CheckResult::fail(
+                "web_dist_dir",
+                format!(
+                    "WARNING: {value} — {reason}; gateway.web_dist_dir is read \
+                     verbatim, so expand the value yourself (e.g. an absolute path)"
+                ),
+            ),
+        },
+    }
+}
+
+/// Return a human-readable explanation when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_issue(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("starts with `~` which is not expanded")
+    } else if value.contains('$') {
+        Some("contains `$` which is not expanded")
+    } else {
+        None
+    }
+}
+
 /// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
 /// loopback target so the probe can actually connect — and report the
 /// configured value alongside so the user isn't confused about why the
@@ -353,7 +391,25 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host};
+    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_issue};
+
+    #[test]
+    fn web_dist_dir_with_tilde_is_flagged() {
+        // Issue #6079: `~/web-dist` is read verbatim and silently fails.
+        assert!(web_dist_dir_expansion_issue("~/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("~").is_some());
+    }
+
+    #[test]
+    fn web_dist_dir_with_env_var_is_flagged() {
+        // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        assert!(web_dist_dir_expansion_issue("$HOME/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("${HOME}/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("/srv/$USER/dist").is_some());
+        // Absolute and relative literal paths must NOT be flagged.
+        assert!(web_dist_dir_expansion_issue("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_issue("./dist").is_none());
+    }
 
     #[test]
     fn resolve_probe_host_ipv4_wildcard() {
