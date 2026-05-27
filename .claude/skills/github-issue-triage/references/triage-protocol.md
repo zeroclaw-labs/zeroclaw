@@ -27,9 +27,10 @@ gh label create "status:stale"       --color "E4E669" --repo zeroclaw-labs/zeroc
 gh label create "status:accepted"    --color "0E8A16" --repo zeroclaw-labs/zeroclaw
 gh label create "status:blocked"     --color "B60205" --repo zeroclaw-labs/zeroclaw
 gh label create "status:no-stale"    --color "0E8A16" --repo zeroclaw-labs/zeroclaw
-gh label create "status:wont-do"     --color "B60205" --repo zeroclaw-labs/zeroclaw
 gh label create "status:in-progress" --color "0075CA" --repo zeroclaw-labs/zeroclaw
+gh label create "wontfix"            --color "B60205" --repo zeroclaw-labs/zeroclaw
 gh label create "duplicate"          --color "CFD3D7" --repo zeroclaw-labs/zeroclaw
+gh label create "invalid"            --color "CFD3D7" --repo zeroclaw-labs/zeroclaw
 ```
 
 Only create labels that are actually needed in the current run.
@@ -400,7 +401,6 @@ Derived from RFC #5577 and current maintainer label policy. Apply these consiste
 - `type:rfc` — architectural proposal issue
 - `r:needs-repro` — bug report missing reproduction evidence
 - `r:support` — usage/configuration question, not a bug
-- `duplicate` — applied to the issue being closed in favour of a primary
 
 ### Priority (apply when determinable)
 
@@ -423,8 +423,13 @@ For issues, risk labels estimate likely fix blast radius from the report. Reasse
 - `status:accepted` — RFC or work item accepted by the team; not stale-exempt by itself
 - `status:blocked` — waiting on external blocker; exempt from stale while the blocker is recorded and unresolved
 - `status:in-progress` — linked open PR exists; verify live PR state before stale decisions
-- `status:wont-do` — architectural won't-fix; permanent decision, not a deferral
 - `status:no-stale` — explicitly exempt from stale automation for accepted or otherwise long-lived work that is not already protected by another exclusion; maintainer-applied with a recorded reason
+
+### Resolution
+
+- `wontfix` — valid request or report the project is explicitly choosing not to pursue; leave a rationale
+- `invalid` — not actionable as a bug, feature request, support item, RFC, or tracked project work
+- `duplicate` — applied to the issue being closed in favour of a primary
 
 ### Module labels (apply when issue is scoped to a specific subsystem)
 

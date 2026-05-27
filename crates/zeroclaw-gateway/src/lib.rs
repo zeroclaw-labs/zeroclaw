@@ -526,14 +526,24 @@ pub async fn run_gateway(
     let display_addr = format!("{host}:{actual_port}");
 
     let fallback = config.first_model_provider();
-    let model_provider_name = config.first_model_provider_type().unwrap_or("openrouter");
+    let model_provider_name = config
+        .first_model_provider_alias()
+        .unwrap_or_else(|| "openrouter".to_string());
+    let provider_runtime_options_base =
+        zeroclaw_providers::provider_runtime_options_from_config(&config);
+    let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+        &config,
+        &model_provider_name,
+        &provider_runtime_options_base,
+    );
     let model_provider: Arc<dyn ModelProvider> = Arc::from(
-        zeroclaw_providers::create_resilient_model_provider_with_options(
-            model_provider_name,
+        zeroclaw_providers::create_resilient_model_provider_from_ref(
+            &config,
+            &model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_from_config(&config),
+            &provider_runtime_options,
         )?,
     );
     // Model resolution (1) the first-model_provider's `model`,
@@ -3894,6 +3904,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         let key = whatsapp_memory_key(&msg);

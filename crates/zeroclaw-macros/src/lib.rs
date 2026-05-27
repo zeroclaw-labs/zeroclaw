@@ -215,6 +215,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     // section's role in this Config, which is what the operator needs.
     let mut nested_section_help_arms: Vec<proc_macro2::TokenStream> = Vec::new();
 
+    // Static enumeration of every `#[secret]` field's terminal name
+    // reachable from this Configurable type. Direct `#[secret]` fields
+    // push their own snake-case ident; `#[nested]` fields push a
+    // recursive call into the inner type's `secret_field_terminals()`.
+    // The migration crate's raw-TOML encrypt walker uses this allowlist
+    // so map-shaped `#[secret]` fields (e.g. `mcp.servers[*].headers`)
+    // get the same coverage as scalar ones — `prop_fields()` skips
+    // compound types and is not a safe source for that allowlist.
+    let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
@@ -225,6 +236,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_resource_key = has_attr(field, "resource_key");
 
         // ── Secret handling ──
+        //
+        // mask / restore / encrypt / decrypt / is_set are dispatched through
+        // `crate::traits::SecretField`. Each supported shape (`String`,
+        // `Option<String>`, `Vec<String>`, `HashMap<String, String>`,
+        // `Option<HashMap<String, String>>`) lives as a trait impl in
+        // `crates/zeroclaw-config/src/traits.rs` — adding a new shape is a
+        // single impl block, not a new branch here.
+        //
+        // `set_secret(name, value)` only makes sense for string-shaped fields
+        // (the public API takes `String`), so only `String` and `Option<String>`
+        // push to `set_arms`. Container shapes are read-only through that path.
         if is_secret {
             let field_name_kebab = snake_to_kebab(&field_ident.to_string());
             let full_name = if prefix.is_empty() {
@@ -232,119 +254,72 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             } else {
                 format!("{}.{}", prefix, field_name_kebab)
             };
-
-            let is_option = is_option_type(&field.ty);
-            let is_vec_string = extract_vec_inner(&field.ty)
-                .map(|inner| inner.to_token_stream().to_string() == "String")
-                .unwrap_or(false);
             let full_name_lit = &full_name;
             let category_lit = &category;
 
-            if is_vec_string {
-                // Vec<String> with #[secret]: mask each element
-                mask_ops.push(quote! {
-                    for element in &mut self.#field_ident {
-                        crate::traits::mask_required_secret(element);
-                    }
-                });
-                restore_ops.push(quote! {
-                    for (element, cur) in self.#field_ident.iter_mut().zip(current.#field_ident.iter()) {
-                        crate::traits::restore_required_secret(element, cur);
-                    }
-                });
+            mask_ops.push(quote! {
+                crate::traits::SecretField::mask(&mut self.#field_ident);
+            });
+            restore_ops.push(quote! {
+                crate::traits::SecretField::restore_from(
+                    &mut self.#field_ident,
+                    &current.#field_ident,
+                );
+            });
+            secret_field_entries.push(quote! {
+                crate::config::SecretFieldInfo {
+                    name: #full_name_lit,
+                    category: #category_lit,
+                    is_set: crate::traits::SecretField::is_set(&self.#field_ident),
+                }
+            });
+            // Static terminal name (snake_case, matches the raw TOML key).
+            // Pushed regardless of shape so compound `#[secret]` fields
+            // like `HashMap<String, String>` reach the migration encrypt
+            // walker — they don't surface through `prop_fields()`.
+            let terminal_name = field_ident.to_string();
+            secret_terminal_pushes.push(quote! {
+                out.push(#terminal_name);
+            });
+            encrypt_ops.push(quote! {
+                crate::traits::SecretField::encrypt_in_place(
+                    &mut self.#field_ident,
+                    store,
+                    #full_name_lit,
+                )?;
+            });
+            decrypt_ops.push(quote! {
+                crate::traits::SecretField::decrypt_in_place(
+                    &mut self.#field_ident,
+                    store,
+                    #full_name_lit,
+                )?;
+            });
 
-                // Vec<String> with #[secret]: iterate elements for encrypt/decrypt
-                secret_field_entries.push(quote! {
-                    crate::config::SecretFieldInfo {
-                        name: #full_name_lit,
-                        category: #category_lit,
-                        is_set: !self.#field_ident.is_empty(),
-                    }
-                });
-                encrypt_ops.push(quote! {
-                    for element in &mut self.#field_ident {
-                        if !element.is_empty() && !crate::security::SecretStore::is_encrypted(element) {
-                            *element = store.encrypt(element)
-                                .with_context(|| format!("Failed to encrypt {}[]", #full_name_lit))?;
-                        }
-                    }
-                });
-                decrypt_ops.push(quote! {
-                    for element in &mut self.#field_ident {
-                        if crate::security::SecretStore::is_encrypted(element) {
-                            *element = store.decrypt(element)
-                                .with_context(|| format!("Failed to decrypt {}[]", #full_name_lit))?;
-                        }
-                    }
-                });
-            } else if is_option {
-                mask_ops.push(quote! {
-                    crate::traits::mask_optional_secret(&mut self.#field_ident);
-                });
-                restore_ops.push(quote! {
-                    crate::traits::restore_optional_secret(&mut self.#field_ident, &current.#field_ident);
-                });
-
-                secret_field_entries.push(quote! {
-                    crate::config::SecretFieldInfo {
-                        name: #full_name_lit,
-                        category: #category_lit,
-                        is_set: self.#field_ident.as_ref().is_some_and(|v| !v.is_empty()),
-                    }
-                });
-                set_arms.push(quote! {
-                    #full_name_lit => { self.#field_ident = Some(value); Ok(()) }
-                });
-                encrypt_ops.push(quote! {
-                    if let Some(raw) = &self.#field_ident {
-                        if !crate::security::SecretStore::is_encrypted(raw) {
-                            self.#field_ident = Some(
-                                store.encrypt(raw)
-                                    .with_context(|| format!("Failed to encrypt {}", #full_name_lit))?
-                            );
-                        }
-                    }
-                });
-                decrypt_ops.push(quote! {
-                    if let Some(raw) = &self.#field_ident {
-                        if crate::security::SecretStore::is_encrypted(raw) {
-                            self.#field_ident = Some(
-                                store.decrypt(raw)
-                                    .with_context(|| format!("Failed to decrypt {}", #full_name_lit))?
-                            );
-                        }
-                    }
-                });
-            } else {
-                mask_ops.push(quote! {
-                    crate::traits::mask_required_secret(&mut self.#field_ident);
-                });
-                restore_ops.push(quote! {
-                    crate::traits::restore_required_secret(&mut self.#field_ident, &current.#field_ident);
-                });
-
-                secret_field_entries.push(quote! {
-                    crate::config::SecretFieldInfo {
-                        name: #full_name_lit,
-                        category: #category_lit,
-                        is_set: !self.#field_ident.is_empty(),
-                    }
-                });
-                set_arms.push(quote! {
-                    #full_name_lit => { self.#field_ident = value; Ok(()) }
-                });
-                encrypt_ops.push(quote! {
-                    if !self.#field_ident.is_empty() && !crate::security::SecretStore::is_encrypted(&self.#field_ident) {
-                        self.#field_ident = store.encrypt(&self.#field_ident)
-                            .with_context(|| format!("Failed to encrypt {}", #full_name_lit))?;
-                    }
-                });
-                decrypt_ops.push(quote! {
-                    if crate::security::SecretStore::is_encrypted(&self.#field_ident) {
-                        self.#field_ident = store.decrypt(&self.#field_ident)
-                            .with_context(|| format!("Failed to decrypt {}", #full_name_lit))?;
-                    }
-                });
+            // Only string-shaped fields wire into `set_secret` — the
+            // container shapes have no single-string set semantics. Look
+            // through `Option<...>` when checking shape so an annotation
+            // like `Option<HashMap<String, String>> #[secret]` doesn't fall
+            // through to a `self.field = Some(value: String)` arm that
+            // wouldn't type-check.
+            let is_option = is_option_type(&field.ty);
+            let shape_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
+            let is_vec_string = extract_vec_inner(shape_ty)
+                .map(|inner| inner.to_token_stream().to_string() == "String")
+                .unwrap_or(false);
+            let is_hashmap_string_string = extract_hashmap_value_type(shape_ty)
+                .map(|inner| inner.to_token_stream().to_string() == "String")
+                .unwrap_or(false);
+            if !is_vec_string && !is_hashmap_string_string {
+                if is_option {
+                    set_arms.push(quote! {
+                        #full_name_lit => { self.#field_ident = Some(value); Ok(()) }
+                    });
+                } else {
+                    set_arms.push(quote! {
+                        #full_name_lit => { self.#field_ident = value; Ok(()) }
+                    });
+                }
             }
         }
 
@@ -487,6 +462,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 fields.extend(inner.secret_fields());
                             }
                         }
+                    });
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty>::secret_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner_map in self.#field_ident.values_mut() {
@@ -825,6 +803,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         for inner in self.#field_ident.values() {
                             fields.extend(inner.secret_fields());
                         }
+                    });
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#value_ty>::secret_field_terminals());
                     });
                     nested_set.push(quote! {
                         for inner in self.#field_ident.values_mut() {
@@ -1168,6 +1149,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     });
 
+                    secret_terminal_recurse.push(quote! {
+                        out.extend(<#inner_ty_tokens>::secret_field_terminals());
+                    });
+
                     // Recurse: pull the inner type's map_key_sections + create_map_key.
                     map_key_recurse.push(quote! {
                         out.extend(<#inner_ty_tokens>::map_key_sections());
@@ -1184,18 +1169,58 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             } else if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
                 // ── Nested Vec<T> ──
                 // Vec doesn't implement Configurable, so we cannot delegate
-                // get_prop / set_prop / secret_fields / prop_fields /
-                // init_defaults to the field directly. The list-section
-                // emission below handles `+ Add` and per-entry creation;
-                // per-prop access to elements happens through the schema's
-                // natural-key routing once entries are inserted.
+                // get_prop / set_prop / prop_fields / init_defaults to the
+                // field directly — those address an element by name and a
+                // Vec carries no name index. The list-section emission below
+                // handles `+ Add` and per-entry creation; per-prop access to
+                // elements happens through the schema's natural-key routing
+                // once entries are inserted.
                 //
-                // Intentionally NO push to nested_collect / nested_set /
-                // nested_encrypt / nested_decrypt / nested_prop_fields /
-                // nested_get_prop / nested_set_prop / nested_prop_is_secret
-                // / init_defaults_ops / map_key_recurse / create_map_key_recurse
-                // for Vec<T> + #[nested] — all those call methods Vec doesn't
-                // have.
+                // Bulk-walk operations (encrypt / decrypt / mask / restore /
+                // secret_fields / set_secret), however, only need to iterate
+                // the Vec and dispatch on each element's own `T` method —
+                // they don't address by name. So those DO push here, mirroring
+                // the single-level `HashMap<String, T>` traversal above.
+                //
+                // Intentionally NO push to nested_prop_fields / nested_get_prop /
+                // nested_set_prop / nested_prop_is_secret / init_defaults_ops /
+                // map_key_recurse / create_map_key_recurse for Vec<T> + #[nested]
+                // — all those call methods Vec doesn't have.
+                nested_collect.push(quote! {
+                    for inner in self.#field_ident.iter() {
+                        fields.extend(inner.secret_fields());
+                    }
+                });
+                secret_terminal_recurse.push(quote! {
+                    out.extend(<#vec_inner_ty>::secret_field_terminals());
+                });
+                nested_set.push(quote! {
+                    for inner in self.#field_ident.iter_mut() {
+                        if let Ok(()) = inner.set_secret(name, value.clone()) {
+                            return Ok(());
+                        }
+                    }
+                });
+                nested_encrypt.push(quote! {
+                    for inner in self.#field_ident.iter_mut() {
+                        inner.encrypt_secrets(store)?;
+                    }
+                });
+                nested_decrypt.push(quote! {
+                    for inner in self.#field_ident.iter_mut() {
+                        inner.decrypt_secrets(store)?;
+                    }
+                });
+                mask_ops.push(quote! {
+                    crate::traits::MaskSecrets::mask_secrets(&mut self.#field_ident);
+                });
+                restore_ops.push(quote! {
+                    crate::traits::MaskSecrets::restore_secrets_from(
+                        &mut self.#field_ident,
+                        &current.#field_ident,
+                    );
+                });
+
                 let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
                 let field_doc = extract_doc(&field.attrs);
                 let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
@@ -1258,6 +1283,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 }
                 nested_collect.push(quote! {
                     fields.extend(self.#field_ident.secret_fields());
+                });
+                let plain_field_ty = &field.ty;
+                secret_terminal_recurse.push(quote! {
+                    out.extend(<#plain_field_ty>::secret_field_terminals());
                 });
                 nested_set.push(quote! {
                     if let Ok(()) = self.#field_ident.set_secret(name, value.clone()) {
@@ -1701,9 +1730,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 fields
             }
 
+            /// Static enumeration of every `#[secret]` field's terminal name
+            /// (snake_case, matching the on-disk TOML key) reachable from
+            /// this type via `#[nested]` traversal. Unlike `secret_fields()`,
+            /// this requires no instance — the per-struct codegen literals
+            /// are joined at call time with recursive calls into the inner
+            /// types' own `secret_field_terminals()`.
+            ///
+            /// Used by the migration crate's raw-TOML encrypt walker as the
+            /// secret-key allowlist. `prop_fields()`-derived allowlists skip
+            /// compound (non-Vec) `#[secret]` fields, so this method is the
+            /// authoritative source.
+            pub fn secret_field_terminals() -> Vec<&'static str> {
+                let mut out: Vec<&'static str> = Vec::new();
+                #(#secret_terminal_pushes)*
+                #(#secret_terminal_recurse)*
+                out
+            }
+
             /// Encrypt all secret fields in place using the provided store.
             pub fn encrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
-                use anyhow::Context;
                 #(#encrypt_ops)*
                 #(#nested_encrypt)*
                 Ok(())
@@ -1711,7 +1757,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
             /// Decrypt all secret fields in place using the provided store.
             pub fn decrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
-                use anyhow::Context;
                 #(#decrypt_ops)*
                 #(#nested_decrypt)*
                 Ok(())

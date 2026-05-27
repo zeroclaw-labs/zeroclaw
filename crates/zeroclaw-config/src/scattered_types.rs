@@ -454,7 +454,7 @@ fn default_true() -> bool {
     true
 }
 fn default_subject() -> String {
-    "ZeroClaw Message".into()
+    "Re: Message".into()
 }
 fn default_max_attachment_bytes() -> usize {
     25 * 1024 * 1024
@@ -504,6 +504,10 @@ pub struct EmailConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// When `true` (default), outbound emails are rendered as HTML via Markdown conversion.
+    /// Set to `false` to send plain-text emails instead.
+    #[serde(default = "default_true")]
+    pub html_body: bool,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -535,6 +539,7 @@ impl Default for EmailConfig {
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: Vec::new(),
+            html_body: true,
         }
     }
 }

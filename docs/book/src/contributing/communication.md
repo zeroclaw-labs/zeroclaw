@@ -19,6 +19,8 @@ Channels:
 
 **Discord is ephemeral** — if the conversation leads to a bug or a feature idea, capture it as a GitHub issue afterwards so the record persists. Discord is for conversation; GitHub is for memory.
 
+Use a GitHub handoff when Discord produces something the project must remember. Create or update an issue, discussion, PR comment, or maintainer doc when the thread produces a reproducible bug, concrete feature scope, architecture or governance decision, maintainer commitment, owner assignment, milestone decision, blocker, workaround, validation evidence, release-impact note, or stale-exemption reason. The handoff only needs the decision, evidence, owner when one exists, and enough context for another maintainer to continue without rereading chat.
+
 ## GitHub issues
 
 For bugs, feature requests, and anything that needs to be tracked.
@@ -31,7 +33,11 @@ Search before filing. Duplicates get consolidated; the search box is your friend
 
 ## GitHub Discussions
 
-For design chatter and conceptual conversations that aren't ready to be an issue. Works well for "does anyone else see this" posts and longer-form threads where Discord would scroll away.
+For community-facing threads that need more permanence than Discord but are not yet tracked work. Discussions work well for Q&A, ideas, show-and-tell, project or integration demos, polls, announcements, and "does anyone else see this?" threads where Discord would scroll away.
+
+Treat Discussions as non-urgent community conversation. They are maintained intake only when a steward or review cadence is documented.
+
+Discussions are part of the GitHub handoff system, not a replacement for issues, RFCs, PR comments, or maintainer docs. Move a Discussion into the tracked surface once it produces a concrete bug, feature scope, owner, blocker, validation evidence, policy decision, or docs requirement.
 
 [github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
 

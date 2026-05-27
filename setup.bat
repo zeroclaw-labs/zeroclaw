@@ -128,7 +128,7 @@ if "%MODE%"=="full"     goto :build_full
 echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
-echo   2) Minimal build     - Default features only (~15 min)
+echo   2) Minimal build     - Core only (^--no-default-features, ~15 min)
 echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
 echo   4) Full build        - All features including hardware + browser (~30 min)
 echo.
@@ -189,8 +189,8 @@ goto verify
 
 :: ---- Minimal build ----
 :build_minimal
-set "FEATURES="
-set "BUILD_DESC=minimal (default features)"
+set "FEATURES=--no-default-features"
+set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :: ---- Standard build ----
@@ -227,6 +227,7 @@ rustup target add %TARGET% >nul 2>&1
 echo   This may take 15-30 minutes on first build...
 echo.
 
+echo   Command: cargo build --release --locked %FEATURES% --target %TARGET%
 cargo build --release --locked %FEATURES% --target %TARGET%
 if %ERRORLEVEL% NEQ 0 (
     echo.
@@ -245,7 +246,15 @@ echo.
 echo %BOLD%[4/5] Installing binary...%RESET%
 mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
 copy /Y "target\%TARGET%\release\zeroclaw.exe" "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" >nul
-echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+set "BIN_PATH=%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
+for /f %%S in ('powershell -NoProfile -Command "[math]::Round(((Get-Item -LiteralPath ''%BIN_PATH%'').Length / 1MB), 2)"') do (
+    set "BINARY_MB=%%S"
+)
+if defined BINARY_MB (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(%BINARY_MB% MB^)
+) else (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(size unavailable^)
+)
 
 :: Add to PATH if not already there
 echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
@@ -285,8 +294,14 @@ echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
+if /I "%MODE%"=="minimal" (
+echo     2. Minimal build excludes onboarding ^(zeroclaw onboard is unavailable^)
+echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
+) else (
 echo     2. Run: zeroclaw onboard
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
+)
 echo.
 echo   Alternative install via Scoop:
 echo     scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
@@ -305,7 +320,7 @@ echo Usage: setup.bat [OPTIONS]
 echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
-echo   --minimal     Build with default features only
+echo   --minimal     Build core only ^(--no-default-features^)
 echo   --standard    Build with Matrix + Lark/Feishu
 echo   --full        Build with all features
 echo   --help, -h    Show this help message

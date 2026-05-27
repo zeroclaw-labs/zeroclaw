@@ -261,6 +261,7 @@ impl BlueskyChannel {
             thread_ts: Some(notif.uri.clone()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 

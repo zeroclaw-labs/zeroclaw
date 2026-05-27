@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+use zeroclaw_config::sections::Section;
 
 use super::AppState;
 use super::api::require_auth;
@@ -65,6 +66,11 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
+    /// Optional configured alias under `providers.models.<provider>.<alias>`.
+    /// When present, the catalog endpoint validates that alias's own URI/auth
+    /// instead of only checking the provider family's default endpoint.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +85,131 @@ pub struct ModelsResponse {
     /// served (or if this model_provider has no remote catalog and the empty list
     /// is the genuine answer).
     pub live: bool,
+}
+
+async fn catalog_models_for_config(
+    cfg: &zeroclaw_config::schema::Config,
+    model_provider: &str,
+    alias: Option<&str>,
+) -> ModelsResponse {
+    let alias = alias.map(str::trim).filter(|alias| !alias.is_empty());
+    let local = model_provider_family_is_local(model_provider);
+
+    let provider_path = if let Some(alias) = alias {
+        let Some(entry) = cfg.providers.models.find(model_provider, alias) else {
+            return ModelsResponse {
+                model_provider: model_provider.to_string(),
+                models: Vec::new(),
+                local,
+                live: false,
+            };
+        };
+        let api_key = entry.api_key.as_deref();
+        let options =
+            zeroclaw_providers::provider_runtime_options_for_alias(cfg, model_provider, alias);
+        let has_alias_endpoint = entry
+            .uri
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|uri| !uri.is_empty())
+            || options
+                .provider_api_url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|uri| !uri.is_empty());
+        let alias_catalog_must_match_alias =
+            has_alias_endpoint || !model_provider_family_has_public_catalog(model_provider);
+        match zeroclaw_providers::create_model_provider_for_alias(
+            cfg,
+            model_provider,
+            alias,
+            api_key,
+            &options,
+        ) {
+            Ok(provider) => match provider.list_models().await {
+                Ok(models) => Some((models, true)),
+                Err(e) => {
+                    record_catalog_models_error(model_provider, Some(alias), &e);
+                    if alias_catalog_must_match_alias {
+                        return ModelsResponse {
+                            model_provider: model_provider.to_string(),
+                            models: Vec::new(),
+                            local,
+                            live: false,
+                        };
+                    }
+                    None
+                }
+            },
+            Err(e) => {
+                record_catalog_models_error(model_provider, Some(alias), &e);
+                if alias_catalog_must_match_alias {
+                    return ModelsResponse {
+                        model_provider: model_provider.to_string(),
+                        models: Vec::new(),
+                        local,
+                        live: false,
+                    };
+                }
+                None
+            }
+        }
+    } else {
+        match zeroclaw_providers::create_model_provider(model_provider, None) {
+            Ok(provider) => match provider.list_models().await {
+                Ok(models) => Some((models, true)),
+                Err(e) => {
+                    record_catalog_models_error(model_provider, None, &e);
+                    None
+                }
+            },
+            Err(e) => {
+                record_catalog_models_error(model_provider, None, &e);
+                None
+            }
+        }
+    };
+
+    let (models, live) = match provider_path {
+        Some((models, live)) => (models, live),
+        None => match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
+            Ok(models) => (models, true),
+            Err(e) => {
+                record_catalog_models_error(model_provider, alias, &e);
+                (Vec::new(), false)
+            }
+        },
+    };
+
+    ModelsResponse {
+        model_provider: model_provider.to_string(),
+        models,
+        local,
+        live,
+    }
+}
+
+fn model_provider_family_has_public_catalog(family: &str) -> bool {
+    match zeroclaw_providers::catalog::catalog_source_for(family) {
+        Some((models_dev_key, openrouter_vendor_prefix)) => {
+            models_dev_key.is_some() || openrouter_vendor_prefix.is_some()
+        }
+        None => false,
+    }
+}
+
+fn record_catalog_models_error(model_provider: &str, alias: Option<&str>, error: &anyhow::Error) {
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "model_provider": model_provider,
+                "alias": alias,
+                "error": format!("{}", error),
+            })
+        ),
+        "model catalog fetch failed"
+    );
 }
 
 /// `GET /api/onboard/catalog/models?model_provider=<name>` — fetch the model list
@@ -98,43 +229,9 @@ pub async fn handle_catalog_models(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let _ = state;
-    let local = model_provider_family_is_local(&q.model_provider);
-
-    // Try provider construction + list_models first (covers credentialed
-    // /models endpoints). Fall back to the family catalog table when
-    // construction or list_models fails — this is the path that covers
-    // onboard mode where the operator hasn't supplied a credential
-    // and the provider has typed required fields (Azure resource,
-    // Bedrock region, …) that haven't been populated yet.
-    let provider_path = match zeroclaw_providers::create_model_provider(&q.model_provider, None) {
-        Ok(h) => match h.list_models().await {
-            Ok(ms) if !ms.is_empty() => Some(ms),
-            _ => None,
-        },
-        Err(_) => None,
-    };
-
-    let (models, live) = match provider_path {
-        Some(ms) => (ms, true),
-        None => {
-            match zeroclaw_providers::catalog::list_models_for_family(&q.model_provider).await {
-                Ok(ms) => (ms, true),
-                Err(e) => {
-                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": q.model_provider, "error": format!("{}", e)})), "model catalog fetch failed");
-                    (Vec::new(), false)
-                }
-            }
-        }
-    };
-
-    axum::Json(ModelsResponse {
-        model_provider: q.model_provider,
-        models,
-        local,
-        live,
-    })
-    .into_response()
+    let cfg = state.config.read().clone();
+    axum::Json(catalog_models_for_config(&cfg, &q.model_provider, q.alias.as_deref()).await)
+        .into_response()
 }
 
 fn error_response(err: ConfigApiError) -> Response {
@@ -197,6 +294,21 @@ pub struct SectionsResponse {
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OnboardRepairItem {
+    /// Stable machine-readable reason. The web UI uses this for targeted
+    /// onboarding repair controls without parsing localized copy.
+    pub code: &'static str,
+    /// Human-readable repair instruction for the current non-localized UI.
+    pub message: String,
+    /// Onboarding section that contains the repair surface.
+    pub section: &'static str,
+    /// Optional config prefix the UI can open directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct OnboardStatusResponse {
     /// `true` when no agent is dispatchable yet. The dashboard uses this
     /// signal to redirect first-load visits from `/` to `/onboard`.
@@ -212,6 +324,9 @@ pub struct OnboardStatusResponse {
     /// Human-readable readiness failures. When onboarding cannot finish, the
     /// UI shows these directly so the operator knows exactly what is missing.
     pub missing: Vec<String>,
+    /// Structured repair checklist for half-configured installs. Mirrors
+    /// `missing` but keeps stable codes and targets for UI routing.
+    pub repair_items: Vec<OnboardRepairItem>,
 }
 
 /// Pure derivation of the onboard-status response from a config snapshot.
@@ -222,8 +337,12 @@ pub struct OnboardStatusResponse {
 /// that state.
 #[must_use]
 pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardStatusResponse {
-    let missing = onboard_missing_requirements(cfg);
-    let ready = missing.is_empty();
+    let repair_items = onboard_repair_items(cfg);
+    let missing: Vec<String> = repair_items
+        .iter()
+        .map(|item| item.message.clone())
+        .collect();
+    let ready = repair_items.is_empty();
     let has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
         || cfg.providers.models.iter_entries().next().is_some()
         || !cfg.risk_profiles.is_empty()
@@ -241,87 +360,201 @@ pub fn derive_onboard_status(cfg: &zeroclaw_config::schema::Config) -> OnboardSt
         reason,
         has_partial_state,
         missing,
+        repair_items,
     }
 }
 
-fn onboard_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec<String> {
-    let mut missing = Vec::new();
+fn onboard_repair_items(cfg: &zeroclaw_config::schema::Config) -> Vec<OnboardRepairItem> {
+    let mut items = Vec::new();
     if cfg.providers.models.iter_entries().next().is_none() {
-        missing.push("Add a model provider.".to_string());
+        items.push(repair_item(
+            "model_provider_missing",
+            "Add a model provider.",
+            Section::ModelProviders,
+            None,
+        ));
     }
     if cfg.agents.is_empty() {
-        missing.push("Create an agent.".to_string());
-        return missing;
+        items.push(repair_item(
+            "agent_missing",
+            "Create an agent.",
+            Section::Agents,
+            None,
+        ));
+        return items;
     }
 
     let mut agent_aliases: Vec<&String> = cfg.agents.keys().collect();
     agent_aliases.sort();
-    let mut has_dispatchable_agent = false;
+    if agent_aliases
+        .iter()
+        .any(|alias| onboard_agent_is_dispatchable(cfg, alias, &cfg.agents[*alias]))
+    {
+        return Vec::new();
+    }
     for alias in agent_aliases {
-        let agent_missing = onboard_agent_missing_requirements(cfg, alias, &cfg.agents[alias]);
-        if agent_missing.is_empty() {
-            has_dispatchable_agent = true;
-            break;
-        }
-        missing.extend(agent_missing);
+        items.extend(onboard_agent_repair_items(cfg, alias, &cfg.agents[alias]));
     }
-    if has_dispatchable_agent {
-        missing.clear();
-    }
-    missing
+    items
 }
 
-fn onboard_agent_missing_requirements(
+fn onboard_agent_repair_items(
     cfg: &zeroclaw_config::schema::Config,
     alias: &str,
     agent: &zeroclaw_config::schema::AliasedAgentConfig,
-) -> Vec<String> {
-    let mut missing = Vec::new();
+) -> Vec<OnboardRepairItem> {
+    let agent_focus = Some(format!("agents.{alias}"));
+    let mut items = Vec::new();
     if !agent.enabled {
-        missing.push(format!("Enable agent `{alias}`."));
+        items.push(repair_item(
+            "agent_disabled",
+            format!("Enable agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
     }
 
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
-        missing.push(format!("Set a model provider for agent `{alias}`."));
-    } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
+        items.push(repair_item(
+            "agent_model_provider_missing",
+            format!("Set a model provider for agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
+    } else if let Some((family, provider_alias, provider)) =
+        cfg.resolved_model_provider_for_agent(alias)
+    {
         let has_model = provider
             .model
             .as_deref()
             .map(str::trim)
             .is_some_and(|m| !m.is_empty());
+        let provider_focus = model_provider_focus(family, provider_alias);
         if !has_model {
-            missing.push(format!("Choose a model for model provider `{model_ref}`."));
+            items.push(repair_item(
+                "model_provider_model_missing",
+                format!("Choose a model for model provider `{model_ref}`."),
+                Section::ModelProviders,
+                provider_focus,
+            ));
         } else if !model_provider_alias_usable(provider, model_provider_family_is_local(family)) {
-            missing.push(format!(
-                "Set credential/auth for model provider `{model_ref}`."
+            items.push(repair_item(
+                "model_provider_auth_missing",
+                format!("Set credential/auth for model provider `{model_ref}`."),
+                Section::ModelProviders,
+                provider_focus,
             ));
         }
     } else {
-        missing.push(format!(
-            "Fix agent `{alias}` model provider `{model_ref}`; it does not resolve to a configured provider."
+        items.push(repair_item(
+            "agent_model_provider_unresolved",
+            format!(
+                "Fix agent `{alias}` model provider `{model_ref}`; it does not resolve to a configured provider."
+            ),
+            Section::Agents,
+            agent_focus.clone(),
         ));
     }
 
     let risk_ref = agent.risk_profile.trim();
     if risk_ref.is_empty() {
-        missing.push(format!("Set a risk profile for agent `{alias}`."));
+        items.push(repair_item(
+            "agent_risk_profile_missing",
+            format!("Set a risk profile for agent `{alias}`."),
+            Section::Agents,
+            agent_focus.clone(),
+        ));
     } else if !cfg.risk_profiles.contains_key(risk_ref) {
-        missing.push(format!(
-            "Fix agent `{alias}` risk profile `{risk_ref}`; it does not resolve to a configured profile."
+        items.push(repair_item(
+            "agent_risk_profile_unresolved",
+            format!(
+                "Fix agent `{alias}` risk profile `{risk_ref}`; it does not resolve to a configured profile."
+            ),
+            Section::Agents,
+            agent_focus.clone(),
         ));
     }
 
     let runtime_ref = agent.runtime_profile.trim();
     if runtime_ref.is_empty() {
-        missing.push(format!("Set a runtime profile for agent `{alias}`."));
+        items.push(repair_item(
+            "agent_runtime_profile_missing",
+            format!("Set a runtime profile for agent `{alias}`."),
+            Section::Agents,
+            agent_focus,
+        ));
     } else if !cfg.runtime_profiles.contains_key(runtime_ref) {
-        missing.push(format!(
-            "Fix agent `{alias}` runtime profile `{runtime_ref}`; it does not resolve to a configured profile."
+        items.push(repair_item(
+            "agent_runtime_profile_unresolved",
+            format!(
+                "Fix agent `{alias}` runtime profile `{runtime_ref}`; it does not resolve to a configured profile."
+            ),
+            Section::Agents,
+            agent_focus,
         ));
     }
 
-    missing
+    items
+}
+
+fn repair_item(
+    code: &'static str,
+    message: impl Into<String>,
+    section: Section,
+    focus: Option<String>,
+) -> OnboardRepairItem {
+    OnboardRepairItem {
+        code,
+        message: message.into(),
+        section: section.as_str(),
+        focus,
+    }
+}
+
+fn model_provider_focus(family: &str, alias: &str) -> Option<String> {
+    if alias.trim().is_empty() {
+        return None;
+    }
+    let section = Section::ModelProviders;
+    let config_family = typed_family_config_key(section, family);
+    let section_key = section.as_str();
+    Some(format!("{section_key}.{config_family}.{alias}"))
+}
+
+fn onboard_agent_is_dispatchable(
+    cfg: &zeroclaw_config::schema::Config,
+    alias: &str,
+    agent: &zeroclaw_config::schema::AliasedAgentConfig,
+) -> bool {
+    if !agent.enabled {
+        return false;
+    }
+    let model_ref = agent.model_provider.trim();
+    if model_ref.is_empty() {
+        return false;
+    }
+    let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) else {
+        return false;
+    };
+    let has_model = provider
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|m| !m.is_empty());
+    if !has_model || !model_provider_alias_usable(provider, model_provider_family_is_local(family))
+    {
+        return false;
+    }
+    let risk_ref = agent.risk_profile.trim();
+    if risk_ref.is_empty() || !cfg.risk_profiles.contains_key(risk_ref) {
+        return false;
+    }
+    let runtime_ref = agent.runtime_profile.trim();
+    if runtime_ref.is_empty() || !cfg.runtime_profiles.contains_key(runtime_ref) {
+        return false;
+    }
+    true
 }
 
 /// `GET /api/onboard/status` — boolean signal for the dashboard's
@@ -573,7 +806,7 @@ fn section_ready(cfg: &zeroclaw_config::schema::Config, key: &str, completed_mar
         Some(Section::Agents) => cfg
             .agents
             .iter()
-            .any(|(alias, agent)| onboard_agent_missing_requirements(cfg, alias, agent).is_empty()),
+            .any(|(alias, agent)| onboard_agent_is_dispatchable(cfg, alias, agent)),
         _ => completed_marker,
     }
 }
@@ -1606,6 +1839,50 @@ mod tests {
     }
 
     #[test]
+    fn derive_onboard_status_returns_structured_repair_items_for_half_configured_agent() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.atomic-chat", "local")
+            .unwrap();
+        cfg.create_map_key("risk-profiles", "default").unwrap();
+        cfg.create_map_key("agents", "default").unwrap();
+        let agent = cfg.agents.get_mut("default").unwrap();
+        agent.enabled = true;
+        agent.model_provider = "atomic_chat.local".into();
+        agent.risk_profile = "default".into();
+
+        let resp = derive_onboard_status(&cfg);
+
+        assert!(resp.needs_onboarding);
+        assert_eq!(resp.reason, "incomplete_agent");
+        let provider_item = resp
+            .repair_items
+            .iter()
+            .find(|item| item.code == "model_provider_model_missing")
+            .expect("model repair item");
+        assert_eq!(provider_item.section, "providers.models");
+        assert_eq!(
+            provider_item.focus.as_deref(),
+            Some("providers.models.atomic-chat.local")
+        );
+        assert_eq!(
+            provider_item.message,
+            "Choose a model for model provider `atomic_chat.local`."
+        );
+        let runtime_item = resp
+            .repair_items
+            .iter()
+            .find(|item| item.code == "agent_runtime_profile_missing")
+            .expect("runtime repair item");
+        assert_eq!(runtime_item.section, "agents");
+        assert_eq!(runtime_item.focus.as_deref(), Some("agents.default"));
+        assert!(
+            resp.missing
+                .iter()
+                .any(|item| item == "Set a runtime profile for agent `default`.")
+        );
+    }
+
+    #[test]
     fn apply_first_run_agent_defaults_binds_existing_provider_and_profiles() {
         let mut cfg = zeroclaw_config::schema::Config::default();
         cfg.create_map_key("providers.models.anthropic", "work")
@@ -1633,6 +1910,122 @@ mod tests {
             section_ready(&cfg, "memory", true),
             "Memory should show checked after the user has advanced through that section"
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_models_uses_alias_local_uri() {
+        let base_url =
+            spawn_openai_compatible_models_server(r#"{"data":[{"id":"llama3.2:latest"}]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(resp.live);
+        assert_eq!(resp.models, vec!["llama3.2:latest"]);
+    }
+
+    #[tokio::test]
+    async fn catalog_models_keeps_live_empty_alias_catalog() {
+        let base_url = spawn_openai_compatible_models_server(r#"{"data":[]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(
+            resp.live,
+            "reachable local endpoint with no models is still live"
+        );
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_marks_unreachable_local_alias_not_live() {
+        let cfg = ollama_alias_config("http://127.0.0.1:1");
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("default")).await;
+
+        assert!(resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_marks_unreachable_hosted_alias_endpoint_not_live() {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.moonshot", "default")
+            .unwrap();
+        cfg.set_prop_persistent("providers.models.moonshot.default.api-key", "sk-test")
+            .unwrap();
+        cfg.set_prop_persistent(
+            "providers.models.moonshot.default.uri",
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+
+        let resp = catalog_models_for_config(&cfg, "moonshot", Some("default")).await;
+
+        assert!(!resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_models_missing_alias_does_not_probe_default_endpoint() {
+        let base_url =
+            spawn_openai_compatible_models_server(r#"{"data":[{"id":"llama3.2:latest"}]}"#).await;
+        let cfg = ollama_alias_config(&base_url);
+
+        let resp = catalog_models_for_config(&cfg, "ollama", Some("missing")).await;
+
+        assert!(resp.local);
+        assert!(!resp.live);
+        assert!(resp.models.is_empty());
+    }
+
+    fn ollama_alias_config(base_url: &str) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.ollama", "default")
+            .unwrap();
+        cfg.set_prop_persistent("providers.models.ollama.default.uri", base_url)
+            .unwrap();
+        cfg
+    }
+
+    async fn spawn_openai_compatible_models_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = [0_u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let response = if request.starts_with("GET /v1/models ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        )
+                    } else {
+                        let body = r#"{"error":"unexpected path"}"#;
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
     }
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {

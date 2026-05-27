@@ -51,6 +51,7 @@ lettre = { version = "0.11.22", default-features = false, features = [
   "rustls-tls",
   "smtp-transport",
 ], optional = true }
+pulldown-cmark = { version = "0.13", optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 matrix-sdk = { version = "0.17", optional = true, default-features = false, features = [
   "e2e-encryption",
@@ -188,7 +189,7 @@ channels-full = [
   "channel-whatsapp-cloud",
 ]
 # Channels with optional deps
-channel-email = ["dep:async-imap", "dep:lettre", "dep:mail-parser"]
+channel-email = ["dep:async-imap", "dep:lettre", "dep:mail-parser", "dep:pulldown-cmark"]
 channel-telegram = ["dep:image"]
 channel-lark = ["dep:prost"]
 channel-line = []
