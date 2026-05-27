@@ -25,7 +25,7 @@ impl Tool for MemoryPurgeTool {
     }
 
     fn description(&self) -> &str {
-        "Remove all memories in a namespace (category) or session. Use to bulk-delete conversation context or category-scoped data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
+        "Remove all memories in a namespace or session. Use to bulk-delete per-tenant or per-conversation data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,7 +34,7 @@ impl Tool for MemoryPurgeTool {
             "properties": {
                 "namespace": {
                     "type": "string",
-                    "description": "The namespace (category) to purge. Deletes all memories in this category."
+                    "description": "The namespace to purge. Deletes all memories whose namespace field equals this value."
                 },
                 "session_id": {
                     "type": "string",
