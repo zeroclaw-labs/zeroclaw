@@ -341,6 +341,190 @@ pub fn should_auto_launch(config: &Config) -> bool {
     !config.onboard_state.quickstart_completed && config.agents.is_empty()
 }
 
+/// Snapshot of the bits of `Config` the Quickstart UI needs to render
+/// each step's "Use existing" section without pulling the entire config.
+///
+/// Shared by every surface — the gateway's `GET /api/quickstart/state`
+/// and the RPC `quickstart/state` method both build the response from
+/// this one function, so the two transports cannot drift.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartState {
+    pub quickstart_completed: bool,
+    pub agents: Vec<String>,
+    pub risk_profiles: Vec<String>,
+    pub runtime_profiles: Vec<String>,
+    /// `<provider_type>.<alias>` refs for every configured model provider.
+    pub model_providers: Vec<String>,
+    /// `<channel_type>.<alias>` refs.
+    pub channels: Vec<String>,
+    /// `<storage_type>.<alias>` refs.
+    pub storage: Vec<String>,
+}
+
+/// Build a [`QuickstartState`] snapshot from the live config.
+pub fn snapshot_state(cfg: &Config) -> QuickstartState {
+    QuickstartState {
+        quickstart_completed: cfg.onboard_state.quickstart_completed,
+        agents: cfg.agents.keys().cloned().collect(),
+        risk_profiles: cfg.risk_profiles.keys().cloned().collect(),
+        runtime_profiles: cfg.runtime_profiles.keys().cloned().collect(),
+        model_providers: cfg
+            .providers
+            .models
+            .iter_entries()
+            .map(|(family, alias, _)| format!("{family}.{alias}"))
+            .collect(),
+        channels: collect_aliased_refs(&cfg.channels),
+        storage: collect_aliased_refs(&cfg.storage),
+    }
+}
+
+/// Walk the serialised form of `value` and yield `<type>.<alias>` refs
+/// for every `HashMap<String, _>`-shaped subsection. Schema-driven —
+/// adding a new channel or storage slot in the schema lights up here
+/// for free, no code change required.
+fn collect_aliased_refs<T: serde::Serialize>(value: &T) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(value) else {
+        return out;
+    };
+    for (family, subvalue) in map {
+        if let serde_json::Value::Object(entries) = subvalue {
+            for alias in entries.keys() {
+                out.push(format!("{family}.{alias}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Selector kinds that the Quickstart "field shape" descriptor
+/// covers. The TUI / web ask the runtime for the shape, then render
+/// inputs dumbly off the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldSection {
+    ModelProvider,
+    Channel,
+}
+
+/// One renderable input the TUI / web modal must draw.
+///
+/// Shape is derived from `prop_fields()` filtered by the relevant
+/// schema prefix, then trimmed to the "greatest hits" required for
+/// Quickstart per [`field_shape`]. Surfaces never invent fields —
+/// adding a provider or channel kind to the schema lights up here
+/// automatically.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FieldDescriptor {
+    /// Schema-side field key (kebab-case terminal segment). The
+    /// caller submits this back through [`BuilderSubmission`].
+    pub key: String,
+    /// Human label shown next to the input.
+    pub label: String,
+    /// One-line help blurb. Empty when the schema field has no doc.
+    pub help: String,
+    /// Wire-tag for the input control to render. Mirrors
+    /// `PropKind::wire_name`.
+    pub kind: zeroclaw_config::traits::PropKind,
+    /// `true` for `#[secret]` fields — the modal masks input.
+    pub is_secret: bool,
+    /// Closed-set choices for `Enum` kind. `None` for everything else.
+    pub enum_variants: Option<Vec<String>>,
+    /// `true` when Quickstart treats this field as required. Currently
+    /// every field returned by [`field_shape`] is required, but the
+    /// flag is exposed so future additions can include optional rows.
+    pub required: bool,
+    /// Pre-filled default the modal should show as ghost text /
+    /// initial input value. `None` when the schema has no meaningful
+    /// default for this field (e.g. API keys, bot tokens).
+    pub default: Option<String>,
+}
+
+/// Return the renderable field shape for a single section + type
+/// combination. Walks `prop_fields()` against a synthetic config with
+/// one default-instantiated entry under the requested type, then
+/// filters to the per-section "essential" allowlist.
+pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor> {
+    const SYNTHETIC_ALIAS: &str = "__qs_shape__";
+    let (section_path, essentials) = match section {
+        FieldSection::ModelProvider => (
+            format!("providers.models.{type_key}"),
+            MODEL_PROVIDER_ESSENTIALS,
+        ),
+        FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
+    };
+
+    // A throwaway Config we can mutate freely. Inject one default
+    // entry under the requested type so `prop_fields()` enumerates
+    // its leaves.
+    let mut probe = Config::default();
+    if probe
+        .create_map_key(&section_path, SYNTHETIC_ALIAS)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let leaf_prefix = format!("{section_path}.{SYNTHETIC_ALIAS}.");
+
+    let mut out = Vec::new();
+    for info in probe.prop_fields() {
+        let Some(field_path) = info.name.strip_prefix(&leaf_prefix) else {
+            continue;
+        };
+        if !essentials.contains(&field_path) {
+            continue;
+        }
+        // `display_value` already masks secrets as `****`; we want
+        // ghost-text defaults for plain fields only.
+        let default = if info.is_secret {
+            None
+        } else {
+            let raw = info.display_value.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                Some(raw.to_string())
+            }
+        };
+        out.push(FieldDescriptor {
+            key: field_path.to_string(),
+            label: humanize_field_key(field_path),
+            help: info.description.trim().to_string(),
+            kind: info.kind,
+            is_secret: info.is_secret,
+            enum_variants: info.enum_variants.map(|f| f()),
+            required: true,
+            default,
+        });
+    }
+    out.sort_by_key(|d| {
+        essentials
+            .iter()
+            .position(|k| *k == d.key.as_str())
+            .unwrap_or(usize::MAX)
+    });
+    out
+}
+
+/// Essentials per section kind. Kept in one place so adding a
+/// provider type or channel kind lights up Quickstart for free,
+/// while keeping the modal focused on what an agent cannot start
+/// without.
+const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", "api-key", "base-url"];
+const CHANNEL_ESSENTIALS: &[&str] = &["bot-token", "token", "webhook-url", "allowed-users"];
+
+fn humanize_field_key(key: &str) -> String {
+    let mut s = key.replace('-', " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    s
+}
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,

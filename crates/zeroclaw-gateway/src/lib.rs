@@ -1347,6 +1347,10 @@ pub async fn run_gateway(
             get(api_quickstart::handle_state),
         )
         .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
             "/api/quickstart/validate",
             post(api_quickstart::handle_validate),
         )

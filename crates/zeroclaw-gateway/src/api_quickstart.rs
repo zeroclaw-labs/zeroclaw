@@ -52,39 +52,39 @@ pub enum ApplyResult {
 
 /// `GET /api/quickstart/state` — minimal payload the Quickstart UI
 /// needs to render every step's "Use existing" section without
-/// pulling the entire config.
-#[derive(Debug, Serialize)]
-pub struct QuickstartState {
-    pub quickstart_completed: bool,
-    pub agents: Vec<String>,
-    pub risk_profiles: Vec<String>,
-    pub runtime_profiles: Vec<String>,
-    /// `<provider_type>.<alias>` refs for every configured model provider.
-    pub model_providers: Vec<String>,
-    /// `<channel_type>.<alias>` refs for every configured per-alias channel.
-    pub channels: Vec<String>,
-    /// `<storage_type>.<alias>` refs for every configured storage backend.
-    pub storage: Vec<String>,
-}
-
+/// pulling the entire config. Response shape is owned by
+/// `zeroclaw_runtime::quickstart::QuickstartState`; both transports
+/// build the body via [`snapshot_state`] so they cannot drift.
 pub async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
     let cfg = state.config.read().clone();
-    let body = QuickstartState {
-        quickstart_completed: cfg.onboard_state.quickstart_completed,
-        agents: cfg.agents.keys().cloned().collect(),
-        risk_profiles: cfg.risk_profiles.keys().cloned().collect(),
-        runtime_profiles: cfg.runtime_profiles.keys().cloned().collect(),
-        model_providers: cfg
-            .providers
-            .models
-            .iter_entries()
-            .map(|(family, alias, _)| format!("{family}.{alias}"))
-            .collect(),
-        channels: collect_channel_refs(&cfg.channels),
-        storage: collect_storage_refs(&cfg.storage),
+    let body = zeroclaw_runtime::quickstart::snapshot_state(&cfg);
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FieldsRequest {
+    pub section: zeroclaw_runtime::quickstart::FieldSection,
+    pub type_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FieldsResult {
+    pub fields: Vec<zeroclaw_runtime::quickstart::FieldDescriptor>,
+}
+
+pub async fn handle_fields(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<FieldsRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let body = FieldsResult {
+        fields: zeroclaw_runtime::quickstart::field_shape(req.section, &req.type_key),
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -110,8 +110,10 @@ pub struct DismissRequest {
     pub run_id: String,
     /// Surface name as emitted in earlier events for this run. Echoed
     /// into the dismiss event so the SSE stream can correlate the
-    /// dismissal back to the same `(run_id, surface)` pair.
-    pub surface: String,
+    /// dismissal back to the same `(run_id, surface)` pair. Deserialised
+    /// straight into the typed enum (snake_case wire form) — no
+    /// string-literal `match` at the route boundary.
+    pub surface: Surface,
     /// Furthest step the user reached. `None` = didn't progress past
     /// the first selector.
     #[serde(default)]
@@ -126,13 +128,7 @@ pub async fn handle_dismiss(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let surface = match req.surface.as_str() {
-        "web" => Surface::Web,
-        "tui" => Surface::Tui,
-        "cli" => Surface::Cli,
-        _ => Surface::Web,
-    };
-    record_dismissed(&req.run_id, surface, req.last_step);
+    record_dismissed(&req.run_id, req.surface, req.last_step);
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
@@ -208,36 +204,6 @@ fn signal_daemon_reload(state: &AppState) -> bool {
     true
 }
 
-// ── Helpers: collect every aliased entry from each typed-family slot ──
-//
-// `Configurable::map_key_sections()` reports every keyed section in the
-// schema tree. We list aliased entries by reading the per-section
-// `HashMap` directly via `serde_json` introspection, so adding a
-// channel/storage slot to the schema shows up here for free.
-
-fn collect_channel_refs(channels: &zeroclaw_config::schema::ChannelsConfig) -> Vec<String> {
-    collect_aliased_refs(channels, "channels")
-}
-
-fn collect_storage_refs(storage: &zeroclaw_config::schema::StorageConfig) -> Vec<String> {
-    collect_aliased_refs(storage, "storage")
-}
-
-/// Walk the serialized form of `value` and yield `<type>.<alias>` refs
-/// for every `HashMap<String, _>`-shaped subsection. Schema-driven —
-/// adding a slot needs no code change here.
-fn collect_aliased_refs<T: serde::Serialize>(value: &T, _root_prefix: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(value) else {
-        return out;
-    };
-    for (family, subvalue) in map {
-        if let serde_json::Value::Object(entries) = subvalue {
-            for alias in entries.keys() {
-                out.push(format!("{family}.{alias}"));
-            }
-        }
-    }
-    out.sort();
-    out
-}
+// Per-family alias collection lives in
+// `zeroclaw_runtime::quickstart::snapshot_state` so both transports
+// share one implementation.

@@ -61,6 +61,13 @@ pub mod method {
     // TUI identity
     pub const TUI_LIST: &str = "tui/list";
     pub const FS_LIST_DIR: &str = "fs/list_dir";
+    // Quickstart
+    pub const QUICKSTART_STATE: &str = "quickstart/state";
+    pub const QUICKSTART_FIELDS: &str = "quickstart/fields";
+    #[allow(dead_code)]
+    pub const QUICKSTART_VALIDATE: &str = "quickstart/validate";
+    pub const QUICKSTART_APPLY: &str = "quickstart/apply";
+    pub const QUICKSTART_DISMISS: &str = "quickstart/dismiss";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -794,6 +801,70 @@ impl RpcClient {
         .await
     }
 
+    // ── Quickstart methods ───────────────────────────────────────
+    //
+    // Thin RPC mirror of the gateway's `/api/quickstart/*` HTTP routes.
+    // Same shapes both ways; the daemon-side handlers live in
+    // `zeroclaw_runtime::rpc::dispatch` and call into
+    // `zeroclaw_runtime::quickstart::{validate_only,apply}_with_surface`.
+
+    pub async fn quickstart_state(&self) -> Result<QuickstartStateResult> {
+        self.call(method::QUICKSTART_STATE, serde_json::json!({}))
+            .await
+    }
+
+    pub async fn quickstart_fields(
+        &self,
+        section: QuickstartFieldSection,
+        type_key: &str,
+    ) -> Result<QuickstartFieldsResult> {
+        self.call(
+            method::QUICKSTART_FIELDS,
+            serde_json::json!({ "section": section, "type_key": type_key }),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn quickstart_validate(
+        &self,
+        submission: &zeroclaw_config::presets::BuilderSubmission,
+    ) -> Result<QuickstartValidateResult> {
+        self.call(
+            method::QUICKSTART_VALIDATE,
+            serde_json::json!({ "submission": submission }),
+        )
+        .await
+    }
+
+    pub async fn quickstart_apply(
+        &self,
+        submission: &zeroclaw_config::presets::BuilderSubmission,
+    ) -> Result<QuickstartApplyResult> {
+        self.call(
+            method::QUICKSTART_APPLY,
+            serde_json::json!({ "submission": submission }),
+        )
+        .await
+    }
+
+    pub async fn quickstart_dismiss(
+        &self,
+        run_id: &str,
+        surface: QuickstartSurface,
+        last_step: Option<QuickstartStep>,
+    ) -> Result<QuickstartDismissResult> {
+        self.call(
+            method::QUICKSTART_DISMISS,
+            serde_json::json!({
+                "run_id": run_id,
+                "surface": surface,
+                "last_step": last_step,
+            }),
+        )
+        .await
+    }
+
     // ── Session methods ──────────────────────────────────────────
 
     pub async fn session_new(
@@ -1140,6 +1211,141 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+// ── Quickstart types ─────────────────────────────────────────────
+//
+// **Mirror** of the wire shapes defined in
+// `zeroclaw_runtime::rpc::types` (the daemon-side single source of
+// truth, which itself mirrors the gateway's HTTP route shapes). The
+// types live in `zeroclaw-runtime`, but that crate is not on the
+// `apps/zerocode` dependency tree — pulling it in would compile the
+// entire runtime into the TUI binary. Instead we duplicate the wire
+// shape here; the integration drift test enforces equality across
+// surfaces, so divergence is a CI failure rather than a silent bug.
+
+/// Mirror of `zeroclaw_runtime::quickstart::Surface` (`snake_case` on the wire).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickstartSurface {
+    Web,
+    Tui,
+    Cli,
+    Test,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::QuickstartStep`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickstartStep {
+    ModelProvider,
+    RiskProfile,
+    RuntimeProfile,
+    Memory,
+    Channels,
+    Agent,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::QuickstartError`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartError {
+    pub step: QuickstartStep,
+    pub field: String,
+    pub message: String,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::AppliedAgent`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct AppliedAgent {
+    pub alias: String,
+    pub model_provider: String,
+    pub risk_profile: String,
+    pub runtime_profile: String,
+    pub channels: Vec<String>,
+    pub memory_backend: String,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::FieldSection`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickstartFieldSection {
+    ModelProvider,
+    Channel,
+}
+
+/// Mirror of `zeroclaw_config::traits::PropKind` (wire form).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickstartFieldKind {
+    String,
+    Bool,
+    Integer,
+    Float,
+    Enum,
+    StringArray,
+    ObjectArray,
+    Object,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::FieldDescriptor`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartFieldDescriptor {
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    pub kind: QuickstartFieldKind,
+    pub is_secret: bool,
+    pub enum_variants: Option<Vec<String>>,
+    pub required: bool,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartFieldsResult {
+    pub fields: Vec<QuickstartFieldDescriptor>,
+}
+
+/// Mirror of `zeroclaw_runtime::quickstart::QuickstartState`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartStateResult {
+    pub quickstart_completed: bool,
+    pub agents: Vec<String>,
+    pub risk_profiles: Vec<String>,
+    pub runtime_profiles: Vec<String>,
+    pub model_providers: Vec<String>,
+    pub channels: Vec<String>,
+    pub storage: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum QuickstartValidateResult {
+    Ok,
+    Errors { errors: Vec<QuickstartError> },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuickstartApplyResult {
+    Applied {
+        agent: AppliedAgent,
+        daemon_restarted: bool,
+    },
+    Errors {
+        errors: Vec<QuickstartError>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct QuickstartDismissResult {
+    pub recorded: bool,
+}
 
 // ── Logs types ───────────────────────────────────────────────────
 

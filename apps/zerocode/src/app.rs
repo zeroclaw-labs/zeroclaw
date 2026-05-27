@@ -17,6 +17,7 @@ use crate::config_manager;
 use crate::dashboard;
 use crate::logs;
 use crate::mouse;
+use crate::quickstart_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
@@ -24,12 +25,13 @@ use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 5] = [
+const MODES: [Mode; 6] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
     Mode::Chat,
     Mode::Logs,
+    Mode::Quickstart,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -41,6 +43,7 @@ enum Mode {
     Acp, // displayed as "Code" in the UI
     Chat,
     Logs,
+    Quickstart,
 }
 
 impl Mode {
@@ -51,6 +54,7 @@ impl Mode {
             Mode::Acp => "Code",
             Mode::Chat => "Chat",
             Mode::Logs => "Logs",
+            Mode::Quickstart => "Quickstart",
         }
     }
 
@@ -61,6 +65,7 @@ impl Mode {
             Mode::Acp => "F3",
             Mode::Chat => "F4",
             Mode::Logs => "F5",
+            Mode::Quickstart => "F6",
         }
     }
 }
@@ -91,6 +96,8 @@ pub async fn run(
     chat_pane.init().await?;
     let mut logs_pane = logs::Logs::new(&rpc);
     logs_pane.init().await?;
+    let mut quickstart = quickstart_pane::QuickstartPane::new(Arc::clone(&rpc_arc));
+    quickstart.init().await?;
 
     loop {
         // Draw
@@ -115,6 +122,7 @@ pub async fn run(
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
+                Mode::Quickstart => quickstart.draw(frame, chunks[1]),
             }
 
             let (ctx_input, ctx_max) = match mode {
@@ -143,6 +151,7 @@ pub async fn run(
                     Mode::Acp => acp_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
+                    Mode::Quickstart => quickstart.help_context(),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
@@ -188,28 +197,21 @@ pub async fn run(
                 }
 
                 // Global keys: F1–F6 switch modes
-                match key.code {
-                    KeyCode::F(1) => {
-                        mode = Mode::Dashboard;
-                        continue;
+                let switch_to: Option<Mode> = match key.code {
+                    KeyCode::F(1) => Some(Mode::Dashboard),
+                    KeyCode::F(2) => Some(Mode::Config),
+                    KeyCode::F(3) => Some(Mode::Acp),
+                    KeyCode::F(4) => Some(Mode::Chat),
+                    KeyCode::F(5) => Some(Mode::Logs),
+                    KeyCode::F(6) => Some(Mode::Quickstart),
+                    _ => None,
+                };
+                if let Some(next) = switch_to {
+                    if mode == Mode::Quickstart && next != Mode::Quickstart {
+                        quickstart.dismiss_beacon().await;
                     }
-                    KeyCode::F(2) => {
-                        mode = Mode::Config;
-                        continue;
-                    }
-                    KeyCode::F(3) => {
-                        mode = Mode::Acp;
-                        continue;
-                    }
-                    KeyCode::F(4) => {
-                        mode = Mode::Chat;
-                        continue;
-                    }
-                    KeyCode::F(5) => {
-                        mode = Mode::Logs;
-                        continue;
-                    }
-                    _ => {}
+                    mode = next;
+                    continue;
                 }
 
                 // `?` opens help unless pane is in text-input mode.
@@ -220,6 +222,7 @@ pub async fn run(
                         Mode::Acp => acp_pane.wants_text_input(),
                         Mode::Chat => chat_pane.wants_text_input(),
                         Mode::Logs => logs_pane.wants_text_input(),
+                        Mode::Quickstart => quickstart.wants_text_input(),
                     };
                     if !in_text_input {
                         show_help = true;
@@ -239,6 +242,7 @@ pub async fn run(
                     Mode::Acp => acp_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
+                    Mode::Quickstart => quickstart.handle_key(key).await,
                 };
                 if quit {
                     break;
@@ -263,7 +267,11 @@ pub async fn run(
                     if let Some(n) =
                         mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
                     {
-                        mode = MODES[(n - 1) as usize];
+                        let next = MODES[(n - 1) as usize];
+                        if mode == Mode::Quickstart && next != Mode::Quickstart {
+                            quickstart.dismiss_beacon().await;
+                        }
+                        mode = next;
                         continue;
                     }
                 }
@@ -285,6 +293,7 @@ pub async fn run(
                         Mode::Chat => {
                             chat_pane.handle_mouse(mouse, content_area);
                         }
+                        Mode::Quickstart => {}
                     }
                 }
             }

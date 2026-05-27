@@ -21,6 +21,7 @@ mod file_explorer;
 mod input_bar;
 mod logs;
 mod mouse;
+mod quickstart_pane;
 mod theme;
 mod turn_status;
 mod widgets;

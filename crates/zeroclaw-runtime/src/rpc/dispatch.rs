@@ -123,6 +123,13 @@ pub enum Method {
     // Files
     FileAttach,
     FsListDir,
+
+    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
+    QuickstartState,
+    QuickstartFields,
+    QuickstartValidate,
+    QuickstartApply,
+    QuickstartDismiss,
 }
 
 impl Method {
@@ -199,6 +206,12 @@ impl Method {
         // Files
         (Method::FileAttach, "file/attach"),
         (Method::FsListDir, "fs/list_dir"),
+        // Quickstart
+        (Method::QuickstartState, "quickstart/state"),
+        (Method::QuickstartFields, "quickstart/fields"),
+        (Method::QuickstartValidate, "quickstart/validate"),
+        (Method::QuickstartApply, "quickstart/apply"),
+        (Method::QuickstartDismiss, "quickstart/dismiss"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -448,6 +461,13 @@ impl RpcDispatcher {
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
             Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+
+            // Quickstart
+            Method::QuickstartState => self.handle_quickstart_state(),
+            Method::QuickstartFields => self.handle_quickstart_fields(&req.params),
+            Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
+            Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
+            Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
         };
 
         if is_notification {
@@ -1394,11 +1414,11 @@ impl RpcDispatcher {
         let req: ConfigSetParams = parse_params(params)?;
         {
             let mut config = self.ctx.config.write();
-            // Polymorphic value: strings pass through, everything else coerced.
             let info = config
                 .prop_fields()
                 .into_iter()
                 .find(|f| f.name == req.prop);
+            // Polymorphic value: strings pass through, everything else coerced.
             let value_str = match &req.value {
                 Value::String(s) => s.clone(),
                 other => zeroclaw_config::typed_value::coerce_for_set_prop(
@@ -1407,6 +1427,25 @@ impl RpcDispatcher {
                 )
                 .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
             };
+            // Reject the masked sentinel for secrets — surfaces echo the
+            // masked display value back when no real edit happened, and
+            // letting that through silently clobbers the live secret with
+            // the literal masked string.
+            if info
+                .as_ref()
+                .is_some_and(|i| i.is_secret || i.derived_from_secret)
+                && (value_str == zeroclaw_config::traits::MASKED_SECRET
+                    || value_str == "****"
+                    || value_str.is_empty())
+            {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Refusing to overwrite secret `{}` with a masked or empty value",
+                        req.prop
+                    ),
+                ));
+            }
             config
                 .set_prop_persistent(&req.prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
@@ -2188,6 +2227,118 @@ impl RpcDispatcher {
             let _ = self.rpc.send_raw(json).await;
         }
     }
+
+    // ── Quickstart ───────────────────────────────────────────────
+    //
+    // RPC mirror of the HTTP `/api/quickstart/*` routes in
+    // `zeroclaw-gateway`. All business logic lives in
+    // `zeroclaw_runtime::quickstart`; these handlers are call-the-runtime
+    // plumbing only — they MUST stay byte-equivalent to the HTTP routes
+    // so the drift test holds.
+
+    fn handle_quickstart_state(&self) -> RpcResult {
+        let cfg = self.ctx.config.read().clone();
+        to_result(crate::quickstart::snapshot_state(&cfg))
+    }
+
+    fn handle_quickstart_fields(&self, params: &Value) -> RpcResult {
+        let req: QuickstartFieldsParams = parse_params(params)?;
+        let descriptors = crate::quickstart::field_shape(req.section, &req.type_key);
+        to_result(QuickstartFieldsResult {
+            fields: descriptors,
+        })
+    }
+
+    fn handle_quickstart_validate(&self, params: &Value) -> RpcResult {
+        let req: QuickstartValidateParams = parse_params(params)?;
+        let cfg = self.ctx.config.read().clone();
+        let body = match crate::quickstart::validate_only_with_surface(
+            &req.submission,
+            &cfg,
+            crate::quickstart::Surface::Tui,
+        ) {
+            Ok(()) => QuickstartValidateResult::Ok,
+            Err(errors) => QuickstartValidateResult::Errors { errors },
+        };
+        to_result(body)
+    }
+
+    async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
+        let req: QuickstartApplyParams = parse_params(params)?;
+        // Clone out of the lock to satisfy `&mut Config`. On success
+        // write the mutated snapshot back, mirroring `flush_config`
+        // and the gateway's `handle_apply`.
+        let mut working = self.ctx.config.read().clone();
+        let result = crate::quickstart::apply_with_surface(
+            req.submission,
+            &mut working,
+            crate::quickstart::Surface::Tui,
+        )
+        .await;
+        let body = match result {
+            Ok(agent) => {
+                *self.ctx.config.write() = working;
+                let reload_signalled = self.signal_daemon_reload();
+                QuickstartApplyResult::Applied {
+                    agent,
+                    daemon_restarted: reload_signalled,
+                }
+            }
+            Err(errors) => QuickstartApplyResult::Errors { errors },
+        };
+        to_result(body)
+    }
+
+    fn handle_quickstart_dismiss(&self, params: &Value) -> RpcResult {
+        let req: QuickstartDismissParams = parse_params(params)?;
+        crate::quickstart::record_dismissed(&req.run_id, req.surface, req.last_step);
+        to_result(QuickstartDismissResult { recorded: true })
+    }
+
+    /// Signal the in-place daemon reload using the same `reload_tx`
+    /// watch channel `/admin/reload` and the gateway's quickstart route
+    /// use. Returns `true` when the supervisor was notified, `false`
+    /// when no supervisor is attached (e.g. test harness).
+    fn signal_daemon_reload(&self) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "no_supervisor",
+                        "surface": crate::quickstart::Surface::Tui.as_str(),
+                    })),
+                "quickstart: daemon reload not available (standalone daemon)"
+            );
+            return false;
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_attrs(
+                ::serde_json::json!({
+                    "surface": crate::quickstart::Surface::Tui.as_str(),
+                })
+            ),
+            "quickstart: daemon reload signalled"
+        );
+        let started = std::time::Instant::now();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = reload_tx.send(true);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                        "surface": crate::quickstart::Surface::Tui.as_str(),
+                    })),
+                "quickstart: daemon reload dispatched"
+            );
+        });
+        true
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -2736,5 +2887,107 @@ mod tests {
             "Chat session must stamp its agent_alias in session_backend (got: {:?})",
             entry.agent_alias
         );
+    }
+
+    // ── config/set secret-routing ────────────────────────────────
+
+    fn make_config_set_test_dispatcher(config: zeroclaw_config::schema::Config) -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
+    /// Mint a config with `providers.models.anthropic.default` so we can
+    /// poke its `#[secret]` `api-key` field through `config/set`.
+    fn make_secret_test_config() -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg
+    }
+
+    #[tokio::test]
+    async fn config_set_writes_real_secret_through_set_prop() {
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config());
+        let params = json!({
+            "prop": "providers.models.anthropic.default.api-key",
+            "value": "sk-real-test-key"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "config/set must accept a real secret: {res:?}");
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("sk-real-test-key"),
+            "real secret must land in memory as plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_masked_secret_value() {
+        let mut cfg = make_secret_test_config();
+        cfg.providers
+            .models
+            .anthropic
+            .get_mut("default")
+            .unwrap()
+            .base
+            .api_key = Some("sk-live-secret".into());
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        for masked in [zeroclaw_config::traits::MASKED_SECRET, "****", ""] {
+            let params = json!({
+                "prop": "providers.models.anthropic.default.api-key",
+                "value": masked
+            });
+            let res = dispatcher.handle_config_set(&params).await;
+            assert!(
+                res.is_err(),
+                "config/set must refuse masked/empty secret (`{masked}`), got: {res:?}"
+            );
+        }
+
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        let stored = cfg_after
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("sk-live-secret"),
+            "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_non_secret_field_still_uses_set_prop() {
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config());
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "claude-sonnet-4-5"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "non-secret set must succeed: {res:?}");
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.model.clone());
+        assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
     }
 }

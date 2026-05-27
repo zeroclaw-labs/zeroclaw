@@ -614,6 +614,28 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(e.with_path(&body.path)),
     };
 
+    // Reject the masked sentinel for secrets — surfaces occasionally
+    // echo the masked display value back when no real edit happened.
+    // Letting that through would overwrite the live secret with the
+    // literal masked string.
+    let is_sensitive = info.is_secret || info.derived_from_secret;
+    if is_sensitive
+        && (value_str == zeroclaw_config::traits::MASKED_SECRET
+            || value_str == "****"
+            || value_str.is_empty())
+    {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!(
+                    "Refusing to overwrite secret `{}` with a masked or empty value",
+                    body.path
+                ),
+            )
+            .with_path(&body.path),
+        );
+    }
+
     if let Err(e) = new_config.set_prop_persistent(&body.path, &value_str) {
         return error_response(map_prop_error(e, &body.path));
     }

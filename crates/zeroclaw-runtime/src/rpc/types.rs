@@ -1168,3 +1168,102 @@ pub enum SessionUpdateEvent {
         max_context_tokens: Option<u64>,
     },
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ── Quickstart ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+//
+// RPC mirror of the HTTP `/api/quickstart/*` routes in
+// `zeroclaw-gateway`. The wire shapes are deliberately identical so the
+// drift test in `tests/quickstart_drift.rs` can submit the same fixture
+// `BuilderSubmission` through both transports and assert identical
+// on-disk delta + identical response shape.
+
+pub use crate::quickstart::{
+    AppliedAgent, FieldDescriptor, FieldSection, QuickstartError, QuickstartStep, Surface,
+};
+pub use zeroclaw_config::presets::BuilderSubmission;
+
+rpc_type! {
+    /// Mirrors `zeroclaw_gateway::api_quickstart::QuickstartState`.
+    pub struct QuickstartStateResult {
+        pub quickstart_completed: bool,
+        pub agents: Vec<String>,
+        pub risk_profiles: Vec<String>,
+        pub runtime_profiles: Vec<String>,
+        /// `<provider_type>.<alias>` refs.
+        pub model_providers: Vec<String>,
+        /// `<channel_type>.<alias>` refs.
+        pub channels: Vec<String>,
+        /// `<storage_type>.<alias>` refs.
+        pub storage: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartValidateParams {
+        pub submission: BuilderSubmission,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartFieldsParams {
+        pub section: FieldSection,
+        pub type_key: String,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartFieldsResult {
+        pub fields: Vec<FieldDescriptor>,
+    }
+}
+
+/// Tagged enum — matches the HTTP route's `ValidateResult` shape so
+/// the drift test can compare bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuickstartValidateResult {
+    Ok,
+    Errors { errors: Vec<QuickstartError> },
+}
+
+rpc_type! {
+    pub struct QuickstartApplyParams {
+        pub submission: BuilderSubmission,
+    }
+}
+
+/// Tagged enum — matches the HTTP route's `ApplyResult` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuickstartApplyResult {
+    Applied {
+        agent: AppliedAgent,
+        /// `true` when the in-place daemon reload was signalled.
+        /// `false` when no reload tx was attached (e.g. test harness)
+        /// — caller must restart the daemon manually to pick up the
+        /// change.
+        daemon_restarted: bool,
+    },
+    Errors {
+        errors: Vec<QuickstartError>,
+    },
+}
+
+rpc_type! {
+    pub struct QuickstartDismissParams {
+        pub run_id: String,
+        /// Surface that emitted the dismissal. Deserialised straight
+        /// into the typed enum — no string-match at the boundary.
+        pub surface: Surface,
+        #[serde(default)]
+        pub last_step: Option<QuickstartStep>,
+    }
+}
+
+rpc_type! {
+    pub struct QuickstartDismissResult {
+        pub recorded: bool,
+    }
+}
