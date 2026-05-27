@@ -1,0 +1,40 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Plugin interface for a single callable tool exposed to the ZeroClaw agent loop.
+interface tool {
+    /// Semantic alias: a JSON-encoded string value.
+    /// Callers must produce valid JSON; receivers must parse it as JSON.
+    type json-string = string;
+
+    /// Result returned by a tool execution.
+    record tool-result {
+        success: bool,
+        output: string,
+        error: option<string>,
+    }
+
+    /// Tool name used in LLM function calling.
+    name: func() -> string;
+
+    /// Human-readable description forwarded to the LLM.
+    description: func() -> string;
+
+    /// JSON Schema for the tool's parameters, encoded as a JSON string.
+    parameters-schema: func() -> json-string;
+
+    /// Execute the tool with the given JSON-encoded arguments.
+    /// Returns an error string on failure.
+    execute: func(args: json-string) -> result<tool-result, string>;
+}
+
+/// A component that exports `tool` is a single-tool plugin.
+///
+/// The runtime registers it with the agent loop by calling `name`, `description`,
+/// and `parameters-schema` once at load time, then dispatches `execute` per
+/// invocation.
+///
+/// Note: `spec()` is a host-side convenience that composes the three metadata
+/// functions above; it is not part of this interface.
+world tool-plugin {
+    export tool;
+}
