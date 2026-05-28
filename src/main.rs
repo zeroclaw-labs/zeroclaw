@@ -974,6 +974,7 @@ async fn run_quickstart_cli(
         // `channels_visited == false` is *not* satisfied — the
         // selector still shows `[ ]`.
         channels_visited: bool,
+        peer_groups: Vec<zeroclaw_config::presets::QuickstartPeerGroup>,
         agent: Option<AgentChoice>,
     }
     enum ProviderChoice {
@@ -1007,6 +1008,7 @@ async fn run_quickstart_cli(
     struct AgentChoice {
         name: String,
         system_prompt: String,
+        personality_files: Vec<zeroclaw_config::presets::QuickstartPersonalityFile>,
     }
 
     impl Form {
@@ -1085,6 +1087,7 @@ async fn run_quickstart_cli(
             form.agent = Some(AgentChoice {
                 name: trimmed.to_string(),
                 system_prompt: String::new(),
+                personality_files: Vec::new(),
             });
         }
     }
@@ -1097,6 +1100,7 @@ async fn run_quickstart_cli(
         Runtime,
         Memory,
         Channels,
+        PeerGroups,
         Agent,
         Create,
         Quit,
@@ -1152,10 +1156,20 @@ async fn run_quickstart_cli(
         let agent_summary = match &form.agent {
             None => "not yet named".to_string(),
             Some(a) => format!(
-                "alias: {}, system prompt: {} chars",
+                "alias: {}, system prompt: {} chars, {} personality file(s)",
                 a.name,
-                a.system_prompt.len()
+                a.system_prompt.len(),
+                a.personality_files.len(),
             ),
+        };
+        let peer_groups_summary = if form.peer_groups.is_empty() {
+            "none — channels accept no peers".to_string()
+        } else {
+            form.peer_groups
+                .iter()
+                .map(|pg| format!("{} → {}", pg.channel, pg.name))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
         let mut labels: Vec<String> = vec![
@@ -1181,6 +1195,7 @@ async fn run_quickstart_cli(
                 "{} Channels (0..N)    — {channels_summary}",
                 glyph(form.channels_done())
             ),
+            format!("   Peer groups        — {peer_groups_summary}",),
             format!(
                 "{} Agent identity     — {agent_summary}",
                 glyph(form.agent_done())
@@ -1200,6 +1215,7 @@ async fn run_quickstart_cli(
             Action::Runtime,
             Action::Memory,
             Action::Channels,
+            Action::PeerGroups,
             Action::Agent,
             Action::Create,
             Action::Quit,
@@ -1577,6 +1593,112 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
+            Action::PeerGroups => {
+                // Available channel refs: staged channels (this run) +
+                // unassigned channels already in config. Refs already
+                // covered by a staged peer-group are filtered out.
+                let staged_refs: Vec<String> = form
+                    .channels
+                    .iter()
+                    .map(|c| match c {
+                        ChannelChoice::Fresh { kind, alias, .. } => format!("{kind}.{alias}"),
+                        ChannelChoice::Existing { alias_ref } => alias_ref.clone(),
+                    })
+                    .collect();
+                let claimed: std::collections::HashSet<String> = form
+                    .peer_groups
+                    .iter()
+                    .map(|pg| pg.channel.clone())
+                    .collect();
+                let mut available: Vec<String> = staged_refs
+                    .iter()
+                    .chain(state.unassigned_channels.iter())
+                    .filter(|r| !claimed.contains(r.as_str()))
+                    .cloned()
+                    .collect();
+                available.dedup();
+                loop {
+                    let mut items: Vec<String> = form
+                        .peer_groups
+                        .iter()
+                        .map(|pg| {
+                            format!(
+                                "{} → {} ({} peers)",
+                                pg.channel,
+                                pg.name,
+                                pg.external_peers.len()
+                            )
+                        })
+                        .collect();
+                    let drafts = items.len();
+                    if !available.is_empty() {
+                        items.push("+ Add peer group".into());
+                    }
+                    items.push("Done".into());
+                    let Some(pick) = FuzzySelect::new()
+                        .with_prompt("Peer groups (Enter on a row to remove, + Add to create)")
+                        .items(&items)
+                        .default(items.len() - 1)
+                        .max_length(items.len())
+                        .interact_opt()?
+                    else {
+                        break;
+                    };
+                    if pick < drafts {
+                        form.peer_groups.remove(pick);
+                        continue;
+                    }
+                    if pick == drafts && !available.is_empty() {
+                        let Some(ch_idx) = FuzzySelect::new()
+                            .with_prompt("Channel to authorize")
+                            .items(&available)
+                            .default(0)
+                            .max_length(available.len())
+                            .interact_opt()?
+                        else {
+                            continue;
+                        };
+                        let channel = available[ch_idx].clone();
+                        let (ch_type, ch_alias) = match channel.split_once('.') {
+                            Some(parts) => parts,
+                            None => continue,
+                        };
+                        let name = format!("{ch_type}_{ch_alias}_default");
+                        let Ok(peers_raw) = Input::<String>::new()
+                            .with_prompt(
+                                "External peers (comma- or newline-separated, blank for none)",
+                            )
+                            .allow_empty(true)
+                            .interact_text()
+                        else {
+                            continue;
+                        };
+                        let external_peers: Vec<String> = peers_raw
+                            .split(|c: char| c == ',' || c == '\n')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        form.peer_groups
+                            .push(zeroclaw_config::presets::QuickstartPeerGroup {
+                                name,
+                                channel,
+                                external_peers,
+                                ignore: Vec::new(),
+                            });
+                        // The channel just got claimed; refresh the available list.
+                        available = staged_refs
+                            .iter()
+                            .chain(state.unassigned_channels.iter())
+                            .filter(|r| !form.peer_groups.iter().any(|pg| &pg.channel == *r))
+                            .cloned()
+                            .collect();
+                        available.dedup();
+                        continue;
+                    }
+                    // Done.
+                    break;
+                }
+            }
             Action::Agent => {
                 let default_name = form
                     .agent
@@ -1606,9 +1728,61 @@ async fn run_quickstart_cli(
                 {
                     system_prompt = edited;
                 }
+                // Personality files. The canonical list comes from the
+                // snapshot — no hardcoded filenames. Pre-seed buffers
+                // from any previously-staged content so re-entering
+                // Agent doesn't drop the user's edits.
+                let prior_files: std::collections::HashMap<String, String> = form
+                    .agent
+                    .as_ref()
+                    .map(|a| {
+                        a.personality_files
+                            .iter()
+                            .map(|f| (f.filename.clone(), f.content.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut personality_files: Vec<
+                    zeroclaw_config::presets::QuickstartPersonalityFile,
+                > = Vec::new();
+                for filename in state.personality_files {
+                    let staged = prior_files.get(*filename).cloned().unwrap_or_default();
+                    let label = if staged.is_empty() {
+                        format!("Edit `{filename}` in $EDITOR? (blank to skip)")
+                    } else {
+                        format!(
+                            "Edit `{filename}` in $EDITOR? (currently {} chars; blank to drop)",
+                            staged.len()
+                        )
+                    };
+                    let go = Confirm::new()
+                        .with_prompt(label)
+                        .default(false)
+                        .interact_opt()?;
+                    if let Some(true) = go {
+                        if let Some(edited) = Editor::new().edit(&staged)? {
+                            if !edited.trim().is_empty() {
+                                personality_files.push(
+                                    zeroclaw_config::presets::QuickstartPersonalityFile {
+                                        filename: (*filename).to_string(),
+                                        content: edited,
+                                    },
+                                );
+                            }
+                        }
+                    } else if !staged.is_empty() {
+                        personality_files.push(
+                            zeroclaw_config::presets::QuickstartPersonalityFile {
+                                filename: (*filename).to_string(),
+                                content: staged,
+                            },
+                        );
+                    }
+                }
                 form.agent = Some(AgentChoice {
                     name,
                     system_prompt,
+                    personality_files,
                 });
             }
         }
@@ -1673,12 +1847,12 @@ async fn run_quickstart_cli(
         runtime_profile,
         memory,
         channels,
-        peer_groups: Vec::new(),
+        peer_groups: form.peer_groups,
         agent: AgentIdentity {
             name: agent_choice.name.clone(),
             system_prompt: agent_choice.system_prompt,
             personality_file: None,
-            personality_files: Vec::new(),
+            personality_files: agent_choice.personality_files,
         },
     };
 

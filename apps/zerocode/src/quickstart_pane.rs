@@ -270,7 +270,9 @@ struct FormState {
     /// "I considered this and chose 0 / N" before the selector
     /// counts as `[✓]`).
     channels_visited: bool,
+    peer_groups: Vec<crate::wire::QuickstartPeerGroup>,
     agent_name: String,
+    personality_files: Vec<crate::wire::QuickstartPersonalityFile>,
 }
 
 impl FormState {
@@ -291,7 +293,9 @@ impl FormState {
             memory_existing_alias: String::new(),
             channels: Vec::new(),
             channels_visited: false,
+            peer_groups: Vec::new(),
             agent_name: String::new(),
+            personality_files: Vec::new(),
         }
     }
 
@@ -394,12 +398,12 @@ impl FormState {
                     }
                 })
                 .collect(),
-            peer_groups: Vec::new(),
+            peer_groups: self.peer_groups.clone(),
             agent: AgentIdentity {
                 name: self.agent_name.clone(),
                 system_prompt: String::new(),
                 personality_file: None,
-                personality_files: Vec::new(),
+                personality_files: self.personality_files.clone(),
             },
         }
     }
