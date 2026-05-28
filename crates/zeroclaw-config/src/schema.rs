@@ -14620,6 +14620,15 @@ impl Config {
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
+        // Conscience: surface misordered or out-of-range thresholds loudly so
+        // the operator notices instead of getting silently clamped behaviour.
+        // See Plans/glimmering-mixing-moore.md Step 5. The companion
+        // `ConscienceConfig::normalize` is for in-memory rewrites (e.g. before
+        // serialising a generated config) and is intentionally not called here.
+        if let Err(msg) = self.conscience.validate() {
+            anyhow::bail!("{msg}");
+        }
+
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {

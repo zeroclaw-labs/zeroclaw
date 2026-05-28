@@ -896,6 +896,143 @@ impl Default for ConscienceConfig {
     }
 }
 
+impl ConscienceConfig {
+    /// Read-only validation: returns `Err` when thresholds are out of bounds
+    /// or in the wrong order. The companion [`Self::normalize`] silently
+    /// clamps and reorders instead — call `normalize` on the in-memory
+    /// config before serialising, and call `validate` on a loaded config
+    /// to surface misconfigurations the user wrote on disk.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.allow_threshold) {
+            return Err(format!(
+                "conscience.allow_threshold must be in [0,1], got {}",
+                self.allow_threshold
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.ask_threshold) {
+            return Err(format!(
+                "conscience.ask_threshold must be in [0,1], got {}",
+                self.ask_threshold
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.block_threshold) {
+            return Err(format!(
+                "conscience.block_threshold must be in [0,1], got {}",
+                self.block_threshold
+            ));
+        }
+        if self.block_threshold > self.ask_threshold {
+            return Err(format!(
+                "conscience.block_threshold ({}) must be <= ask_threshold ({})",
+                self.block_threshold, self.ask_threshold
+            ));
+        }
+        if self.ask_threshold > self.allow_threshold {
+            return Err(format!(
+                "conscience.ask_threshold ({}) must be <= allow_threshold ({})",
+                self.ask_threshold, self.allow_threshold
+            ));
+        }
+        Ok(())
+    }
+
+    /// Clamp threshold values to `[0.0, 1.0]` and enforce
+    /// `block_threshold <= ask_threshold <= allow_threshold`.
+    ///
+    /// Misordered thresholds would otherwise produce verdicts that contradict
+    /// the gate's intent (e.g. a score above the block threshold but below the
+    /// ask threshold). Returns the count of fields that were adjusted, useful
+    /// for caller-side logging.
+    ///
+    /// Implements Step 5 of `Plans/glimmering-mixing-moore.md` (ISC-C5).
+    pub fn normalize(&mut self) -> usize {
+        let mut adjusted = 0_usize;
+
+        let clamp = |v: &mut f64, was_adjusted: &mut usize| {
+            let new = v.clamp(0.0, 1.0);
+            if (new - *v).abs() > f64::EPSILON {
+                *was_adjusted += 1;
+            }
+            *v = new;
+        };
+        clamp(&mut self.allow_threshold, &mut adjusted);
+        clamp(&mut self.ask_threshold, &mut adjusted);
+        clamp(&mut self.block_threshold, &mut adjusted);
+
+        // Enforce monotonicity: block <= ask <= allow. Push down rather than up
+        // so the more permissive thresholds stay where the operator set them.
+        if self.ask_threshold > self.allow_threshold {
+            self.ask_threshold = self.allow_threshold;
+            adjusted += 1;
+        }
+        if self.block_threshold > self.ask_threshold {
+            self.block_threshold = self.ask_threshold;
+            adjusted += 1;
+        }
+        adjusted
+    }
+}
+
+#[cfg(test)]
+mod conscience_config_tests {
+    use super::ConscienceConfig;
+
+    #[test]
+    fn validate_clamps_out_of_range_thresholds() {
+        let mut cc = ConscienceConfig {
+            gate_enabled: true,
+            allow_threshold: 1.5,
+            ask_threshold: -0.3,
+            block_threshold: 0.4,
+        };
+        let adjusted = cc.normalize();
+        assert_eq!(cc.allow_threshold, 1.0);
+        assert_eq!(cc.ask_threshold, 0.0);
+        assert_eq!(cc.block_threshold, 0.0);
+        assert!(adjusted >= 2, "at least allow + ask were adjusted");
+    }
+
+    #[test]
+    fn validate_enforces_block_ask_allow_monotonicity() {
+        let mut cc = ConscienceConfig {
+            gate_enabled: true,
+            allow_threshold: 0.4,
+            ask_threshold: 0.6,
+            block_threshold: 0.8,
+        };
+        let adjusted = cc.normalize();
+        assert_eq!(cc.allow_threshold, 0.4);
+        assert_eq!(cc.ask_threshold, 0.4);
+        assert_eq!(cc.block_threshold, 0.4);
+        assert_eq!(adjusted, 2);
+    }
+
+    #[test]
+    fn validate_is_noop_for_well_formed_config() {
+        let mut cc = ConscienceConfig::default();
+        let adjusted = cc.normalize();
+        assert_eq!(adjusted, 0);
+        assert_eq!(cc.allow_threshold, 0.80);
+        assert_eq!(cc.ask_threshold, 0.55);
+        assert_eq!(cc.block_threshold, 0.45);
+    }
+
+    #[test]
+    fn validate_handles_compound_violation_clamp_then_reorder() {
+        let mut cc = ConscienceConfig {
+            gate_enabled: true,
+            allow_threshold: 2.0,
+            ask_threshold: 1.5,
+            block_threshold: 1.2,
+        };
+        cc.normalize();
+        // All three clamp to 1.0, monotonicity already holds afterwards.
+        assert_eq!(cc.allow_threshold, 1.0);
+        assert_eq!(cc.ask_threshold, 1.0);
+        assert_eq!(cc.block_threshold, 1.0);
+    }
+}
+
 // ── TaskQueue Config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
