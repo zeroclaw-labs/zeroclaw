@@ -1,22 +1,19 @@
 name: Release Stable
 
 on:
+  # Tag-push trigger covers both stable (v1.2.3) and pre-release
+  # (v1.2.3-beta-2, v1.2.3-rc.1) tags. The validate-version step extracts
+  # the version from REF_NAME, validates the prerelease-aware regex, and
+  # skips the tag-exists check on the push path.
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+" # stable tags only (no -beta suffix)
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
         description: "Stable version to release (e.g. 0.2.0)"
         required: true
         type: string
-  # Tag-push trigger: `git push origin v0.8.0-beta-2` starts a release
-  # without an extra `gh workflow run` dispatch. The validate-version
-  # step extracts the version from REF_NAME for this path and skips the
-  # "tag already exists" check (since the tag is the trigger).
-  push:
-    tags:
-      - "v*"
 
 concurrency:
   group: promote-release
