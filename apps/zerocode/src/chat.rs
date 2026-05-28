@@ -1363,15 +1363,25 @@ fn render_entry_into(
     };
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
-            let mut spans = vec![Span::styled(
+            let label_span = Span::styled(
                 "You: ",
                 theme::user_label_style().add_modifier(sel_mod),
-            )];
-            if let Some(t) = text {
-                spans.push(Span::styled(
-                    t.to_string(),
-                    theme::body_style().add_modifier(sel_mod),
-                ));
+            );
+            let body_style = theme::body_style().add_modifier(sel_mod);
+            let mut text_lines: Vec<&str> = match text {
+                Some(t) => t.split('\n').collect(),
+                None => Vec::new(),
+            };
+            if text_lines.is_empty() {
+                text_lines.push("");
+            }
+            for (idx, line_text) in text_lines.iter().enumerate() {
+                let mut spans = Vec::new();
+                if idx == 0 {
+                    spans.push(label_span.clone());
+                }
+                spans.push(Span::styled((*line_text).to_string(), body_style));
+                lines.push(Line::from(spans));
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -1379,12 +1389,11 @@ fn render_entry_into(
                     .map(|a| a.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
-                spans.push(Span::styled(
+                lines.push(Line::from(Span::styled(
                     format!(" [{label}]"),
                     theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod),
-                ));
+                )));
             }
-            lines.push(Line::from(spans));
         }
         ChatEntry::AgentMessage(text) => {
             lines.push(Line::from(vec![Span::styled(
