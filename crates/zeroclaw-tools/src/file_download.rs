@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
@@ -226,11 +226,25 @@ impl Tool for FileDownloadTool {
             });
         }
 
-        let client = zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "tool.file_download",
-            self.config.timeout_secs,
-            10,
-        );
+        // Disable redirect-following: the configured `[file_download].url` is
+        // the operator-approved endpoint, so a 3xx response from it must surface
+        // as a non-success status rather than silently rehome the request.
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.file_download");
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build download client: {e}")),
+                });
+            }
+        };
 
         let mut request = client.get(url).query(&[("document_id", document_id)]);
         for (k, v) in &self.config.headers {
@@ -253,10 +267,19 @@ impl Tool for FileDownloadTool {
         if !status.is_success() {
             let raw_body = response.text().await.unwrap_or_default();
             let truncated = if raw_body.len() > RESPONSE_BODY_LIMIT_BYTES {
+                // The body is attacker-influenceable, so split on a char boundary
+                // to avoid panicking when the byte cutoff lands inside a
+                // multi-byte UTF-8 sequence. floor_char_boundary is unstable, so
+                // walk down at most three bytes — a UTF-8 code point is at most
+                // four bytes wide, so a boundary is always within reach.
+                let mut cut = RESPONSE_BODY_LIMIT_BYTES;
+                while cut > 0 && !raw_body.is_char_boundary(cut) {
+                    cut -= 1;
+                }
                 format!(
                     "{}... [truncated {} bytes]",
-                    &raw_body[..RESPONSE_BODY_LIMIT_BYTES],
-                    raw_body.len() - RESPONSE_BODY_LIMIT_BYTES
+                    &raw_body[..cut],
+                    raw_body.len() - cut
                 )
             } else {
                 raw_body
@@ -692,5 +715,106 @@ mod tests {
             part_files(tmp.path()).is_empty(),
             "no partial file may remain"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_does_not_follow_redirects_from_configured_endpoint() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        // The configured endpoint returns a 302 pointing at a sibling path.
+        // With redirects disabled, the tool must surface the 302 itself as a
+        // non-success status and must never contact the redirect target.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/elsewhere", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"redirected-bytes".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            ..FileDownloadConfig::default()
+        };
+        let tool = FileDownloadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+        );
+
+        let result = tool
+            .execute(json!({ "document_id": "doc-1", "dest_path": "out.bin" }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("302"),
+            "expected the 302 status to surface; got {result:?}"
+        );
+        assert!(
+            !tmp.path().join("out.bin").exists(),
+            "no file may be written when the configured endpoint returns 3xx"
+        );
+        assert!(
+            part_files(tmp.path()).is_empty(),
+            "no partial file may remain after a 3xx response"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_truncates_non_ascii_error_body_safely() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+
+        // Build a non-2xx body that is longer than RESPONSE_BODY_LIMIT_BYTES
+        // (4096) and where the byte at offset 4096 lands inside a multi-byte
+        // UTF-8 sequence. Pre-truncation pad — 4094 ASCII bytes — places the
+        // first byte of the next 3-byte character ("界") at offset 4094, so
+        // offset 4096 lies in the middle of that code point.
+        let mut body = "x".repeat(4094);
+        body.push_str("世界世界世界世界世界世界");
+        assert!(!body.is_char_boundary(4096));
+
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            ..FileDownloadConfig::default()
+        };
+        let tool = FileDownloadTool::new(
+            test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
+            config,
+        );
+
+        // Must not panic when slicing the body at a non-char-boundary byte
+        // index. The truncated output must still be valid UTF-8 and must
+        // include the "[truncated ...]" marker.
+        let result = tool
+            .execute(json!({ "document_id": "doc-1", "dest_path": "out.bin" }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("500"));
+        assert!(result.output.contains("[truncated"));
+        assert!(
+            result.output.len() < body.len(),
+            "expected the body to be shortened"
+        );
+        assert!(!tmp.path().join("out.bin").exists());
     }
 }
