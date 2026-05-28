@@ -3374,6 +3374,46 @@ pub const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 120;
 /// Default delegate tool timeout for agentic runs: 300 seconds.
 pub const DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 
+/// Per-channel reply-pacing accessor. Implemented by every `*Config`
+/// struct that participates in outbound pacing so validation and
+/// wrapper construction can walk all of them through a single
+/// abstraction rather than nine duplicated method calls.
+pub trait HasReplyPacing {
+    fn reply_min_interval_secs(&self) -> u64;
+    fn reply_queue_depth_max(&self) -> u16;
+}
+
+macro_rules! impl_reply_pacing {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl HasReplyPacing for $ty {
+            fn reply_min_interval_secs(&self) -> u64 { self.reply_min_interval_secs }
+            fn reply_queue_depth_max(&self) -> u16 { self.reply_queue_depth_max }
+        })+
+    };
+}
+
+/// Inclusive upper bound (seconds) for per-channel `reply_min_interval_secs`.
+pub const REPLY_MIN_INTERVAL_MAX_SECS: u64 = 3600;
+
+/// Inclusive upper bound for per-channel `reply_queue_depth_max`. The lower
+/// bound is `0`, where `0` means "use [`DEFAULT_REPLY_QUEUE_DEPTH`] at the
+/// pacing-wrapper construction site." A non-zero value pins the bound
+/// explicitly. Validator rejects values above this ceiling.
+pub const REPLY_QUEUE_DEPTH_CEILING: u16 = 1024;
+
+/// Fallback queue depth applied at the pacing-wrapper construction site
+/// when a channel's `reply_queue_depth_max` is left at `0`. Sized for the
+/// AI-pacing use case: a paced channel buffering more than this is a sign
+/// the agent is producing replies faster than the floor will ever drain
+/// them and the overflow log is the right signal.
+pub const DEFAULT_REPLY_QUEUE_DEPTH: u16 = 16;
+
+/// Per-(channel, recipient) recipient cap on the pacing wrapper's LRU.
+/// Protects against unbounded growth when a bot legitimately serves many
+/// thousands of distinct peers. Not exposed in config — promote to a
+/// schema field if an operator reports hitting it.
+pub const PACING_RECIPIENT_CAP: usize = 1024;
+
 /// Validate that a temperature value is within the allowed range.
 pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
     if TEMPERATURE_RANGE.contains(&value) {
@@ -10355,6 +10395,17 @@ pub struct TelegramConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -10439,6 +10490,17 @@ pub struct DiscordConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -10523,6 +10585,17 @@ pub struct SlackConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -10612,6 +10685,17 @@ pub struct MattermostConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -10662,6 +10746,17 @@ pub struct WebhookConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -10688,6 +10783,17 @@ pub struct IMessageConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for IMessageConfig {
@@ -10775,6 +10881,17 @@ pub struct MatrixConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -10829,6 +10946,17 @@ pub struct SignalConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -10970,6 +11098,17 @@ pub struct WhatsAppConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -10980,6 +11119,18 @@ impl ChannelConfig for WhatsAppConfig {
         "Business Cloud API"
     }
 }
+
+impl_reply_pacing!(
+    TelegramConfig,
+    DiscordConfig,
+    SlackConfig,
+    MattermostConfig,
+    WebhookConfig,
+    IMessageConfig,
+    MatrixConfig,
+    SignalConfig,
+    WhatsAppConfig,
+);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13860,6 +14011,35 @@ impl Config {
         Vec::new()
     }
 
+    /// Walk every channel HashMap that carries reply pacing fields and yield
+    /// `(dotted-path-prefix, &dyn HasReplyPacing)` pairs. Used by validation
+    /// and by anywhere that wants a single source of truth for which channel
+    /// types participate in pacing.
+    pub fn reply_pacing_entries(&self) -> Vec<(String, &dyn HasReplyPacing)> {
+        let c = &self.channels;
+        fn rows<'a, C: HasReplyPacing>(
+            ch_type: &'static str,
+            map: &'a std::collections::HashMap<String, C>,
+        ) -> impl Iterator<Item = (String, &'a dyn HasReplyPacing)> + 'a {
+            map.iter().map(move |(alias, cfg)| {
+                (
+                    format!("channels.{ch_type}.{alias}"),
+                    cfg as &dyn HasReplyPacing,
+                )
+            })
+        }
+        rows("telegram", &c.telegram)
+            .chain(rows("discord", &c.discord))
+            .chain(rows("slack", &c.slack))
+            .chain(rows("mattermost", &c.mattermost))
+            .chain(rows("webhook", &c.webhook))
+            .chain(rows("imessage", &c.imessage))
+            .chain(rows("matrix", &c.matrix))
+            .chain(rows("signal", &c.signal))
+            .chain(rows("whatsapp", &c.whatsapp))
+            .collect()
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -13889,6 +14069,30 @@ impl Config {
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
+                );
+            }
+        }
+
+        // Reply-pacing bounds — both `reply_min_interval_secs` and
+        // `reply_queue_depth_max` walk through one entry list so adding
+        // a new paced channel only requires extending `reply_pacing_entries`.
+        for (path_prefix, cfg) in self.reply_pacing_entries() {
+            let secs = cfg.reply_min_interval_secs();
+            if secs > REPLY_MIN_INTERVAL_MAX_SECS {
+                let path = format!("{path_prefix}.reply_min_interval_secs");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {secs} is out of range; must be 0..={REPLY_MIN_INTERVAL_MAX_SECS}"
+                );
+            }
+            let depth = cfg.reply_queue_depth_max();
+            if depth > REPLY_QUEUE_DEPTH_CEILING {
+                let path = format!("{path_prefix}.reply_queue_depth_max");
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {depth} is out of range; must be 0..={REPLY_QUEUE_DEPTH_CEILING}"
                 );
             }
         }
@@ -15872,6 +16076,85 @@ enabled = true
     }
 
     #[test]
+    async fn validate_rejects_reply_min_interval_above_upper_bound() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = REPLY_MIN_INTERVAL_MAX_SECS + 1;
+        config.channels.telegram.insert("default".to_string(), tg);
+        let err = config.validate().expect_err("over-bound must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channels.telegram.default.reply_min_interval_secs"),
+            "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_reply_min_interval_at_upper_bound() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = REPLY_MIN_INTERVAL_MAX_SECS;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config.validate().expect("documented upper bound must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_reply_queue_depth_above_ceiling() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = REPLY_QUEUE_DEPTH_CEILING + 1;
+        config.channels.telegram.insert("default".to_string(), tg);
+        let err = config
+            .validate()
+            .expect_err("over-ceiling depth must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("channels.telegram.default.reply_queue_depth_max"),
+            "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_reply_queue_depth_at_ceiling() {
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = REPLY_QUEUE_DEPTH_CEILING;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config.validate().expect("documented ceiling must pass");
+    }
+
+    #[test]
+    async fn validate_accepts_reply_queue_depth_zero_meaning_default() {
+        // depth=0 means "fall back to DEFAULT_REPLY_QUEUE_DEPTH at the
+        // pacing-wrapper construction site." Validator must accept it.
+        let mut config = Config::default();
+        let mut tg = TelegramConfig {
+            bot_token: "tok".into(),
+            ..Default::default()
+        };
+        tg.reply_min_interval_secs = 1;
+        tg.reply_queue_depth_max = 0;
+        config.channels.telegram.insert("default".to_string(), tg);
+        config
+            .validate()
+            .expect("zero depth means default; must pass");
+    }
+
+    #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");
@@ -16300,6 +16583,8 @@ auto_save = true
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
                         excluded_tools: vec![],
+                        reply_min_interval_secs: 0,
+                        reply_queue_depth_max: 0,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -17324,6 +17609,8 @@ default_temperature = 0.7
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -17360,6 +17647,8 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17385,6 +17674,8 @@ default_temperature = 0.7
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -17441,6 +17732,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -17474,6 +17767,8 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -17523,6 +17818,8 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -17547,6 +17844,8 @@ allowed_users = ["@u:matrix.org"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -17581,6 +17880,8 @@ allowed_users = ["@u:matrix.org"]
                 IMessageConfig {
                     enabled: true,
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             matrix: HashMap::from([(
@@ -17603,6 +17904,8 @@ allowed_users = ["@u:matrix.org"]
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             signal: HashMap::new(),
@@ -17840,6 +18143,8 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -17870,6 +18175,8 @@ bot_token = "xoxb-tok"
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -17923,6 +18230,8 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -17950,6 +18259,8 @@ allowed_numbers = ["+1", "+2"]
             proxy_url: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -17989,6 +18300,8 @@ allowed_numbers = ["+1", "+2"]
                     proxy_url: None,
                     approval_timeout_secs: 300,
                     excluded_tools: vec![],
+                    reply_min_interval_secs: 0,
+                    reply_queue_depth_max: 0,
                 },
             )]),
             linq: HashMap::new(),
@@ -19959,6 +20272,8 @@ require_otp_to_resume = true
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -20801,6 +21116,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -20833,6 +21150,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -20858,6 +21177,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -20884,6 +21205,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -20921,6 +21244,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -20953,6 +21278,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
 
@@ -20994,6 +21321,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config
@@ -21044,6 +21373,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         // Encrypt
@@ -21081,6 +21412,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21114,6 +21447,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -21142,6 +21477,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         }
     }
 

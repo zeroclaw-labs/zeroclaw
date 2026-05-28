@@ -111,6 +111,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+use crate::paced_channel::PacedChannel;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_log::Instrument;
@@ -5819,22 +5821,25 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                    tg.mention_only,
-                )
-                .with_persistence(config_arc.clone())
-                .with_ack_reactions(ack)
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_tts(&config)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
-                .with_proxy_url(tg.proxy_url.clone())
-                .with_tool_command_specs(tool_specs.to_vec())
-                .with_approval_timeout_secs(tg.approval_timeout_secs),
+            channel: PacedChannel::wrap(
+                Arc::new(
+                    TelegramChannel::new(
+                        tg.bot_token.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                        tg.mention_only,
+                    )
+                    .with_persistence(config_arc.clone())
+                    .with_ack_reactions(ack)
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_transcription(config.transcription.clone())
+                    .with_tts(&config)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
+                    .with_proxy_url(tg.proxy_url.clone())
+                    .with_tool_command_specs(tool_specs.to_vec())
+                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                ),
+                tg,
             ),
         });
     }
@@ -5901,7 +5906,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Discord",
             alias: Some(alias.clone()),
-            channel: Arc::new(discord_ch),
+            channel: PacedChannel::wrap(Arc::new(discord_ch), dc),
         });
     }
 
@@ -5932,24 +5937,27 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Slack",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.app_token.clone(),
-                    sl.channel_ids.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                )
-                .with_thread_replies(sl.thread_replies.unwrap_or(true))
-                .with_group_reply_policy(sl.mention_only, Vec::new())
-                .with_strict_mention_in_thread(sl.strict_mention_in_thread)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
-                .with_markdown_blocks(sl.use_markdown_blocks)
-                .with_proxy_url(sl.proxy_url.clone())
-                .with_transcription(config.transcription.clone())
-                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                .with_cancel_reaction(sl.cancel_reaction.clone())
-                .with_approval_timeout_secs(sl.approval_timeout_secs),
+            channel: PacedChannel::wrap(
+                Arc::new(
+                    SlackChannel::new(
+                        sl.bot_token.clone(),
+                        sl.app_token.clone(),
+                        sl.channel_ids.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_thread_replies(sl.thread_replies.unwrap_or(true))
+                    .with_group_reply_policy(sl.mention_only, Vec::new())
+                    .with_strict_mention_in_thread(sl.strict_mention_in_thread)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
+                    .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_proxy_url(sl.proxy_url.clone())
+                    .with_transcription(config.transcription.clone())
+                    .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                    .with_cancel_reaction(sl.cancel_reaction.clone())
+                    .with_approval_timeout_secs(sl.approval_timeout_secs),
+                ),
+                sl,
             ),
         });
     }
@@ -5981,22 +5989,25 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                MattermostChannel::new(
-                    mm.url.clone(),
-                    mm.bot_token.clone(),
-                    mm.login_id.clone(),
-                    mm.password.clone(),
-                    mm.channel_ids.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                    mm.thread_replies.unwrap_or(true),
-                    mm.mention_only.unwrap_or(false),
-                )
-                .with_team_ids(mm.team_ids.clone())
-                .with_discover_dms(mm.discover_dms.unwrap_or(true))
-                .with_proxy_url(mm.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+            channel: PacedChannel::wrap(
+                Arc::new(
+                    MattermostChannel::new(
+                        mm.url.clone(),
+                        mm.bot_token.clone(),
+                        mm.login_id.clone(),
+                        mm.password.clone(),
+                        mm.channel_ids.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                        mm.thread_replies.unwrap_or(true),
+                        mm.mention_only.unwrap_or(false),
+                    )
+                    .with_team_ids(mm.team_ids.clone())
+                    .with_discover_dms(mm.discover_dms.unwrap_or(true))
+                    .with_proxy_url(mm.proxy_url.clone())
+                    .with_transcription(config.transcription.clone()),
+                ),
+                mm,
             ),
         });
     }
@@ -6029,7 +6040,10 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
             alias: Some(alias.clone()),
-            channel: Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
+            channel: PacedChannel::wrap(
+                Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
+                im,
+            ),
         });
     }
 
@@ -6072,7 +6086,7 @@ fn collect_configured_channels(
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
                     alias: Some(alias.clone()),
-                    channel: Arc::new(channel),
+                    channel: PacedChannel::wrap(Arc::new(channel), mx),
                 });
             }
             Err(e) => {
@@ -6116,19 +6130,22 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Signal",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                SignalChannel::new(
-                    sig.http_url.clone(),
-                    sig.account.clone(),
-                    sig.group_ids.clone(),
-                    sig.dm_only,
-                    alias.clone(),
-                    peer_resolver,
-                    sig.ignore_attachments,
-                    sig.ignore_stories,
-                )
-                .with_proxy_url(sig.proxy_url.clone())
-                .with_approval_timeout_secs(sig.approval_timeout_secs),
+            channel: PacedChannel::wrap(
+                Arc::new(
+                    SignalChannel::new(
+                        sig.http_url.clone(),
+                        sig.account.clone(),
+                        sig.group_ids.clone(),
+                        sig.dm_only,
+                        alias.clone(),
+                        peer_resolver,
+                        sig.ignore_attachments,
+                        sig.ignore_stories,
+                    )
+                    .with_proxy_url(sig.proxy_url.clone())
+                    .with_approval_timeout_secs(sig.approval_timeout_secs),
+                ),
+                sig,
             ),
         });
     }
@@ -6174,18 +6191,21 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: Arc::new(
-                            WhatsAppChannel::new(
-                                wa.access_token.clone().unwrap_or_default(),
-                                wa.phone_number_id.clone().unwrap_or_default(),
-                                wa.verify_token.clone().unwrap_or_default(),
-                                alias.clone(),
-                                peer_resolver,
-                            )
-                            .with_proxy_url(wa.proxy_url.clone())
-                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                            .with_group_mention_patterns(wa.group_mention_patterns.clone())
-                            .with_approval_timeout_secs(wa.approval_timeout_secs),
+                        channel: PacedChannel::wrap(
+                            Arc::new(
+                                WhatsAppChannel::new(
+                                    wa.access_token.clone().unwrap_or_default(),
+                                    wa.phone_number_id.clone().unwrap_or_default(),
+                                    wa.verify_token.clone().unwrap_or_default(),
+                                    alias.clone(),
+                                    peer_resolver,
+                                )
+                                .with_proxy_url(wa.proxy_url.clone())
+                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_approval_timeout_secs(wa.approval_timeout_secs),
+                            ),
+                            wa,
                         ),
                     });
                 } else {
@@ -6227,12 +6247,15 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: Arc::new(
-                            WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
-                                .with_transcription(config.transcription.clone())
-                                .with_tts(&config)
-                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                        channel: PacedChannel::wrap(
+                            Arc::new(
+                                WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
+                                    .with_transcription(config.transcription.clone())
+                                    .with_tts(&config)
+                                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                    .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                            ),
+                            wa,
                         ),
                     });
                 } else {
@@ -7060,15 +7083,18 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Webhook",
             alias: Some(alias.clone()),
-            channel: Arc::new(WebhookChannel::new(
-                alias.clone(),
-                wh.port,
-                wh.listen_path.clone(),
-                wh.send_url.clone(),
-                wh.send_method.clone(),
-                wh.auth_header.clone(),
-                wh.secret.clone(),
-            )),
+            channel: PacedChannel::wrap(
+                Arc::new(WebhookChannel::new(
+                    alias.clone(),
+                    wh.port,
+                    wh.listen_path.clone(),
+                    wh.send_url.clone(),
+                    wh.send_method.clone(),
+                    wh.auth_header.clone(),
+                    wh.secret.clone(),
+                )),
+                wh,
+            ),
         });
     }
 
@@ -14864,6 +14890,8 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // A channel is only collected when an enabled agent references it.
@@ -14910,6 +14938,8 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.agents.clear();
@@ -16451,6 +16481,8 @@ This is an example JSON object for profile settings."#;
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
