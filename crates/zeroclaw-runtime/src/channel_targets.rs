@@ -22,10 +22,12 @@ macro_rules! scan_channel_map {
             if cfg.enabled
                 && let Some(ref t) = cfg.default_target
             {
-                $entries.push((
-                    format!(concat!(stringify!($channel_type), ".{}"), alias),
-                    t.clone(),
-                ));
+                let key = if alias.is_empty() {
+                    stringify!($channel_type).to_string()
+                } else {
+                    format!(concat!(stringify!($channel_type), ".{}"), alias)
+                };
+                $entries.push((key, t.clone()));
             }
         }
     };
@@ -34,10 +36,12 @@ macro_rules! scan_channel_map {
             if cfg.enabled
                 && let Some(ref t) = cfg.default_target
             {
-                $map_out.insert(
-                    format!(concat!(stringify!($channel_type), ".{}"), alias),
-                    t.clone(),
-                );
+                let key = if alias.is_empty() {
+                    stringify!($channel_type).to_string()
+                } else {
+                    format!(concat!(stringify!($channel_type), ".{}"), alias)
+                };
+                $map_out.insert(key, t.clone());
             }
         }
     };
