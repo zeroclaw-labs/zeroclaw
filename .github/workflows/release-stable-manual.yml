@@ -53,8 +53,12 @@ jobs:
             input_version="$INPUT_VERSION"
           fi
 
-          if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
+          # Accept core semver (X.Y.Z) plus an optional pre-release tag
+          # (X.Y.Z-foo, X.Y.Z-foo.bar, X.Y.Z-beta-2, etc.) so beta and rc
+          # releases run through this same pipeline. Pre-release character
+          # set follows SemVer 2.0.0 §9.
+          if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Version must be semver (X.Y.Z or X.Y.Z-prerelease). Got: ${input_version}"
             exit 1
           fi
 
