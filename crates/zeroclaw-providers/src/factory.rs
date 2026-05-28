@@ -352,7 +352,7 @@ impl CompatFamilySpec for AstraiModelProviderConfig {
 }
 impl CompatFamilySpec for SiliconflowModelProviderConfig {
     const DISPLAY: &'static str = "SiliconFlow";
-    const DEFAULT_URL: &'static str = "https://api.siliconflow.cn/v1";
+    const DEFAULT_URL: &'static str = "https://api.siliconflow.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("siliconflow");
 }

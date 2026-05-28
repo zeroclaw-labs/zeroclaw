@@ -1357,9 +1357,12 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // For the ACP command and agent interactive mode, we default to WARN to avoid
+    // INFO logs corrupting the stdio protocol or interleaving with conversation output.
     // We also always redirect logs to stderr so stdout remains clean for data.
-    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. })
+        || matches!(cli.command, Commands::Agent { message: None, .. })
+    {
         "warn"
     } else {
         // matrix_sdk crates are suppressed to warn because they are extremely

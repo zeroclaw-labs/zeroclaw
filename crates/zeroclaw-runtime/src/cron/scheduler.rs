@@ -24,6 +24,100 @@ const SCHEDULER_COMPONENT: &str = "scheduler";
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
+#[derive(Clone, Copy)]
+pub enum CronDeliveryContext {
+    Scheduled,
+    ToolManual,
+    GatewayManual,
+}
+
+impl CronDeliveryContext {
+    fn failure_message(self, best_effort: bool) -> &'static str {
+        match (self, best_effort) {
+            (Self::Scheduled, true) => "Cron delivery failed (best_effort)",
+            (Self::Scheduled, false) => "Cron delivery failed",
+            (Self::ToolManual, true) => "cron_run delivery failed (best_effort)",
+            (Self::ToolManual, false) => "cron_run delivery failed",
+            (Self::GatewayManual, true) => "manual cron trigger delivery failed (best_effort)",
+            (Self::GatewayManual, false) => "manual cron trigger delivery failed",
+        }
+    }
+}
+
+pub struct CronDeliveryOutcome {
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+}
+
+pub async fn deliver_and_classify_run_result(
+    config: &Config,
+    job: &CronJob,
+    mut success: bool,
+    mut output: String,
+    context: CronDeliveryContext,
+) -> CronDeliveryOutcome {
+    let mut status = if success { "ok" } else { "error" }.to_string();
+
+    if let Err(e) = deliver_if_configured(config, job, &output).await {
+        // Cron add-time accepts dangling delivery refs (the job's channel
+        // may not be provisioned yet); the loudly-logged warn here is
+        // the scheduler-side half of that contract. Manual trigger paths
+        // share this classifier so status history cannot drift again.
+        let channel = job.delivery.channel.as_deref().unwrap_or("");
+        let target = job.delivery.to.as_deref().unwrap_or("");
+        let delivery_error = e.to_string();
+
+        if job.delivery.best_effort {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "channel": channel,
+                        "target": target,
+                        "error": delivery_error
+                    })),
+                context.failure_message(true)
+            );
+            if success {
+                status = "degraded".to_string();
+            }
+        } else {
+            success = false;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "channel": channel,
+                        "target": target,
+                        "error": delivery_error
+                    })),
+                context.failure_message(false)
+            );
+            status = "error".to_string();
+        }
+
+        if output.trim().is_empty() {
+            output = format!("delivery failed: {delivery_error}");
+        } else {
+            output.push_str("\n\ndelivery failed: ");
+            output.push_str(&delivery_error);
+        }
+    }
+
+    CronDeliveryOutcome {
+        success,
+        status,
+        output,
+    }
+}
+
 pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -520,43 +614,22 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let mut persisted_status = if success { "ok" } else { "error" }.to_string();
-    let mut persisted_output = output.to_string();
+    let outcome = deliver_and_classify_run_result(
+        config,
+        job,
+        success,
+        output.to_string(),
+        CronDeliveryContext::Scheduled,
+    )
+    .await;
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
-        // Cron add-time accepts dangling delivery refs (the job's channel
-        // may not be provisioned yet); the loudly-logged warn here is
-        // the scheduler-side half of that contract — operators see the
-        // exact channel composite, target, and job id every time a
-        // dangling delivery fires.
-        let channel = job.delivery.channel.as_deref().unwrap_or("");
-        let target = job.delivery.to.as_deref().unwrap_or("");
-        if job.delivery.best_effort {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": format!("{}", e)})), "Cron delivery failed (best_effort)");
-            if success {
-                persisted_status = "degraded".to_string();
-            }
-        } else {
-            success = false;
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": format!("{}", e)})), "Cron delivery failed");
-            persisted_status = "error".to_string();
-        }
-
-        if persisted_output.trim().is_empty() {
-            persisted_output = format!("delivery failed: {e}");
-        } else {
-            persisted_output.push_str("\n\ndelivery failed: ");
-            persisted_output.push_str(&e.to_string());
-        }
-    }
-
-    let action = if is_one_shot_auto_delete(job) && success {
+    let action = if is_one_shot_auto_delete(job) && outcome.success {
         RunCompletionAction::Delete
     } else if matches!(job.schedule, Schedule::At { .. }) {
         RunCompletionAction::Disable
@@ -571,8 +644,8 @@ async fn persist_job_result(
         started_at,
         finished_at,
         job_state_at,
-        &persisted_status,
-        Some(&persisted_output),
+        &outcome.status,
+        Some(&outcome.output),
         duration_ms,
         action,
     ) {
@@ -593,8 +666,8 @@ async fn persist_job_result(
                 config,
                 job,
                 job_state_at,
-                &persisted_status,
-                Some(&persisted_output),
+                &outcome.status,
+                Some(&outcome.output),
                 RunCompletionAction::Disable,
             ) {
                 ::zeroclaw_log::record!(
@@ -612,8 +685,8 @@ async fn persist_job_result(
                 config,
                 job,
                 job_state_at,
-                &persisted_status,
-                Some(&persisted_output),
+                &outcome.status,
+                Some(&outcome.output),
                 action,
             ) {
                 ::zeroclaw_log::record!(
@@ -627,7 +700,7 @@ async fn persist_job_result(
         }
     }
 
-    success
+    outcome.success
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -1743,6 +1816,43 @@ mod tests {
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_classification_preserves_empty_output_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+        let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            String::new(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+
+        assert!(outcome.success);
+        assert_eq!(outcome.status, "degraded");
+        assert!(outcome.output.starts_with("delivery failed:"));
     }
 
     #[tokio::test]
