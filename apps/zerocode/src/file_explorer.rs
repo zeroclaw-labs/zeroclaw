@@ -103,18 +103,29 @@ impl FileExplorerState {
         state
     }
 
-    /// Create a new explorer in directory-picker mode.
-    pub fn new_dir_picker(start_dir: PathBuf) -> Self {
-        let mut state = Self::new(start_dir);
-        state.dir_picker = true;
-        state
-    }
-
     /// Create a directory picker that fetches entries from the remote daemon (WSS).
-    #[allow(dead_code)]
+    ///
+    /// Builds the struct with `remote_rpc` set **before** the first
+    /// `load_entries()` call so the listing comes from the remote daemon
+    /// rather than the local filesystem.
     pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
-        let mut state = Self::new_dir_picker(start_dir);
-        state.remote_rpc = Some(rpc);
+        let mut state = Self {
+            cwd: start_dir,
+            entries: Vec::new(),
+            list_state: ListState::default(),
+            selected: HashSet::new(),
+            show_hidden: false,
+            error: None,
+            search_query: String::new(),
+            searching: false,
+            dir_picker: true,
+            remote_rpc: Some(rpc),
+            last_list_area: Rect::default(),
+        };
+        state.load_entries();
+        if !state.entries.is_empty() {
+            state.list_state.select(Some(0));
+        }
         state
     }
 
@@ -710,7 +721,8 @@ mod tests {
     #[test]
     fn dir_picker_c_key_returns_confirm_dir() {
         let tmp = std::env::temp_dir();
-        let mut state = FileExplorerState::new_dir_picker(tmp.clone());
+        let mut state = FileExplorerState::new(tmp.clone());
+        state.dir_picker = true;
         let action = state.handle_key(KeyEvent::from(KeyCode::Char('c')));
         assert!(
             matches!(action, ExplorerAction::ConfirmDir(ref p) if p == &tmp),
@@ -730,7 +742,8 @@ mod tests {
     #[test]
     fn dir_picker_enter_on_dir_navigates_not_confirms() {
         let tmp = std::env::temp_dir();
-        let mut state = FileExplorerState::new_dir_picker(tmp.clone());
+        let mut state = FileExplorerState::new(tmp.clone());
+        state.dir_picker = true;
         // Enter on a directory should navigate into it, not confirm it.
         // If no subdirs exist in tmp, this just verifies no ConfirmDir is returned.
         let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -738,5 +751,98 @@ mod tests {
             !matches!(action, ExplorerAction::ConfirmDir(_)),
             "Enter must not return ConfirmDir in dir-picker mode"
         );
+    }
+
+    /// Verify that `new_dir_picker_remote` sends the initial listing request
+    /// over the RPC channel (not the local filesystem) and populates entries
+    /// from the remote response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_dir_picker_remote_lists_via_rpc() {
+        use crate::client::RpcClient;
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+
+        // Spawn the constructor on a blocking-friendly task so
+        // `block_in_place` inside `load_entries` is allowed.
+        let client2 = Arc::clone(&client);
+        let handle = tokio::task::spawn_blocking(move || {
+            FileExplorerState::new_dir_picker_remote(PathBuf::from("/remote/work"), client2)
+        });
+
+        // The constructor's `load_entries()` will issue an `fs/list_dir` RPC
+        // request. Read it from the channel and reply with a fake listing.
+        let line = rx
+            .recv()
+            .await
+            .expect("expected an RPC request from load_entries");
+        let req: serde_json::Value =
+            serde_json::from_str(&line).expect("RPC request is valid JSON");
+
+        assert_eq!(
+            req["method"], "fs/list_dir",
+            "load_entries must call fs/list_dir"
+        );
+        assert_eq!(
+            req["params"]["path"], "/remote/work",
+            "request path must be the remote start_dir, not a local path"
+        );
+
+        let id = req["id"]
+            .as_str()
+            .expect("request must have an id")
+            .to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "cwd": "/remote/work",
+                "entries": [
+                    {
+                        "name": "src",
+                        "full_path": "/remote/work/src",
+                        "is_dir": true,
+                        "is_hidden": false,
+                        "size": 0
+                    },
+                    {
+                        "name": "README.md",
+                        "full_path": "/remote/work/README.md",
+                        "is_dir": false,
+                        "is_hidden": false,
+                        "size": 1024
+                    }
+                ]
+            })),
+            None,
+        );
+
+        let state = handle.await.expect("constructor must not panic");
+
+        // Structural assertions.
+        assert!(state.dir_picker, "must be in dir-picker mode");
+        assert!(state.remote_rpc.is_some(), "remote_rpc must be set");
+        assert_eq!(state.cwd, PathBuf::from("/remote/work"));
+        assert!(state.error.is_none(), "no error expected");
+
+        // Entries must come from the remote response, not the local fs.
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries[0].name, "src");
+        assert!(state.entries[0].is_dir);
+        assert_eq!(
+            state.entries[0].full_path,
+            PathBuf::from("/remote/work/src")
+        );
+        assert_eq!(state.entries[1].name, "README.md");
+        assert!(!state.entries[1].is_dir);
+        assert_eq!(
+            state.entries[1].full_path,
+            PathBuf::from("/remote/work/README.md")
+        );
+
+        // First entry must be selected.
+        assert_eq!(state.list_state.selected(), Some(0));
     }
 }

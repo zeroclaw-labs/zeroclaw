@@ -15,8 +15,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -86,23 +87,232 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
 
 // ── Wrap geometry helpers ────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualLine {
+    start: usize,
+    end: usize,
+    width: u16,
+}
+
+fn char_cell_width(ch: char) -> u16 {
+    ch.width().and_then(|w| u16::try_from(w).ok()).unwrap_or(0)
+}
+
+fn str_cell_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text).try_into().unwrap_or(u16::MAX)
+}
+
+fn push_hard_wrapped(
+    lines: &mut Vec<VisualLine>,
+    text: &str,
+    start: usize,
+    end: usize,
+    width: u16,
+) {
+    let mut line_start = start;
+    let mut line_width = 0;
+
+    for (offset, ch) in text[start..end].char_indices() {
+        let byte_idx = start + offset;
+        let ch_width = char_cell_width(ch);
+        if ch_width > width {
+            continue;
+        }
+        if line_width > 0 && line_width + ch_width > width {
+            lines.push(VisualLine {
+                start: line_start,
+                end: byte_idx,
+                width: line_width,
+            });
+            line_start = byte_idx;
+            line_width = 0;
+        }
+        line_width += ch_width;
+    }
+
+    if line_start < end || line_width > 0 {
+        lines.push(VisualLine {
+            start: line_start,
+            end,
+            width: line_width,
+        });
+    }
+}
+
+fn push_wrapped_physical_line(
+    lines: &mut Vec<VisualLine>,
+    text: &str,
+    start: usize,
+    end: usize,
+    width: u16,
+) {
+    if start == end {
+        lines.push(VisualLine {
+            start,
+            end,
+            width: 0,
+        });
+        return;
+    }
+
+    let mut line_start = start;
+    let mut line_end = start;
+    let mut line_width = 0;
+    let mut pending_ws_start: Option<usize> = None;
+    let mut pending_ws_end = start;
+    let mut pending_ws_width = 0;
+    let mut idx = start;
+
+    while idx < end {
+        let Some(ch) = text[idx..end].chars().next() else {
+            break;
+        };
+
+        if ch.is_whitespace() {
+            let ws_start = idx;
+            let mut ws_end = idx;
+            let mut ws_width = 0;
+            while ws_end < end {
+                let Some(ws_ch) = text[ws_end..end].chars().next() else {
+                    break;
+                };
+                if !ws_ch.is_whitespace() {
+                    break;
+                }
+                ws_width += char_cell_width(ws_ch);
+                ws_end += ws_ch.len_utf8();
+            }
+            pending_ws_start = Some(ws_start);
+            pending_ws_end = ws_end;
+            pending_ws_width = ws_width;
+            idx = ws_end;
+            continue;
+        }
+
+        let word_start = idx;
+        let mut word_end = idx;
+        let mut word_width = 0;
+        while word_end < end {
+            let Some(word_ch) = text[word_end..end].chars().next() else {
+                break;
+            };
+            if word_ch.is_whitespace() {
+                break;
+            }
+            word_width += char_cell_width(word_ch);
+            word_end += word_ch.len_utf8();
+        }
+
+        if word_width > width {
+            if line_end > line_start {
+                lines.push(VisualLine {
+                    start: line_start,
+                    end: line_end,
+                    width: line_width,
+                });
+            }
+            push_hard_wrapped(lines, text, word_start, word_end, width);
+            line_start = word_end;
+            line_end = word_end;
+            line_width = 0;
+            pending_ws_start = None;
+            pending_ws_width = 0;
+            idx = word_end;
+            continue;
+        }
+
+        if line_end == line_start {
+            if let Some(ws_start) = pending_ws_start {
+                let combined_width = pending_ws_width + word_width;
+                if combined_width <= width {
+                    line_start = ws_start;
+                    line_end = word_end;
+                    line_width = combined_width;
+                } else {
+                    line_start = word_start;
+                    line_end = word_end;
+                    line_width = word_width;
+                }
+            } else {
+                line_start = word_start;
+                line_end = word_end;
+                line_width = word_width;
+            }
+        } else if line_width + pending_ws_width + word_width <= width {
+            line_end = word_end;
+            line_width += pending_ws_width + word_width;
+        } else {
+            lines.push(VisualLine {
+                start: line_start,
+                end: line_end,
+                width: line_width,
+            });
+            line_start = word_start;
+            line_end = word_end;
+            line_width = word_width;
+        }
+
+        pending_ws_start = None;
+        pending_ws_width = 0;
+        idx = word_end;
+    }
+
+    if let Some(ws_start) = pending_ws_start {
+        if line_end == line_start {
+            push_hard_wrapped(lines, text, ws_start, pending_ws_end, width);
+            return;
+        }
+        if line_width + pending_ws_width <= width {
+            line_end = pending_ws_end;
+            line_width += pending_ws_width;
+        }
+    }
+
+    if line_end > line_start {
+        lines.push(VisualLine {
+            start: line_start,
+            end: line_end,
+            width: line_width,
+        });
+    }
+}
+
+fn wrap_visual_lines(text: &str, width: u16) -> Vec<VisualLine> {
+    if width == 0 {
+        return vec![VisualLine {
+            start: 0,
+            end: 0,
+            width: 0,
+        }];
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for segment in text.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let content_end = start + segment.len() - usize::from(has_newline);
+        push_wrapped_physical_line(&mut lines, text, start, content_end, width);
+        start += segment.len();
+    }
+
+    if text.is_empty() || text.ends_with('\n') {
+        lines.push(VisualLine {
+            start: text.len(),
+            end: text.len(),
+            width: 0,
+        });
+    }
+
+    lines
+}
+
 /// Count the number of visual rows `text` occupies when soft-wrapped at `width` columns.
 /// Each `\n` starts a new visual line. Empty input returns 1 (cursor needs a row).
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
-    if width == 0 || text.is_empty() {
-        return 1;
-    }
-    let w = width as usize;
-    let mut total: u16 = 0;
-    for line in text.split('\n') {
-        let chars = line.chars().count();
-        if chars == 0 {
-            total += 1;
-        } else {
-            total += chars.div_ceil(w) as u16;
-        }
-    }
-    total
+    wrap_visual_lines(text, width)
+        .len()
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 /// Map a byte offset within `text` to `(row, col)` in wrapped coordinates.
@@ -111,27 +321,26 @@ fn cursor_to_visual(text: &str, cursor: usize, width: u16) -> (u16, u16) {
     if width == 0 {
         return (0, 0);
     }
-    let before = &text[..cursor];
-    let mut row: u16 = 0;
-    let mut col: u16 = 0;
-    for ch in before.chars() {
-        if ch == '\n' {
-            row += 1;
-            col = 0;
-        } else {
-            if col == width {
-                row += 1;
-                col = 0;
+    let lines = wrap_visual_lines(text, width);
+    for (row, line) in lines.iter().enumerate() {
+        if cursor >= line.start && cursor <= line.end {
+            if cursor == line.end && lines.get(row + 1).is_some_and(|next| next.start == cursor) {
+                return ((row + 1).try_into().unwrap_or(u16::MAX), 0);
             }
-            col += 1;
+            let col = if cursor == line.end {
+                line.width
+            } else {
+                str_cell_width(&text[line.start..cursor])
+            };
+            return (row.try_into().unwrap_or(u16::MAX), col.min(width));
+        }
+        if cursor < line.start {
+            return (row.try_into().unwrap_or(u16::MAX), 0);
         }
     }
-    // If col landed exactly at width, the cursor is at the start of the next row.
-    if col == width && cursor < text.len() && text[cursor..].starts_with(|c: char| c != '\n') {
-        row += 1;
-        col = 0;
-    }
-    (row, col)
+    let row = lines.len().saturating_sub(1).try_into().unwrap_or(u16::MAX);
+    let col = lines.last().map_or(0, |line| line.width);
+    (row, col.min(width))
 }
 
 /// Map a visual `(row, col)` position back to a byte offset in `text`.
@@ -140,33 +349,26 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
     if width == 0 {
         return 0;
     }
-    let mut row: u16 = 0;
-    let mut col: u16 = 0;
-    for (byte_idx, ch) in text.char_indices() {
-        if row == target_row && col >= target_col {
-            return byte_idx;
+    let lines = wrap_visual_lines(text, width);
+    let Some(line) = lines.get(target_row as usize) else {
+        return text.len();
+    };
+
+    let mut col = 0;
+    for (offset, ch) in text[line.start..line.end].char_indices() {
+        if col >= target_col {
+            return line.start + offset;
         }
-        if ch == '\n' {
-            if row == target_row {
-                return byte_idx;
-            }
-            row += 1;
-            col = 0;
-        } else {
-            if col == width {
-                row += 1;
-                col = 0;
-                if row == target_row && col >= target_col {
-                    return byte_idx;
-                }
-            }
-            col += 1;
-        }
-        if row > target_row {
-            return byte_idx;
+        col += char_cell_width(ch);
+        if col > target_col {
+            return line.start + offset;
         }
     }
-    text.len()
+    if target_col >= line.width {
+        line.end
+    } else {
+        line.start
+    }
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -846,31 +1048,32 @@ impl InputBarState {
 
     // ── Selection rendering helper ───────────────────────────
 
-    /// Build styled lines for the input text, splitting on `\n` and
-    /// highlighting any selection range.
-    fn build_input_lines(&self) -> Vec<Line<'_>> {
+    /// Build styled lines for the input text, pre-wrapped using the same
+    /// `wrap_visual_lines` logic that drives cursor positioning.
+    ///
+    /// Each returned `Line` corresponds to exactly one visual row so the
+    /// `Paragraph` must be rendered **without** `Wrap` — otherwise ratatui
+    /// would re-wrap with its own algorithm and the cursor would drift.
+    fn build_input_lines(&self, width: u16) -> Vec<Line<'_>> {
         let sel_style = Style::default()
             .bg(theme::SELECTION_BG)
             .fg(theme::ICY_WHITE);
 
-        // Split input into physical lines and build spans per line,
-        // applying selection highlighting across line boundaries.
-        let mut lines = Vec::new();
-        let mut byte_pos: usize = 0;
+        let visual = wrap_visual_lines(&self.input, width);
 
-        for segment in self.input.split('\n') {
-            let seg_start = byte_pos;
-            let seg_end = byte_pos + segment.len();
+        let mut lines: Vec<Line<'_>> = Vec::with_capacity(visual.len());
+
+        for vl in &visual {
+            let seg_start = vl.start;
+            let seg_end = vl.end;
 
             let mut spans: Vec<Span<'_>> = Vec::new();
 
             if let Some((sel_start, sel_end)) = self.selection {
-                // Compute overlap of selection with this segment.
                 let overlap_start = sel_start.max(seg_start);
                 let overlap_end = sel_end.min(seg_end);
 
                 if overlap_start < overlap_end {
-                    // There is selection overlap in this segment.
                     if overlap_start > seg_start {
                         spans.push(Span::raw(&self.input[seg_start..overlap_start]));
                     }
@@ -882,7 +1085,6 @@ impl InputBarState {
                         spans.push(Span::raw(&self.input[overlap_end..seg_end]));
                     }
                 } else {
-                    // No selection in this segment.
                     spans.push(Span::raw(&self.input[seg_start..seg_end]));
                 }
             } else {
@@ -890,7 +1092,6 @@ impl InputBarState {
             }
 
             lines.push(Line::from(spans));
-            byte_pos = seg_end + 1; // +1 for the '\n'
         }
 
         if lines.is_empty() {
@@ -994,11 +1195,11 @@ impl InputBarState {
             f.render_widget(p, input_area);
         } else {
             // Wrapped input content with optional selection highlighting.
-            // Each \n in the input becomes a separate Line for proper rendering.
-            let input_lines = self.build_input_lines();
+            // Lines are pre-broken by wrap_visual_lines() — the same logic
+            // that cursor_to_visual uses — so no Paragraph::wrap() is needed.
+            let input_lines = self.build_input_lines(inner_width);
             let p = Paragraph::new(input_lines)
                 .block(block)
-                .wrap(Wrap { trim: false })
                 .scroll((self.scroll_offset, 0));
             f.render_widget(p, input_area);
         }
@@ -1318,6 +1519,11 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_line_count_word_wraps_like_paragraph() {
+        assert_eq!(wrapped_line_count("hello world", 10), 2);
+    }
+
+    #[test]
     fn wrapped_line_count_zero_width() {
         assert_eq!(wrapped_line_count("hello", 0), 1);
     }
@@ -1342,6 +1548,20 @@ mod tests {
     }
 
     #[test]
+    fn cursor_to_visual_word_wrap() {
+        assert_eq!(
+            cursor_to_visual("hello world", "hello world".len(), 10),
+            (1, 5)
+        );
+    }
+
+    #[test]
+    fn cursor_to_visual_uses_terminal_cell_width() {
+        let text = "abcd界";
+        assert_eq!(cursor_to_visual(text, text.len(), 5), (1, 2));
+    }
+
+    #[test]
     fn cursor_to_visual_newline() {
         // "abc\ndef" — cursor after \n (byte 4, char 'd') is (1, 0).
         assert_eq!(cursor_to_visual("abc\ndef", 4, 20), (1, 0));
@@ -1361,6 +1581,14 @@ mod tests {
         // "1234567890" width 5 — row 1, col 0 = byte 5.
         assert_eq!(visual_to_cursor("1234567890", 1, 0, 5), 5);
         assert_eq!(visual_to_cursor("1234567890", 1, 2, 5), 7);
+    }
+
+    #[test]
+    fn visual_to_cursor_word_wrap() {
+        assert_eq!(
+            visual_to_cursor("hello world", 1, 5, 10),
+            "hello world".len()
+        );
     }
 
     #[test]
@@ -1472,7 +1700,7 @@ mod tests {
     fn build_input_lines_no_selection() {
         let mut bar = InputBarState::new();
         bar.insert_text("hello");
-        let lines = bar.build_input_lines();
+        let lines = bar.build_input_lines(80);
         assert_eq!(lines.len(), 1);
     }
 
@@ -1480,7 +1708,7 @@ mod tests {
     fn build_input_lines_with_newlines() {
         let mut bar = InputBarState::new();
         bar.insert_text("hello\nworld\nfoo");
-        let lines = bar.build_input_lines();
+        let lines = bar.build_input_lines(80);
         assert_eq!(lines.len(), 3);
     }
 
@@ -1489,7 +1717,7 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("hello world");
         bar.selection = Some((2, 7));
-        let lines = bar.build_input_lines();
+        let lines = bar.build_input_lines(80);
         // Single line, 3 spans: "he" + "llo w" (selected) + "orld"
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 3);

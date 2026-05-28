@@ -149,10 +149,8 @@ impl Chat {
     async fn pick_or_start_session(&mut self, agent_alias: &str) {
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
         {
-            let start_dir = std::env::current_dir()
-                .ok()
-                .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()))
-                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            // Remote ACP: start from the daemon root, not a local path.
+            let start_dir = std::path::PathBuf::from("/");
             self.phase = ChatPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
                 explorer: FileExplorerState::new_dir_picker_remote(
@@ -640,12 +638,8 @@ impl Chat {
                 {
                     // For WSS ACP, go through the CWD picker for new sessions too.
                     let _ = self.rpc.session_close(&state.session_id).await;
-                    let start_dir = std::env::current_dir()
-                        .ok()
-                        .or_else(|| {
-                            directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                        })
-                        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    // Remote ACP picker must start from a path the daemon understands.
+                    let start_dir = std::path::PathBuf::from("/");
                     self.phase = ChatPhase::PickCwd {
                         agent_alias: alias,
                         explorer: FileExplorerState::new_dir_picker_remote(
