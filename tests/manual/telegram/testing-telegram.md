@@ -159,7 +159,7 @@ Solution: Check user allowlist
   1. Send message to bot
   2. Check logs for user_id
   3. Update config: allowed_users = ["YOUR_ID"]
-  4. Run: zeroclaw onboard --channels-only
+  4. Run: zeroclaw onboard channels
 ```
 
 **Issue: Message splitting not working**

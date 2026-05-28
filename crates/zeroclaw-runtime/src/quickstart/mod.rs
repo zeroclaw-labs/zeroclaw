@@ -486,9 +486,12 @@ fn memory_kind_keys() -> Vec<String> {
     ]
     .into_iter()
     .map(|k| {
-        let _ = match k {
+        // Exhaustiveness guard: adding a new variant forces this match to fail
+        // to compile until the contributor decides whether the new backend
+        // belongs in the quickstart picker.
+        match k {
             M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::None => (),
-        };
+        }
         serde_json::to_value(k)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -1600,8 +1603,10 @@ mod tests {
         // Expected: the user's block is untouched; the new agent's
         // `risk_profile = "balanced"` ref points at the existing block.
         let mut cfg = Config::default();
-        let mut custom = zeroclaw_config::schema::RiskProfileConfig::default();
-        custom.allowed_commands = vec!["user-only-cmd".into()];
+        let custom = zeroclaw_config::schema::RiskProfileConfig {
+            allowed_commands: vec!["user-only-cmd".into()],
+            ..Default::default()
+        };
         cfg.risk_profiles.insert("balanced".into(), custom);
         let pre_allowed = cfg.risk_profiles["balanced"].allowed_commands.clone();
 
@@ -1619,9 +1624,11 @@ mod tests {
         // FTUE rule: a Quickstart that lands on a config with no
         // `[skill-bundles.*]` rows synthesizes a `default` bundle.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().join("config.toml");
-        cfg.data_dir = tmp.path().join("data");
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
         assert!(cfg.skill_bundles.is_empty(), "precondition: no bundles");
 
@@ -1636,9 +1643,11 @@ mod tests {
     #[tokio::test]
     async fn fresh_apply_with_peer_group_writes_peer_groups_block() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().join("config.toml");
-        cfg.data_dir = tmp.path().join("data");
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
 
         let mut submission = fresh_submission("peer_bot");
@@ -1668,9 +1677,11 @@ mod tests {
     #[tokio::test]
     async fn peer_group_unknown_channel_returns_structured_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().join("config.toml");
-        cfg.data_dir = tmp.path().join("data");
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
 
         let mut submission = fresh_submission("orphan_pg_bot");
@@ -1695,9 +1706,11 @@ mod tests {
     #[tokio::test]
     async fn fresh_apply_writes_personality_files_into_agent_workspace() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().join("config.toml");
-        cfg.data_dir = tmp.path().join("data");
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
 
         // Pick a real editable filename from the canonical list.
@@ -1725,9 +1738,11 @@ mod tests {
     #[tokio::test]
     async fn personality_file_with_unknown_name_returns_structured_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().join("config.toml");
-        cfg.data_dir = tmp.path().join("data");
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         std::fs::create_dir_all(&cfg.data_dir).expect("data dir");
 
         let mut submission = fresh_submission("bad_personality_bot");

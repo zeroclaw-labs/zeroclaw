@@ -17,8 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::attachment::build_attachments_json;
 use crate::client::{
-    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate,
-    method, parse_session_update,
+    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, method,
+    parse_session_update,
 };
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};

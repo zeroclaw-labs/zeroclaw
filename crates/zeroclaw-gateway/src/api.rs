@@ -524,47 +524,23 @@ pub async fn handle_api_cron_run(
         zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
     let finished_at = chrono::Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
+    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+        &config,
+        &job,
+        success,
+        output,
+        zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+    )
+    .await;
+    success = outcome.success;
 
-    if job.delivery.mode.eq_ignore_ascii_case("announce")
-        && let (Some(channel), Some(target)) =
-            (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
-        && let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
-            &config,
-            channel,
-            target,
-            job.delivery.thread_id.as_deref(),
-            &output,
-        )
-        .await
-    {
-        if job.delivery.best_effort {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-                "manual cron trigger delivery failed (best_effort)"
-            );
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-                "manual cron trigger delivery failed"
-            );
-            success = false;
-        }
-    }
-
-    let status = if success { "ok" } else { "error" };
     if let Err(e) = zeroclaw_runtime::cron::record_run(
         &config,
         &job.id,
         started_at,
         finished_at,
-        status,
-        Some(&output),
+        &outcome.status,
+        Some(&outcome.output),
         duration_ms,
     ) {
         ::zeroclaw_log::record!(
@@ -575,9 +551,13 @@ pub async fn handle_api_cron_run(
             "manual cron trigger: failed to persist run history"
         );
     }
-    if let Err(e) =
-        zeroclaw_runtime::cron::record_last_run(&config, &job.id, finished_at, success, &output)
-    {
+    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
+        &config,
+        &job.id,
+        finished_at,
+        &outcome.status,
+        &outcome.output,
+    ) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -593,16 +573,16 @@ pub async fn handle_api_cron_run(
         "type": "cron_result",
         "job_id": job.id,
         "success": success,
-        "output": output,
+        "output": &outcome.output,
         "manual": true,
         "timestamp": finished_at.to_rfc3339(),
     }));
 
     Json(serde_json::json!({
-        "status": status,
+        "status": &outcome.status,
         "job_id": job.id,
         "success": success,
-        "output": output,
+        "output": &outcome.output,
         "duration_ms": duration_ms,
         "started_at": started_at.to_rfc3339(),
         "finished_at": finished_at.to_rfc3339(),
@@ -1899,6 +1879,17 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    fn link_job_to_test_agent(state: &AppState, job_id: &str) {
+        state
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent configured by with_test_agent")
+            .cron_jobs
+            .push(job_id.to_string());
+    }
+
     fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
@@ -2580,18 +2571,8 @@ mod tests {
         .expect("job added");
 
         // Imperative jobs get UUID ids; the scheduler resolves owning
-        // agent by reverse-lookup against `agent.cron_jobs`. Wire the
-        // freshly-created job's id into test-agent so execute_job_now
-        // can find its owner. (Carrying agent on the DB row is a
-        // follow-up.)
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job.id.clone());
+        // agent by reverse-lookup against `agent.cron_jobs`.
+        link_job_to_test_agent(&state, &job.id);
 
         let response =
             handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
@@ -2614,6 +2595,88 @@ mod tests {
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_api_run_records_best_effort_delivery_failure_as_degraded() {
+        zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            None,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello-from-manual-trigger",
+            Some(zeroclaw_runtime::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .expect("job added");
+        link_job_to_test_agent(&state, &job.id);
+
+        let response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["success"], true);
+        assert!(
+            json["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let config = state.config.read().clone();
+        let updated = zeroclaw_runtime::cron::get_job(&config, &job.id).expect("updated job");
+        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
+
+        let runs = zeroclaw_runtime::cron::list_runs(&config, &job.id, 10).expect("runs listed");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delivery failed:")
+        );
     }
 
     #[tokio::test]

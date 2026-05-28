@@ -653,7 +653,7 @@ impl TelegramChannel {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard channels` first",
                     self.alias
                 );
             }

@@ -1638,6 +1638,33 @@ impl OpenAiCompatibleModelProvider {
         model.is_empty() || lower.contains("gemma-4") || lower.contains("gemma4")
     }
 
+    fn build_native_tool_chat_request(
+        &self,
+        effective_messages: &[ChatMessage],
+        tools: Option<Vec<serde_json::Value>>,
+        model: &str,
+        temperature: f64,
+        allow_user_image_parts: bool,
+    ) -> NativeChatRequest {
+        let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
+        let tool_choice = tools.as_ref().map(|_| "auto".to_string());
+
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            temperature,
+            stream: Some(false),
+            // Non-streaming path; `usage` is on the final response body, not
+            // gated on `stream_options.include_usage`.
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(has_tool_entries),
+            tools,
+            tool_choice,
+            max_tokens: self.max_tokens,
+        }
+    }
+
     /// Normalize local file paths and remote URLs inside `[IMAGE:…]` markers
     /// to base64 data URIs before any message reaches the upstream provider.
     ///
@@ -2279,35 +2306,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
-            tools: if tools.is_empty() {
-                None
-            } else {
-                Some(tools.to_vec())
-            },
-            tool_choice: if tools.is_empty() {
-                None
-            } else {
-                Some("auto".to_string())
-            },
-            max_tokens: self.max_tokens,
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
         };
+        let tools = if tools.is_empty() {
+            None
+        } else {
+            Some(tools.to_vec())
+        };
+        let request = self.build_native_tool_chat_request(
+            &effective_messages,
+            tools,
+            model,
+            temperature,
+            !merge,
+        );
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2401,26 +2416,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
+        };
 
         // When wire_api = "responses", route all turns through the responses API.
 
         let tools = self.convert_tool_specs_for_model(request.tools, model);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: self.convert_messages_for_native(&effective_messages, !merge),
-            temperature,
-            stream: Some(false),
-            // Non-streaming path; `usage` is on the final response body, not
-            // gated on `stream_options.include_usage`.
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: self
-                .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+        let native_request = self.build_native_tool_chat_request(
+            &effective_messages,
             tools,
-            max_tokens: self.max_tokens,
-        };
+            model,
+            temperature,
+            !merge,
+        );
 
         let url = self.chat_completions_url();
         let response = match self
@@ -4315,6 +4326,55 @@ mod tests {
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn chat_with_tools_request_preserves_reasoning_content_in_history() {
+        let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        let history_json = serde_json::json!({
+            "content": "I will inspect the workspace.",
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "Need to inspect the current files before answering."
+        });
+        let messages = vec![
+            ChatMessage::assistant(history_json.to_string()),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"src\nCargo.toml"}"#),
+            ChatMessage::user("continue"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {}
+            }
+        })];
+
+        let request = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "deepseek-v4-flash",
+            0.7,
+            true,
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        let first_message = &value["messages"][0];
+
+        assert_eq!(first_message["role"], "assistant");
+        assert_eq!(
+            first_message["reasoning_content"],
+            "Need to inspect the current files before answering."
+        );
+        assert!(
+            first_message["tool_calls"].is_array(),
+            "assistant tool-call history must stay native in chat_with_tools requests"
+        );
+        assert_eq!(value["tools"][0]["function"]["name"], "shell");
+        assert_eq!(value["tool_choice"], "auto");
     }
 
     #[test]

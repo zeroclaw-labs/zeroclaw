@@ -212,6 +212,12 @@ impl DiscordChannel {
         anyhow::Error::new(DiscordListenerFatalError::new(message))
     }
 
+    fn validate_gateway_preflight_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(response.error_for_status()?)
+    }
+
     pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
         self.archive_memory = Some(mem);
         self
@@ -1568,12 +1574,7 @@ impl Channel for DiscordChannel {
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
             .await?;
-        if gw_resp.status().as_u16() == 429 {
-            return Err(Self::fatal_listener_error(
-                "discord gateway preflight rate-limited (429 Too Many Requests)",
-            ));
-        }
-        let gw_resp = gw_resp.error_for_status()?;
+        let gw_resp = Self::validate_gateway_preflight_response(gw_resp)?;
         let gw_resp: serde_json::Value = gw_resp.json().await?;
 
         if let Some(remaining) = gw_resp
@@ -2663,6 +2664,29 @@ mod tests {
         let token = "MTIzNDU2.fake.hmac";
         let id = DiscordChannel::bot_user_id_from_token(token);
         assert_eq!(id, Some("123456".to_string()));
+    }
+
+    #[test]
+    fn gateway_preflight_429_remains_retryable_http_error() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "1")
+                .body(reqwest::Body::from(""))
+                .expect("test response should build"),
+        );
+
+        let error = DiscordChannel::validate_gateway_preflight_response(response)
+            .expect_err("429 should remain an HTTP error");
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(
+            error.downcast_ref::<DiscordListenerFatalError>().is_none(),
+            "gateway preflight 429 must not be wrapped as fatal"
+        );
+        assert!(
+            !zeroclaw_providers::reliable::is_non_retryable(&error),
+            "gateway preflight 429 should stay on the supervisor retry path"
+        );
     }
 
     #[test]

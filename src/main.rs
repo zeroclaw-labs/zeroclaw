@@ -1674,7 +1674,7 @@ async fn run_quickstart_cli(
                             continue;
                         };
                         let external_peers: Vec<String> = peers_raw
-                            .split(|c: char| c == ',' || c == '\n')
+                            .split([',', '\n'])
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect();
@@ -2413,12 +2413,19 @@ async fn main() -> Result<()> {
 
     // Initialize logging - respects RUST_LOG env var.
     // Ephemeral daemon mode defaults to debug so tool call spans are visible.
-    // All other modes default to info.
+    // For the ACP command and agent interactive mode, we default to WARN to avoid
+    // INFO logs corrupting the stdio protocol or interleaving with conversation output.
+    // We also always redirect logs to stderr so stdout remains clean for data.
+    // matrix_sdk crates are suppressed to warn because they are extremely
+    // noisy at info level. To restore SDK-level output for Matrix debugging:
+    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+    // acp_server has to be WARN because INFO injects junk data into the JSON stream.
     let default_log_level = match &cli.command {
         Commands::Daemon {
             ephemeral: true, ..
         } => "debug",
-        _ => "info",
+        Commands::Acp { .. } | Commands::Agent { message: None, .. } => "warn",
+        _ => "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn",
     };
 
     zeroclaw_log::install_global_subscriber(default_log_level);
@@ -4212,7 +4219,7 @@ async fn main() -> Result<()> {
                 if !daemon_running {
                     eprintln!(
                         "Note: gateway does not appear to be running at {host}:{port}. \
-                         Start it with `zeroclaw daemon start` to load the explorer."
+                         Start it with `zeroclaw service start` (background) or `zeroclaw daemon` (foreground) to load the explorer."
                     );
                 }
                 Ok(())

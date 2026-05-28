@@ -3109,16 +3109,18 @@ mod tests {
     }
 
     #[test]
-    fn provider_runtime_options_for_agent_falls_back_to_first_provider_when_unknown_agent() {
+    fn provider_runtime_options_for_agent_unknown_agent_returns_safe_defaults() {
+        // Per HEAD's explicit-resolution policy (48a386f55 — delete
+        // first_model_provider*), unknown agents do NOT fall back to a
+        // first-configured provider. They return safe defaults (no URL) so
+        // dispatch surfaces a setup error instead of silently routing to an
+        // arbitrary provider the operator never bound to the agent.
         let config = config_with_two_anthropic_aliases();
         let opts = provider_runtime_options_for_agent(&config, "nonexistent");
-        // Falls back to iter_entries().next() — order across HashMap is not
-        // guaranteed but the URL must match one of the configured aliases.
-        let url = opts.provider_api_url.as_deref().unwrap_or("");
         assert!(
-            url == "https://work-proxy.example/v1/v1/anthropic/messages"
-                || url == "https://api.default.example/v1/messages",
-            "fallback must resolve to one of the configured anthropic aliases; got `{url}`"
+            opts.provider_api_url.is_none(),
+            "unknown agent must not silently inherit any configured provider; got `{:?}`",
+            opts.provider_api_url
         );
     }
 

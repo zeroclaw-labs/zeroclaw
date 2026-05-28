@@ -29,8 +29,8 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 enabled            = true                            # gate; required
 url                = "https://mattermost.example.com" # required
 bot_token          = "..."                            # secret; OR login_id+password
-login_id           = ""                               # alternative auth path
-password           = ""                               # secret; pairs with login_id
+# login_id         = ""                               # alternative auth path; only when bot_token is unset
+# password         = ""                               # secret; pairs with login_id
 
 channel_ids        = []                               # [] or ["*"] = auto-discover
 team_ids           = []                               # [] = all teams

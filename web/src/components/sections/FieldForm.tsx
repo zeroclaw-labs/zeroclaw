@@ -360,7 +360,7 @@ function isOptionalArray(typeHint: string): boolean {
   );
 }
 
-// Per-provider catalog cache. Cleared via clearFieldFormCatalogCaches() on
+// Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
 // nav so a new model alias added under (say) `anthropic` shows up the next
 // time the user opens an agent form without a hard refresh.
 let modelsCache: Record<
@@ -1100,9 +1100,10 @@ function FieldRow({
 
   useEffect(() => {
     if (!isProviderModelField) return;
-    const provider = entry.path.split(".")[2];
-    if (!provider) return;
-    const cached = modelsCache[provider];
+    const [, , provider, alias] = entry.path.split('.');
+    if (!provider || !alias) return;
+    const cacheKey = `${provider}.${alias}`;
+    const cached = modelsCache[cacheKey];
     if (cached) {
       setProviderModels(cached.models);
       setModelsFetchFailed(!cached.live && cached.models.length === 0);
@@ -1110,16 +1111,12 @@ function FieldRow({
     }
     void getCatalogModels(provider)
       .then((r) => {
-        modelsCache[provider] = {
-          models: r.models,
-          live: r.live,
-          local: r.local,
-        };
+        modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
         setProviderModels(r.models);
         setModelsFetchFailed(!r.live && r.models.length === 0);
       })
       .catch(() => {
-        modelsCache[provider] = {
+        modelsCache[cacheKey] = {
           models: [],
           live: false,
           local: isLocalModelProviderName(provider),

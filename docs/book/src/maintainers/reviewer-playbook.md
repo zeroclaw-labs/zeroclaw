@@ -88,13 +88,20 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 |---|---|
 | `r:needs-repro` | Bug report missing a deterministic repro. Block deeper triage on this. |
 | `r:support` | Usage or help question better routed outside the bug backlog. |
-| `duplicate` / `invalid` | Non-actionable noise. Close with a polite pointer. |
 | `status:accepted` | The team has accepted the RFC or work item. Add `status:no-stale` only when the issue also needs stale protection. |
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
 | `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason in a maintainer comment, issue body, or tracker entry. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
+
+### Resolution labels
+
+Use resolution labels only when closing or removing an item from the active queue. They explain the terminal outcome; they do not replace `status:*` lifecycle labels on work that should stay open. The [labels guide](./labels.md#resolution-labels) is the source of truth for current resolution-label definitions and migration holdbacks.
+
+For duplicates, link the canonical target before closing or redirecting discussion. For invalid reports, explain what makes the report unactionable or where it should go instead. For work we are explicitly choosing not to pursue, use the board-level `Won't Do` / live `wontfix` path and leave a brief rationale.
+
+For replaced PRs or issue paths, use [Superseding PRs](./superseding.md) and preserve contributor attribution when relevant.
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
 
@@ -103,7 +110,7 @@ If logs or payloads in the report contain personal identifiers or sensitive data
 When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size: XS/S`) at the top of the queue.
-2. Ask overlapping PRs to consolidate; close older ones as `superseded` after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
+2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
 3. Mark dormant PRs as `stale-candidate` before stale closure window starts.
 4. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
 

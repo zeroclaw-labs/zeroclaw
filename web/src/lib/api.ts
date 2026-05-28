@@ -1002,9 +1002,11 @@ export interface ModelsResponse {
   live: boolean;
 }
 
-export function getCatalogModels(provider: string): Promise<ModelsResponse> {
+export function getCatalogModels(provider: string, alias?: string): Promise<ModelsResponse> {
+  const params = new URLSearchParams({ provider });
+  if (alias) params.set('alias', alias);
   return apiFetch<ModelsResponse>(
-    `/api/config/catalog/models?provider=${encodeURIComponent(provider)}`,
+    `/api/config/catalog/models?${params.toString()}`,
   );
 }
 
@@ -1061,6 +1063,15 @@ export interface SectionStatusResponse {
   has_partial_state: boolean;
   /** Human-readable readiness failures for the finish gate. */
   missing: string[];
+  /** Structured repair targets for half-configured onboarding state. */
+  repair_items: OnboardRepairItem[];
+}
+
+export interface OnboardRepairItem {
+  code: string;
+  message: string;
+  section: string;
+  focus?: string;
 }
 
 export function getSectionStatus(): Promise<SectionStatusResponse> {

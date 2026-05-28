@@ -1148,9 +1148,20 @@ mod tests {
         Arc::new(config)
     }
 
+    fn read_saved_provider_entry(
+        cfg_path: &std::path::Path,
+        family: &str,
+        alias: &str,
+    ) -> Option<zeroclaw_config::schema::ModelProviderConfig> {
+        let contents = std::fs::read_to_string(cfg_path).ok()?;
+        let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
+        cfg.providers.models.find(family, alias).cloned()
+    }
+
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
@@ -1164,19 +1175,10 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["model_provider"].as_str(),
-            Some("moonshot")
-        );
-        assert_eq!(
-            output["config"]["default"]["model"].as_str(),
-            Some("moonshot-v1-8k")
-        );
-        assert_eq!(
-            output["config"]["default"]["temperature"].as_f64(),
-            Some(0.2)
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "moonshot", "default")
+            .expect("set_default must materialize the moonshot.default slot");
+        assert_eq!(entry.model.as_deref(), Some("moonshot-v1-8k"));
+        assert_eq!(entry.temperature, Some(0.2));
     }
 
     #[tokio::test]
@@ -1310,10 +1312,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
-        // When no API key is configured (test_config has none), the probe is
-        // skipped and any model string is accepted. This verifies the probe-
-        // skip path doesn't accidentally reject valid config changes.
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
@@ -1326,18 +1326,15 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["model"].as_str(),
-            Some("totally-fake-model-12345")
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "anthropic", "default")
+            .expect("set_default must materialize the anthropic.default slot");
+        assert_eq!(entry.model.as_deref(), Some("totally-fake-model-12345"));
     }
 
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
-        // Temperature-only changes don't set a new model, so the probe should
-        // not fire at all (no model_provider/model to probe).
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
@@ -1349,10 +1346,8 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["temperature"].as_f64(),
-            Some(1.5)
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "custom", "default")
+            .expect("temperature-only set_default must create the custom.default placeholder slot");
+        assert_eq!(entry.temperature, Some(1.5));
     }
 }

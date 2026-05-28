@@ -63,6 +63,7 @@ pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
+pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
@@ -896,6 +897,19 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
+        )));
+    }
+
+    // File upload tool — enabled iff [file_upload].url is set
+    if root_config
+        .file_upload
+        .url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty())
+    {
+        tool_arcs.push(Arc::new(FileUploadTool::new(
+            security.clone(),
+            root_config.file_upload.clone(),
         )));
     }
 

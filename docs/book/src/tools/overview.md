@@ -71,17 +71,16 @@ The [autonomy level](../security/autonomy.md) determines what each risk tier can
 
 Every tool invocation — approved or blocked — produces a [tool receipt](../security/tool-receipts.md) in the audit log.
 
-## Disabling tools per channel
+## Disabling tools on non-CLI channels
 
-A public-facing channel may want a more restrictive tool set than the operator's CLI:
+The schema has no per-channel `tools_allow` / `tools_deny` field. The available mechanism is the global `[autonomy].non_cli_excluded_tools` list, which removes the listed tools from every non-CLI channel (Discord, Telegram, Bluesky, Matrix, Slack, etc.) while leaving the local CLI untouched:
 
 ```toml
-[channels.public-bluesky]
-tools_allow = ["http", "web_search", "memory_search"]
-# shell, file_write, browser, etc. are implicitly disabled for this channel
+[autonomy]
+non_cli_excluded_tools = ["shell", "file_write", "browser"]
 ```
 
-`tools_deny` works inversely (allow everything except the listed). The two can't be combined — pick one.
+The granularity is binary (CLI vs non-CLI), not per-channel. If you need finer-grained gating, drop the global `[autonomy].level` to `read_only` or `supervised` and rely on the per-tool `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
 
 ## See also
 

@@ -346,11 +346,8 @@ impl Tool for ShellTool {
         #[cfg(unix)]
         let _group_guard = ChildGroupGuard::new(child.id());
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {

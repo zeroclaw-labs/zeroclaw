@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -226,35 +227,64 @@ fn extract_node_ws_token<'a>(
 }
 
 /// GET /ws/nodes — WebSocket upgrade for node connections
+/// Check the /ws/nodes access-control policy.
+///
+/// Returns `Some(status, body)` if the request should be rejected before
+/// the WebSocket upgrade, or `None` if it passes and the upgrade may proceed.
+/// Extracted so the auth decision matrix can be unit-tested without a WS
+/// handshake (which axum performs before calling the handler).
+pub(crate) fn check_node_auth(
+    nodes_config: &zeroclaw_config::schema::NodesConfig,
+    pairing: &PairingGuard,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<(axum::http::StatusCode, &'static str)> {
+    if !nodes_config.enabled {
+        return Some((
+            axum::http::StatusCode::NOT_FOUND,
+            "Not Found — node discovery is disabled (set nodes.enabled=true to enable)",
+        ));
+    }
+    if let Some(ref expected_token) = nodes_config.auth_token {
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        if token != expected_token {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide a valid node auth token",
+            ));
+        }
+    } else if pairing.require_pairing() {
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        if !pairing.is_authenticated(token) {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization header or ?token= query param",
+            ));
+        }
+    } else {
+        return Some((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable — node registration is disabled because no auth method is configured. \
+             Set nodes.auth_token OR enable gateway.require_pairing.",
+        ));
+    }
+    None
+}
+
 pub async fn handle_ws_nodes(
     State(state): State<AppState>,
     Query(params): Query<NodeWsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth: check node auth token if configured
     let nodes_config = state.config.read().nodes.clone();
-    if let Some(ref expected_token) = nodes_config.auth_token {
-        let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
-        if token != expected_token {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide a valid node auth token",
-            )
-                .into_response();
-        }
-    }
-
-    // Fall back to pairing auth if no node-specific token
-    if nodes_config.auth_token.is_none() && state.pairing.require_pairing() {
-        let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or ?token= query param",
-            )
-                .into_response();
-        }
+    if let Some((status, body)) = check_node_auth(
+        &nodes_config,
+        &state.pairing,
+        &headers,
+        params.token.as_deref(),
+    ) {
+        return (status, body).into_response();
     }
 
     // Echo sub-protocol if client requests it
@@ -408,6 +438,89 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use zeroclaw_config::schema::NodesConfig;
+    use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    // ── Auth matrix tests (via check_node_auth — no WS handshake required) ──
+
+    fn empty_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    fn make_pairing(require: bool) -> PairingGuard {
+        PairingGuard::new(require, &[])
+    }
+
+    /// nodes.enabled=false → 404 before any WS upgrade attempt.
+    #[test]
+    fn nodes_disabled_returns_404() {
+        let cfg = NodesConfig {
+            enabled: false,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::NOT_FOUND));
+    }
+
+    /// nodes.enabled=true, no auth_token, pairing disabled → 503.
+    /// Previously this combination allowed unauthenticated registration.
+    #[test]
+    fn nodes_enabled_no_auth_no_pairing_returns_503() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set, caller presents wrong/missing token → 401.
+    #[test]
+    fn nodes_auth_token_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    /// nodes.auth_token set, correct token → auth passes (None = proceed to upgrade).
+    #[test]
+    fn nodes_auth_token_correct_token_passes() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("secret");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert!(result.is_none(), "correct token must pass auth gate");
+    }
+
+    /// Pairing required, wrong/missing bearer token → 401.
+    #[test]
+    fn nodes_pairing_required_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(true), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
 
     #[test]
     fn node_registry_register_and_unregister() {

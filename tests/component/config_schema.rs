@@ -467,7 +467,7 @@ fn config_extra_unknown_keys_ignored() {
     let config = migrate(
         r#"
 default_temperature = 0.5
-default_model_provider = "openai"
+default_provider = "openai"
 future_feature = true
 [some_future_section]
 value = 123

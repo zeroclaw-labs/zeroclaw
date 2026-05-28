@@ -373,14 +373,12 @@ impl Channel for AcpChannel {
             "rawInput": raw_input,
             "content": content,
         });
-        if is_edit_tool {
-            if let Some(args) = &request.raw_arguments {
-                if let Some(new_text) = args.get("new_string").or_else(|| args.get("content")) {
-                    if let Some(s) = new_text.as_str() {
-                        tool_call["proposedEdit"] = json!(s);
-                    }
-                }
-            }
+        if is_edit_tool
+            && let Some(args) = &request.raw_arguments
+            && let Some(new_text) = args.get("new_string").or_else(|| args.get("content"))
+            && let Some(s) = new_text.as_str()
+        {
+            tool_call["proposedEdit"] = json!(s);
         }
         let params = json!({
             "sessionId": self.session_id,
