@@ -1968,6 +1968,7 @@ fn trimmed_agent_name_for_templates(prior_name: Option<&str>) -> String {
         })
 }
 
+#[cfg(feature = "agent-runtime")]
 fn prompt_for_field(
     desc: &zeroclaw_runtime::quickstart::FieldDescriptor,
     seed: Option<&str>,
