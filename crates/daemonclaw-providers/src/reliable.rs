@@ -767,6 +767,16 @@ impl Provider for ReliableProvider {
             .any(|(_, provider)| provider.supports_vision())
     }
 
+    fn context_window_for_model(&self, model: &str) -> usize {
+        for (_, provider) in &self.providers {
+            let w = provider.context_window_for_model(model);
+            if w > 0 {
+                return w;
+            }
+        }
+        0
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],

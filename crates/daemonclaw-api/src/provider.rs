@@ -412,6 +412,12 @@ pub trait Provider: Send + Sync {
         self.capabilities().vision
     }
 
+    /// Return the context window size (in tokens) for the given model.
+    /// Returns 0 if the provider doesn't know the limit for this model.
+    fn context_window_for_model(&self, _model: &str) -> usize {
+        0
+    }
+
     /// Warm up the HTTP connection pool.
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
@@ -510,6 +516,10 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
 
     fn supports_vision(&self) -> bool {
         self.as_ref().supports_vision()
+    }
+
+    fn context_window_for_model(&self, model: &str) -> usize {
+        self.as_ref().context_window_for_model(model)
     }
 
     async fn chat_with_system(
