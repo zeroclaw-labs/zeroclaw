@@ -2,11 +2,11 @@
 
 The gateway daemon ships its HTTP API in the binary, but the web dashboard
 HTML/JS/CSS lives on disk in a `web/dist/` directory produced by Vite. The
-`gateway.web_dist_dir` setting (and its `ZEROCLAW_WEB_DIST_DIR` env-var
-mirror) tells the daemon where that directory is. When neither the setting
-nor a known fallback location contains a built `index.html`, the gateway
-boots in **API-only mode** and the dashboard URL returns a "not available"
-message.
+`gateway.web_dist_dir` setting (and its `ZEROCLAW_gateway__web_dist_dir`
+schema-mirror env-var override) tells the daemon where that directory is.
+When neither the setting nor a known fallback location contains a built
+`index.html`, the gateway boots in **API-only mode** and the dashboard URL
+returns a "not available" message.
 
 ## TL;DR
 
@@ -19,9 +19,6 @@ web_dist_dir = "/absolute/path/to/zeroclaw/web/dist"   # NOTE: no ~, no $HOME
 ```sh
 # Equivalent env-var override (in-memory only, never persisted)
 export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
-
-# Alternative — see "Bootstrap variant" below
-export ZEROCLAW_WEB_DIST_DIR="/absolute/path/to/zeroclaw/web/dist"
 ```
 
 Then build the bundle once:
@@ -115,10 +112,8 @@ The value is resolved with the standard config-layer order:
 
 1. `ZEROCLAW_gateway__web_dist_dir` (schema-mirror env var, see
    [Environment variables](../reference/env-vars.md))
-2. `ZEROCLAW_WEB_DIST_DIR` (uppercase bootstrap alias — same value, kept for
-   muscle-memory parity with `ZEROCLAW_WORKSPACE` / `ZEROCLAW_CONFIG_DIR`)
-3. `gateway.web_dist_dir` in `config.toml`
-4. Auto-detect (the five candidates above)
+2. `gateway.web_dist_dir` in `config.toml`
+3. Auto-detect (the five candidates above)
 
 Env-var overrides apply to the in-memory `Config` only; they are never
 written back to `config.toml`.
@@ -164,14 +159,16 @@ Shell variables (`$HOME`, `%USERPROFILE%`) are likewise not expanded. Pre-expand
 them in the env var if you set the value that way:
 
 ```sh
-export ZEROCLAW_WEB_DIST_DIR="$HOME/zeroclaw/web/dist"   # shell expands $HOME
+export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # shell expands $HOME
 ```
 
-A `zeroclaw doctor` self-test surfaces the tilde mistake explicitly — see
-[issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079) for the
-check that produces the targeted "looks like an unexpanded `~` —
+Once companion [PR #6961](https://github.com/zeroclaw-labs/zeroclaw/pull/6961)
+lands, `zeroclaw doctor` will surface this misconfig with a Warn-severity
+diagnostic — the targeted "looks like an unexpanded `~` —
 [`shellexpand`](https://crates.io/crates/shellexpand) it before writing this
-value" diagnostic.
+value" check tracked in
+[issue #6079](https://github.com/zeroclaw-labs/zeroclaw/issues/6079). Until
+that PR merges, the same check is available via `zeroclaw self-test`.
 
 ### Relative paths resolve against CWD, not the config file
 
@@ -203,13 +200,6 @@ web/dist directory.
 
 API endpoints still work — only the HTML/JS bundle is missing. Build it
 (option A/B/C above) or set the path.
-
-## Bootstrap variant — `ZEROCLAW_WEB_DIST_DIR`
-
-For symmetry with `ZEROCLAW_WORKSPACE` and `ZEROCLAW_CONFIG_DIR`, the
-uppercase form `ZEROCLAW_WEB_DIST_DIR` is accepted as an alias for
-`ZEROCLAW_gateway__web_dist_dir`. Either spelling is fine; pick the one your
-deployment tooling already uses.
 
 ## See also
 

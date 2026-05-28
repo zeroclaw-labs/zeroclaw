@@ -58,7 +58,10 @@ ZEROCLAW_WORKSPACE=/srv/zeroclaw          # workspace root
 ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location
 ```
 
-`ZEROCLAW_WEB_DIST_DIR` is accepted as an uppercase alias for the schema-mirror name `ZEROCLAW_gateway__web_dist_dir` — both spellings resolve to the same `gateway.web_dist_dir` field. The alias is offered for muscle-memory parity with the two bootstrap names above. See [Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full setting reference.
+The gateway's web-dashboard location is configured via the standard
+schema-mirror form `ZEROCLAW_gateway__web_dist_dir` — see
+[Web dashboard (web_dist_dir)](../gateway/web-dashboard.md) for the full
+setting reference.
 
 ## Persistence boundary
 
