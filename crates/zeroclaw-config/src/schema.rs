@@ -10488,12 +10488,16 @@ pub struct SlackConfig {
     #[serde(default)]
     pub mention_only: bool,
     /// When true (and `mention_only` is also true), messages inside a Slack
-    /// thread must also @-mention the bot to trigger a response. By default,
-    /// thread replies are allowed through without a mention so the bot can
-    /// keep a back-and-forth going without the user repeating @-mentions.
-    /// Set this to true in channels shared with human discussion where the
-    /// bot should stay silent unless explicitly addressed.
-    #[serde(default)]
+    /// thread must also @-mention the bot to trigger a response. Default: `true`.
+    ///
+    /// Slack delivers every thread reply event in any channel the bot is a
+    /// member of — regardless of whether the bot ever spoke in that specific
+    /// thread. The previous default (`false`) treated any thread reply as an
+    /// active conversation with the bot, which caused the bot to jump into
+    /// unrelated human threads in shared channels. Set this to `false` only if
+    /// the bot is the sole/primary participant in its channels and you want
+    /// thread follow-ups to skip the `@`-mention requirement.
+    #[serde(default = "default_strict_mention_in_thread")]
     pub strict_mention_in_thread: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
@@ -10527,6 +10531,10 @@ pub struct SlackConfig {
 
 fn default_slack_draft_update_interval_ms() -> u64 {
     1200
+}
+
+fn default_strict_mention_in_thread() -> bool {
+    true
 }
 
 impl ChannelConfig for SlackConfig {
@@ -17801,6 +17809,22 @@ bot_token = "xoxb-tok"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.channel_ids.is_empty());
+    }
+
+    #[test]
+    async fn slack_config_strict_mention_in_thread_defaults_to_true() {
+        let toml_str = r#"
+bot_token = "xoxb-tok"
+"#;
+        let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.strict_mention_in_thread);
+
+        let opt_out = r#"
+bot_token = "xoxb-tok"
+strict_mention_in_thread = false
+"#;
+        let parsed: SlackConfig = toml::from_str(opt_out).unwrap();
+        assert!(!parsed.strict_mention_in_thread);
     }
 
     #[test]

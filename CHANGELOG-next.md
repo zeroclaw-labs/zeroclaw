@@ -119,6 +119,7 @@ ACP mode (the `zeroclaw acp` subprocess and the `zeroclaw-acp-bridge` editor bri
 |---|---|
 | Config / V3 | V2→V3 migration correctness: provider-globals fold lands on the right V3 paths, channel `enabled` restored, dotted `model_provider` aliases resolve in routes and channel paths, Feishu V2 block migrates to `lark.feishu`, JSON-patch errors emitted for CLI patch (#6617) |
 | Channels | Telegram tool calls; Matrix honors global `ack_reactions`; localized runtime command replies (#6550); media uploads routed into the owning agent's workspace |
+| Channels (Slack) | `strict_mention_in_thread` defaults to `true` so the bot no longer auto-engages in unrelated human threads in shared channels — Slack delivers every thread reply in joined channels regardless of whether the bot ever spoke in that thread, and the old `false` default treated any thread reply as an active conversation. Opt out per channel with `strict_mention_in_thread = false`. |
 | Providers | Skip unresolvable multimodal images (#6743); Ollama routed through `compatible.rs` at `/v1/chat/completions`; error source chain included in retry logs; GLM/compat fixes |
 | Gateway / Web | Boot degrades (not crashes) when an enabled agent has an unresolved `risk_profile`; CronSchedule union restored; reload-banner and cron-modal fixes; OpenAPI re-export cleanup |
 | Cron | Timezone preserved through the cron API (#6741, #6740); `cmd.exe` on Windows instead of hardcoded `sh` (#6713) |

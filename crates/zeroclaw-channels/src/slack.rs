@@ -186,7 +186,7 @@ impl SlackChannel {
             peer_resolver,
             thread_replies: true,
             mention_only: false,
-            strict_mention_in_thread: false,
+            strict_mention_in_thread: true,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
@@ -248,8 +248,13 @@ impl SlackChannel {
     }
 
     /// When true (and `mention_only` is also true), require an @-mention
-    /// for messages inside a Slack thread too. Default: false (threads
-    /// bypass the mention requirement so follow-ups don't need @).
+    /// for messages inside a Slack thread too. Default: `true`.
+    ///
+    /// Slack delivers every thread reply event in channels the bot is a
+    /// member of, so the previous default (`false`) caused the bot to engage
+    /// in unrelated human threads. Set to `false` only when the bot is the
+    /// primary participant in its channels and you want thread follow-ups to
+    /// skip the `@`-mention requirement.
     pub fn with_strict_mention_in_thread(mut self, strict: bool) -> Self {
         self.strict_mention_in_thread = strict;
         self
@@ -4745,9 +4750,9 @@ mod tests {
             "slack_test_alias",
             Arc::new(Vec::new),
         );
-        assert!(!ch.strict_mention_in_thread);
-        let ch = ch.with_strict_mention_in_thread(true);
         assert!(ch.strict_mention_in_thread);
+        let ch = ch.with_strict_mention_in_thread(false);
+        assert!(!ch.strict_mention_in_thread);
     }
 
     #[test]
