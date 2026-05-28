@@ -3678,10 +3678,19 @@ async fn process_channel_message_body(
     let classifier_intent = if explicit_channel_address {
         AssistantChannelOutcome::Reply(String::new())
     } else {
-        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (Arc<dyn ModelProvider>, String, Option<f64>) =
-            resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider)
-                .await
-                .unwrap_or_else(|| (Arc::clone(&active_model_provider), route.model.clone(), None));
+        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+            Arc<dyn ModelProvider>,
+            String,
+            Option<f64>,
+        ) = resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider)
+            .await
+            .unwrap_or_else(|| {
+                (
+                    Arc::clone(&active_model_provider),
+                    route.model.clone(),
+                    None,
+                )
+            });
 
         classify_channel_reply_intent(
             classifier_provider_arc.as_ref(),
