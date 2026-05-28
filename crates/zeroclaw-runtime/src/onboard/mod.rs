@@ -1103,7 +1103,7 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
                     persist(cfg, &format!("{prefix}.wire-api"), "responses").await?;
                     ui.note(
                         "Codex subscription auth uses your ChatGPT account.\n\
-                         Run `zeroclaw auth login --model-provider openai-codex` to authenticate before starting your agent.",
+                         Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.",
                     );
                 } else {
                     if currently_codex {
