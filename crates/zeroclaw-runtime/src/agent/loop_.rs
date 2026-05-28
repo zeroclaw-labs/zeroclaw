@@ -2847,6 +2847,23 @@ pub struct AgentRunOverrides {
     pub is_subagent: bool,
 }
 
+/// Build the dotted provider ref (`"openai.qwertfoozp"`) from the agent's
+/// configured `model_provider` field. Returns `None` when the agent has no
+/// `model_provider` set or when the ref does not resolve to a known alias.
+///
+/// Using the full dotted ref (rather than just the family type) ensures the
+/// alias-aware factory path is taken, so config fields such as
+/// `requires_openai_auth` reach `dispatch_family_factory` instead of being
+/// silently dropped.
+fn agent_provider_composite(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<String> {
+    config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(ty, alias, _)| format!("{ty}.{alias}"))
+}
+
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
 /// Falls back to `fallback` (the agent's configured provider) for bare family
@@ -3158,9 +3175,7 @@ pub async fn run(
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────
-        let agent_provider_ref = agent_provider_resolved
-            .as_ref()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"));
+        let agent_provider_ref = agent_provider_composite(&config, agent_alias);
         let mut provider_name = provider_override
             .as_deref()
             .or(agent_provider_ref.as_deref())
@@ -11614,6 +11629,51 @@ Let me check the result."#;
         assert!(
             tools.is_empty(),
             "Some(vec![]) on policy must deny every tool"
+        );
+    }
+
+    // ── agent_provider_composite regression ───────────────────────────────
+
+    #[test]
+    fn agent_provider_composite_returns_dotted_ref_not_bare_family() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig};
+        use zeroclaw_config::providers::ModelProviderRef;
+
+        let alias = "qwertfoozp";
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            alias.to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "my_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: ModelProviderRef::new(format!("openai.{alias}")),
+                ..Default::default()
+            },
+        );
+
+        let result = super::agent_provider_composite(&config, "my_agent");
+
+        // Must be the full dotted ref so the alias-aware factory path is taken.
+        assert_eq!(
+            result.as_deref(),
+            Some("openai.qwertfoozp"),
+            "agent_provider_composite must return the dotted composite ref"
+        );
+        // Explicitly assert it is NOT the bare family — this is the regression
+        // this test protects against.
+        assert_ne!(
+            result.as_deref(),
+            Some("openai"),
+            "bare family name would bypass the alias-aware factory path and drop \
+             requires_openai_auth from the config, routing to the wrong provider"
         );
     }
 }
