@@ -1975,11 +1975,10 @@ fn prompt_for_field(
 ) -> anyhow::Result<Option<String>> {
     use dialoguer::{FuzzySelect, Input, Password};
     use zeroclaw_config::traits::PropKind;
-    let prompt = if desc.help.is_empty() {
-        desc.label.clone()
-    } else {
-        format!("{} ({})", desc.label, desc.help)
-    };
+    if !desc.help.is_empty() {
+        println!("  {}", desc.help);
+    }
+    let prompt = desc.label.clone();
     if desc.is_secret {
         // dialoguer 0.12 has no Esc-cancellable Password — only Ctrl+C
         // (returns `ErrorKind::Interrupted` wrapped in `dialoguer::Error::IO`).
