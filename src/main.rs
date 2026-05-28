@@ -3105,10 +3105,9 @@ async fn main() -> Result<()> {
                             })
                         }
                     })),
-                    #[cfg(unix)]
                     socket_start: Some(Box::new(|ctx, cancel, client_count| {
                         Box::pin(async move {
-                            Box::pin(zeroclaw_runtime::rpc::unix::run_unix_socket(
+                            Box::pin(zeroclaw_runtime::rpc::local::run_local_listener(
                                 ctx,
                                 cancel,
                                 client_count,

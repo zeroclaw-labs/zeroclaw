@@ -70,9 +70,9 @@ struct Cli {
     tls_skip_verify: bool,
 }
 
-/// Where the TUI should connect.
+/// Where zerocode should connect.
 enum ConnectTarget {
-    UnixSocket(PathBuf),
+    LocalSocket(PathBuf),
     Wss { url: String, skip_verify: bool },
 }
 
@@ -80,7 +80,7 @@ impl ConnectTarget {
     /// Human-readable label for the dashboard Status box.
     fn label(&self) -> String {
         match self {
-            Self::UnixSocket(p) => format!("unix:{}", p.display()),
+            Self::LocalSocket(p) => format!("local:{}", p.display()),
             Self::Wss { url, .. } => url.clone(),
         }
     }
@@ -135,12 +135,12 @@ async fn run() -> anyhow::Result<()> {
     } else {
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         let socket = client::resolve_socket_path(&config_dir)?;
-        ConnectTarget::UnixSocket(socket)
+        ConnectTarget::LocalSocket(socket)
     };
 
     // Initial connection (before the terminal is initialized).
     let rpc = match &target {
-        ConnectTarget::UnixSocket(socket) => {
+        ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
                 Ok(c) => c,
                 Err(_) => {
@@ -190,13 +190,7 @@ async fn run_until_exit(
     }
     #[cfg(not(unix))]
     {
-        run_with_reconnect(
-            Arc::new(rpc.clone()),
-            term,
-            target,
-            Arc::clone(&reconnect_state),
-        )
-        .await
+        run_with_reconnect(Arc::clone(&rpc), term, target, Arc::clone(&reconnect_state)).await
     }
 }
 
@@ -233,7 +227,7 @@ async fn run_with_reconnect(
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let result = match target {
-                ConnectTarget::UnixSocket(socket) => {
+                ConnectTarget::LocalSocket(socket) => {
                     client::RpcClient::connect(socket, prev_id.as_deref(), prev_sig.as_deref())
                         .await
                 }
@@ -266,10 +260,10 @@ fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
         .arg("--config-dir")
         .arg(config_dir);
 
-    // Lower the daemon's log level to DEBUG when spawned ephemerally by the
-    // TUI so that the Logs pane can show debug events without any manual
-    // RUST_LOG override.  Third-party crates stay at WARN to avoid noise.
-    // Honour an existing RUST_LOG if the user set one themselves.
+    // Lower the daemon's log level to DEBUG when spawned ephemerally by
+    // zerocode so that the Logs pane can show debug events without any
+    // manual RUST_LOG override. Third-party crates stay at WARN to avoid
+    // noise. Honour an existing RUST_LOG if the user set one themselves.
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env(
             "RUST_LOG",

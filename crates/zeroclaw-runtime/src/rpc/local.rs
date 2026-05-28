@@ -1,7 +1,10 @@
-//! Unix socket transport for the RPC layer.
+//! Local IPC transport for the RPC layer.
 //!
-//! Binds at `<config.data_dir>/daemon.sock` so each `--data-dir` gets its own
-//! socket. `$ZEROCLAW_SOCKET` overrides the path.
+//! On Unix this binds a `SOCK_STREAM` AF_UNIX socket at
+//! `<config.data_dir>/daemon.sock`; on Windows it creates a per-user named
+//! pipe whose name is derived from the data_dir so each `--data-dir` gets
+//! its own endpoint. `$ZEROCLAW_SOCKET` overrides the endpoint path on
+//! both platforms.
 
 use super::context::RpcContext;
 use super::dispatch::RpcDispatcher;
@@ -12,35 +15,47 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
-/// Resolve socket path: `$ZEROCLAW_SOCKET` or `<data_dir>/daemon.sock`.
+use platform::LocalStream;
+
+/// Resolve the local-IPC endpoint path.
+///
+/// Returns `$ZEROCLAW_SOCKET` when set, otherwise a per-`data_dir`
+/// platform-native endpoint:
+/// - Unix: `<data_dir>/daemon.sock` (filesystem path)
+/// - Windows: `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from
+///   `data_dir` so each data directory gets its own pipe
 pub fn socket_path(config: &Config) -> PathBuf {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         return PathBuf::from(p);
     }
-    config.data_dir.join("daemon.sock")
+    platform::default_endpoint(&config.data_dir)
 }
 
 // ── Transport ────────────────────────────────────────────────────
 
-pub struct UnixSocketTransport {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+/// Platform-neutral half-write type produced by `tokio::io::split`.
+type LocalWriteHalf = tokio::io::WriteHalf<LocalStream>;
+/// Platform-neutral half-read type produced by `tokio::io::split`.
+type LocalReadHalf = tokio::io::ReadHalf<LocalStream>;
+
+pub struct LocalTransport {
+    reader: BufReader<LocalReadHalf>,
     writer_tx: mpsc::Sender<String>,
     peer_label: String,
 }
 
-impl UnixSocketTransport {
-    pub fn new(stream: UnixStream) -> Self {
-        let peer_label = peer_label_from(&stream);
-        let (read_half, write_half) = stream.into_split();
+impl LocalTransport {
+    pub fn new(stream: LocalStream) -> Self {
+        let peer_label = platform::peer_label_from(&stream);
+        let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
         zeroclaw_spawn::spawn!(async move {
-            let mut writer = write_half;
+            let mut writer: LocalWriteHalf = write_half;
             while let Some(mut line) = writer_rx.recv().await {
                 if !line.ends_with('\n') {
                     line.push('\n');
@@ -60,7 +75,7 @@ impl UnixSocketTransport {
 }
 
 #[async_trait]
-impl RpcTransport for UnixSocketTransport {
+impl RpcTransport for LocalTransport {
     fn writer(&self) -> mpsc::Sender<String> {
         self.writer_tx.clone()
     }
@@ -79,24 +94,13 @@ impl RpcTransport for UnixSocketTransport {
     }
 }
 
-fn peer_label_from(stream: &UnixStream) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(cred) = stream.peer_cred() {
-            return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
-        }
-    }
-    let _ = stream;
-    "unix:unknown".to_string()
-}
-
 // ── Listener ─────────────────────────────────────────────────────
 
-/// Run the Unix socket RPC listener as a daemon subsystem.
+/// Run the local IPC RPC listener as a daemon subsystem.
 ///
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
-pub async fn run_unix_socket(
+pub async fn run_local_listener(
     ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
@@ -106,39 +110,18 @@ pub async fn run_unix_socket(
         socket_path(&config)
     };
 
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .await
-                .ok();
-        }
-    }
+    platform::prepare_parent(&path).await?;
+    platform::remove_stale(&path).await?;
 
-    // Remove stale socket.
-    if path.exists() {
-        tokio::fs::remove_file(&path)
-            .await
-            .context("removing stale socket")?;
-    }
+    let mut listener = platform::bind(&path).context("binding local IPC endpoint")?;
 
-    let listener = UnixListener::bind(&path).context("binding unix socket")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .ok();
-    }
+    platform::secure_endpoint(&path).await;
 
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_attrs(::serde_json::json!({"path": path.display().to_string()})),
-        "RPC unix socket listening"
+        "RPC local IPC listening"
     );
 
     loop {
@@ -147,19 +130,19 @@ pub async fn run_unix_socket(
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "RPC unix socket shutting down"
+                    "RPC local IPC shutting down"
                 );
                 break;
             }
-            accept = listener.accept() => {
-                let (stream, _addr) = match accept {
+            accept = platform::accept(&mut listener, &path) => {
+                let stream = match accept {
                     Ok(v) => v,
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!("unix socket accept error: {e}")
+                            &format!("local IPC accept error: {e}")
                         );
                         continue;
                     }
@@ -171,13 +154,12 @@ pub async fn run_unix_socket(
                 count.fetch_add(1, Ordering::Relaxed);
 
                 zeroclaw_spawn::spawn!(async move {
-                    let mut transport = UnixSocketTransport::new(stream);
+                    let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
                     dispatcher.run(&mut transport).await;
 
-                    // Cleanup: unregister TUI from registry on disconnect
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
                     }
@@ -188,8 +170,151 @@ pub async fn run_unix_socket(
         }
     }
 
-    tokio::fs::remove_file(&path).await.ok();
+    platform::cleanup(&path).await;
     Ok(())
+}
+
+// ── Platform shims ───────────────────────────────────────────────
+
+#[cfg(unix)]
+mod platform {
+    use anyhow::{Context, Result};
+    use std::path::{Path, PathBuf};
+    use tokio::net::{UnixListener, UnixStream};
+
+    pub type LocalListener = UnixListener;
+    pub type LocalStream = UnixStream;
+
+    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
+        data_dir.join("daemon.sock")
+    }
+
+    pub async fn prepare_parent(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .await
+                .ok();
+        }
+        Ok(())
+    }
+
+    pub async fn remove_stale(path: &Path) -> Result<()> {
+        if path.exists() {
+            tokio::fs::remove_file(path)
+                .await
+                .context("removing stale socket")?;
+        }
+        Ok(())
+    }
+
+    pub fn bind(path: &Path) -> Result<LocalListener> {
+        UnixListener::bind(path).context("binding unix socket")
+    }
+
+    pub async fn secure_endpoint(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .ok();
+    }
+
+    pub async fn accept(listener: &mut LocalListener, _path: &Path) -> Result<LocalStream> {
+        let (stream, _addr) = listener
+            .accept()
+            .await
+            .context("accepting local connection")?;
+        Ok(stream)
+    }
+
+    pub async fn cleanup(path: &Path) {
+        tokio::fs::remove_file(path).await.ok();
+    }
+
+    pub fn peer_label_from(stream: &LocalStream) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(cred) = stream.peer_cred() {
+                return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
+            }
+        }
+        let _ = stream;
+        "unix:unknown".to_string()
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use anyhow::{Context, Result};
+    use std::path::{Path, PathBuf};
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+    /// On Windows the "listener" is a single pending server instance. After
+    /// each accept the caller creates a new pending instance for the next
+    /// client; see `accept`.
+    pub type LocalListener = NamedPipeServer;
+    pub type LocalStream = NamedPipeServer;
+
+    pub fn default_endpoint(data_dir: &Path) -> PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        data_dir.hash(&mut hasher);
+        PathBuf::from(format!(r"\\.\pipe\zeroclaw-{:x}", hasher.finish()))
+    }
+
+    pub async fn prepare_parent(_path: &Path) -> Result<()> {
+        // Named pipes live in the kernel object namespace, not the
+        // filesystem — no parent directory to create.
+        Ok(())
+    }
+
+    pub async fn remove_stale(_path: &Path) -> Result<()> {
+        // Named pipes are cleaned up when the last handle closes; there is
+        // no "stale" file equivalent.
+        Ok(())
+    }
+
+    pub fn bind(path: &Path) -> Result<LocalListener> {
+        let name = path_to_pipe_name(path);
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .with_context(|| format!("creating named pipe {name}"))
+    }
+
+    pub async fn secure_endpoint(_path: &Path) {
+        // The default ServerOptions ACL grants access to the creating user
+        // and SYSTEM, matching the spirit of Unix 0o600. Stricter SDDL is
+        // a separate hardening pass.
+    }
+
+    pub async fn accept(listener: &mut LocalListener, path: &Path) -> Result<LocalStream> {
+        listener
+            .connect()
+            .await
+            .context("awaiting named-pipe client")?;
+        // Take the now-connected pipe and replace `listener` with a fresh
+        // pending instance so the next accept call can wait on it.
+        let next = ServerOptions::new()
+            .create(path_to_pipe_name(path))
+            .context("creating next named-pipe instance")?;
+        let connected = std::mem::replace(listener, next);
+        Ok(connected)
+    }
+
+    pub async fn cleanup(_path: &Path) {
+        // Pipe handles drop with the server instance; nothing to remove.
+    }
+
+    pub fn peer_label_from(_stream: &LocalStream) -> String {
+        "pipe:local".to_string()
+    }
+
+    fn path_to_pipe_name(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -197,7 +322,9 @@ mod tests {
     use super::*;
     use crate::rpc::dispatch::Method;
     use crate::rpc::session::SessionStore;
-    use crate::rpc::types::{InitializeParams, StatusResult};
+    use crate::rpc::types::InitializeParams;
+    #[cfg(unix)]
+    use crate::rpc::types::StatusResult;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use zeroclaw_api::jsonrpc::{JSONRPC_VERSION, JsonRpcRequest};
     use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -228,7 +355,7 @@ mod tests {
         s
     }
 
-    /// Read a single NDJSON response and deserialize the `result` field.
+    #[cfg(unix)]
     async fn read_result<T: serde::de::DeserializeOwned>(
         reader: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     ) -> (serde_json::Value, T) {
@@ -240,7 +367,7 @@ mod tests {
         (frame, result)
     }
 
-    /// Send initialize handshake and return the authenticated reader/writer.
+    #[cfg(unix)]
     async fn do_initialize(
         sock_path: &std::path::Path,
     ) -> (
@@ -266,7 +393,7 @@ mod tests {
         (reader, writer)
     }
 
-    /// Poll until the socket file appears.
+    #[cfg(unix)]
     async fn wait_for_socket(path: &std::path::Path) {
         for _ in 0..50 {
             if path.exists() {
@@ -277,6 +404,7 @@ mod tests {
         panic!("socket never appeared at {}", path.display());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_initialize_handshake() {
         let tmp = tempfile::tempdir().unwrap();
@@ -287,12 +415,11 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_unix_socket(server_ctx, server_cancel, test_client_count()).await
+            run_local_listener(server_ctx, server_cancel, test_client_count()).await
         });
 
         wait_for_socket(&sock_path).await;
 
-        // Connect and send initialize.
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let (read_half, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(read_half);
@@ -316,8 +443,6 @@ mod tests {
         assert_eq!(init_result.protocol_version, 1);
         assert!(!init_result.server_version.is_empty());
 
-        // Send status (should work after auth).
-        // Status takes no meaningful params — use empty object.
         writer
             .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
             .await
@@ -331,6 +456,7 @@ mod tests {
         let _ = handle.await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_rejects_before_initialize() {
         let tmp = tempfile::tempdir().unwrap();
@@ -341,7 +467,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -350,7 +476,6 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
 
-        // Send status without initialize first.
         writer
             .write_all(rpc_request(Method::Status, &serde_json::json!({}), 1).as_bytes())
             .await
@@ -369,6 +494,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_permissions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -379,7 +505,7 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -395,13 +521,13 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stale_socket_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
 
-        // Pre-create a stale socket file.
         std::fs::create_dir_all(tmp.path()).unwrap();
         std::fs::write(&sock_path, b"stale").unwrap();
         assert!(sock_path.exists());
@@ -410,19 +536,16 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
         });
 
-        // Wait for the listener to start (it should remove the stale file and bind).
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            // Try connecting -- if we can, the listener is up.
             if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
                 break;
             }
         }
 
-        // Verify we can actually connect (stale file was replaced by real socket).
         let stream = tokio::net::UnixStream::connect(&sock_path).await;
         assert!(
             stream.is_ok(),
@@ -432,6 +555,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn session_approve_resolves_pending_approval() {
         let tmp = tempfile::tempdir().unwrap();
@@ -442,13 +566,12 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_unix_socket(server_ctx, server_cancel, test_client_count()).await;
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count()).await;
         });
         wait_for_socket(&sock_path).await;
 
         let (mut reader, mut writer) = do_initialize(&sock_path).await;
 
-        // Insert a fake pending approval directly into the shared map.
         let (pending_tx, mut pending_rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
         ctx.approval_pending
@@ -476,6 +599,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn client_count_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
@@ -488,29 +612,84 @@ mod tests {
         let server_ctx = ctx.clone();
         let server_count = count.clone();
         zeroclaw_spawn::spawn!(async move {
-            let _ = run_unix_socket(server_ctx, server_cancel, server_count).await;
+            let _ = run_local_listener(server_ctx, server_cancel, server_count).await;
         });
 
         wait_for_socket(&sock_path).await;
 
         assert_eq!(count.load(Ordering::Relaxed), 0);
 
-        // Connect two clients.
         let s1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let s2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(count.load(Ordering::Relaxed), 2);
 
-        // Drop one — count should go to 1.
         drop(s1);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
-        // Drop the other — count should go to 0.
         drop(s2);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(count.load(Ordering::Relaxed), 0);
 
         cancel.cancel();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_initialize_handshake() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use tokio::time::{Duration, sleep};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let pipe_path = socket_path(&ctx.config.read());
+        let cancel = CancellationToken::new();
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+        });
+
+        // Poll-connect until the server creates its pending instance.
+        let pipe_name = pipe_path.to_string_lossy().into_owned();
+        let mut client = None;
+        for _ in 0..50 {
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let mut client = client.expect("named pipe never accepted a client");
+        let (read_half, mut write_half) = tokio::io::split(&mut client);
+        let mut reader = tokio::io::BufReader::new(read_half);
+
+        let init_params = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+        };
+        write_half
+            .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        assert_eq!(frame["jsonrpc"], JSONRPC_VERSION);
+        assert_eq!(frame["id"], 1);
+
+        cancel.cancel();
+        drop(write_half);
+        drop(reader);
+        drop(client);
+        let _ = handle.await;
     }
 }

@@ -204,10 +204,9 @@ pub struct DaemonSubsystems {
                 + Sync,
         >,
     >,
-    /// Start the Unix socket RPC listener.
-    /// First argument is the shared `RpcContext`; third is the client count
-    /// for `--ephemeral` shutdown.
-    #[cfg(unix)]
+    /// Start the local IPC RPC listener (Unix socket on Unix, Named Pipe on
+    /// Windows). First argument is the shared `RpcContext`; third is the
+    /// client count for `--ephemeral` shutdown.
     pub socket_start: Option<
         Box<
             dyn Fn(
@@ -347,10 +346,7 @@ pub async fn run(
     // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    #[cfg(unix)]
     let need_rpc_ctx = subsystems.socket_start.is_some() || subsystems.wss_start.is_some();
-    #[cfg(not(unix))]
-    let need_rpc_ctx = subsystems.wss_start.is_some();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -429,8 +425,7 @@ pub async fn run(
         None
     };
 
-    // Unix socket RPC listener.
-    #[cfg(unix)]
+    // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = subsystems.socket_start {
         let rpc_ctx = rpc_ctx
             .clone()
@@ -546,10 +541,9 @@ pub async fn run(
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    #[cfg(unix)]
     println!(
         "   Socket:   {}",
-        crate::rpc::unix::socket_path(&config).display()
+        crate::rpc::local::socket_path(&config).display()
     );
     println!("   Components: gateway, channels, heartbeat, scheduler");
     if config.gateway.require_pairing {

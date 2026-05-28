@@ -178,7 +178,7 @@ impl Chat {
         // Over Unix socket, pass local CWD so the agent works in the
         // directory the TUI was launched from.  Over WSS the server
         // uses the agent's workspace dir unless the user supplies one.
-        let cwd_str: Option<String> = if self.rpc.transport() == crate::client::Transport::Unix {
+        let cwd_str: Option<String> = if self.rpc.transport() == crate::client::Transport::Local {
             std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_string))
@@ -648,7 +648,7 @@ impl Chat {
                         ),
                     };
                 } else {
-                    let local_cwd = if self.rpc.transport() == crate::client::Transport::Unix {
+                    let local_cwd = if self.rpc.transport() == crate::client::Transport::Local {
                         std::env::current_dir().ok()
                     } else {
                         None

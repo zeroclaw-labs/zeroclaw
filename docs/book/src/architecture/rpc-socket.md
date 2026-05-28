@@ -1,28 +1,40 @@
 # RPC Socket Transport
 
-The daemon exposes a JSON-RPC 2.0 interface over a Unix domain socket. This is the primary transport for local clients like the TUI. The HTTP/WS gateway remains for webhooks, the web dashboard, and remote REST consumers.
+The daemon exposes a JSON-RPC 2.0 interface over a local IPC stream — a Unix
+domain socket on Unix and a named pipe on Windows. This is the primary
+transport for local clients like zerocode. The HTTP/WS gateway remains for
+webhooks, the web dashboard, and remote REST consumers.
 
-## Socket path
+## Endpoint resolution
 
-The socket is created at `<data_dir>/daemon.sock`. Each `--data-dir` gets its own socket, so multiple daemon instances on the same machine do not collide.
+Each `--data-dir` gets its own endpoint, so multiple daemon instances on the
+same machine do not collide.
 
-Override with the `ZEROCLAW_SOCKET` environment variable:
+| OS | Default endpoint |
+|---|---|
+| Linux | `<data_dir>/daemon.sock` (Unix domain socket) |
+| macOS | `<data_dir>/daemon.sock` (Unix domain socket) |
+| Windows | `\\.\pipe\zeroclaw-<hash>` where `<hash>` is derived from `data_dir` |
+
+Override with the `ZEROCLAW_SOCKET` environment variable on either platform:
 
 ```bash
+# Unix
 export ZEROCLAW_SOCKET=/tmp/my-zeroclaw.sock
 zeroclaw daemon
 ```
 
-Default paths (when `ZEROCLAW_SOCKET` is not set):
-
-| OS | Default `data_dir` | Socket path |
-|---|---|---|
-| Linux | `~/.local/share/zeroclaw/` | `~/.local/share/zeroclaw/daemon.sock` |
-| macOS | `~/Library/Application Support/zeroclaw/` | `~/Library/Application Support/zeroclaw/daemon.sock` |
+```powershell
+# Windows
+$env:ZEROCLAW_SOCKET = '\\.\pipe\my-zeroclaw'
+zeroclaw daemon
+```
 
 ## Wire protocol
 
-NDJSON (newline-delimited JSON). Each line is a complete JSON-RPC 2.0 message. No HTTP framing, no length prefix.
+NDJSON (newline-delimited JSON). Each line is a complete JSON-RPC 2.0 message.
+No HTTP framing, no length prefix. The framing is identical across platforms;
+named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
@@ -31,7 +43,9 @@ NDJSON (newline-delimited JSON). Each line is a complete JSON-RPC 2.0 message. N
 
 ## Handshake
 
-The first RPC call must be `initialize`. The daemon rejects all other methods until `initialize` succeeds. Protocol version mismatch produces a structured error with code `-32002`.
+The first RPC call must be `initialize`. The daemon rejects all other methods
+until `initialize` succeeds. Protocol version mismatch produces a structured
+error with code `-32002`.
 
 ```json
 {
@@ -44,7 +58,11 @@ The first RPC call must be `initialize`. The daemon rejects all other methods un
 }
 ```
 
-The socket does not require a pairing token. Access control is handled by Unix filesystem permissions (socket is `0o600`, directory is `0o700`).
+The endpoint does not require a pairing token. Access control is handled by
+the operating system:
+
+- Unix: socket is `0o600`, parent directory is `0o700`.
+- Windows: named pipe ACL defaults to the creating user and `SYSTEM`.
 
 ## Methods
 
@@ -60,7 +78,9 @@ The socket does not require a pairing token. Access control is handled by Unix f
 
 ### Turn streaming
 
-`session/prompt` returns the final result when the turn completes. During execution, the daemon sends `session/update` notifications with incremental events:
+`session/prompt` returns the final result when the turn completes. During
+execution, the daemon sends `session/update` notifications with incremental
+events:
 
 ```json
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"...","type":"agent_message_chunk","text":"Hello"}}
@@ -68,19 +88,26 @@ The socket does not require a pairing token. Access control is handled by Unix f
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"...","type":"tool_result","toolCallId":"tc_1","name":"bash","rawOutput":"..."}}
 ```
 
-Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_result`, `approval_request`.
+Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
+`tool_result`, `approval_request`.
 
 ## Ephemeral mode
 
-`zeroclaw daemon --ephemeral` tracks connected socket clients and self-terminates when the last one disconnects (after a 30-second grace period). A reconnect during the grace period cancels the shutdown. The daemon will not exit until at least one client has connected.
+`zeroclaw daemon --ephemeral` tracks connected clients and self-terminates
+when the last one disconnects (after a 30-second grace period). A reconnect
+during the grace period cancels the shutdown. The daemon will not exit until
+at least one client has connected.
 
-Daemons started without `--ephemeral` ignore client count and run until explicitly stopped.
+Daemons started without `--ephemeral` ignore client count and run until
+explicitly stopped.
 
 ## Security
 
-- Socket directory: `0o700` (owner only)
-- Socket file: `0o600` (owner only)
-- `SO_PEERCRED` on Linux provides the connecting process PID and UID for audit logging
+- Unix socket directory: `0o700` (owner only)
+- Unix socket file: `0o600` (owner only)
+- Windows named pipe: default ACL grants the creating user and `SYSTEM`
+- `SO_PEERCRED` on Linux provides the connecting process PID and UID for
+  audit logging; Windows logs `pipe:local` as the peer label
 
 ## Quick test
 
@@ -90,7 +117,7 @@ Start the daemon in one terminal:
 zeroclaw daemon
 ```
 
-In a second terminal, connect with `socat`:
+In a second terminal on Unix, connect with `socat`:
 
 ```bash
 socat READLINE UNIX-CONNECT:~/.local/share/zeroclaw/daemon.sock
@@ -103,15 +130,8 @@ Paste lines one at a time:
 {"jsonrpc":"2.0","method":"status","params":{},"id":2}
 ```
 
-## Windows
-
-Native Windows has no Unix domain socket support. Two options:
-
-1. **WSL2 (recommended):** Run the daemon inside WSL2. Unix sockets work natively. The TUI connects over the socket from the same WSL2 instance. This is the supported path for local socket transport on Windows.
-
-2. **Gateway only:** Use the HTTP/WS gateway (`zeroclaw daemon` on native Windows already starts the gateway). The TUI can connect over WebSocket instead of a socket. This path does not require WSL.
-
-There is no named-pipe transport for native Windows at this time.
+On Windows, use any named-pipe client (PowerShell `[System.IO.Pipes.NamedPipeClientStream]`,
+`nc` via WSL, or just run `zerocode`).
 
 ## Internals
 
@@ -123,8 +143,12 @@ The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
 | `turn.rs` | `execute_turn()` shared turn executor |
 | `session.rs` | `RpcSession`, `SessionStore` |
 | `dispatch.rs` | `RpcDispatcher` method routing |
-| `unix.rs` | `UnixSocketTransport` + listener |
+| `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 
-The `RpcTransport` trait is designed so that additional transports (WSS, vsock) slot in without touching the dispatch or session logic.
+The `RpcTransport` trait is designed so that additional transports (vsock,
+custom IPC) slot in without touching the dispatch or session logic. The
+`local.rs` module wraps the Unix and Windows primitives behind a single
+`LocalTransport` struct using `tokio::io::split`, so the read/write loop is
+shared across both platforms.

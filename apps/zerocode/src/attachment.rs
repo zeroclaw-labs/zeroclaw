@@ -89,7 +89,7 @@ impl PendingAttachment {
             AttachmentSource::Clipboard => "clipboard",
         };
         match transport {
-            Transport::Unix => Ok(serde_json::json!({
+            Transport::Local => Ok(serde_json::json!({
                 "path": self.path.to_string_lossy(),
                 "filename": self.filename,
                 "mime_type": self.mime_type,
@@ -183,7 +183,7 @@ mod tests {
         };
         // We can't actually call to_json without the file existing,
         // but for Unix mode it just serializes the path.
-        let json = att.to_json(Transport::Unix).unwrap();
+        let json = att.to_json(Transport::Local).unwrap();
         assert!(json.get("path").is_some());
         assert!(json.get("data_b64").is_none());
         assert_eq!(json["filename"], "photo.png");

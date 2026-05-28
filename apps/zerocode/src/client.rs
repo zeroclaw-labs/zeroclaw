@@ -1,4 +1,5 @@
-//! JSON-RPC 2.0 client over Unix socket (NDJSON) or WebSocket (WSS).
+//! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
+//! named pipe, NDJSON) or WebSocket (WSS).
 //!
 //! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
 //! plumbing the daemon uses for bidirectional calls.
@@ -10,11 +11,44 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
+
+// ── Platform local-stream shim ──────────────────────────────────
+
+#[cfg(unix)]
+type LocalStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Open a connection to the daemon's local IPC endpoint.
+#[cfg(unix)]
+async fn open_local_stream(path: &Path) -> Result<LocalStream> {
+    tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+#[cfg(windows)]
+async fn open_local_stream(path: &Path) -> Result<LocalStream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::time::{Duration, sleep};
+    // The daemon may not yet have a pending pipe instance; retry briefly.
+    let name = path.to_string_lossy().into_owned();
+    for _ in 0..50 {
+        match ClientOptions::new().open(&name) {
+            Ok(c) => return Ok(c),
+            Err(e) if e.raw_os_error() == Some(231) => {
+                // ERROR_PIPE_BUSY — server hasn't recreated a pending instance yet.
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(anyhow::Error::from(e)),
+        }
+    }
+    anyhow::bail!("named pipe {name} never became available")
+}
 
 // ── Wire method names used by the TUI ────────────────────────────
 
@@ -72,8 +106,9 @@ pub mod method {
 
 // ── Socket path resolution ───────────────────────────────────────
 
-/// Resolve the daemon socket path.
-/// CLI flag > `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock`.
+/// Resolve the daemon's local IPC endpoint path.
+/// CLI flag > `$ZEROCLAW_SOCKET` > `<config_dir>/data/daemon.sock` on Unix
+/// or a `\\.\pipe\zeroclaw-<hash>` derived name on Windows.
 pub fn resolve_socket_path(config_dir: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("ZEROCLAW_SOCKET") {
         let p = p.trim();
@@ -81,10 +116,25 @@ pub fn resolve_socket_path(config_dir: &Path) -> Result<PathBuf> {
             return Ok(PathBuf::from(p));
         }
     }
-    Ok(config_dir.join("data").join("daemon.sock"))
+    #[cfg(unix)]
+    {
+        Ok(config_dir.join("data").join("daemon.sock"))
+    }
+    #[cfg(windows)]
+    {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let data_dir = config_dir.join("data");
+        let mut hasher = DefaultHasher::new();
+        data_dir.hash(&mut hasher);
+        Ok(PathBuf::from(format!(
+            r"\\.\pipe\zeroclaw-{:x}",
+            hasher.finish()
+        )))
+    }
 }
 
-/// Resolve config dir: CLI flag > `$ZEROCLAW_CONFIG_DIR` > `~/.zeroclaw`.
+/// Resolve config dir: CLI flag > `$ZEROCLAW_CONFIG_DIR` > home directory.
 pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = cli_override {
         return Ok(dir.to_path_buf());
@@ -95,8 +145,16 @@ pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
             return Ok(PathBuf::from(d));
         }
     }
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".zeroclaw"))
+    #[cfg(unix)]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join(".zeroclaw"))
+    }
+    #[cfg(windows)]
+    {
+        let profile = std::env::var("USERPROFILE").context("USERPROFILE not set")?;
+        Ok(PathBuf::from(profile).join(".zeroclaw"))
+    }
 }
 
 // ── Notifications ────────────────────────────────────────────────
@@ -230,7 +288,8 @@ pub fn spawn_notification_router(
 /// Transport protocol of the established RPC connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
-    Unix,
+    /// Local IPC stream — Unix socket on Unix, named pipe on Windows.
+    Local,
     Wss,
 }
 
@@ -263,7 +322,8 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    /// Connect to the daemon socket and complete the `initialize` handshake.
+    /// Connect to the daemon's local IPC endpoint and complete the
+    /// `initialize` handshake.
     ///
     /// Pass previous `tui_id` and `tui_sig` on reconnect to reclaim
     /// the same identity. Pass `None` for both on first connect.
@@ -272,10 +332,10 @@ impl RpcClient {
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
     ) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
+        let stream = open_local_stream(socket)
             .await
             .with_context(|| format!("connecting to {}", socket.display()))?;
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
@@ -384,7 +444,7 @@ impl RpcClient {
             connection_state: conn_state,
             tui_id,
             tui_sig,
-            transport: Transport::Unix,
+            transport: Transport::Local,
         })
     }
 
@@ -1121,7 +1181,7 @@ impl RpcClient {
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
-            transport: Transport::Unix,
+            transport: Transport::Local,
         }
     }
 

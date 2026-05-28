@@ -8,7 +8,7 @@
 - [Quick start](./getting-started/quick-start.md)
 - [YOLO mode](./getting-started/yolo.md)
 - [Multi-model setup](./getting-started/multi-model-setup.md)
-- [TUI](./getting-started/tui.md)
+- [zerocode](./getting-started/tui.md)
 
 # Setup
 

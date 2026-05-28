@@ -41,7 +41,7 @@ flowchart TB
 
 | Crate | Role |
 |---|---|
-| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, TUI |
+| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding sections, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
 | `zeroclaw-api` | Public traits — `Provider`, `Channel`, `Tool`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
