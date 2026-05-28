@@ -15944,7 +15944,24 @@ enabled = true
         assert!(a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
+        assert!(
+            !a.forbidden_paths.is_empty(),
+            "default forbidden_paths must not be empty"
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            a.forbidden_paths.iter().any(|p| p == "/etc"),
+            "Default forbidden_paths must include /etc on Unix"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            a.forbidden_paths.iter().any(|p| p == "C:\\Windows"),
+            "Default forbidden_paths must include C:\\Windows on Windows"
+        );
+        assert!(
+            a.forbidden_paths.contains(&"~/.ssh".to_string()),
+            "Default forbidden_paths must include ~/.ssh"
+        );
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
@@ -18222,13 +18239,31 @@ default_temperature = 0.7
         let a = RiskProfileConfig::default();
         assert!(a.workspace_only, "Default profile must be workspace_only");
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            !a.forbidden_paths.is_empty(),
+            "Default forbidden_paths must not be empty"
         );
-        assert!(
-            a.forbidden_paths.contains(&"/proc".to_string()),
-            "Must block /proc"
-        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "/etc"),
+                "Must block /etc on Unix"
+            );
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "/proc"),
+                "Must block /proc on Unix"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "C:\\Windows"),
+                "Must block C:\\Windows on Windows"
+            );
+            assert!(
+                a.forbidden_paths.iter().any(|p| p == "C:\\Program Files"),
+                "Must block C:\\Program Files on Windows"
+            );
+        }
         assert!(
             a.forbidden_paths.contains(&"~/.ssh".to_string()),
             "Must block ~/.ssh"
