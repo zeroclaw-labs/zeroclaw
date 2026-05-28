@@ -644,6 +644,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
     }
 
+    // gateway.web_dist_dir: flag values that rely on shell expansion the
+    // gateway does not perform. Parallel check lives in
+    // `src/commands/self_test.rs::check_web_dist_dir`; keep the wording
+    // and predicate in sync.
+    check_web_dist_dir(config, items);
+
     // Channel: at least one configured
     let cc = &config.channels;
     let has_channel = cc.channels().iter().any(|info| info.configured);
@@ -677,6 +683,43 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
+    }
+}
+
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw doctor` time
+/// instead of at runtime. Parallel check lives in
+/// `src/commands/self_test.rs::check_web_dist_dir`.
+fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    match config.gateway.web_dist_dir.as_deref() {
+        None => {}
+        Some(value) => match web_dist_dir_expansion_issue(value) {
+            None => {}
+            Some(reason) => items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "gateway.web_dist_dir = \"{value}\" — {reason}; gateway.web_dist_dir is \
+                     read verbatim, so expand the value yourself (e.g. an absolute path)"
+                ),
+            )),
+        },
+    }
+}
+
+/// Return a human-readable explanation when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_issue(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("starts with `~` which is not expanded")
+    } else if value.contains('$') {
+        Some("contains `$` which is not expanded")
+    } else {
+        None
     }
 }
 
@@ -1336,6 +1379,62 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
         );
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_tilde() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let results = diagnose(&config);
+        let hit = results.iter().find(|item| {
+            item.category == "config"
+                && item.message.contains("gateway.web_dist_dir")
+                && item.message.contains("~/web-dist")
+        });
+        assert!(
+            hit.is_some(),
+            "doctor should flag web_dist_dir = \"~/web-dist\" as a Warn"
+        );
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_env_var() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("$HOME/web-dist".to_string());
+
+        let results = diagnose(&config);
+        let hit = results.iter().find(|item| {
+            item.category == "config"
+                && item.message.contains("gateway.web_dist_dir")
+                && item.message.contains("$HOME/web-dist")
+        });
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_accepts_literal_web_dist_dir() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let results = diagnose(&config);
+        assert!(
+            !results
+                .iter()
+                .any(|item| item.message.contains("gateway.web_dist_dir")),
+            "literal web_dist_dir paths should produce no doctor diagnostic"
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_expansion_issue_detects_tilde_and_env() {
+        assert!(web_dist_dir_expansion_issue("~/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("$HOME/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("${HOME}/web-dist").is_some());
+        assert!(web_dist_dir_expansion_issue("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_issue("./dist").is_none());
     }
 
     #[test]
