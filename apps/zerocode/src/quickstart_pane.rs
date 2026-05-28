@@ -1230,15 +1230,11 @@ impl QuickstartPane {
                         self.active_modal = None;
                         self.revalidate().await;
                     }
-                    KeyCode::Tab | KeyCode::Down => {
-                        if a.cursor + 1 < row_count {
-                            a.cursor += 1;
-                        }
+                    KeyCode::Tab | KeyCode::Down if a.cursor + 1 < row_count => {
+                        a.cursor += 1;
                     }
-                    KeyCode::Up => {
-                        if a.cursor > 0 {
-                            a.cursor -= 1;
-                        }
+                    KeyCode::Up if a.cursor > 0 => {
+                        a.cursor -= 1;
                     }
                     KeyCode::Char(c) if on_name => {
                         a.name.push(c);
