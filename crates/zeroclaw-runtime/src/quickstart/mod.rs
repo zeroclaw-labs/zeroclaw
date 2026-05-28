@@ -688,10 +688,18 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
             // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. Everything else
-            // in the essentials list is required to actually issue a
-            // request.
-            required: field_path != "uri",
+            // when pointing at a self-hosted gateway. `requires-openai-auth`
+            // and `wire-api` are OpenAI Codex subscription fields — optional
+            // for all providers, meaningful only for OpenAI. `api-key` is
+            // left non-required because local providers (Ollama) and Codex
+            // subscription auth don't need one — the runtime surfaces a
+            // clear error at request time if a remote provider is missing
+            // its key. Everything else in the essentials list is required
+            // to actually issue a request.
+            required: !matches!(
+                field_path,
+                "uri" | "api-key" | "requires-openai-auth" | "wire-api"
+            ),
             default,
         });
     }
@@ -1746,6 +1754,54 @@ mod tests {
             assert!(
                 keys.contains(&"api_key"),
                 "field_shape for `{kind}` is missing `api_key` row; got {keys:?}",
+            );
+        }
+    }
+
+    /// Codex subscription auth: `field_shape(ModelProvider, "openai")` must
+    /// include the `requires-openai-auth` and `wire-api` rows so the
+    /// Quickstart form can offer Codex subscription auth (no API key needed).
+    /// These fields are non-required — they default to `false`/empty and are
+    /// harmless for non-OpenAI providers.
+    #[test]
+    fn field_shape_openai_includes_codex_auth_fields() {
+        let rows = super::field_shape(super::FieldSection::ModelProvider, "openai");
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert!(
+            keys.contains(&"requires-openai-auth"),
+            "field_shape for openai must include `requires-openai-auth` for Codex subscription; got {keys:?}",
+        );
+        assert!(
+            keys.contains(&"wire-api"),
+            "field_shape for openai must include `wire-api` for Codex subscription; got {keys:?}",
+        );
+        // Both must be non-required so Quickstart doesn't block on them.
+        for row in &rows {
+            if row.key == "requires-openai-auth" || row.key == "wire-api" {
+                assert!(
+                    !row.required,
+                    "`{}` must be non-required in the Quickstart form",
+                    row.key
+                );
+            }
+        }
+    }
+
+    /// `api-key` must be non-required in the Quickstart form so Codex
+    /// subscription (no API key) and local providers (Ollama) can proceed
+    /// without one.
+    #[test]
+    fn field_shape_api_key_is_not_required() {
+        for kind in ["openai", "ollama"] {
+            let rows = super::field_shape(super::FieldSection::ModelProvider, kind);
+            let api_key_row = rows.iter().find(|r| r.key == "api-key");
+            assert!(
+                api_key_row.is_some(),
+                "field_shape for `{kind}` must include `api-key`",
+            );
+            assert!(
+                !api_key_row.unwrap().required,
+                "`api-key` must be non-required for `{kind}` (Codex subscription / local providers don't need one)",
             );
         }
     }
