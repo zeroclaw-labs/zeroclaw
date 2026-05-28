@@ -1085,6 +1085,13 @@ impl Agent {
                         config.hooks.builtin.webhook_audit.clone(),
                     )));
                 }
+                // Extras supplied by binary-local hook factories (e.g. the
+                // X0 conscience gate). Empty when no factory is registered,
+                // matching the default runtime-only build. See
+                // crates/zeroclaw-runtime/src/hooks/registry.rs.
+                for extra in crate::hooks::registry::build_extras(config) {
+                    runner.register(extra);
+                }
                 Some(Arc::new(runner))
             } else {
                 None

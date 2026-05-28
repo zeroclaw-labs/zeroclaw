@@ -14,11 +14,14 @@
 
 pub mod cosmic_bridge;
 pub mod gate;
+pub mod hook;
 pub mod ledger;
 pub mod types;
 
 #[allow(unused_imports)]
 pub use cosmic_bridge::self_state_from_cosmic;
+#[allow(unused_imports)]
+pub use hook::{ConscienceHook, register_hook_factory};
 #[allow(unused_imports)]
 pub use gate::{
     AuditResult, GateVerdict, compute_conscience_score, conscience_audit, conscience_gate,

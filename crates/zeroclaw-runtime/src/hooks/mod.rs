@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod registry;
 mod runner;
 mod traits;
 
