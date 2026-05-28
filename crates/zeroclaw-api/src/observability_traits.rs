@@ -127,6 +127,21 @@ pub enum ObserverEvent {
     },
     /// Recovery from a failed deployment has completed.
     RecoveryCompleted { deploy_id: String },
+    /// The conscience gate emitted a verdict for a pending tool call.
+    ///
+    /// Fired before the tool actually executes. `verdict` is the lowercase
+    /// form of `GateVerdict` (`"allow"` / `"ask"` / `"block"` / `"revise"`);
+    /// `score` is the normalised harm score the gate computed. Verdicts
+    /// other than `"allow"` mean the tool was NOT executed — the agent
+    /// surface returned a synthetic `<tool_result>` instead.
+    ConscienceVerdict {
+        /// Name of the tool that was evaluated.
+        tool: String,
+        /// Lowercase verdict string for downstream backends.
+        verdict: String,
+        /// Harm score in `[0, 1]` produced by the gate.
+        score: f64,
+    },
 }
 
 /// Numeric metrics emitted by the agent runtime.

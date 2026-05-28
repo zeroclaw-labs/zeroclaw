@@ -28,6 +28,20 @@ Two delivery slices. **Slice A** (call-site wiring) is the headline gap — the 
 
 **Goal:** `evaluate_tool_call` runs on every LLM-issued tool call, with norms read from config, an `IntegrityLedger`-backed `SelfState`, and proper handling for `Allow` / `Ask` / `Block` / `Revise`. Gated by `config.conscience.gate_enabled` (default `false`).
 
+**Architectural finding (2026-05-28):** `run_tool_call_loop` lives in `crates/zeroclaw-runtime`, the conscience module lives in `src/conscience/` in the binary tree, and the runtime crate cannot depend on binary-local code. Wiring the gate requires one of:
+
+1. **Move the conscience module into a new `zeroclaw-conscience` crate** that the runtime depends on (cleanest, most invasive).
+2. **Add an Agent builder extension point** for "extra hooks" — the X0 binary builds a `ConscienceHook: HookHandler` and injects it. Agent::new currently constructs the HookRunner inline at `crates/zeroclaw-runtime/src/agent/agent.rs:1079` with no extension slot. The conscience hook's `before_tool_call` would call `conscience::gate::evaluate_tool_call` and return `HookResult::Cancel` for Block/Ask/Revise verdicts. Smallest API change but still needs an architectural decision about where extras hook in.
+3. **Define an abstract `ConscienceGateFn` callback type in `zeroclaw-api`** and add a 30th parameter to `run_tool_call_loop`. Smallest call-site touch but compounds the param-surface debt the loop is already in.
+
+**Shipped so far (post-PR with this plan):**
+- `ObserverEvent::ConscienceVerdict { tool, verdict, score }` variant with all observer impls updated (log emits structured event; otel + prometheus no-op until backend mapping lands).
+- `ConscienceConfig.default_norms: Vec<NormConfigSerde>` with four shipped defaults (`no_rm_rf_root`, `no_rm_rf_home`, `no_drop_table`, `no_curl_pipe_sh`). The serde mirror types (`NormConfigSerde`, `NormActionSerde`) decouple `zeroclaw-config` from the binary-local conscience types; the binary's gate adapter copies values at startup.
+- Validation that the default norms list is non-empty and that severities are in `[0, 1]`.
+- TOML round-trip test confirms operator-edited norms survive deserialise + reserialise.
+
+**Deferred (need the architectural decision above):**
+
 **Files:**
 
 1. `crates/zeroclaw-config/src/x0_extensions.rs` — extend `ConscienceConfig`:

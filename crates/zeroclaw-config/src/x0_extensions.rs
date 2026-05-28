@@ -882,6 +882,74 @@ pub struct ConscienceConfig {
     pub allow_threshold: f64,
     pub ask_threshold: f64,
     pub block_threshold: f64,
+    /// Normative rules consulted by the gate before dispatching a tool call.
+    /// Each entry is a serialised `NormConfig` (name + action + condition +
+    /// severity). The defaults forbid the most obviously dangerous shell
+    /// patterns (`rm -rf`, `drop table`) so a freshly-enabled gate has a
+    /// non-empty rulebook on day zero.
+    ///
+    /// Sourced from a static default — `default_conscience_norms` —
+    /// rather than `Default::default()` so the list survives a
+    /// deserialise + reserialise round-trip.
+    #[serde(default = "default_conscience_norms")]
+    pub default_norms: Vec<NormConfigSerde>,
+}
+
+/// Plain-data mirror of `crate::conscience::types::NormConfig`, declared here
+/// so `ConscienceConfig` (in `zeroclaw-config`) can carry serialised norms
+/// without depending on the X0 fork's binary-side conscience module.
+///
+/// Field shape kept aligned with `NormConfig`; the binary's gate adapter
+/// copies values across at startup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct NormConfigSerde {
+    pub name: String,
+    pub action: NormActionSerde,
+    pub condition: String,
+    pub severity: f64,
+}
+
+/// Plain-data mirror of `crate::conscience::types::NormAction`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum NormActionSerde {
+    Allow,
+    Forbid,
+    Require,
+}
+
+/// Ship a non-empty default rulebook so the gate has bite the moment
+/// `gate_enabled` flips to `true`. Operators override by setting
+/// `[conscience.default_norms]` in `config.toml`.
+pub fn default_conscience_norms() -> Vec<NormConfigSerde> {
+    vec![
+        NormConfigSerde {
+            name: "no_rm_rf_root".into(),
+            action: NormActionSerde::Forbid,
+            condition: "rm -rf /".into(),
+            severity: 0.99,
+        },
+        NormConfigSerde {
+            name: "no_rm_rf_home".into(),
+            action: NormActionSerde::Forbid,
+            condition: "rm -rf ~".into(),
+            severity: 0.95,
+        },
+        NormConfigSerde {
+            name: "no_drop_table".into(),
+            action: NormActionSerde::Forbid,
+            condition: "drop table".into(),
+            severity: 0.95,
+        },
+        NormConfigSerde {
+            name: "no_curl_pipe_sh".into(),
+            action: NormActionSerde::Forbid,
+            condition: "curl | sh".into(),
+            severity: 0.85,
+        },
+    ]
 }
 
 impl Default for ConscienceConfig {
@@ -892,6 +960,7 @@ impl Default for ConscienceConfig {
             allow_threshold: 0.80,
             ask_threshold: 0.55,
             block_threshold: 0.45,
+            default_norms: default_conscience_norms(),
         }
     }
 }
@@ -984,6 +1053,7 @@ mod conscience_config_tests {
             allow_threshold: 1.5,
             ask_threshold: -0.3,
             block_threshold: 0.4,
+            default_norms: Vec::new(),
         };
         let adjusted = cc.normalize();
         assert_eq!(cc.allow_threshold, 1.0);
@@ -999,6 +1069,7 @@ mod conscience_config_tests {
             allow_threshold: 0.4,
             ask_threshold: 0.6,
             block_threshold: 0.8,
+            default_norms: Vec::new(),
         };
         let adjusted = cc.normalize();
         assert_eq!(cc.allow_threshold, 0.4);
@@ -1018,12 +1089,64 @@ mod conscience_config_tests {
     }
 
     #[test]
+    fn default_norms_ship_a_non_empty_rulebook() {
+        let cc = ConscienceConfig::default();
+        assert!(
+            !cc.default_norms.is_empty(),
+            "freshly-enabled gate must have norms"
+        );
+        // The names below are part of the public default contract — bumping
+        // them is a behaviour change operators will see in their generated
+        // configs, so it should be deliberate.
+        let names: Vec<&str> = cc
+            .default_norms
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        for required in [
+            "no_rm_rf_root",
+            "no_rm_rf_home",
+            "no_drop_table",
+            "no_curl_pipe_sh",
+        ] {
+            assert!(
+                names.contains(&required),
+                "default norms must include {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_norms_severities_are_in_unit_interval() {
+        for norm in ConscienceConfig::default().default_norms {
+            assert!(
+                (0.0..=1.0).contains(&norm.severity),
+                "norm {} has severity {} outside [0,1]",
+                norm.name,
+                norm.severity,
+            );
+        }
+    }
+
+    #[test]
+    fn default_norms_survive_toml_roundtrip() {
+        let cc = ConscienceConfig::default();
+        let toml = toml::to_string(&cc).expect("serialise");
+        let parsed: ConscienceConfig = toml::from_str(&toml).expect("deserialise");
+        assert_eq!(parsed.default_norms.len(), cc.default_norms.len());
+        for (a, b) in parsed.default_norms.iter().zip(cc.default_norms.iter()) {
+            assert_eq!(a, b, "norm round-trip drift");
+        }
+    }
+
+    #[test]
     fn validate_handles_compound_violation_clamp_then_reorder() {
         let mut cc = ConscienceConfig {
             gate_enabled: true,
             allow_threshold: 2.0,
             ask_threshold: 1.5,
             block_threshold: 1.2,
+            default_norms: Vec::new(),
         };
         cc.normalize();
         // All three clamp to 1.0, monotonicity already holds afterwards.

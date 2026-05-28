@@ -158,6 +158,22 @@ impl Observer for LogObserver {
                     "recovery.completed"
                 );
             }
+            ObserverEvent::ConscienceVerdict {
+                tool,
+                verdict,
+                score,
+            } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "tool": tool,
+                            "verdict": verdict,
+                            "score": score,
+                        })),
+                    "conscience.verdict"
+                );
+            }
         }
     }
 
