@@ -3265,6 +3265,31 @@ impl Config {
             .join("workspace")
     }
 
+    /// Return a clone of this config with the `agents` map filtered to
+    /// only the named alias and `gateway.port` rewritten to the agent's
+    /// `gateway_port` (when set). Used by the daemon when spawning a
+    /// dedicated per-agent gateway so the cloned view exposes one agent
+    /// on one port — first slice of `Plans/binary-seeking-umbrella.md`
+    /// Phase 2.
+    ///
+    /// Returns `None` when:
+    /// - the alias does not name a configured agent, or
+    /// - the agent does not declare its own `gateway_port` (no isolated
+    ///   gateway to spawn — it shares the global one).
+    ///
+    /// Only the gateway subsystem should consume this view. Channels and
+    /// cron continue to see the full multi-agent config and route across
+    /// every agent.
+    #[must_use]
+    pub fn isolated_to_agent(&self, alias: &str) -> Option<Self> {
+        let agent = self.agents.get(alias)?;
+        let port = agent.gateway_port?;
+        let mut view = self.clone();
+        view.agents = std::collections::HashMap::from([(alias.to_string(), agent.clone())]);
+        view.gateway.port = port;
+        Some(view)
+    }
+
     /// Effective gateway port for `agent_alias`. Falls back to the global
     /// `gateway.port` when the agent has no per-agent override set.
     ///
@@ -15898,6 +15923,50 @@ mod tests {
         );
         let (_, _, port) = dup.unwrap();
         assert_eq!(port, 42617);
+    }
+
+    #[test]
+    async fn isolated_to_agent_returns_none_for_unknown_alias() {
+        let config = Config::default();
+        assert!(config.isolated_to_agent("does-not-exist").is_none());
+    }
+
+    #[test]
+    async fn isolated_to_agent_returns_none_when_agent_has_no_port() {
+        let mut config = Config::default();
+        let agent = AliasedAgentConfig::default();
+        // gateway_port left as None
+        config.agents.insert("shared".into(), agent);
+        assert!(
+            config.isolated_to_agent("shared").is_none(),
+            "an agent without gateway_port has no isolated gateway to spawn"
+        );
+    }
+
+    #[test]
+    async fn isolated_to_agent_returns_filtered_view_with_overridden_port() {
+        let mut config = Config::default();
+        config.gateway.port = 42617;
+        let mut a = AliasedAgentConfig::default();
+        a.gateway_port = Some(9001);
+        let mut b = AliasedAgentConfig::default();
+        b.gateway_port = Some(9002);
+        config.agents.insert("alpha".into(), a);
+        config.agents.insert("beta".into(), b);
+
+        let isolated = config
+            .isolated_to_agent("alpha")
+            .expect("alpha has a port");
+        assert_eq!(isolated.agents.len(), 1);
+        assert!(isolated.agents.contains_key("alpha"));
+        assert!(!isolated.agents.contains_key("beta"));
+        assert_eq!(
+            isolated.gateway.port, 9001,
+            "isolated view rewrites gateway.port to the agent's port"
+        );
+        // Original is untouched.
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.gateway.port, 42617);
     }
 
     #[test]

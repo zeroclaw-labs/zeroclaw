@@ -185,15 +185,58 @@ pub async fn run(
             "gateway",
             initial_backoff,
             max_backoff,
-            move || {
-                let cfg = gateway_cfg.clone();
-                let host = gateway_host.clone();
-                let tx = gateway_event_tx.clone();
-                let reload = gateway_reload_tx.clone();
-                let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload)).await }
+            {
+                let gateway_start = gateway_start.clone();
+                move || {
+                    let cfg = gateway_cfg.clone();
+                    let host = gateway_host.clone();
+                    let tx = gateway_event_tx.clone();
+                    let reload = gateway_reload_tx.clone();
+                    let start = gateway_start.clone();
+                    async move { start(host, port, cfg, Some(tx), Some(reload)).await }
+                }
             },
         ));
+
+        // Per-agent gateways: any agent whose [agents.<alias>].gateway_port
+        // is Some(p) gets its own supervised gateway listening on `p` with
+        // an agents-filtered config view. First slice of
+        // Plans/binary-seeking-umbrella.md Phase 2 — channels and cron
+        // still see the full multi-agent config.
+        for (alias, agent) in &config.agents {
+            let Some(agent_port) = agent.gateway_port else { continue };
+            let Some(isolated_cfg) = config.isolated_to_agent(alias) else {
+                continue;
+            };
+            let name: &'static str = Box::leak(format!("gateway-{alias}").into_boxed_str());
+            let agent_host = host.clone();
+            let agent_event_tx = event_tx.clone();
+            let agent_reload_tx = reload_tx.clone();
+            let agent_start = gateway_start.clone();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "agent": alias,
+                        "host": &agent_host,
+                        "port": agent_port,
+                    })),
+                "spawning per-agent gateway"
+            );
+            handles.push(spawn_component_supervisor(
+                name,
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = isolated_cfg.clone();
+                    let host = agent_host.clone();
+                    let tx = agent_event_tx.clone();
+                    let reload = agent_reload_tx.clone();
+                    let start = agent_start.clone();
+                    async move { start(host, agent_port, cfg, Some(tx), Some(reload)).await }
+                },
+            ));
+        }
     }
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
