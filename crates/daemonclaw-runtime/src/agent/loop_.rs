@@ -930,13 +930,23 @@ pub async fn run_tool_call_loop(
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Preemptive context management: trim history before it overflows
-        if context_token_budget > 0 {
+        // Preemptive context management: trim history before it overflows.
+        // When context_token_budget is 0 ("unlimited"), resolve the real limit
+        // from the provider or the static model table.
+        let effective_budget = if context_token_budget == 0 {
+            daemonclaw_providers::model_limits::resolve_context_window(
+                provider.context_window_for_model(model),
+                model,
+            )
+        } else {
+            context_token_budget
+        };
+        {
             let estimated = estimate_history_tokens(history);
-            if estimated > context_token_budget {
+            if estimated > effective_budget {
                 tracing::info!(
                     estimated,
-                    budget = context_token_budget,
+                    budget = effective_budget,
                     iteration = iteration + 1,
                     "Preemptive context trim: estimated tokens exceed budget"
                 );
@@ -944,14 +954,13 @@ pub async fn run_tool_call_loop(
                 if chars_saved > 0 {
                     tracing::info!(chars_saved, "Preemptive fast-trim applied");
                 }
-                // If still over budget, use the history pruner for deeper cleanup
                 let recheck = estimate_history_tokens(history);
-                if recheck > context_token_budget {
+                if recheck > effective_budget {
                     let stats = crate::agent::history_pruner::prune_history(
                         history,
                         &crate::agent::history_pruner::HistoryPrunerConfig {
                             enabled: true,
-                            max_tokens: context_token_budget,
+                            max_tokens: effective_budget,
                             keep_recent: 4,
                             collapse_tool_results: true,
                         },

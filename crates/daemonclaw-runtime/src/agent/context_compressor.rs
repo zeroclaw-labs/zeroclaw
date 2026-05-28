@@ -202,23 +202,24 @@ impl ContextCompressor {
             });
         }
 
-        // context_window == 0 means "unlimited / no limit" — skip compression
-        // entirely.  Without this guard, threshold computes to 0 and *every*
-        // non-empty history triggers compression on every turn, silently
-        // discarding recent conversation context through lossy summarisation.
-        if self.context_window == 0 {
-            let tokens = estimate_tokens(history);
-            return Ok(CompressionResult {
-                compressed: false,
-                tokens_before: tokens,
-                tokens_after: tokens,
-                passes_used: 0,
-            });
-        }
+        let effective_window = if self.context_window == 0 {
+            let resolved = daemonclaw_providers::model_limits::resolve_context_window(
+                provider.context_window_for_model(model),
+                model,
+            );
+            tracing::debug!(
+                model,
+                resolved,
+                "context_window=0, resolved effective window"
+            );
+            resolved
+        } else {
+            self.context_window
+        };
 
         let tokens_before = estimate_tokens(history);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let threshold = (self.context_window as f64 * self.config.threshold_ratio) as usize;
+        let threshold = (effective_window as f64 * self.config.threshold_ratio) as usize;
 
         if tokens_before <= threshold {
             return Ok(CompressionResult {
