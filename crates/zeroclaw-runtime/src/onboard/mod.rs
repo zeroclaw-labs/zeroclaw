@@ -16,6 +16,7 @@ use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
 
 use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
 use crate::agent::personality_templates::{TemplateContext, render as render_personality};
+use crate::i18n;
 
 const CUSTOM_OPENAI_COMPAT_LABEL: &str = "Custom OpenAI-compatible endpoint";
 const OPENAI_COMPAT_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1071,20 +1072,14 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
                     .find("openai", &alias)
                     .map(|c| c.requires_openai_auth)
                     .unwrap_or(false);
-                ui.note(
-                    "OpenAI authentication:\n\
-                     • API key — standard API access via platform.openai.com (sk-...)\n\
-                     • Codex subscription — uses your ChatGPT Plus/Pro account (no API key needed)",
-                );
+                ui.note(&i18n::get_required_cli_string("onboard-openai-auth-note"));
+                let auth_prompt = i18n::get_required_cli_string("onboard-openai-auth-prompt");
                 let auth_items = [
-                    SelectItem::new("API key"),
-                    SelectItem::new("Codex subscription"),
+                    SelectItem::new(i18n::get_required_cli_string("onboard-openai-auth-api-key")),
+                    SelectItem::new(i18n::get_required_cli_string("onboard-openai-auth-codex")),
                 ];
                 let auth_default = if currently_codex { Some(1) } else { Some(0) };
-                let codex_chosen = match ui
-                    .select("Authentication", &auth_items, auth_default)
-                    .await?
-                {
+                let codex_chosen = match ui.select(&auth_prompt, &auth_items, auth_default).await? {
                     Answer::Back => {
                         if flags.model_provider.is_some() {
                             return Ok(Nav::Back);
@@ -1101,10 +1096,9 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
                 if codex_chosen {
                     persist(cfg, &format!("{prefix}.requires-openai-auth"), "true").await?;
                     persist(cfg, &format!("{prefix}.wire-api"), "responses").await?;
-                    ui.note(
-                        "Codex subscription auth uses your ChatGPT account.\n\
-                         Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.",
-                    );
+                    ui.note(&i18n::get_required_cli_string(
+                        "onboard-openai-codex-followup",
+                    ));
                 } else {
                     if currently_codex {
                         persist(cfg, &format!("{prefix}.requires-openai-auth"), "false").await?;
@@ -3003,7 +2997,10 @@ mod tests {
         let mut ui = QuickUi::new()
             .with("ModelProvider", "OpenAI")
             // Accept "default" alias via placeholder fallback (no scripted answer needed)
-            .with("Authentication", "Codex subscription");
+            .with(
+                &i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                &i18n::get_required_cli_string("onboard-openai-auth-codex"),
+            );
 
         Box::pin(run(
             &mut cfg,
@@ -3064,7 +3061,10 @@ mod tests {
         let mut ui = QuickUi::new()
             .with("ModelProvider", "OpenAI")
             .with("Alias", "default")
-            .with("Authentication", "API key")
+            .with(
+                &i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                &i18n::get_required_cli_string("onboard-openai-auth-api-key"),
+            )
             .with("api-key", "sk-test-key");
 
         Box::pin(run(

@@ -383,3 +383,15 @@ channel-wecom-ws-dm-access-denied =
     Your userid: {$userid}
 
     Ask an administrator to add your userid to {$allowed_users_path}.
+
+# Onboarding — OpenAI auth picker
+onboard-openai-auth-note =
+    OpenAI authentication:
+    • API key — standard API access via platform.openai.com (sk-...)
+    • Codex subscription — uses your ChatGPT Plus/Pro account (no API key needed)
+onboard-openai-auth-prompt = Authentication
+onboard-openai-auth-api-key = API key
+onboard-openai-auth-codex = Codex subscription
+onboard-openai-codex-followup =
+    Codex subscription auth uses your ChatGPT account.
+    Run `zeroclaw auth login --provider openai-codex` to authenticate before starting your agent.
