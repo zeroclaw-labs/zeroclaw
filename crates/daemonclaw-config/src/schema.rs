@@ -5709,7 +5709,7 @@ pub struct AutonomyConfig {
     /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
     /// Default includes system paths (`/proc`, `/sys`, `/etc`, `/tmp`, etc.)
     /// so the agent can read system info and use temp files.
-    #[serde(default = "default_allowed_roots")]
+    #[serde(default = "default_allowed_roots", alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
 
     /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).

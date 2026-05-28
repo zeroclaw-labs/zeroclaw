@@ -1080,10 +1080,6 @@ impl Agent {
             }
 
             if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -1390,13 +1386,6 @@ impl Agent {
             }
 
             // ── Tool calls ─────────────────────────────────────────────
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-            }
-
             self.history.push(ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
@@ -2249,6 +2238,198 @@ mod tests {
                      entry — pair was split during trim"
                 );
             }
+        }
+    }
+
+    // ── Duplicate narration guard ────────────────────────────────────
+
+    /// When the model returns narration text alongside tool calls, the agent
+    /// must store exactly ONE assistant history entry (AssistantToolCalls) —
+    /// not a plain Chat(assistant) followed by AssistantToolCalls. The latter
+    /// pattern causes providers that enforce role-alternation to reject the
+    /// next request with a consecutive-assistant-role error.
+    #[tokio::test]
+    async fn narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = daemonclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..daemonclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            daemonclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![daemonclaw_providers::ChatResponse {
+                text: Some("I will echo the message.".into()),
+                tool_calls: vec![daemonclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.turn("hi").await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "history contains Chat(assistant) immediately before AssistantToolCalls — \
+                 duplicate narration push was not removed"
+            );
+        }
+    }
+
+    /// Streaming mock that emits narration text + tool call on the first turn,
+    /// then a plain text response on the second. Used to verify the streaming
+    /// path has the same duplicate-narration guard as the blocking path.
+    struct NarrationStreamProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for NarrationStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<daemonclaw_providers::ChatResponse> {
+            Ok(daemonclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: daemonclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            daemonclaw_providers::traits::StreamResult<daemonclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                stream::iter(vec![
+                    Ok(daemonclaw_providers::traits::StreamEvent::TextDelta(
+                        daemonclaw_providers::traits::StreamChunk {
+                            delta: "I will echo the message.".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(daemonclaw_providers::traits::StreamEvent::ToolCall(
+                        daemonclaw_providers::ToolCall {
+                            id: "tc1".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                        },
+                    )),
+                    Ok(daemonclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![
+                    Ok(daemonclaw_providers::traits::StreamEvent::TextDelta(
+                        daemonclaw_providers::traits::StreamChunk {
+                            delta: "done".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(daemonclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = daemonclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..daemonclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            daemonclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(NarrationStreamProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent.turn_streamed("hi", event_tx, None).await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "streaming path: history contains Chat(assistant) immediately before \
+                 AssistantToolCalls — duplicate narration push was not removed"
+            );
         }
     }
 

@@ -274,6 +274,25 @@ impl Provider for RouterProvider {
             .any(|(_, provider)| provider.supports_streaming_tool_events())
     }
 
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat_with_system(
+            system_prompt,
+            message,
+            &resolved_model,
+            temperature,
+            options,
+        )
+    }
+
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
