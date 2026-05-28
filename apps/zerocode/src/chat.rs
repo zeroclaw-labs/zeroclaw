@@ -874,7 +874,6 @@ impl Chat {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // Scrollbar track click → start drag, jump scroll.
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
@@ -893,7 +892,6 @@ impl Chat {
                         }
                         return;
                     }
-                    // Entry click → selection.
                     let hit = state
                         .entry_rects
                         .iter()
@@ -921,7 +919,6 @@ impl Chat {
                             state.mark_dirty_full();
                         }
                     } else {
-                        // Click in empty conv area → clear selection.
                         state.browse_multi.clear();
                         state.browse_cursor = None;
                         state.browse_anchor = None;
@@ -1338,8 +1335,7 @@ fn render_tool_entry(
         )));
     }
 
-    // Apply REVERSED to every body line that came from `diff_lines`/
-    // `write_lines` so the whole tool block visually pops when selected.
+    // Apply REVERSED to body lines from diff_lines/write_lines too.
     if is_selected {
         for line in &mut lines[body_start..] {
             let spans = std::mem::take(&mut line.spans);
@@ -1512,10 +1508,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.last_inner_height = inner_height;
     state.scroll_offset = scroll;
 
-    // Hit-rect cache: project each entry's unwrapped-line range into
-    // screen coordinates given the current scroll. Lines that fall
-    // outside the viewport get a zero-sized rect so mouse routing
-    // ignores them.
+    // Project each entry's line range into screen coords. Off-viewport
+    // ranges get no rect.
     let body_x = area.x + 1;
     let body_y = area.y + 1;
     let body_w = inner_width;
@@ -1548,8 +1542,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         area,
         &mut scrollbar_state,
     );
-    // Scrollbar track rect: right-most column of `area`, excluding the
-    // border rows. ratatui's Scrollbar paints in `area.right() - 1`.
+    // Scrollbar paints in `area.right() - 1`; mirror that.
     if area.height > 2 {
         state.scrollbar_track_rect = Some(Rect::new(
             area.x + area.width.saturating_sub(1),
@@ -2026,8 +2019,7 @@ impl ChatState {
         self.browse_cursor.is_some() || !self.browse_multi.is_empty()
     }
 
-    /// Build the clipboard string. Single-entry → body only. Multi-entry →
-    /// each entry prefixed by its role label, blank line between.
+    /// Build the clipboard string. Single = body. Multi = role-prefixed.
     fn yank_selection(&self) -> String {
         let sel = self.selected_entries();
         let count = sel.len();
@@ -2492,7 +2484,7 @@ impl ChatState {
     }
 }
 
-/// Body-only clipboard text (no role label). Used for single-entry yank.
+/// Body-only clipboard text.
 fn clipboard_text(entry: &ChatEntry) -> String {
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
@@ -2523,8 +2515,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
     }
 }
 
-/// Clipboard text with role label prefix. Used for multi-entry yank so the
-/// reader can tell speakers apart in the joined transcript.
+/// Role-prefixed clipboard text. Used when ≥2 entries are yanked.
 fn labelled_clipboard_text(entry: &ChatEntry) -> String {
     match entry {
         ChatEntry::UserMessage { .. } => format!("You: {}", clipboard_text(entry)),
