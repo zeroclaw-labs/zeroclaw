@@ -1811,7 +1811,10 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(config: Arc<RwLock<Config>>, pairing: &PairingGuard) -> Result<()> {
+pub(crate) async fn persist_pairing_tokens(
+    config: Arc<RwLock<Config>>,
+    pairing: &PairingGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
     // This is needed because parking_lot's guard is not Send so we clone the inner
     // this should be removed once async mutexes are used everywhere
