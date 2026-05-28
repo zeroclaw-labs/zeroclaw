@@ -7526,7 +7526,7 @@ pub async fn start_channels(
             delegate_handle_ch,
             ask_user_handle_ch,
             reaction_handle_ch,
-            _poll_handle_ch,
+            poll_handle_ch,
             escalate_handle_ch,
             channel_send_handle_ch,
         ) = tools::all_tools_with_runtime(
@@ -7927,6 +7927,12 @@ pub async fn start_channels(
             }
         }
         if let Some(ref handle) = ask_user_handle_ch {
+            let mut map = handle.write();
+            for (name, ch) in channels_by_name.as_ref() {
+                map.insert(name.clone(), Arc::clone(ch));
+            }
+        }
+        if let Some(ref handle) = poll_handle_ch {
             let mut map = handle.write();
             for (name, ch) in channels_by_name.as_ref() {
                 map.insert(name.clone(), Arc::clone(ch));
