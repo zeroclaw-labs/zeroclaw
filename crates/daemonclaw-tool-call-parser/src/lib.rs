@@ -1471,6 +1471,10 @@ pub fn build_native_assistant_history_from_parsed_calls(
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
 ) -> Option<String> {
+    if tool_calls.is_empty() {
+        return None;
+    }
+
     let calls_json = tool_calls
         .iter()
         .map(|tc| {
@@ -1506,6 +1510,41 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls() {
+        let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
+        assert!(
+            result.is_none(),
+            "expected None for empty tool_calls slice, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls_with_reasoning() {
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer text",
+            &[],
+            Some("deep thought"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_emits_tool_calls_when_non_empty() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_1".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let s = result.expect("Some(_) for non-empty tool_calls");
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        let arr = parsed["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("shell"));
+    }
 
     #[test]
     fn parse_tool_calls_extracts_multiple_calls() {
