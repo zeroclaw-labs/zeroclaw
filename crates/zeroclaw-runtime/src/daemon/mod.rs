@@ -236,6 +236,24 @@ pub async fn run(
                     async move { start(host, agent_port, cfg, Some(tx), Some(reload)).await }
                 },
             ));
+            // Per-agent heartbeat tick (Plans/binary-seeking-umbrella.md
+            // Phase 6). spawn_component_supervisor only marks the
+            // component ok on each retry-loop iteration; for a gateway
+            // that runs forever without crashing, `last_ok` would never
+            // refresh and the dashboard would show stale data. This
+            // ticker keeps the heartbeat fresh so operators can tell a
+            // running-but-idle bot apart from a hung one.
+            let beat_name = name; // Re-use the leaked &'static str.
+            handles.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                loop {
+                    interval.tick().await;
+                    crate::health::mark_component_ok(beat_name);
+                }
+            }));
         }
     }
 

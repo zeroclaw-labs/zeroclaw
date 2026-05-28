@@ -14,6 +14,7 @@
 
 pub mod acp;
 pub mod api;
+pub mod api_agents;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -1341,6 +1342,7 @@ pub async fn run_gateway(
             "/api/personality/{filename}",
             get(api_personality::handle_get).put(api_personality::handle_put),
         )
+        .route("/api/agents/summary", get(api_agents::handle_agents_summary))
         .route("/api/browse", get(api_browse::handle_browse))
         .route("/api/browse/mkdir", post(api_browse::handle_browse_mkdir))
         .route("/api/browse/rmdir", delete(api_browse::handle_browse_rmdir))
