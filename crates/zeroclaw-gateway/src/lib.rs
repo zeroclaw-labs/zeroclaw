@@ -635,9 +635,9 @@ pub async fn run_gateway(
             let (
                 tools_registry_raw,
                 delegate_handle_gw,
-                reaction_handle_gw,
-                channel_map_handle_gw,
                 ask_user_handle_gw,
+                reaction_handle_gw,
+                poll_handle_gw,
                 escalate_handle_gw,
                 channel_send_handle_gw,
             ) = tools::all_tools_with_runtime(
@@ -664,14 +664,14 @@ pub async fn run_gateway(
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
             // orchestrator::start_channels).
-            // channel_map_handle_gw is PerToolChannelHandle (not Option);
+            // reaction_handle_gw is PerToolChannelHandle (not Option);
             // register_channels_for_tools expects &Option for all handles.
-            let channel_map_handle_opt = Some(channel_map_handle_gw);
+            let reaction_handle_gw_opt = Some(reaction_handle_gw);
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &ask_user_handle_gw,
-                &reaction_handle_gw,
-                &channel_map_handle_opt,
+                &reaction_handle_gw_opt,
+                &poll_handle_gw,
                 &escalate_handle_gw,
                 &channel_send_handle_gw,
             );
