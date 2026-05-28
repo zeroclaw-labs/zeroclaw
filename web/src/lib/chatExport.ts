@@ -8,6 +8,27 @@
 
 import type { PersistedChatBubble } from './chatHistoryStorage';
 
+/**
+ * Shape accepted by the exporters. Compatible with both
+ * `PersistedChatBubble` (timestamp: string) and the in-memory
+ * `ChatMessage` shape used by `AgentContext` (timestamp: Date), plus any
+ * `toolCall` structure that has at least a `name`. Lets callers export
+ * either persisted history or live messages without an adapter step.
+ *
+ * Defined here rather than imported from a sibling so consumers do not
+ * need a separate file to bring it in. Previously the type was referenced
+ * by the four exporter signatures below without ever being declared,
+ * which slipped past the local typecheck but broke the production
+ * `tsc -b && vite build` in the release workflow (see PR #11).
+ */
+export interface ExportableMessage {
+  role: PersistedChatBubble['role'];
+  content: string;
+  thinking?: string;
+  toolCall?: { name: string; args?: unknown; output?: string };
+  timestamp: string | Date;
+}
+
 export interface ExportOptions {
   /** Include `[YYYY-MM-DD HH:MM:SS]` per message. Default: `true`. */
   includeTimestamps?: boolean;
