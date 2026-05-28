@@ -19,8 +19,10 @@
 
 pub mod registry;
 pub mod shadow;
+pub mod tracker;
 pub mod types;
 
 pub use registry::{get_or_create, remove};
 pub use shadow::ShadowSnapshot;
+pub use tracker::spawn_tracker;
 pub use types::{FileDiff, FileStatus, Patch};

@@ -1,4 +1,4 @@
-# Unreleased — post-v0.8.0-beta-1
+# v0.8.0-beta-2 (2026-05-28)
 
 Maintenance batch that pulls in 20 upstream fixes/features from `zeroclaw-labs/zeroclaw`, plus four new ports from the claurst codebase and one fork-specific feature. Backward compatible; no migrations.
 
@@ -12,10 +12,17 @@ Maintenance batch that pulls in 20 upstream fixes/features from `zeroclaw-labs/z
 - **`npm install -g zeroclaw` distribution** — new `npm/` postinstall wrapper downloads the matching native binary from GitHub Releases for 5 targets. `npx zeroclaw --help` works without prior install.
 - **Web dashboard chat export** — Export button on `AgentChat` toolbar with Markdown / JSON / HTML / plaintext output, filenames `zeroclaw-<alias>-<YYYY-MM-DD>.<ext>`.
 
+## Also in this batch
+
+- **Integration test debt resolved** (PR #6) — 912 tests pass workspace-wide under `cargo test --features ci-all`, 0 fail, 0 warnings. The previously-broken `tests/cosmic_*`, `tests/conscience_*`, `tests/continuity_*`, and `tests/consciousness_integration` are now feature-gated to `x0-extended`; `tests/memory_comparison` updated to the V3 Memory signature; `tests/bot_isolation` and `tests/agent_e2e` parked behind `bot-isolation-v2` and `agent-e2e-v2` placeholder features until the V3 rewrites land. `tests/reply_target_field_regression` tolerates the now-removed `examples/` directory.
+- **`ConscienceConfig` threshold validation** (PR #7) — `validate()` rejects out-of-range or misordered thresholds at config load time; `normalize()` clamps and reorders for in-memory rewrites. First concrete deliverable from `Plans/glimmering-mixing-moore.md`.
+- **`Plans/glimmering-mixing-moore-v2.md`** — re-scopes the conscience refactor against current code. Headline finding: `evaluate_tool_call` is fully implemented at `src/conscience/gate.rs:160` but never called from `run_tool_call_loop` — the gate is inert until the loop-side wiring lands. Splits remaining work into Slice A (call-site wiring) and Slice B (`LoopContext` reduction of the now-29-arg loop signature).
+- **`x86_64-apple-darwin` added to the release build matrix** — Intel Mac users were previously stuck without a binary. New `macos-13` job in `.github/workflows/release-stable-manual.yml`.
+- **`npm/install.js` aligned to canonical artifact naming** — was previously requesting `zeroclaw-{linux,macos,windows}-{x86_64,aarch64}.{tar.gz,zip}` which the release workflow does not emit. Now requests Rust target triples (`zeroclaw-x86_64-unknown-linux-gnu.tar.gz`, `zeroclaw-aarch64-apple-darwin.tar.gz`, `zeroclaw-x86_64-pc-windows-msvc.zip`, …). `npx zeroclaw` is now end-to-end operational once a release is cut.
+
 ## Known Limitations
 
-- Pre-existing X0 fork integration tests under `tests/{bot_isolation,cosmic_*,conscience_*,continuity_*,memory_comparison,agent_e2e}.rs` do not compile — `cosmic` / `conscience` / `continuity` modules are not pub-exported from the binary library, and the `Memory` trait test calls use the 3-arg pre-V3 signature. Present on `main` since `74ff25746 feat(sync): wire X0 fork modules into upstream v0.8 architecture`.
-- Release CI must publish assets named `zeroclaw-{linux,macos,windows}-{x86_64,aarch64}.{tar.gz,zip}` before `npm install -g zeroclaw` is operational.
+- The conscience gate ships fully implemented but is **never invoked** by `run_tool_call_loop` — `config.conscience.gate_enabled = true` has no behavioural effect until Slice A of the v2 plan lands.
 
 ---
 

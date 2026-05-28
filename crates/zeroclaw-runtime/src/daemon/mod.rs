@@ -164,6 +164,13 @@ pub async fn run(
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // Optional shadow-git auto-tracker. Returns `None` when
+    // `[snapshot] auto_track_enabled = false`, so the daemon doesn't take
+    // any extra tasks in the default config.
+    if let Some(handle) = crate::snapshot::spawn_tracker(config.clone()) {
+        handles.push(handle);
+    }
+
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);

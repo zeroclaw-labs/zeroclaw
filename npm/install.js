@@ -25,20 +25,25 @@ function getPlatform() {
   const platform = process.platform;
   const arch = process.arch;
 
+  // Asset names follow the Rust target-triple convention emitted by
+  // .github/workflows/release-stable-manual.yml, e.g.:
+  //   zeroclaw-x86_64-unknown-linux-gnu.tar.gz
+  //   zeroclaw-aarch64-apple-darwin.tar.gz
+  //   zeroclaw-x86_64-pc-windows-msvc.zip
   if (platform === 'win32' && arch === 'x64') {
-    return { artifact: 'zeroclaw-windows-x86_64', ext: '.exe', archive: '.zip' };
+    return { artifact: 'zeroclaw-x86_64-pc-windows-msvc', ext: '.exe', archive: '.zip' };
   }
   if (platform === 'linux' && arch === 'x64') {
-    return { artifact: 'zeroclaw-linux-x86_64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'zeroclaw-x86_64-unknown-linux-gnu', ext: '', archive: '.tar.gz' };
   }
   if (platform === 'linux' && arch === 'arm64') {
-    return { artifact: 'zeroclaw-linux-aarch64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'zeroclaw-aarch64-unknown-linux-gnu', ext: '', archive: '.tar.gz' };
   }
   if (platform === 'darwin' && arch === 'x64') {
-    return { artifact: 'zeroclaw-macos-x86_64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'zeroclaw-x86_64-apple-darwin', ext: '', archive: '.tar.gz' };
   }
   if (platform === 'darwin' && arch === 'arm64') {
-    return { artifact: 'zeroclaw-macos-aarch64', ext: '', archive: '.tar.gz' };
+    return { artifact: 'zeroclaw-aarch64-apple-darwin', ext: '', archive: '.tar.gz' };
   }
   throw new Error(
     `Unsupported platform: ${platform}/${arch}.\n` +
