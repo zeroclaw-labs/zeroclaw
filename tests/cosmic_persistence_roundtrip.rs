@@ -1,7 +1,7 @@
 use zeroclaw::cosmic::{
-    gather_snapshot, BeliefSource, CausalGraph, ConsolidationEngine, CosmicMemoryGraph,
-    CosmicPersistence, DriftDetector, EmotionalModulator, GlobalWorkspace, NormativeEngine,
-    SelfModel, SensoryThalamus, WorldModel,
+    BeliefSource, CausalGraph, ConsolidationEngine, CosmicMemoryGraph, CosmicPersistence,
+    DriftDetector, EmotionalModulator, GlobalWorkspace, NormativeEngine, SelfModel,
+    SensoryThalamus, WorldModel, gather_snapshot,
 };
 
 #[test]

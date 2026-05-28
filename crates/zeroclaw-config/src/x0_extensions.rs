@@ -1,9 +1,17 @@
 //! X0 fork-specific configuration extensions.
 //! These types are additive to the upstream zeroclaw-config schema.
+//!
+//! The `default_*` helper fns below are wired in as `#[serde(default = "fn")]`
+//! attributes once the corresponding fork modules complete their V3 port. They
+//! are intentionally written ahead so the schema reaches stability before the
+//! consumers do. The `dead_code` allow is module-scoped and transitional —
+//! remove it as each consumer comes online.
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use serde_json;
+use std::path::PathBuf;
 
 // BotRateLimiter uses atomics but is not serializable — skipped from config.
 // We use a placeholder for fields that reference upstream types not available here.
@@ -1385,10 +1393,9 @@ fn default_config_and_workspace_dirs() -> anyhow::Result<(PathBuf, PathBuf)> {
 fn default_config_dir() -> anyhow::Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u: directories::UserDirs| u.home_dir().to_path_buf())
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        .ok_or_else(|| anyhow::Error::msg("Could not find home directory"))?;
     Ok(home.join(".zeroclaw"))
 }
-
 
 // --- HasPropKind implementations for X0 config types ---
 // These are required by the Configurable derive macro on Config.

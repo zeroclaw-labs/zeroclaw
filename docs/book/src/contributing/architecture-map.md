@@ -50,7 +50,7 @@ Coding agents should use the same public docs as humans, plus the repository-loc
 ## RFC And PR Checkpoints
 
 This map does not replace the [RFC process](./rfcs.md) or the PR template.
-It exists to make architecture and contribution scope easier to find; see the discussion in [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808) for the context behind adding this routing page.
+It exists to make architecture and contribution scope easier to find. After RFC #6808 policy slices are promoted, follow [FND-003](../foundations/fnd-003-governance.md), [Labels](../maintainers/labels.md), [PR workflow](../maintainers/pr-workflow.md), and [Reviewer playbook](../maintainers/reviewer-playbook.md).
 
 - Check or open an RFC first when the RFC page says the change is RFC-shaped: established default changes, breaking config or schema migration, new subsystem or protocol, cross-cutting refactor, governance, release, or contribution-model changes.
 - If a change is ambiguous but not clearly RFC-shaped, ask a maintainer or narrow the PR before implementation.

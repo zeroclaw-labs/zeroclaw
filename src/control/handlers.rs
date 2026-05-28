@@ -2,17 +2,17 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{
-        sse::{Event as SseEvent, KeepAlive},
         IntoResponse, Json, Sse,
+        sse::{Event as SseEvent, KeepAlive},
     },
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use std::sync::Arc;
 

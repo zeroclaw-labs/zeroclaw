@@ -276,10 +276,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("blocked by security policy"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("blocked by security policy")
+        );
     }
 
     #[tokio::test]
@@ -298,10 +300,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("every_ms must be > 0"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("every_ms must be > 0")
+        );
     }
 
     #[tokio::test]
@@ -318,9 +322,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'prompt'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'prompt'")
+        );
     }
 }

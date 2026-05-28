@@ -351,11 +351,7 @@ impl SelfContinuityEngine {
         let avg_confidence =
             proposals.iter().map(|p| p.confidence).sum::<f64>() / proposals.len() as f64;
 
-        if avg_confidence < 0.5 {
-            1
-        } else {
-            0
-        }
+        if avg_confidence < 0.5 { 1 } else { 0 }
     }
 
     fn evolve_phase(&mut self) {

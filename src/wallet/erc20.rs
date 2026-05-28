@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, Bytes, U256};
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::{SolCall, sol};
 
 sol! {
     function transfer(address to, uint256 amount) external returns (bool);

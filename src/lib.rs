@@ -90,6 +90,10 @@ pub(crate) mod service;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod skills;
 #[cfg(feature = "agent-runtime")]
+pub mod snapshot_cli;
+#[cfg(feature = "agent-runtime")]
+pub use snapshot_cli::SnapshotCommands;
+#[cfg(feature = "agent-runtime")]
 pub mod sop;
 #[cfg(feature = "agent-runtime")]
 pub mod tools;

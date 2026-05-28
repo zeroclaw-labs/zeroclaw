@@ -3,7 +3,7 @@
 use super::keypair::WalletKeypair;
 use alloy_primitives::{Address, B256, U256};
 use alloy_signer::Signer;
-use alloy_sol_types::{eip712_domain, sol, SolStruct};
+use alloy_sol_types::{SolStruct, eip712_domain, sol};
 use serde::{Deserialize, Serialize};
 
 // Define the x402 payment authorization struct using alloy's sol! macro.

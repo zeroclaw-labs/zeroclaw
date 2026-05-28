@@ -385,9 +385,11 @@ mod tests {
 
         let state = make_state(10, 0.9);
         let suggestions = engine.suggest_adjustments(&config, &state);
-        assert!(suggestions
-            .iter()
-            .any(|a| a.parameter == "debate_rounds" && a.new_value < config.debate_rounds as f64));
+        assert!(
+            suggestions.iter().any(
+                |a| a.parameter == "debate_rounds" && a.new_value < config.debate_rounds as f64
+            )
+        );
     }
 
     #[test]

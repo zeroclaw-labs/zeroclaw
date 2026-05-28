@@ -287,7 +287,9 @@ impl ControlStore {
         limit: i64,
     ) -> Result<Vec<Command>> {
         let db = self.db.lock();
-        let mut sql = String::from("SELECT id, bot_id, kind, payload, status, created_by, created_at, acked_at, result, requires_approval FROM commands");
+        let mut sql = String::from(
+            "SELECT id, bot_id, kind, payload, status, created_by, created_at, acked_at, result, requires_approval FROM commands",
+        );
         let mut conditions = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
@@ -694,9 +696,11 @@ mod tests {
         let (store, _tmp) = test_store();
         store.insert_command(&sample_command("c1", "b1")).unwrap();
 
-        assert!(store
-            .update_command_status("c1", "acked", Some("ok"))
-            .unwrap());
+        assert!(
+            store
+                .update_command_status("c1", "acked", Some("ok"))
+                .unwrap()
+        );
         let cmds = store.list_commands(None, None, 10).unwrap();
         assert_eq!(cmds[0].status, "acked");
         assert!(cmds[0].acked_at.is_some());
@@ -765,9 +769,11 @@ mod tests {
             .unwrap();
         store.insert_approval(&sample_approval("a1", "c1")).unwrap();
 
-        assert!(store
-            .update_approval("c1", "approved", "reviewer1", Some("lgtm"))
-            .unwrap());
+        assert!(
+            store
+                .update_approval("c1", "approved", "reviewer1", Some("lgtm"))
+                .unwrap()
+        );
 
         let cmds = store.list_commands(None, Some("approved"), 10).unwrap();
         assert_eq!(cmds.len(), 1);
@@ -785,9 +791,11 @@ mod tests {
             .unwrap();
         store.insert_approval(&sample_approval("a1", "c1")).unwrap();
 
-        assert!(store
-            .update_approval("c1", "rejected", "reviewer1", Some("nope"))
-            .unwrap());
+        assert!(
+            store
+                .update_approval("c1", "rejected", "reviewer1", Some("nope"))
+                .unwrap()
+        );
 
         let cmds = store.list_commands(None, Some("rejected"), 10).unwrap();
         assert_eq!(cmds.len(), 1);

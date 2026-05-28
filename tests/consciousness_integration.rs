@@ -273,9 +273,11 @@ fn metacognitive_generates_adjustment_on_low_coherence() {
             .any(|p| p.action.contains("coherence_ema_alpha")),
         "expected coherence adjustment proposal when coherence=0.3"
     );
-    assert!(proposals
-        .iter()
-        .all(|p| p.source == AgentKind::Metacognitive));
+    assert!(
+        proposals
+            .iter()
+            .all(|p| p.source == AgentKind::Metacognitive)
+    );
 }
 
 #[test]

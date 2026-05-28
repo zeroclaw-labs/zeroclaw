@@ -34,6 +34,7 @@ pub mod security;
 pub mod service;
 pub mod skillforge;
 pub mod skills;
+pub mod snapshot;
 pub mod sop;
 pub mod subagent;
 pub mod tools;

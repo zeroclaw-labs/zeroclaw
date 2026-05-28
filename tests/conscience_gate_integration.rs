@@ -10,7 +10,7 @@
 
 use zeroclaw::config::schema::ConscienceConfig;
 use zeroclaw::conscience::{
-    evaluate_tool_call, GateVerdict, Norm, NormAction, SelfState, Thresholds,
+    GateVerdict, Norm, NormAction, SelfState, Thresholds, evaluate_tool_call,
 };
 
 fn neutral_self_state() -> SelfState {

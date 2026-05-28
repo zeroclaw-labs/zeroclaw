@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::goals::{Goal, GoalSource, GoalStatus, VerificationMethod};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 const COLUMN_LIST: &str = "id, title, description, source, status, priority, proposed_at, approved_at, completed_at, evidence, success_criteria, verification_method";

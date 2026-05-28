@@ -4,7 +4,7 @@
 //! A SHA-256 hash of the laws is computed at genesis and verified on every load
 //! to detect tampering.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

@@ -349,11 +349,13 @@ mod tests {
             "conservative"
         );
         assert!(reparsed.bio.as_ref().unwrap().contains("autonomous agent"));
-        assert!(reparsed
-            .genesis_prompt
-            .as_ref()
-            .unwrap()
-            .contains("ZeroClaw"));
+        assert!(
+            reparsed
+                .genesis_prompt
+                .as_ref()
+                .unwrap()
+                .contains("ZeroClaw")
+        );
     }
 
     #[test]

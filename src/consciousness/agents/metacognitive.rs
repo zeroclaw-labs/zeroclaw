@@ -311,9 +311,11 @@ mod tests {
         let mut agent = MetacognitiveAgent::new(MetacognitivePolicy::default());
         let state = make_state(0.3);
         let proposals = agent.perceive(&state, &[]);
-        assert!(proposals
-            .iter()
-            .any(|p| p.action.contains("coherence_ema_alpha")));
+        assert!(
+            proposals
+                .iter()
+                .any(|p| p.action.contains("coherence_ema_alpha"))
+        );
     }
 
     #[test]
@@ -343,11 +345,13 @@ mod tests {
 
         let verdicts = agent.deliberate(&[proposal], &state);
         assert_eq!(verdicts[0].kind, VerdictKind::Reject);
-        assert!(verdicts[0]
-            .objection
-            .as_ref()
-            .unwrap()
-            .contains("kill-switch"));
+        assert!(
+            verdicts[0]
+                .objection
+                .as_ref()
+                .unwrap()
+                .contains("kill-switch")
+        );
         assert!(agent.is_kill_switch_active());
     }
 

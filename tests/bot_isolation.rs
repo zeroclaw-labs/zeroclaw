@@ -4,7 +4,7 @@
 
 use tempfile::TempDir;
 use zeroclaw::config::schema::{BotConfig, BotRateLimiter, Config};
-use zeroclaw::memory::{sqlite::SqliteMemory, Memory, MemoryCategory};
+use zeroclaw::memory::{Memory, MemoryCategory, sqlite::SqliteMemory};
 
 // ── Helpers ────────────────────────────────────────────────────
 

@@ -237,9 +237,11 @@ mod tests {
             ..Default::default()
         };
         let proposals = chairman.perceive(&state, &[]);
-        assert!(proposals
-            .iter()
-            .any(|p| p.action == "emergency_coherence_restore"));
+        assert!(
+            proposals
+                .iter()
+                .any(|p| p.action == "emergency_coherence_restore")
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::soul::model::SoulModel;
-use crate::soul::reflection::{apply_insights, write_soul_file, ReflectionInsights};
+use crate::soul::reflection::{ReflectionInsights, apply_insights, write_soul_file};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;

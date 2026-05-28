@@ -245,10 +245,12 @@ mod tests {
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("command")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("command"))
+        );
         assert!(schema["properties"]["approved"].is_object());
     }
 
@@ -427,11 +429,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("explicit approval")
+        );
 
         let allowed = tool
             .execute(json!({

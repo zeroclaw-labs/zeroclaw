@@ -725,16 +725,7 @@ impl Channel for EmailChannel {
                 .unwrap_or_else(|| {
                     ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
                 });
-            let att_data = if att.data.is_empty() && std::path::Path::new(&att.file_name).exists() {
-                std::fs::read(&att.file_name).map_err(|e| {
-                    anyhow::Error::msg(format!(
-                        "failed to read attachment '{}': {}",
-                        att.file_name, e
-                    ))
-                })?
-            } else {
-                att.data.clone()
-            };
+            let att_data = resolve_attachment_data(&att.file_name, &att.data)?;
             let att_name = std::path::Path::new(&att.file_name)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -823,6 +814,31 @@ impl Channel for EmailChannel {
     }
 }
 
+/// Resolve the byte content of an attachment for sending.
+///
+/// # Trust boundary
+///
+/// `file_name` is treated as a file-system path **only** when `data` is empty.
+/// This fallback exists exclusively for internally constructed
+/// [`MediaAttachment`](zeroclaw_api::media::MediaAttachment) values whose
+/// bytes were intentionally omitted (e.g. created via
+/// [`MediaAttachment::from_file`](zeroclaw_api::media::MediaAttachment::from_file)
+/// after a round-trip through serialization).  Callers that build attachments
+/// from untrusted input — user messages, HTTP request bodies, or any external
+/// data source — **must** validate or constrain `file_name` before reaching
+/// this function; no additional path sanitization is applied here.
+///
+/// Read errors are propagated rather than silently suppressed.
+fn resolve_attachment_data(file_name: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if data.is_empty() && std::path::Path::new(file_name).exists() {
+        std::fs::read(file_name).map_err(|e| {
+            anyhow::Error::msg(format!("failed to read attachment '{}': {}", file_name, e))
+        })
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn default_imap_port() -> u16 {
@@ -844,6 +860,71 @@ mod tests {
         25 * 1024 * 1024
     }
     use super::*;
+
+    // -- resolve_attachment_data tests --
+
+    #[test]
+    fn resolve_attachment_data_returns_provided_bytes_when_non_empty() {
+        let data = b"hello attachment".to_vec();
+        let result = resolve_attachment_data("ignored.bin", &data).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn resolve_attachment_data_falls_back_to_file_when_data_empty_and_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att.txt");
+        std::fs::write(&path, b"file contents").unwrap();
+        let result = resolve_attachment_data(path.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(result, b"file contents");
+    }
+
+    #[test]
+    fn resolve_attachment_data_returns_empty_when_data_empty_and_file_absent() {
+        // file_name does not exist on disk — should return empty vec, not error.
+        // Use a temp dir to guarantee the path does not exist, rather than a
+        // hard-coded /tmp path, for portability.
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("does-not-exist.bin");
+        let result = resolve_attachment_data(absent.to_str().unwrap(), &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_attachment_data_propagates_read_error_on_unreadable_file() {
+        // Create a file, then make it unreadable (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("locked.bin");
+            std::fs::write(&path, b"secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Permission enforcement is not guaranteed when running as root;
+            // skip rather than produce a false failure.  Reading from
+            // /proc/self/status is Linux-specific but that is where this test
+            // is most likely to run.  On other Unix systems the check falls
+            // back to the USER env var, which is a best-effort heuristic only.
+            #[cfg(target_os = "linux")]
+            let is_root = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|uid| uid.parse::<u32>().ok())
+                })
+                .map(|uid| uid == 0)
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_root = std::env::var("USER").map(|u| u == "root").unwrap_or(false);
+            if is_root {
+                return;
+            }
+            let result = resolve_attachment_data(path.to_str().unwrap(), &[]);
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn default_smtp_port_uses_tls_port() {

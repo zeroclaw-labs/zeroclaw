@@ -77,7 +77,7 @@ impl Tool for ResearchClawTool {
                             success: false,
                             output: String::new(),
                             error: Some("'topic' is required for 'run' action".to_string()),
-                        })
+                        });
                     }
                 };
 

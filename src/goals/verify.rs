@@ -55,7 +55,10 @@ async fn verify_command(cmd: &str, expect_exit_zero: bool) -> Result<Verificatio
         passed,
         evidence: format!(
             "exit={} (expect_zero={expect_exit_zero}); stdout={stdout_preview}; stderr={stderr_preview}",
-            output.status.code().map_or("signal".to_string(), |c| c.to_string()),
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string()),
         ),
     })
 }

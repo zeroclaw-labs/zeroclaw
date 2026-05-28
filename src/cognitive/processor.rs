@@ -6,6 +6,7 @@ use crate::cosmic::{
     BehavioralBias, BeliefSource, EmotionalModulator, FreeEnergyState, SelfModel, WorldModel,
 };
 
+use super::EmotionalState;
 use super::compression::MemoryCompressor;
 use super::concept_abstraction::ConceptHierarchy;
 use super::decision_memory::DecisionMemory;
@@ -22,7 +23,6 @@ use super::skill_evolution::SkillEvolution;
 use super::skill_library::SkillLibrary;
 use super::token_context::TokenContext;
 use super::tool_usage_log::ToolUsageLog;
-use super::EmotionalState;
 
 const PREFERENCE_EMA_ALPHA: f64 = 0.2;
 const FREE_ENERGY_CAPACITY: usize = 200;
@@ -863,10 +863,11 @@ mod tests {
         cp.pre_message();
         cp.post_message("test message about rust", "response");
         assert!(cp.world_model.get_belief("world:user_engagement").is_some());
-        assert!(cp
-            .world_model
-            .get_belief("world:conversation_depth")
-            .is_some());
+        assert!(
+            cp.world_model
+                .get_belief("world:conversation_depth")
+                .is_some()
+        );
         assert!(cp.world_model.get_belief("world:user_topic").is_some());
     }
 

@@ -1,11 +1,12 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Download } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { AgentProvider, useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import { downloadText, toHTML, toJSON, toMarkdown, toPlaintext } from '@/lib/chatExport';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
@@ -175,6 +176,31 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
     });
   }, []);
 
+  // Export menu (Markdown / JSON / HTML / Plaintext) — driven by
+  // `chatExport` over the live `messages` from AgentContext. The exporter
+  // accepts ChatMessage shape directly via its `ExportableMessage`
+  // signature, so no adapter is needed. Filename uses agent alias + ISO
+  // date; mime drives Content-Type for browsers that respect it.
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const handleExport = useCallback(
+    (format: 'md' | 'json' | 'html' | 'txt') => {
+      const today = new Date().toISOString().slice(0, 10);
+      const base = `zeroclaw-${agentAlias}-${today}`;
+      const title = `ZeroClaw chat — ${agentAlias}`;
+      if (format === 'md') {
+        downloadText(`${base}.md`, toMarkdown(messages, { title }), 'text/markdown');
+      } else if (format === 'json') {
+        downloadText(`${base}.json`, toJSON(messages, { title }), 'application/json');
+      } else if (format === 'html') {
+        downloadText(`${base}.html`, toHTML(messages, { title }), 'text/html');
+      } else {
+        downloadText(`${base}.txt`, toPlaintext(messages, { title }), 'text/plain');
+      }
+      setShowExportMenu(false);
+    },
+    [agentAlias, messages],
+  );
+
   /**
    * Fallback copy using a temporary textarea for HTTP contexts
    * where navigator.clipboard is unavailable.
@@ -315,6 +341,39 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
             <Wrench className="h-3 w-3" />
             {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
           </button>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setShowExportMenu((v) => !v)}
+              className="btn-secondary flex items-center gap-1.5 text-xs"
+              style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
+              aria-label="Export chat"
+              aria-haspopup="menu"
+              aria-expanded={showExportMenu}
+            >
+              <Download className="h-3 w-3" />
+              Export
+            </button>
+            {showExportMenu && (
+              <div
+                role="menu"
+                className="absolute right-0 mt-1 rounded-md shadow-md text-xs z-10"
+                style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', border: '1px solid var(--pc-border)', minWidth: '10rem' }}
+              >
+                <button type="button" role="menuitem" onClick={() => handleExport('md')}
+                  className="w-full text-left px-3 py-2 hover:bg-opacity-10"
+                  style={{ borderBottom: '1px solid var(--pc-border)' }}>Markdown (.md)</button>
+                <button type="button" role="menuitem" onClick={() => handleExport('json')}
+                  className="w-full text-left px-3 py-2"
+                  style={{ borderBottom: '1px solid var(--pc-border)' }}>JSON (.json)</button>
+                <button type="button" role="menuitem" onClick={() => handleExport('html')}
+                  className="w-full text-left px-3 py-2"
+                  style={{ borderBottom: '1px solid var(--pc-border)' }}>HTML (.html)</button>
+                <button type="button" role="menuitem" onClick={() => handleExport('txt')}
+                  className="w-full text-left px-3 py-2">Plaintext (.txt)</button>
+              </div>
+            )}
+          </div>
           <button
             type="button"
             onClick={handleClearAll}

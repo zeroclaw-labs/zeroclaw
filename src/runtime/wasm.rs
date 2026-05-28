@@ -13,7 +13,7 @@
 
 use super::traits::RuntimeAdapter;
 use crate::config::WasmRuntimeConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 /// WASM sandbox runtime — executes tool modules in an isolated interpreter.
@@ -379,10 +379,12 @@ mod tests {
         let rt = WasmRuntime::new(default_config());
         let result = rt.build_shell_command("echo hello", Path::new("/tmp"));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not support shell"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not support shell")
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod compatible;
 pub mod copilot;
 pub mod factory;
+pub mod free_catalog;
 pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)

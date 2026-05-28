@@ -258,10 +258,12 @@ mod tests {
         collective.receive_peer_state(make_peer("peer_a", 0.8, 0.5));
 
         assert!(!collective.resonance_events().is_empty());
-        assert!(collective
-            .resonance_events()
-            .iter()
-            .any(|e| e.dimension == "attention"));
+        assert!(
+            collective
+                .resonance_events()
+                .iter()
+                .any(|e| e.dimension == "attention")
+        );
     }
 
     #[test]

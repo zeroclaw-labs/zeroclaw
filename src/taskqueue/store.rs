@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::taskqueue::{TaskItem, TaskPatch, TaskPriority, TaskSource, TaskStatus};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 pub fn enqueue(config: &Config, item: &TaskItem) -> Result<TaskItem> {

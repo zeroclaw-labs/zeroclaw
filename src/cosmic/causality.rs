@@ -202,11 +202,7 @@ impl CausalGraph {
                 min = s;
             }
         }
-        if min.is_infinite() {
-            0.0
-        } else {
-            min
-        }
+        if min.is_infinite() { 0.0 } else { min }
     }
 
     fn loop_phi(&self, path: &[String], back_to: &str) -> f64 {

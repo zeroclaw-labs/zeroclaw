@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawnSync } = require('child_process');
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+
+const ext = os.platform() === 'win32' ? '.exe' : '';
+const binary = path.join(__dirname, '..', 'native', `zeroclaw${ext}`);
+
+if (!fs.existsSync(binary)) {
+  console.error(
+    'zeroclaw: native binary not found.\n' +
+      'Try reinstalling: npm install -g zeroclaw\n' +
+      `Expected: ${binary}`,
+  );
+  process.exit(1);
+}
+
+const result = spawnSync(binary, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: process.env,
+});
+
+process.exit(result.status ?? 1);

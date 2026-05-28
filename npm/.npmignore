@@ -1,0 +1,7 @@
+# Downloaded native binary lives outside the publish set — `npm install`
+# triggers postinstall (install.js) which fetches it from GitHub Releases.
+native/
+
+# Temp files
+*.zip
+*.tar.gz

@@ -12,7 +12,7 @@ use crate::providers::{
     canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_zai_alias, is_zai_cn_alias,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
@@ -5028,9 +5028,10 @@ mod tests {
         };
 
         let err = run_models_refresh(&config, None, true).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not support live model discovery"));
+        assert!(
+            err.to_string()
+                .contains("does not support live model discovery")
+        );
     }
 
     // ── provider_env_var ────────────────────────────────────────

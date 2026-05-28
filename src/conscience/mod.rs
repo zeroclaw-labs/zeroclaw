@@ -21,8 +21,8 @@ pub mod types;
 pub use cosmic_bridge::self_state_from_cosmic;
 #[allow(unused_imports)]
 pub use gate::{
-    compute_conscience_score, conscience_audit, conscience_gate, evaluate_tool_call, AuditResult,
-    GateVerdict,
+    AuditResult, GateVerdict, compute_conscience_score, conscience_audit, conscience_gate,
+    evaluate_tool_call,
 };
 #[allow(unused_imports)]
 pub use ledger::IntegrityLedger;

@@ -1,3 +1,24 @@
+# Unreleased — post-v0.8.0-beta-1
+
+Maintenance batch that pulls in 20 upstream fixes/features from `zeroclaw-labs/zeroclaw`, plus four new ports from the claurst codebase and one fork-specific feature. Backward compatible; no migrations.
+
+## Highlights
+
+- **`zeroclaw snapshot` subcommand** — shadow-git capture/diff/restore/revert/undo/cleanup against `<data_dir>/snapshot/<project_hash>/<worktree_hash>/`. Lets agents (and operators) checkpoint and roll back worktree state without polluting the user's real git history. 7 subcommands, `--yes` gated on destructive ops.
+- **`delegate` tool `isolation: "worktree"` parameter** — when set, the runtime creates a detached `git worktree` of the caller's repo for the sub-agent so its file edits don't race the parent checkout or sibling parallel agents. RAII cleanup on Drop.
+- **Self-update SHA256 verification** — `zeroclaw update` now verifies downloaded artifacts against the release's `SHA256SUMS` file (upstream #6900).
+- **20 upstream cherry-picks** — discord 429 retry, cron manual-delivery degraded persistence, /ws/nodes auth, Codex OAuth alias preservation, siliconflow URL fix, RouterModelProvider system streaming, structured onboarding repair items, websocket steering transcript, `file_upload` tool, `SecretField` config trait, and more.
+- **Free-tier provider catalog** — `providers/free_catalog.rs` exposes 11 providers (Groq, Cerebras, Google, Mistral, SambaNova, NVIDIA NIM, Cohere, OpenRouter, Z.AI, Zhipu, Ollama) with `lookup()` and `priority_order()` helpers.
+- **`npm install -g zeroclaw` distribution** — new `npm/` postinstall wrapper downloads the matching native binary from GitHub Releases for 5 targets. `npx zeroclaw --help` works without prior install.
+- **Web dashboard chat export** — Export button on `AgentChat` toolbar with Markdown / JSON / HTML / plaintext output, filenames `zeroclaw-<alias>-<YYYY-MM-DD>.<ext>`.
+
+## Known Limitations
+
+- Pre-existing X0 fork integration tests under `tests/{bot_isolation,cosmic_*,conscience_*,continuity_*,memory_comparison,agent_e2e}.rs` do not compile — `cosmic` / `conscience` / `continuity` modules are not pub-exported from the binary library, and the `Memory` trait test calls use the 3-arg pre-V3 signature. Present on `main` since `74ff25746 feat(sync): wire X0 fork modules into upstream v0.8 architecture`.
+- Release CI must publish assets named `zeroclaw-{linux,macos,windows}-{x86_64,aarch64}.{tar.gz,zip}` before `npm install -g zeroclaw` is operational.
+
+---
+
 # Changelog: v0.7.5 → v0.8.0-beta-1
 
 v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. One install now runs many named agents side by side, each with its own identity, workspace, memory, model provider, channels, and security profile, and they can talk to each other through peer groups or spawn scoped sub-agents. Delivering that meant a ground-up config rewrite (schema **V3**) plus a new on-disk layout, so this is a large, breaking release. Upgrades migrate automatically on first boot; **read the Breaking Changes section before upgrading a production install**, especially if you run Postgres or Qdrant memory.

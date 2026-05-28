@@ -263,7 +263,7 @@ use config::Config;
 pub use zeroclaw::{
     ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
     MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands, SkillCommands,
-    SopCommands,
+    SnapshotCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -681,6 +681,28 @@ Examples:
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
+    },
+
+    /// Capture, diff, and restore worktree state via the shadow-git snapshot store
+    #[command(long_about = "\
+Operate on the per-worktree shadow git repository under \
+<data_dir>/snapshot/<project_hash>/<worktree_hash>/.
+
+The shadow repo lets agents (and you) capture worktree state as tree \
+objects without polluting the user's real git history. Use `track` to \
+record current state and capture the returned hash, then `diff`, `patch`, \
+or `restore` against that hash.
+
+Examples:
+  zeroclaw snapshot track                      # capture and print tree hash
+  zeroclaw snapshot diff <hash>                # unified diff of cwd vs hash
+  zeroclaw snapshot patch <hash>               # list files changed
+  zeroclaw snapshot undo --yes                 # roll back to most recent track
+  zeroclaw snapshot restore <hash> --yes       # roll back to a specific hash
+  zeroclaw snapshot cleanup                    # prune objects older than 7 days")]
+    Snapshot {
+        #[command(subcommand)]
+        snapshot_command: SnapshotCommands,
     },
 
     /// Manage configuration
@@ -1357,9 +1379,12 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // For the ACP command and agent interactive mode, we default to WARN to avoid
+    // INFO logs corrupting the stdio protocol or interleaving with conversation output.
     // We also always redirect logs to stderr so stdout remains clean for data.
-    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. })
+        || matches!(cli.command, Commands::Agent { message: None, .. })
+    {
         "warn"
     } else {
         // matrix_sdk crates are suppressed to warn because they are extremely
@@ -2375,6 +2400,10 @@ async fn main() -> Result<()> {
 
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await
+        }
+
+        Commands::Snapshot { snapshot_command } => {
+            zeroclaw::snapshot_cli::handle_command(snapshot_command, &config).await
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,

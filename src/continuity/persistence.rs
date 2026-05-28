@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::types::Preference;
 use super::NarrativeStore;
+use super::types::Preference;
 
 pub fn continuity_dir(workspace: &Path, override_dir: Option<&Path>) -> Result<PathBuf> {
     let dir = override_dir

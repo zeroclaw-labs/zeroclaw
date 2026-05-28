@@ -87,29 +87,37 @@ fn idcore_immutability_enforced() {
         name: "altered".into(),
         ..original.clone()
     };
-    assert!(guard
-        .validate_core_immutability(&original, &changed_name)
-        .is_err());
+    assert!(
+        guard
+            .validate_core_immutability(&original, &changed_name)
+            .is_err()
+    );
 
     let changed_hash = IdentityCore {
         constitution_hash: "xyz789".into(),
         ..original.clone()
     };
-    assert!(guard
-        .validate_core_immutability(&original, &changed_hash)
-        .is_err());
+    assert!(
+        guard
+            .validate_core_immutability(&original, &changed_hash)
+            .is_err()
+    );
 
     let changed_epoch = IdentityCore {
         creation_epoch: 9999,
         ..original.clone()
     };
-    assert!(guard
-        .validate_core_immutability(&original, &changed_epoch)
-        .is_err());
+    assert!(
+        guard
+            .validate_core_immutability(&original, &changed_epoch)
+            .is_err()
+    );
 
-    assert!(guard
-        .validate_core_immutability(&original, &original)
-        .is_ok());
+    assert!(
+        guard
+            .validate_core_immutability(&original, &original)
+            .is_ok()
+    );
 }
 
 #[test]
