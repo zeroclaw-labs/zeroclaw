@@ -381,6 +381,7 @@ async fn handle_socket(
             &agent_alias,
             Some(&session_cwd),
             true,
+            Some(state.canvas_store.clone()),
         )
         .await
         {

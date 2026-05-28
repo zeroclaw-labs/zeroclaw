@@ -604,17 +604,24 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             false,
+            None,
         )
         .await
     }
 
     /// Build an Agent for direct ACP/WS sessions that have a client approval
     /// back-channel. This keeps shell approval on the runtime-controlled path.
+    ///
+    /// `canvas_store` should be the shared [`tools::CanvasStore`] from the
+    /// gateway / daemon supervisor so that canvas frames pushed by this agent
+    /// reach the `/ws/canvas/:id` WebSocket subscribers.  Pass `None` only in
+    /// standalone contexts (e.g. `zeroclaw acp`) where no gateway is running.
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -622,6 +629,7 @@ impl Agent {
             session_cwd,
             initialize_mcp,
             true,
+            canvas_store,
         )
         .await
     }
@@ -632,6 +640,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -743,7 +752,7 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
         );
 
