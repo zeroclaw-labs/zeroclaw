@@ -40,6 +40,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod spawn_subagent;
 pub mod verifiable_intent;
+pub mod worktree;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
 pub use zeroclaw_tools::ask_user::AskUserTool;

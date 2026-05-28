@@ -575,6 +575,17 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["worktree", "none"],
+                    "description": "When set to 'worktree', the sub-agent runs in a detached git \
+                                    worktree rooted at the caller's repository so its file edits do \
+                                    not conflict with the parent checkout or sibling parallel agents. \
+                                    Requires a git repository at or above the caller's workspace_dir; \
+                                    falls back to the parent workspace with a warning if no git root \
+                                    is found. Only meaningful for agentic delegations and parallel \
+                                    fanouts. Default: 'none'."
                 }
             },
             "required": []
@@ -685,6 +696,51 @@ impl DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
+        // Optional worktree isolation: create a detached git worktree so the
+        // sub-agent's file edits do not race the parent checkout or sibling
+        // agents. The worktree path is appended to the sub-agent's context
+        // so the LLM uses absolute paths under it. Cleanup runs at the end
+        // of this function regardless of result.
+        let isolation = args
+            .get("isolation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let worktree_guard = if isolation == "worktree" {
+            if let Some(git_root) = super::worktree::find_git_root(&self.workspace_dir) {
+                let agent_id = format!(
+                    "{}-{}",
+                    agent_name,
+                    chrono::Utc::now().format("%Y%m%d%H%M%S%f")
+                );
+                super::worktree::create_worktree(&git_root, &agent_id)
+                    .await
+                    .map(|wt| super::worktree::WorktreeGuard::new(git_root, wt))
+            } else {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "agent": agent_name,
+                            "workspace_dir": self.workspace_dir.display().to_string(),
+                        })),
+                    "delegate: isolation=worktree requested but no git root found; using parent workspace"
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let worktree_note = worktree_guard
+            .as_ref()
+            .and_then(|g| g.path())
+            .map(|p| {
+                format!(
+                    "\n\n[Isolated worktree]\nYour file edits should target paths under:\n  {}\nThis is a detached git worktree of the parent repository. Anything you want to preserve must be committed before this delegation returns; the worktree is removed on completion.",
+                    p.display()
+                )
+            })
+            .unwrap_or_default();
+
         // Look up agent config
         let agent_config = match self.agents.get(agent_name) {
             Some(cfg) => cfg,
@@ -766,9 +822,9 @@ impl DelegateTool {
 
         // Build the message
         let full_prompt = if context.is_empty() {
-            prompt.to_string()
+            format!("{prompt}{worktree_note}")
         } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+            format!("[Context]\n{context}{worktree_note}\n\n[Task]\n{prompt}")
         };
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
