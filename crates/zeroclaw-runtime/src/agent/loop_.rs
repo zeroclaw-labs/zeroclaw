@@ -11636,8 +11636,10 @@ Let me check the result."#;
 
     #[test]
     fn agent_provider_composite_returns_dotted_ref_not_bare_family() {
-        use zeroclaw_config::schema::{AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig};
         use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
 
         let alias = "qwertfoozp";
 
