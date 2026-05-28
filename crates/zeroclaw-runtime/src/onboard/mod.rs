@@ -2998,8 +2998,8 @@ mod tests {
             .with("ModelProvider", "OpenAI")
             // Accept "default" alias via placeholder fallback (no scripted answer needed)
             .with(
-                &i18n::get_required_cli_string("onboard-openai-auth-prompt"),
-                &i18n::get_required_cli_string("onboard-openai-auth-codex"),
+                i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                i18n::get_required_cli_string("onboard-openai-auth-codex"),
             );
 
         Box::pin(run(
@@ -3062,8 +3062,8 @@ mod tests {
             .with("ModelProvider", "OpenAI")
             .with("Alias", "default")
             .with(
-                &i18n::get_required_cli_string("onboard-openai-auth-prompt"),
-                &i18n::get_required_cli_string("onboard-openai-auth-api-key"),
+                i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                i18n::get_required_cli_string("onboard-openai-auth-api-key"),
             )
             .with("api-key", "sk-test-key");
 
