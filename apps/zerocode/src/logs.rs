@@ -772,156 +772,165 @@ impl<'a> Logs<'a> {
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Enter => {
+        use crate::keymap::SearchBoxAction;
+        match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Accept) => {
                 let anchor = self.cursor_anchor();
                 self.search_query = self.search_buf.clone();
                 self.search_active = false;
                 self.refilter(anchor);
             }
-            KeyCode::Esc => {
+            Some(SearchBoxAction::Cancel) => {
                 self.search_active = false;
                 self.search_buf = self.search_query.clone();
             }
-            KeyCode::Backspace => {
+            Some(SearchBoxAction::Backspace) => {
                 self.search_buf.pop();
             }
-            KeyCode::Char(c) => {
-                self.search_buf.push(c);
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.search_buf.push(c);
+                }
             }
-            _ => {}
         }
         false
     }
 
     async fn handle_detail_key(&mut self, key: KeyEvent) -> bool {
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+        use crate::keymap::LogsTabAction;
+        match LogsTabAction::from_chord(&key) {
+            Some(LogsTabAction::CloseDetail) | Some(LogsTabAction::OpenDetail) => {
                 self.detail_open = false;
                 self.detail_scroll = 0;
                 self.detail = None;
                 self.detail_request_id = None;
             }
-            KeyCode::Char('c') if !self.search_query.is_empty() => {
+            Some(LogsTabAction::ClearSearch) if !self.search_query.is_empty() => {
                 let anchor = self.cursor_anchor();
                 self.search_query.clear();
                 self.search_buf.clear();
                 self.refilter(anchor);
             }
-            KeyCode::Char('y') if self.detail.is_some() => {
+            Some(LogsTabAction::CopyDetail) if self.detail.is_some() => {
                 if let Some(d) = self.detail.as_ref() {
                     crate::mouse::copy_osc52(&d.clipboard_text());
                 }
             }
-            KeyCode::Char('/') => {
+            Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
-            // Shift+J / Shift+K / Shift+Arrow scroll the detail pane
-            KeyCode::Char('J') => self.detail_scroll = self.detail_scroll.saturating_add(1),
-            KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-            KeyCode::Down if shift => {
+            Some(LogsTabAction::DetailScrollDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
             }
-            KeyCode::Up if shift => {
+            Some(LogsTabAction::DetailScrollUp) => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
             }
-            KeyCode::Left if shift => {
+            Some(LogsTabAction::DetailWidenDown) => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            Some(LogsTabAction::DetailWidenUp) => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            Some(LogsTabAction::DetailWidenLeft) => {
                 self.detail_pct = (self.detail_pct + 5).min(80);
             }
-            KeyCode::Right if shift => {
+            Some(LogsTabAction::DetailWidenRight) => {
                 self.detail_pct = self.detail_pct.saturating_sub(5).max(20);
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            Some(LogsTabAction::IncreaseLevel) => {
                 let anchor = self.cursor_anchor();
                 self.cycle_severity_up();
                 self.refilter(anchor);
             }
-            KeyCode::Char('-') => {
+            Some(LogsTabAction::DecreaseLevel) => {
                 let anchor = self.cursor_anchor();
                 self.cycle_severity_down();
                 self.refilter(anchor);
             }
-            // j/k / plain arrows move the list cursor
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(LogsTabAction::Down) => {
                 self.move_selection_down();
                 self.detail_scroll = 0;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(LogsTabAction::Up) => {
                 self.move_selection_up();
                 self.detail_scroll = 0;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('f') => self.follow = !self.follow,
+            Some(LogsTabAction::ToggleFollow) => {
+                self.follow = !self.follow;
+            }
             _ => {}
         }
         false
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::LogsTabAction;
         let filtered_len = self.filtered_indices().len();
-
-        match key.code {
-            KeyCode::Char('c') if !self.search_query.is_empty() => {
+        match LogsTabAction::from_chord(&key) {
+            Some(LogsTabAction::ClearSearch) if !self.search_query.is_empty() => {
                 let anchor = self.cursor_anchor();
                 self.search_query.clear();
                 self.search_buf.clear();
                 self.refilter(anchor);
             }
-            KeyCode::Char('/') => {
+            Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
-            KeyCode::Enter if self.selected_event_idx().is_some() => {
+            Some(LogsTabAction::OpenDetail) if self.selected_event_idx().is_some() => {
                 self.detail_open = true;
                 self.detail_scroll = 0;
                 self.detail_pct = 50;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(LogsTabAction::Down) => {
                 self.move_selection_down();
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(LogsTabAction::Up) => {
                 self.move_selection_up();
                 self.maybe_load_older().await;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            Some(LogsTabAction::JumpEnd) => {
                 if filtered_len > 0 {
                     self.list_state.select(Some(filtered_len - 1));
                 }
                 self.follow = true;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('g') | KeyCode::Home => {
+            Some(LogsTabAction::JumpStart) => {
                 self.follow = false;
                 self.list_state.select(Some(0));
                 self.maybe_load_older().await;
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::Char('f') => self.follow = !self.follow,
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            Some(LogsTabAction::ToggleFollow) => {
+                self.follow = !self.follow;
+            }
+            Some(LogsTabAction::IncreaseLevel) => {
                 let anchor = self.cursor_anchor();
                 self.cycle_severity_up();
                 self.refilter(anchor);
             }
-            KeyCode::Char('-') => {
+            Some(LogsTabAction::DecreaseLevel) => {
                 let anchor = self.cursor_anchor();
                 self.cycle_severity_down();
                 self.refilter(anchor);
             }
-            KeyCode::PageDown => {
+            Some(LogsTabAction::PageDown) => {
                 self.follow = false;
                 let i = self.list_state.selected().unwrap_or(0);
                 self.list_state
                     .select(Some((i + 20).min(filtered_len.saturating_sub(1))));
                 self.sync_detail_to_selection().await;
             }
-            KeyCode::PageUp => {
+            Some(LogsTabAction::PageUp) => {
                 self.follow = false;
                 let i = self.list_state.selected().unwrap_or(0);
                 self.list_state.select(Some(i.saturating_sub(20)));

@@ -29,6 +29,7 @@ mod diff;
 mod file_explorer;
 mod input_bar;
 mod jsonrpc;
+mod keymap;
 mod logs;
 mod mouse;
 mod quickstart_pane;

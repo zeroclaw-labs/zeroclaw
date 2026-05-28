@@ -1,7 +1,7 @@
 //! Quickstart pane — modal-based checklist that produces one
 //! `BuilderSubmission`, sent through `quickstart/apply` RPC.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -661,16 +661,17 @@ impl QuickstartPane {
         if self.applied_alias.is_some() {
             return false;
         }
-        match key.code {
-            KeyCode::Down => {
+        use crate::keymap::QuickstartTabAction;
+        match QuickstartTabAction::from_chord(&key) {
+            Some(QuickstartTabAction::Down) => {
                 self.move_selection(1);
                 false
             }
-            KeyCode::Up => {
+            Some(QuickstartTabAction::Up) => {
                 self.move_selection(-1);
                 false
             }
-            KeyCode::Enter => {
+            Some(QuickstartTabAction::Enter) => {
                 if let Some(idx) = self.list_state.selected()
                     && let Some(sel) = Selector::ALL.get(idx).copied()
                 {
@@ -685,7 +686,7 @@ impl QuickstartPane {
                 }
                 false
             }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
+            Some(QuickstartTabAction::Create) => {
                 if self.can_create() {
                     self.submit().await;
                 }
@@ -948,16 +949,20 @@ impl QuickstartPane {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
         };
+        use crate::keymap::{Chord, QuickstartModalAction};
+        let action = QuickstartModalAction::from_chord(&key);
         match modal {
-            Modal::Picker(p) => match key.code {
-                KeyCode::Esc => self.active_modal = None,
-                KeyCode::Up if p.cursor > 0 => {
+            Modal::Picker(p) => match action {
+                Some(QuickstartModalAction::Cancel) => {
+                    self.active_modal = None;
+                }
+                Some(QuickstartModalAction::Up) if p.cursor > 0 => {
                     p.cursor -= 1;
                 }
-                KeyCode::Down if p.cursor + 1 < p.options.len() => {
+                Some(QuickstartModalAction::Down) if p.cursor + 1 < p.options.len() => {
                     p.cursor += 1;
                 }
-                KeyCode::Enter => {
+                Some(QuickstartModalAction::Confirm) => {
                     let chosen = p.options[p.cursor].value.clone();
                     let use_existing = p.options[p.cursor].use_existing;
                     let selector = p.selector;
@@ -969,8 +974,6 @@ impl QuickstartPane {
                             self.revalidate().await;
                         }
                         (PickerPurpose::ProviderType, true) => {
-                            // chosen is `<type>.<alias>`. Adopt the
-                            // alias ref; skip the field form.
                             self.adopt_existing_provider(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
@@ -1008,9 +1011,11 @@ impl QuickstartPane {
                 }
                 _ => {}
             },
-            Modal::TextInput(t) => match key.code {
-                KeyCode::Esc => self.active_modal = None,
-                KeyCode::Enter => {
+            Modal::TextInput(t) => match action {
+                Some(QuickstartModalAction::Cancel) => {
+                    self.active_modal = None;
+                }
+                Some(QuickstartModalAction::Confirm) => {
                     let value = t.buf.trim().to_string();
                     let selector = t.selector;
                     if let Some(channel) = t.peer_group_channel.clone() {
@@ -1042,35 +1047,36 @@ impl QuickstartPane {
                         self.revalidate().await;
                     }
                 }
-                KeyCode::Backspace => {
+                Some(QuickstartModalAction::Backspace) => {
                     t.buf.pop();
                 }
-                KeyCode::Char(c) => {
-                    t.buf.push(c);
+                _ => {
+                    if let KeyCode::Char(c) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        t.buf.push(c);
+                    }
                 }
-                _ => {}
             },
-            Modal::FieldForm(f) => match key.code {
-                KeyCode::Esc => self.active_modal = None,
-                KeyCode::Tab | KeyCode::Down => {
+            Modal::FieldForm(f) => match action {
+                Some(QuickstartModalAction::Cancel) => {
+                    self.active_modal = None;
+                }
+                Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down) => {
                     if f.cursor + 1 < f.fields.len() {
                         f.cursor += 1;
                     } else {
                         f.cursor = 0;
                     }
                 }
-                KeyCode::BackTab | KeyCode::Up => {
+                Some(QuickstartModalAction::PrevField) | Some(QuickstartModalAction::Up) => {
                     if f.cursor == 0 {
                         f.cursor = f.fields.len().saturating_sub(1);
                     } else {
                         f.cursor -= 1;
                     }
                 }
-                KeyCode::Enter => {
-                    // Take f out so we can re-borrow `self` for the
-                    // commit. The active_modal stays as FieldForm
-                    // until the commit succeeds; on failure we
-                    // restore it.
+                Some(QuickstartModalAction::Confirm) => {
                     if !self.commit_field_form() {
                         return;
                     }
@@ -1086,7 +1092,7 @@ impl QuickstartPane {
                     }
                     self.revalidate().await;
                 }
-                KeyCode::Left => {
+                Some(QuickstartModalAction::Left) => {
                     if let Some(row) = f.fields.get_mut(f.cursor)
                         && let Some(variants) = row.descriptor.enum_variants.as_deref()
                         && !variants.is_empty()
@@ -1100,7 +1106,7 @@ impl QuickstartPane {
                         row.buf = variants[next].clone();
                     }
                 }
-                KeyCode::Right => {
+                Some(QuickstartModalAction::Right) => {
                     if let Some(row) = f.fields.get_mut(f.cursor)
                         && let Some(variants) = row.descriptor.enum_variants.as_deref()
                         && !variants.is_empty()
@@ -1110,42 +1116,44 @@ impl QuickstartPane {
                         row.buf = variants[next].clone();
                     }
                 }
-                KeyCode::Backspace => {
+                Some(QuickstartModalAction::Backspace) => {
                     if let Some(row) = f.fields.get_mut(f.cursor)
                         && row.descriptor.enum_variants.is_none()
                     {
                         row.buf.pop();
                     }
                 }
-                KeyCode::Char(c) => {
-                    if let Some(row) = f.fields.get_mut(f.cursor)
+                _ => {
+                    if let KeyCode::Char(c) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && let Some(row) = f.fields.get_mut(f.cursor)
                         && row.descriptor.enum_variants.is_none()
                     {
                         row.buf.push(c);
                     }
                 }
-                _ => {}
             },
             Modal::ChannelList(cl) => {
                 let drafts = self.form.channels.len();
                 let row_count = drafts + 2; // drafts + Add + Done
-                match key.code {
-                    KeyCode::Esc => self.active_modal = None,
-                    KeyCode::Up if cl.cursor > 0 => {
+                match action {
+                    Some(QuickstartModalAction::Cancel) => {
+                        self.active_modal = None;
+                    }
+                    Some(QuickstartModalAction::Up) if cl.cursor > 0 => {
                         cl.cursor -= 1;
                     }
-                    KeyCode::Down if cl.cursor + 1 < row_count => {
+                    Some(QuickstartModalAction::Down) if cl.cursor + 1 < row_count => {
                         cl.cursor += 1;
                     }
-                    KeyCode::Char('d') | KeyCode::Char('D') if cl.cursor < drafts => {
+                    Some(QuickstartModalAction::DeleteRow) if cl.cursor < drafts => {
                         self.form.channels.remove(cl.cursor);
                         if cl.cursor >= self.form.channels.len() {
                             cl.cursor = self.form.channels.len();
                         }
                     }
-                    KeyCode::Enter => {
+                    Some(QuickstartModalAction::Confirm) => {
                         if cl.cursor == drafts {
-                            // "+ Add channel" row → open channel-type picker.
                             let mut options: Vec<PickerOption> =
                                 channel_type_options(self.state_snapshot.as_ref());
                             if let Some(snap) = &self.state_snapshot {
@@ -1160,12 +1168,6 @@ impl QuickstartPane {
                                 cursor: 0,
                             }));
                         } else if cl.cursor == drafts + 1 {
-                            // "Done" row → close. Mark the
-                            // Channels selector as visited so the
-                            // checklist shows `[✓]` regardless of
-                            // whether the user added any drafts
-                            // (channels are optional, but the user
-                            // has to acknowledge that explicitly).
                             self.form.channels_visited = true;
                             self.active_modal = None;
                         }
@@ -1176,27 +1178,26 @@ impl QuickstartPane {
             Modal::PeerGroupList(pl) => {
                 let drafts = self.form.peer_groups.len();
                 let row_count = drafts + 2;
-                match key.code {
-                    KeyCode::Esc => self.active_modal = None,
-                    KeyCode::Up if pl.cursor > 0 => {
+                match action {
+                    Some(QuickstartModalAction::Cancel) => {
+                        self.active_modal = None;
+                    }
+                    Some(QuickstartModalAction::Up) if pl.cursor > 0 => {
                         pl.cursor -= 1;
                     }
-                    KeyCode::Down if pl.cursor + 1 < row_count => {
+                    Some(QuickstartModalAction::Down) if pl.cursor + 1 < row_count => {
                         pl.cursor += 1;
                     }
-                    KeyCode::Char('d') | KeyCode::Char('D') if pl.cursor < drafts => {
+                    Some(QuickstartModalAction::DeleteRow) if pl.cursor < drafts => {
                         self.form.peer_groups.remove(pl.cursor);
                         if pl.cursor >= self.form.peer_groups.len() {
                             pl.cursor = self.form.peer_groups.len();
                         }
                     }
-                    KeyCode::Enter => {
+                    Some(QuickstartModalAction::Confirm) => {
                         if pl.cursor == drafts {
-                            // "+ Add" → open channel-ref picker.
                             let options = self.peer_group_channel_options();
                             if options.is_empty() {
-                                // No unclaimed channels; ignore the Enter
-                                // rather than open an empty picker.
                             } else {
                                 self.active_modal = Some(Modal::Picker(PickerModal {
                                     selector: Selector::PeerGroups,
@@ -1219,30 +1220,31 @@ impl QuickstartPane {
                 let on_name = a.cursor == 0;
                 let on_save = a.cursor == last_row;
                 let on_file = !on_name && !on_save;
-                match key.code {
-                    KeyCode::Esc => {
+                match action {
+                    Some(QuickstartModalAction::Cancel) => {
                         self.commit_agent_modal();
                         self.active_modal = None;
                         self.revalidate().await;
                     }
-                    KeyCode::Enter if on_save => {
+                    Some(QuickstartModalAction::Confirm) if on_save => {
                         self.commit_agent_modal();
                         self.active_modal = None;
                         self.revalidate().await;
                     }
-                    KeyCode::Tab | KeyCode::Down if a.cursor + 1 < row_count => {
+                    Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down)
+                        if a.cursor + 1 < row_count =>
+                    {
                         a.cursor += 1;
                     }
-                    KeyCode::Up if a.cursor > 0 => {
+                    Some(QuickstartModalAction::PrevField) | Some(QuickstartModalAction::Up)
+                        if a.cursor > 0 =>
+                    {
                         a.cursor -= 1;
                     }
-                    KeyCode::Char(c) if on_name => {
-                        a.name.push(c);
-                    }
-                    KeyCode::Backspace if on_name => {
+                    Some(QuickstartModalAction::Backspace) if on_name => {
                         a.name.pop();
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') if on_file => {
+                    Some(QuickstartModalAction::EditWithEditor) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         let seed = a.files.get(&filename).cloned().unwrap_or_default();
                         let edited = crate::chat::open_editor_for_content(&seed).await;
@@ -1250,7 +1252,7 @@ impl QuickstartPane {
                             a.files.insert(filename, edited);
                         }
                     }
-                    KeyCode::Char('t') | KeyCode::Char('T') if on_file => {
+                    Some(QuickstartModalAction::EditTemplate) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         let templated = self.fetch_personality_template(&filename).await;
                         if let (Some(content), Some(Modal::Agent(a))) =
@@ -1259,11 +1261,22 @@ impl QuickstartPane {
                             a.files.insert(filename, content);
                         }
                     }
-                    KeyCode::Char('c') | KeyCode::Char('C') if on_file => {
+                    Some(QuickstartModalAction::EditCopy) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         a.files.insert(filename, String::new());
                     }
-                    _ => {}
+                    _ => {
+                        if on_name
+                            && let KeyCode::Char(c) = key.code
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if action.is_none() {
+                                a.name.push(c);
+                            } else {
+                                let _ = Chord::char(c);
+                            }
+                        }
+                    }
                 }
             }
         }

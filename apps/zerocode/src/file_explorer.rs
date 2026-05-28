@@ -252,12 +252,11 @@ impl FileExplorerState {
         let visible = self.visible_entries();
         let vis_len = visible.len();
 
-        match key.code {
-            KeyCode::Esc => ExplorerAction::Cancel,
-
-            KeyCode::Char('q') => ExplorerAction::Cancel,
-
-            KeyCode::Enter => {
+        use crate::keymap::FileExplorerAction;
+        let action = FileExplorerAction::from_chord(&key);
+        match action {
+            Some(FileExplorerAction::Cancel) => ExplorerAction::Cancel,
+            Some(FileExplorerAction::Activate) => {
                 if let Some(entry) = self.current_entry() {
                     if entry.is_dir {
                         let path = entry.full_path.clone();
@@ -282,8 +281,7 @@ impl FileExplorerState {
                     ExplorerAction::None
                 }
             }
-
-            KeyCode::Char(' ') => {
+            Some(FileExplorerAction::ToggleSelect) => {
                 if let Some(entry) = self.current_entry()
                     && !entry.is_dir
                 {
@@ -302,8 +300,7 @@ impl FileExplorerState {
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(FileExplorerAction::Down) => {
                 if let Some(i) = self.selected_idx() {
                     if i + 1 < vis_len {
                         self.list_state.select(Some(i + 1));
@@ -313,8 +310,7 @@ impl FileExplorerState {
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(FileExplorerAction::Up) => {
                 if let Some(i) = self.selected_idx() {
                     if i > 0 {
                         self.list_state.select(Some(i - 1));
@@ -324,22 +320,19 @@ impl FileExplorerState {
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Home | KeyCode::Char('g') => {
+            Some(FileExplorerAction::JumpStart) => {
                 if vis_len > 0 {
                     self.list_state.select(Some(0));
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::End | KeyCode::Char('G') => {
+            Some(FileExplorerAction::JumpEnd) => {
                 if vis_len > 0 {
                     self.list_state.select(Some(vis_len - 1));
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Char('l') | KeyCode::Right => {
+            Some(FileExplorerAction::EnterDir) => {
                 // Enter directory under cursor.
                 if let Some(entry) = self.current_entry()
                     && entry.is_dir
@@ -356,8 +349,7 @@ impl FileExplorerState {
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+            Some(FileExplorerAction::LeaveDir) => {
                 if let Some(parent) = self.cwd.parent() {
                     let prev = self.cwd.clone();
                     self.cwd = parent.to_path_buf();
@@ -373,8 +365,7 @@ impl FileExplorerState {
                 }
                 ExplorerAction::None
             }
-
-            KeyCode::Char('.') => {
+            Some(FileExplorerAction::ToggleHidden) => {
                 self.show_hidden = !self.show_hidden;
                 self.load_entries();
                 self.list_state.select(if self.entries.is_empty() {
@@ -384,22 +375,23 @@ impl FileExplorerState {
                 });
                 ExplorerAction::None
             }
-
-            KeyCode::Char('/') => {
+            Some(FileExplorerAction::BeginSearch) => {
                 self.searching = true;
                 self.search_query.clear();
                 ExplorerAction::None
             }
-
-            KeyCode::Char('c') if self.dir_picker => ExplorerAction::ConfirmDir(self.cwd.clone()),
-
+            Some(FileExplorerAction::ConfirmDir) if self.dir_picker => {
+                ExplorerAction::ConfirmDir(self.cwd.clone())
+            }
             _ => ExplorerAction::None,
         }
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> ExplorerAction {
-        match key.code {
-            KeyCode::Esc => {
+        use crate::keymap::FileExplorerSearchAction;
+        let action = FileExplorerSearchAction::from_chord(&key);
+        match action {
+            Some(FileExplorerSearchAction::Cancel) => {
                 self.searching = false;
                 self.search_query.clear();
                 // Reset selection to first visible.
@@ -408,7 +400,7 @@ impl FileExplorerState {
                     .select(if vis.is_empty() { None } else { Some(0) });
                 ExplorerAction::None
             }
-            KeyCode::Enter => {
+            Some(FileExplorerSearchAction::Accept) => {
                 self.searching = false;
                 // Keep the filter active, confirm if on a file.
                 if let Some(entry) = self.current_entry() {
@@ -433,21 +425,24 @@ impl FileExplorerState {
                     ExplorerAction::None
                 }
             }
-            KeyCode::Backspace => {
+            Some(FileExplorerSearchAction::Backspace) => {
                 self.search_query.pop();
                 let vis = self.visible_entries();
                 self.list_state
                     .select(if vis.is_empty() { None } else { Some(0) });
                 ExplorerAction::None
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_query.push(c);
-                let vis = self.visible_entries();
-                self.list_state
-                    .select(if vis.is_empty() { None } else { Some(0) });
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.search_query.push(c);
+                    let vis = self.visible_entries();
+                    self.list_state
+                        .select(if vis.is_empty() { None } else { Some(0) });
+                }
                 ExplorerAction::None
             }
-            _ => ExplorerAction::None,
         }
     }
 

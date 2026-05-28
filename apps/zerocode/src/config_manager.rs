@@ -91,6 +91,14 @@ enum FilterAction {
     Accept,
 }
 
+enum FilterEditAction {
+    Cancel,
+    Accept,
+    Backspace,
+    CursorUp,
+    CursorDown,
+}
+
 // ── App state ────────────────────────────────────────────────────
 
 pub(crate) struct App<'a> {
@@ -883,15 +891,17 @@ impl<'a> App<'a> {
             FilterAction::Passthrough => {}
         }
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-            KeyCode::Up | KeyCode::Char('k') => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => return Ok(false),
+            Some(ConfigTabAction::Up) => {
                 self.section_cursor = self.section_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.section_cursor + 1 < self.sections.len() => {
+            Some(ConfigTabAction::Down) if self.section_cursor + 1 < self.sections.len() => {
                 self.section_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 return self.enter_section(self.section_cursor).await;
             }
             _ => {}
@@ -953,18 +963,20 @@ impl<'a> App<'a> {
             FilterAction::Passthrough => {}
         }
 
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
                 self.screen = Screen::SectionList;
                 self.status_msg = None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 self.type_cursor = self.type_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.type_cursor + 1 < self.types.len() => {
+            Some(ConfigTabAction::Down) if self.type_cursor + 1 < self.types.len() => {
                 self.type_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 self.enter_type(self.type_cursor).await?;
             }
             _ => {}
@@ -1016,8 +1028,10 @@ impl<'a> App<'a> {
         }
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::AliasList {
                     section_idx,
@@ -1031,13 +1045,13 @@ impl<'a> App<'a> {
                 }
                 self.status_msg = None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 self.alias_cursor = self.alias_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.alias_cursor + 1 < visible_total => {
+            Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 if has_add && self.alias_cursor == add_pos {
                     if let Screen::AliasList {
                         section_idx,
@@ -1057,7 +1071,7 @@ impl<'a> App<'a> {
                     self.enter_alias(self.alias_cursor).await?;
                 }
             }
-            KeyCode::Char('x') if self.alias_cursor < self.aliases.len() => {
+            Some(ConfigTabAction::ToggleSecret) if self.alias_cursor < self.aliases.len() => {
                 if let Screen::AliasList { map_path, .. } = &self.screen {
                     let alias = self.aliases[self.alias_cursor].clone();
                     let map_path = map_path.clone();
@@ -1105,8 +1119,10 @@ impl<'a> App<'a> {
     // ── Alias creation ───────────────────────────────────────────
 
     async fn handle_alias_create(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Esc => {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
                 if let Screen::AliasCreate {
                     section_idx,
                     map_path,
@@ -1122,7 +1138,7 @@ impl<'a> App<'a> {
                     };
                 }
             }
-            KeyCode::Enter => {
+            Some(ConfigEditorAction::Confirm) => {
                 let name = self.edit_buf.trim().to_string();
                 if name.is_empty() {
                     self.status_msg = Some("Alias name cannot be empty".into());
@@ -1160,13 +1176,16 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            Some(ConfigEditorAction::Backspace) => {
                 self.edit_buf.pop();
             }
-            KeyCode::Char(c) => {
-                self.edit_buf.push(c);
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1177,7 +1196,9 @@ impl<'a> App<'a> {
         // Composite tabs get their own handler; only ←/→/Esc fall through.
         if self.is_composite_tab() {
             match self.tab_names[self.active_tab] {
-                ConfigTab::Personality => return self.handle_personality_tab(key, term).await,
+                ConfigTab::Personality => {
+                    return self.handle_personality_tab(key, term).await;
+                }
                 ConfigTab::Skills => return self.handle_skills_tab(key, term).await,
                 _ => {}
             }
@@ -1203,15 +1224,17 @@ impl<'a> App<'a> {
             FilterAction::Passthrough => {}
         }
 
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') if !self.tab_names.is_empty() => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) if !self.tab_names.is_empty() => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Right | KeyCode::Char('l') if !self.tab_names.is_empty() => {
+            Some(ConfigTabAction::TabRight) if !self.tab_names.is_empty() => {
                 if self.active_tab + 1 < self.tab_names.len() {
                     self.active_tab += 1;
                 }
@@ -1220,7 +1243,7 @@ impl<'a> App<'a> {
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            Some(ConfigTabAction::Back) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
@@ -1246,7 +1269,7 @@ impl<'a> App<'a> {
                 }
                 self.status_msg = None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 if let Some(pos) = visible.iter().position(|&i| i == self.field_cursor) {
                     if pos > 0 {
                         self.field_cursor = visible[pos - 1];
@@ -1255,7 +1278,7 @@ impl<'a> App<'a> {
                     self.field_cursor = first;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(ConfigTabAction::Down) => {
                 if let Some(pos) = visible.iter().position(|&i| i == self.field_cursor) {
                     if pos + 1 < visible.len() {
                         self.field_cursor = visible[pos + 1];
@@ -1264,10 +1287,10 @@ impl<'a> App<'a> {
                     self.field_cursor = first;
                 }
             }
-            KeyCode::Enter if visible.contains(&self.field_cursor) => {
+            Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
                 self.enter_field_edit(self.field_cursor, term).await;
             }
-            KeyCode::Char('d') => {
+            Some(ConfigTabAction::DeleteRow) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
                     let prop = field.path.clone();
                     let saved_cursor = self.field_cursor;
@@ -1332,20 +1355,22 @@ impl<'a> App<'a> {
         }
 
         // Tab navigation still works on composite tabs.
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Right | KeyCode::Char('l') if self.active_tab + 1 < self.tab_names.len() => {
+            Some(ConfigTabAction::TabRight) if self.active_tab + 1 < self.tab_names.len() => {
                 self.active_tab += 1;
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            Some(ConfigTabAction::Back) => {
                 // Back to alias list (reuse the normal Esc logic).
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
@@ -1373,15 +1398,15 @@ impl<'a> App<'a> {
                 self.status_msg = None;
                 return Ok(());
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 self.personality_cursor = self.personality_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j')
+            Some(ConfigTabAction::Down)
                 if self.personality_cursor + 1 < self.personality_files.len() =>
             {
                 self.personality_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
                     self.status_msg = Some(format!("Loading {filename}..."));
@@ -1422,9 +1447,6 @@ impl<'a> App<'a> {
                                 }
                                 Err(_) => {
                                     self.status_msg = None;
-                                    // $EDITOR unavailable — stays in inline
-                                    // editor mode (personality_active_file is
-                                    // already set by load_personality_file).
                                 }
                             }
                         }
@@ -1432,7 +1454,7 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            KeyCode::Char('t') => {
+            Some(ConfigTabAction::ApplyTemplate) => {
                 // Fill selected file from default template.
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
@@ -1499,16 +1521,17 @@ impl<'a> App<'a> {
     }
 
     async fn handle_personality_editor(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
-        match key.code {
-            KeyCode::Esc => {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
                 // Back to file picker. Warn if dirty.
                 if self.personality_content != self.personality_loaded {
                     self.status_msg = Some("Unsaved changes discarded".into());
                 }
                 self.personality_active_file = None;
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+S = save.
+            Some(ConfigEditorAction::Save) => {
                 if let Some(filename) = &self.personality_active_file {
                     let filename = filename.clone();
                     let agent = self.personality_agent.clone();
@@ -1526,25 +1549,26 @@ impl<'a> App<'a> {
                         Ok(_) => {
                             self.personality_loaded = self.personality_content.clone();
                             self.status_msg = Some(format!("Saved {filename}"));
-                            // Refresh file list to update exists/size.
                             let _ = self.load_personality_files().await;
-                            // Re-open the same file.
                             self.personality_active_file = Some(filename);
                         }
                         Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
                     }
                 }
             }
-            KeyCode::Enter => {
+            Some(ConfigEditorAction::Confirm) => {
                 self.personality_content.push('\n');
             }
-            KeyCode::Backspace => {
+            Some(ConfigEditorAction::Backspace) => {
                 self.personality_content.pop();
             }
-            KeyCode::Char(c) => {
-                self.personality_content.push(c);
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.personality_content.push(c);
+                }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1557,14 +1581,16 @@ impl<'a> App<'a> {
             return self.handle_skills_editor(key, term).await;
         }
 
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::TabLeft) => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.deactivate_filter();
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            Some(ConfigTabAction::TabRight) => {
                 if self.active_tab + 1 < self.tab_names.len() {
                     self.active_tab += 1;
                 }
@@ -1572,7 +1598,7 @@ impl<'a> App<'a> {
                 self.on_tab_switched(term).await?;
                 return Ok(());
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            Some(ConfigTabAction::Back) => {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
@@ -1599,15 +1625,13 @@ impl<'a> App<'a> {
                 self.status_msg = None;
                 return Ok(());
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 self.skills_cursor = self.skills_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if self.skills_cursor + 1 < self.skills_list.len() =>
-            {
+            Some(ConfigTabAction::Down) if self.skills_cursor + 1 < self.skills_list.len() => {
                 self.skills_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     self.status_msg = Some(format!("Loading {name}..."));
@@ -1642,8 +1666,7 @@ impl<'a> App<'a> {
                                 }
                                 Err(_) => {
                                     self.status_msg = None;
-                                    // $EDITOR unavailable — falls into inline
-                                    // editor.
+                                    // $EDITOR unavailable — falls into inline editor.
                                 }
                             }
                         }
@@ -1651,7 +1674,7 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            KeyCode::Char('x') => {
+            Some(ConfigTabAction::ToggleSecret) => {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     let bundle = self.skills_bundle.clone();
@@ -1672,15 +1695,16 @@ impl<'a> App<'a> {
     }
 
     async fn handle_skills_editor(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
-        let _ = term;
-        match key.code {
-            KeyCode::Esc => {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
                 if self.skills_body != self.skills_body_loaded {
                     self.status_msg = Some("Unsaved changes discarded".into());
                 }
                 self.skills_active = None;
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(ConfigEditorAction::Save) => {
                 if let Some(name) = &self.skills_active {
                     let name = name.clone();
                     let bundle = self.skills_bundle.clone();
@@ -1702,16 +1726,19 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            KeyCode::Enter => {
+            Some(ConfigEditorAction::Confirm) => {
                 self.skills_body.push('\n');
             }
-            KeyCode::Backspace => {
+            Some(ConfigEditorAction::Backspace) => {
                 self.skills_body.pop();
             }
-            KeyCode::Char(c) => {
-                self.skills_body.push(c);
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.skills_body.push(c);
+                }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1895,19 +1922,36 @@ impl<'a> App<'a> {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
+        use crate::keymap::Chord;
         if self.filter.is_none() {
-            if key.code == KeyCode::Char('/') {
-                self.activate_filter();
-                return FilterAction::Consumed;
-            }
-            return FilterAction::Passthrough;
+            return match key.code {
+                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.activate_filter();
+                    FilterAction::Consumed
+                }
+                _ => FilterAction::Passthrough,
+            };
         }
-        match key.code {
-            KeyCode::Esc => {
+        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
+            Some(FilterEditAction::Cancel)
+        } else if Chord::key(KeyCode::Enter).matches(&key) {
+            Some(FilterEditAction::Accept)
+        } else if Chord::key(KeyCode::Backspace).matches(&key) {
+            Some(FilterEditAction::Backspace)
+        } else if Chord::key(KeyCode::Up).matches(&key) || Chord::char('k').matches(&key) {
+            Some(FilterEditAction::CursorUp)
+        } else if Chord::key(KeyCode::Down).matches(&key) || Chord::char('j').matches(&key) {
+            Some(FilterEditAction::CursorDown)
+        } else {
+            None
+        };
+        match editor_chord {
+            Some(FilterEditAction::Cancel) => {
                 self.deactivate_filter();
                 FilterAction::Consumed
             }
-            KeyCode::Backspace => {
+            Some(FilterEditAction::Accept) => FilterAction::Accept,
+            Some(FilterEditAction::Backspace) => {
                 if let Some(buf) = &mut self.filter {
                     buf.pop();
                     if self.filter_cursor >= filtered_len {
@@ -1916,25 +1960,26 @@ impl<'a> App<'a> {
                 }
                 FilterAction::Consumed
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(FilterEditAction::CursorUp) => {
                 self.filter_cursor = self.filter_cursor.saturating_sub(1);
                 FilterAction::Consumed
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(FilterEditAction::CursorDown) => {
                 if self.filter_cursor + 1 < filtered_len {
                     self.filter_cursor += 1;
                 }
                 FilterAction::Consumed
             }
-            KeyCode::Char(c) => {
-                if let Some(buf) = &mut self.filter {
+            None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(buf) = &mut self.filter
+                {
                     buf.push(c);
                     self.filter_cursor = 0;
                 }
                 FilterAction::Consumed
             }
-            KeyCode::Enter => FilterAction::Accept,
-            _ => FilterAction::Consumed,
         }
     }
 
@@ -1948,16 +1993,21 @@ impl<'a> App<'a> {
         let is_string_array = matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
             if self.fields[*field_idx].kind == PropKind::StringArray);
 
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+
         if is_string_array {
-            match key.code {
-                KeyCode::Esc => self.pop_to_field_list().await?,
-                KeyCode::Enter => {
+            match action {
+                Some(ConfigEditorAction::Cancel) => {
+                    self.pop_to_field_list().await?;
+                }
+                Some(ConfigEditorAction::Confirm) => {
                     self.edit_buf.push('\n');
                 }
-                KeyCode::Backspace => {
+                Some(ConfigEditorAction::Backspace) => {
                     self.edit_buf.pop();
                 }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ConfigEditorAction::Save) => {
                     if let Screen::FieldEdit {
                         prefix, field_idx, ..
                     } = &self.screen
@@ -1984,17 +2034,22 @@ impl<'a> App<'a> {
                         }
                     }
                 }
-                KeyCode::Char(c) => {
-                    self.edit_buf.push(c);
+                _ => {
+                    if let KeyCode::Char(c) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.edit_buf.push(c);
+                    }
                 }
-                _ => {}
             }
             return Ok(());
         }
 
-        match key.code {
-            KeyCode::Esc => self.pop_to_field_list().await?,
-            KeyCode::Enter => {
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                self.pop_to_field_list().await?;
+            }
+            Some(ConfigEditorAction::Confirm) => {
                 if let Screen::FieldEdit {
                     prefix, field_idx, ..
                 } = &self.screen
@@ -2013,13 +2068,16 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            Some(ConfigEditorAction::Backspace) => {
                 self.edit_buf.pop();
             }
-            KeyCode::Char(c) => {
-                self.edit_buf.push(c);
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -2039,18 +2097,20 @@ impl<'a> App<'a> {
             FilterAction::Passthrough => {}
         }
 
-        match key.code {
-            KeyCode::Esc => {
+        use crate::keymap::ConfigTabAction;
+        let action = ConfigTabAction::from_chord(&key);
+        match action {
+            Some(ConfigTabAction::Back) => {
                 self.deactivate_filter();
                 self.pop_to_field_list().await?;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(ConfigTabAction::Up) => {
                 self.select_cursor = self.select_cursor.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.select_cursor + 1 < visible.len() => {
+            Some(ConfigTabAction::Down) if self.select_cursor + 1 < visible.len() => {
                 self.select_cursor += 1;
             }
-            KeyCode::Enter => {
+            Some(ConfigTabAction::Enter) => {
                 if let Some(&orig) = visible.get(self.select_cursor) {
                     return self.commit_select(orig).await;
                 }

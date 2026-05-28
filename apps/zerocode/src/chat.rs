@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -325,25 +325,35 @@ impl Chat {
                 if *loading {
                     return false;
                 }
-                match key.code {
-                    KeyCode::Up => {
-                        let i = list_state.selected().unwrap_or(0);
-                        list_state.select(Some(i.saturating_sub(1)));
-                    }
-                    KeyCode::Down => {
-                        let i = list_state.selected().unwrap_or(0);
-                        if i + 1 < agents.len() {
-                            list_state.select(Some(i + 1));
-                        }
-                    }
-                    KeyCode::Enter => {
+                use crate::keymap::{ChatTabAction, GlobalAction, ModalAction};
+                // Three action types in scope here — explicit short-circuit
+                // chain instead of one mixed match.
+                match ModalAction::from_chord(&key) {
+                    Some(ModalAction::Confirm) => {
                         if let Some(i) = list_state.selected()
                             && let Some(alias) = agents.get(i).cloned()
                         {
                             self.pick_or_start_session(&alias).await;
                         }
+                        return false;
                     }
-                    KeyCode::Char('q') => return true,
+                    Some(ModalAction::Cancel) => return true,
+                    _ => {}
+                }
+                if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
+                    return true;
+                }
+                match ChatTabAction::from_chord(&key) {
+                    Some(ChatTabAction::BrowseUp) | Some(ChatTabAction::BrowseUpVim) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        list_state.select(Some(i.saturating_sub(1)));
+                    }
+                    Some(ChatTabAction::BrowseDown) | Some(ChatTabAction::BrowseDownVim) => {
+                        let i = list_state.selected().unwrap_or(0);
+                        if i + 1 < agents.len() {
+                            list_state.select(Some(i + 1));
+                        }
+                    }
                     _ => {}
                 }
                 return false;
@@ -373,7 +383,9 @@ impl Chat {
                 return false;
             }
             ChatPhase::Error(_) => {
-                return matches!(key.code, KeyCode::Char('q'));
+                use crate::keymap::GlobalAction;
+                return GlobalAction::from_chord(&key) == Some(GlobalAction::Quit)
+                    || crate::keymap::Chord::char('q').matches(&key);
             }
             ChatPhase::Active(_) => { /* handled below to avoid borrow conflict */ }
         }
@@ -389,18 +401,12 @@ impl Chat {
                 sessions,
                 list_state,
             } => {
-                match key.code {
-                    KeyCode::Up => {
-                        let i = list_state.selected().unwrap_or(0);
-                        list_state.select(Some(i.saturating_sub(1)));
+                use crate::keymap::{Chord, ModalAction};
+                match ModalAction::from_chord(&key) {
+                    Some(ModalAction::Cancel) => {
+                        state.session_overlay = SessionOverlay::None;
                     }
-                    KeyCode::Down => {
-                        let i = list_state.selected().unwrap_or(0);
-                        if i + 1 < sessions.len() {
-                            list_state.select(Some(i + 1));
-                        }
-                    }
-                    KeyCode::Enter => {
+                    Some(ModalAction::Confirm) => {
                         if let Some(i) = list_state.selected()
                             && let Some(s) = sessions.get(i)
                         {
@@ -451,16 +457,24 @@ impl Chat {
                             }
                         }
                     }
-                    KeyCode::Esc => {
-                        state.session_overlay = SessionOverlay::None;
+                    _ => {
+                        if Chord::key(crossterm::event::KeyCode::Up).matches(&key) {
+                            let i = list_state.selected().unwrap_or(0);
+                            list_state.select(Some(i.saturating_sub(1)));
+                        } else if Chord::key(crossterm::event::KeyCode::Down).matches(&key) {
+                            let i = list_state.selected().unwrap_or(0);
+                            if i + 1 < sessions.len() {
+                                list_state.select(Some(i + 1));
+                            }
+                        }
                     }
-                    _ => {}
                 }
                 return false;
             }
             SessionOverlay::Rename { buf } => {
-                match key.code {
-                    KeyCode::Enter => {
+                use crate::keymap::ConfigEditorAction;
+                match ConfigEditorAction::from_chord(&key) {
+                    Some(ConfigEditorAction::Confirm) => {
                         let name = std::mem::take(buf);
                         if !name.is_empty()
                             && self
@@ -473,16 +487,17 @@ impl Chat {
                         }
                         state.session_overlay = SessionOverlay::None;
                     }
-                    KeyCode::Esc => {
+                    Some(ConfigEditorAction::Cancel) => {
                         state.session_overlay = SessionOverlay::None;
                     }
-                    KeyCode::Char(c) => {
-                        buf.push(c);
-                    }
-                    KeyCode::Backspace => {
+                    Some(ConfigEditorAction::Backspace) => {
                         buf.pop();
                     }
-                    _ => {}
+                    _ => {
+                        if let crossterm::event::KeyCode::Char(c) = key.code {
+                            buf.push(c);
+                        }
+                    }
                 }
                 return false;
             }
@@ -550,18 +565,21 @@ impl Chat {
         }
 
         // ── Chat-specific key handling ───────────────────────────
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if state.turn_in_flight {
-                    if !matches!(state.turn_status, TurnStatus::Cancelling) {
-                        let _ = self.rpc.session_cancel(&state.session_id).await;
-                        state.turn_status = TurnStatus::Cancelling;
-                    }
-                } else {
-                    return true;
+        use crate::keymap::{ChatTabAction, GlobalAction};
+        // Quit chord wins (chat overrides conditionally on turn state below).
+        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
+            if state.turn_in_flight {
+                if !matches!(state.turn_status, TurnStatus::Cancelling) {
+                    let _ = self.rpc.session_cancel(&state.session_id).await;
+                    state.turn_status = TurnStatus::Cancelling;
                 }
+            } else {
+                return true;
             }
-            KeyCode::Esc => {
+            return false;
+        }
+        match ChatTabAction::from_chord(&key) {
+            Some(ChatTabAction::BrowseExitSelection) => {
                 if state.in_browse_mode() {
                     state.exit_browse_mode();
                 } else if state.turn_in_flight
@@ -571,7 +589,7 @@ impl Chat {
                     state.turn_status = TurnStatus::Cancelling;
                 }
             }
-            KeyCode::Enter if state.pending_approval().is_some() => {
+            Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -583,7 +601,7 @@ impl Chat {
                         .await;
                 }
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(ChatTabAction::CancelTurn) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -595,7 +613,7 @@ impl Chat {
                         .await;
                 }
             }
-            KeyCode::Char('a') if state.pending_approval().is_some() => {
+            Some(ChatTabAction::ApprovalApproveAll) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
                         .rpc
@@ -607,7 +625,7 @@ impl Chat {
                         .await;
                 }
             }
-            KeyCode::Char('e') if state.pending_approval().is_some() => {
+            Some(ChatTabAction::ApprovalApproveEdit) if state.pending_approval().is_some() => {
                 let is_edit_tool = state
                     .pending_approval()
                     .map(|pa| matches!(pa.tool_name.as_str(), "file_edit" | "file_write"))
@@ -628,10 +646,7 @@ impl Chat {
                         .await;
                 }
             }
-            // ── Session management ───────────────────────────────
-            KeyCode::Char('n')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
-            {
+            Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
                 let alias = state.agent_alias.clone();
                 if self.pane_kind == PaneKind::Acp
                     && self.rpc.transport() == crate::client::Transport::Wss
@@ -668,9 +683,7 @@ impl Chat {
                     }
                 }
             }
-            KeyCode::Char('s')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
-            {
+            Some(ChatTabAction::SwitchSession) if !state.turn_in_flight => {
                 // ACP and Chat live in separate stores and must not cross-pick:
                 //  • Chat → unified session_backend (filter out channel-backed
                 //    sessions; those are owned by the channels pane).
@@ -701,13 +714,10 @@ impl Chat {
                     list_state: ls,
                 };
             }
-            KeyCode::Char('r')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.turn_in_flight =>
-            {
+            Some(ChatTabAction::RenameSession) if !state.turn_in_flight => {
                 state.session_overlay = SessionOverlay::Rename { buf: String::new() };
             }
-            // ── Thought toggle ───────────────────────────────────
-            KeyCode::Char('t')
+            Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
                     && state.pending_approval().is_none()
                     && !state.in_browse_mode() =>
@@ -715,95 +725,71 @@ impl Chat {
                 state.show_thoughts = !state.show_thoughts;
                 state.mark_dirty_full();
             }
-            // ── Browse mode: enter (Ctrl+↑) ──────────────────────
-            KeyCode::Up
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !state.in_browse_mode() =>
-            {
-                state.enter_browse_mode();
+            Some(ChatTabAction::BrowseEnter) => {
+                if state.in_browse_mode() {
+                    state.browse_move_up(1, false);
+                } else {
+                    state.enter_browse_mode();
+                }
             }
-            KeyCode::Up
-                if key.modifiers.contains(KeyModifiers::CONTROL) && state.in_browse_mode() =>
-            {
-                state.browse_move_up(1, false);
-            }
-            // ── Browse mode: exit (Ctrl+↓) ───────────────────────
-            KeyCode::Down
-                if key.modifiers.contains(KeyModifiers::CONTROL) && state.in_browse_mode() =>
-            {
+            Some(ChatTabAction::BrowseExit) if state.in_browse_mode() => {
                 state.exit_browse_mode();
             }
-            // ── Browse mode: navigate ↑/↓ ────────────────────────
-            KeyCode::Up if state.in_browse_mode() => {
-                state.browse_move_up(1, false);
+            Some(ChatTabAction::BrowseUp) => {
+                if state.in_browse_mode() {
+                    state.browse_move_up(1, false);
+                } else if !state.pinned_to_bottom {
+                    state.scroll_up(1);
+                }
             }
-            KeyCode::Down if state.in_browse_mode() => {
-                state.browse_move_down(1, false);
+            Some(ChatTabAction::BrowseDown) => {
+                if state.in_browse_mode() {
+                    state.browse_move_down(1, false);
+                } else if !state.pinned_to_bottom {
+                    state.scroll_down(1);
+                }
             }
-            // Sympathetic scroll when not in browse mode but scrolled up.
-            KeyCode::Up if !state.pinned_to_bottom => {
-                state.scroll_up(1);
-            }
-            KeyCode::Down if !state.pinned_to_bottom => {
-                state.scroll_down(1);
-            }
-            // ── Browse mode: range extend (Shift+↑/↓) ───────────
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(ChatTabAction::BrowseSelectExtend) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, true);
                 } else {
                     state.scroll_up(1);
                 }
             }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(ChatTabAction::BrowseSelectExtendDown) => {
                 if state.in_browse_mode() {
                     state.browse_move_down(1, true);
                 } else {
                     state.scroll_down(1);
                 }
             }
-            // ── Browse mode: fast scroll (Ctrl+Shift+↑/↓) ───────
-            KeyCode::Up
-                if key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
-            {
+            Some(ChatTabAction::FastScrollUp) => {
                 state.scroll_up(5);
             }
-            KeyCode::Down
-                if key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
-            {
+            Some(ChatTabAction::FastScrollDown) => {
                 state.scroll_down(5);
             }
-            // ── Browse mode: vim-style cursor (j/k, input empty) ─
-            KeyCode::Char('k')
+            Some(ChatTabAction::BrowseUpVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
                 state.browse_move_up(1, false);
             }
-            KeyCode::Char('j')
+            Some(ChatTabAction::BrowseDownVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
                     && !state.turn_in_flight =>
             {
                 state.browse_move_down(1, false);
             }
-            // ── Yank selection ──────────────────────────────────
-            KeyCode::Char('y') if state.has_selection() => {
+            Some(ChatTabAction::CopySelection) if state.has_selection() => {
                 let text = state.yank_selection();
                 if !text.is_empty() {
                     crate::mouse::copy_osc52(&text);
                 }
             }
-            KeyCode::Char('C')
-                if key
-                    .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                    && state.has_selection() =>
-            {
+            Some(ChatTabAction::CopyAllVisible) if state.has_selection() => {
                 let text = state.yank_selection();
                 if !text.is_empty() {
                     crate::mouse::copy_osc52(&text);

@@ -703,45 +703,27 @@ impl InputBarState {
         // Reset blink on any keystroke.
         self.reset_blink();
 
-        match key.code {
-            // ── Ctrl+C: copy selection or pass through ───────
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some((start, end)) = self.selection {
-                    let selected = &self.input[start..end];
-                    mouse::copy_osc52(selected);
-                    return InputBarAction::Consumed;
-                }
-                InputBarAction::NotHandled
-            }
+        use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
+        let action = IbWidgetAction::from_chord(&key);
 
-            // ── Ctrl+A: open file explorer ───────────────────
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let start = UserDirs::new()
-                    .map(|u| u.home_dir().to_path_buf())
-                    .unwrap_or_else(|| {
-                        if cfg!(windows) {
-                            PathBuf::from("C:\\")
-                        } else {
-                            PathBuf::from("/")
-                        }
-                    });
-                self.file_explorer = Some(FileExplorerState::new(start));
-                InputBarAction::Consumed
+        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
+            if let Some((start, end)) = self.selection {
+                let selected = &self.input[start..end];
+                mouse::copy_osc52(selected);
+                return InputBarAction::Consumed;
             }
+            return InputBarAction::NotHandled;
+        }
 
-            // ── Ctrl+V: paste clipboard image ───────────────
-            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.handle_clipboard_image()
+        match action {
+            Some(IbWidgetAction::Paste) => {
+                return self.handle_clipboard_image();
             }
-
-            // ── Esc: dismiss autocomplete or pass through ────
-            KeyCode::Esc if self.autocomplete_active => {
+            Some(IbWidgetAction::AutocompleteCancel) if self.autocomplete_active => {
                 self.dismiss_autocomplete();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Tab: accept autocomplete match ───────────────
-            KeyCode::Tab if self.autocomplete_active => {
+            Some(IbWidgetAction::AutocompleteAccept) if self.autocomplete_active => {
                 if let Some(idx) = self.autocomplete_index
                     && idx < self.autocomplete_matches.len()
                 {
@@ -750,60 +732,60 @@ impl InputBarState {
                     self.cursor = self.input.len();
                     self.dismiss_autocomplete();
                 }
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Up/Down in autocomplete mode ─────────────────
-            KeyCode::Up if self.autocomplete_active => {
+            Some(IbWidgetAction::HistoryPrev) if self.autocomplete_active => {
                 if let Some(idx) = self.autocomplete_index {
                     self.autocomplete_index = Some(idx.saturating_sub(1));
                 }
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-            KeyCode::Down if self.autocomplete_active => {
+            Some(IbWidgetAction::HistoryNext) if self.autocomplete_active => {
                 if let Some(idx) = self.autocomplete_index {
                     let max = self.autocomplete_matches.len().saturating_sub(1);
                     self.autocomplete_index = Some((idx + 1).min(max));
                 }
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Shift/Alt+Enter: insert literal newline ──────
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
-            {
+            Some(IbWidgetAction::NewLine) => {
                 self.push_input_char('\n');
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Enter: submit or slash command ───────────────
-            KeyCode::Enter => self.handle_enter(),
-
-            // ── Up/Down: move cursor in wrapped text ─────────
-            // Only bare Up/Down — any modifier (Ctrl/Shift/Alt) falls
-            // through so chat-level handlers (browse mode, scroll,
-            // fast-scroll) work from the input box.
-            KeyCode::Up if key.modifiers.is_empty() => {
+            Some(IbWidgetAction::Submit) => {
+                return self.handle_enter();
+            }
+            Some(IbWidgetAction::HistoryPrev) => {
                 self.move_cursor_up();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-            KeyCode::Down if key.modifiers.is_empty() => {
+            Some(IbWidgetAction::HistoryNext) => {
                 self.move_cursor_down();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Home/End: start/end of visual line ───────────
-            KeyCode::Home => {
+            Some(IbWidgetAction::CursorStart) => {
+                let was_ctrl_a = crate::keymap::Chord::ctrl('a').matches(&key);
+                if was_ctrl_a {
+                    let start = UserDirs::new()
+                        .map(|u| u.home_dir().to_path_buf())
+                        .unwrap_or_else(|| {
+                            if cfg!(windows) {
+                                PathBuf::from("C:\\")
+                            } else {
+                                PathBuf::from("/")
+                            }
+                        });
+                    self.file_explorer = Some(FileExplorerState::new(start));
+                    return InputBarAction::Consumed;
+                }
                 let width = self.last_inner_width;
                 if width > 0 {
                     let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
                     self.cursor = visual_to_cursor(&self.input, row, 0, width);
                     self.clear_selection();
                 }
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-            KeyCode::End => {
+            Some(IbWidgetAction::CursorEnd) => {
                 let width = self.last_inner_width;
                 if width > 0 {
                     let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
@@ -811,35 +793,31 @@ impl InputBarState {
                     self.cursor = visual_to_cursor(&self.input, row, width, width);
                     self.clear_selection();
                 }
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Cursor movement ──────────────────────────────
-            KeyCode::Left => {
+            Some(IbWidgetAction::CursorLeft) => {
                 self.move_cursor_left();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-            KeyCode::Right => {
+            Some(IbWidgetAction::CursorRight) => {
                 self.move_cursor_right();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Backspace ────────────────────────────────────
-            KeyCode::Backspace => {
+            Some(IbWidgetAction::Backspace) => {
                 self.pop_input_char();
-                InputBarAction::Consumed
+                return InputBarAction::Consumed;
             }
-
-            // ── Character input (plain keys only) ────────────
-            // Ctrl+key combos fall through so chat-level handlers
-            // (Ctrl+S session picker, Ctrl+N new session, etc.) work.
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.push_input_char(c);
-                InputBarAction::Consumed
-            }
-
-            _ => InputBarAction::NotHandled,
+            _ => {}
         }
+
+        if let KeyCode::Char(c) = key.code
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.push_input_char(c);
+            return InputBarAction::Consumed;
+        }
+
+        InputBarAction::NotHandled
     }
 
     /// Handle bracketed paste event.

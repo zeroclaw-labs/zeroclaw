@@ -1429,20 +1429,21 @@ impl<'a> Dashboard<'a> {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Enter => {
+        use crate::keymap::SearchBoxAction;
+        match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Accept) => {
                 self.search_query = self.search_buf.clone();
                 self.search_active = false;
                 // Force re-poll so server-side search (memories) picks up query.
                 self.last_poll = None;
             }
-            KeyCode::Esc => {
+            Some(SearchBoxAction::Cancel) => {
                 // Restore the query from before search was activated.
                 self.search_query = self.search_query_saved.clone();
                 self.search_buf = self.search_query_saved.clone();
                 self.search_active = false;
             }
-            KeyCode::Backspace => {
+            Some(SearchBoxAction::Backspace) => {
                 self.search_buf.pop();
                 // Live-filter for client-side tabs (agents, cron).
                 // Server-side tabs (sessions, memories) wait for Enter.
@@ -1450,65 +1451,66 @@ impl<'a> Dashboard<'a> {
                     self.search_query = self.search_buf.clone();
                 }
             }
-            KeyCode::Char(c) => {
-                self.search_buf.push(c);
-                if !matches!(self.tab, Tab::Sessions | Tab::Memories) {
-                    self.search_query = self.search_buf.clone();
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.search_buf.push(c);
+                    if !matches!(self.tab, Tab::Sessions | Tab::Memories) {
+                        self.search_query = self.search_buf.clone();
+                    }
                 }
             }
-            _ => {}
         }
         false
     }
 
     async fn handle_detail_key(&mut self, key: KeyEvent) -> bool {
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+        use crate::keymap::DashboardTabAction;
+        match DashboardTabAction::from_chord(&key) {
+            Some(DashboardTabAction::CloseDetail) | Some(DashboardTabAction::OpenDetail) => {
                 self.detail_open = false;
                 self.detail_scroll = 0;
-                // Drop lazy-loaded full payloads. Long browsing
-                // sessions never accumulate detail bodies for
-                // entries the user has scrolled past.
                 self.memory_detail = None;
                 self.memory_detail_key = None;
                 self.session_messages.clear();
                 self.session_messages_id = None;
             }
             // Shift+J / Shift+K scroll the detail pane
-            KeyCode::Char('J') => self.detail_scroll = self.detail_scroll.saturating_add(1),
-            KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-            KeyCode::Down if shift => {
+            Some(DashboardTabAction::DetailScrollDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
             }
-            KeyCode::Up if shift => {
+            Some(DashboardTabAction::DetailScrollUp) => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
             }
-            // Shift+Left / Shift+Right resize the detail pane
-            KeyCode::Left if shift => {
+            Some(DashboardTabAction::DetailWidenDown) => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
+            }
+            Some(DashboardTabAction::DetailWidenUp) => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            Some(DashboardTabAction::DetailWidenLeft) => {
                 self.detail_pct = (self.detail_pct + 5).min(80);
             }
-            KeyCode::Right if shift => {
+            Some(DashboardTabAction::DetailWidenRight) => {
                 self.detail_pct = self.detail_pct.saturating_sub(5).max(20);
             }
-            // j/k / plain arrows move the list cursor
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(DashboardTabAction::Down) => {
                 self.move_list_down();
                 self.detail_scroll = 0;
                 self.on_selection_change().await;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(DashboardTabAction::Up) => {
                 self.move_list_up();
                 self.detail_scroll = 0;
                 self.on_selection_change().await;
             }
-            KeyCode::Char('/') => {
+            Some(DashboardTabAction::BeginSearch) => {
                 self.search_query_saved = self.search_query.clone();
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
-            KeyCode::Char('c') => {
+            Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
                 self.search_buf.clear();
                 self.last_poll = None; // re-poll for server-side search
@@ -1519,59 +1521,65 @@ impl<'a> Dashboard<'a> {
     }
 
     async fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Char('q') => return true,
-            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => self.next_tab(),
-            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => self.prev_tab(),
-            KeyCode::Char('1') => self.tab = Tab::Overview,
-            KeyCode::Char('2') => self.tab = Tab::Sessions,
-            KeyCode::Char('3') => self.tab = Tab::Agents,
-            KeyCode::Char('4') => self.tab = Tab::Memories,
-            KeyCode::Char('5') => self.tab = Tab::Health,
-            KeyCode::Char('6') => self.tab = Tab::Cost,
-            KeyCode::Char('7') => self.tab = Tab::Cron,
-            KeyCode::Char('j') | KeyCode::Down => self.move_list_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.move_list_up(),
-            KeyCode::Enter if self.has_detail_pane() => {
+        use crate::keymap::{DashboardTabAction, GlobalAction};
+        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
+            return true;
+        }
+        match DashboardTabAction::from_chord(&key) {
+            Some(DashboardTabAction::NextTab) => self.next_tab(),
+            Some(DashboardTabAction::PrevTab) => self.prev_tab(),
+            Some(DashboardTabAction::Tab1) => self.tab = Tab::Overview,
+            Some(DashboardTabAction::Tab2) => self.tab = Tab::Sessions,
+            Some(DashboardTabAction::Tab3) => self.tab = Tab::Agents,
+            Some(DashboardTabAction::Tab4) => self.tab = Tab::Memories,
+            Some(DashboardTabAction::Tab5) => self.tab = Tab::Health,
+            Some(DashboardTabAction::Tab6) => self.tab = Tab::Cost,
+            Some(DashboardTabAction::Tab7) => self.tab = Tab::Cron,
+            Some(DashboardTabAction::Down) => self.move_list_down(),
+            Some(DashboardTabAction::Up) => self.move_list_up(),
+            Some(DashboardTabAction::OpenDetail) if self.has_detail_pane() => {
                 self.detail_open = true;
                 self.detail_scroll = 0;
                 self.detail_pct = 50;
                 self.on_selection_change().await;
             }
-            KeyCode::Char('/') => {
+            Some(DashboardTabAction::BeginSearch) => {
                 self.search_query_saved = self.search_query.clone();
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
-            KeyCode::Char('c') => {
+            Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
                 self.search_buf.clear();
                 self.last_poll = None; // re-poll for server-side search
             }
-            KeyCode::Char('r') => {
+            Some(DashboardTabAction::Refresh) => {
                 self.poll_data().await;
             }
-            KeyCode::Char('G') | KeyCode::End => self.jump_to_end(),
-            KeyCode::Char('g') | KeyCode::Home => self.jump_to_start(),
+            Some(DashboardTabAction::JumpEnd) => self.jump_to_end(),
+            Some(DashboardTabAction::JumpStart) => self.jump_to_start(),
             _ => {}
         }
 
-        // Scrollable tabs
+        // Health / Cost tabs scroll on j/k too — resolve again so the
+        // outer dashboard match (which consumed the chord into Up/Down)
+        // doesn't shadow the scroll behaviour.
+        let action = DashboardTabAction::from_chord(&key);
         match self.tab {
-            Tab::Health => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
+            Tab::Health => match action {
+                Some(DashboardTabAction::Down) => {
                     self.health_scroll = self.health_scroll.saturating_add(1);
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                Some(DashboardTabAction::Up) => {
                     self.health_scroll = self.health_scroll.saturating_sub(1);
                 }
                 _ => {}
             },
-            Tab::Cost => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
+            Tab::Cost => match action {
+                Some(DashboardTabAction::Down) => {
                     self.cost_scroll = self.cost_scroll.saturating_add(1);
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                Some(DashboardTabAction::Up) => {
                     self.cost_scroll = self.cost_scroll.saturating_sub(1);
                 }
                 _ => {}

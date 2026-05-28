@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -16,6 +16,7 @@ use crate::chat;
 use crate::client::{ConnectionState, RpcClient};
 use crate::config_manager;
 use crate::dashboard;
+use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
@@ -227,8 +228,17 @@ pub async fn run(
                     continue;
                 }
 
-                // Ctrl+C always quits
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                let in_text_input = match mode {
+                    Mode::Dashboard => dashboard_pane.wants_text_input(),
+                    Mode::Config => config_app.wants_text_input(),
+                    Mode::Acp => acp_pane.wants_text_input(),
+                    Mode::Chat => chat_pane.wants_text_input(),
+                    Mode::Logs => logs_pane.wants_text_input(),
+                    Mode::Quickstart => quickstart.wants_text_input(),
+                };
+                let global = GlobalAction::from_chord(&key);
+
+                if global == Some(GlobalAction::Quit) {
                     break;
                 }
 
@@ -236,15 +246,15 @@ pub async fn run(
                 // while open. Mirrors the web dashboard's
                 // `ReloadDaemonButton` confirm flow.
                 if reload_confirm {
-                    match key.code {
-                        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    match ModalAction::from_chord(&key) {
+                        Some(ModalAction::Confirm) => {
                             reload_confirm = false;
                             reload_status = Some(match rpc.config_reload().await {
                                 Ok(_) => "Daemon reload signalled — reconnecting…".into(),
                                 Err(e) => format!("Reload requested ({e})"),
                             });
                         }
-                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                        Some(ModalAction::Cancel) => {
                             reload_confirm = false;
                         }
                         _ => {}
@@ -257,38 +267,21 @@ pub async fn run(
                     reload_status = None;
                 }
 
-                // Ctrl+R opens the reload-daemon confirmation modal,
-                // unless the active pane is in text-input mode (so it
-                // doesn't hijack an edit field).
-                if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    let in_text_input = match mode {
-                        Mode::Dashboard => dashboard_pane.wants_text_input(),
-                        Mode::Config => config_app.wants_text_input(),
-                        Mode::Acp => acp_pane.wants_text_input(),
-                        Mode::Chat => chat_pane.wants_text_input(),
-                        Mode::Logs => logs_pane.wants_text_input(),
-                        Mode::Quickstart => quickstart.wants_text_input(),
-                    };
-                    if !in_text_input {
-                        reload_confirm = true;
-                        continue;
-                    }
+                if global == Some(GlobalAction::ReloadDaemon) && !in_text_input {
+                    reload_confirm = true;
+                    continue;
                 }
 
-                // Help modal: any key dismisses it
+                // Help modal: any key dismisses it.
                 if show_help {
                     show_help = false;
                     continue;
                 }
 
-                let switch_to: Option<Mode> = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match key.code {
-                        KeyCode::Left => Some(mode.cycle(-1)),
-                        KeyCode::Right => Some(mode.cycle(1)),
-                        _ => None,
-                    }
-                } else {
-                    None
+                let switch_to: Option<Mode> = match global {
+                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
+                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
+                    _ => None,
                 };
                 if let Some(next) = switch_to {
                     if mode == Mode::Quickstart && next != Mode::Quickstart {
@@ -299,19 +292,9 @@ pub async fn run(
                 }
 
                 // `?` opens help unless pane is in text-input mode.
-                if key.code == KeyCode::Char('?') {
-                    let in_text_input = match mode {
-                        Mode::Dashboard => dashboard_pane.wants_text_input(),
-                        Mode::Config => config_app.wants_text_input(),
-                        Mode::Acp => acp_pane.wants_text_input(),
-                        Mode::Chat => chat_pane.wants_text_input(),
-                        Mode::Logs => logs_pane.wants_text_input(),
-                        Mode::Quickstart => quickstart.wants_text_input(),
-                    };
-                    if !in_text_input {
-                        show_help = true;
-                        continue;
-                    }
+                if global == Some(GlobalAction::Help) && !in_text_input {
+                    show_help = true;
+                    continue;
                 }
 
                 // Skip pane key handlers when disconnected — they may
