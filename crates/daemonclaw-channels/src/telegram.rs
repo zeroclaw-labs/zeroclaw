@@ -1134,15 +1134,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Apply mention_only gate before downloading + transcribing. Voice
-        // notes typically have no caption, so under `mention_only = true`
-        // they are rejected here — the bot has no reliable way to know it
-        // was mentioned without first transcribing, and we don't want to
-        // pay that cost for messages that will likely be dropped. See #6229.
-        // The transcription itself is discarded; we only care whether the
-        // gate returns Some (allowed) vs None (rejected).
-        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        self.check_media_mention_gate(message, voice_caption)?;
+        // Apply mention_only gate before downloading. Photo / document
+        // updates carry no `text` field, so the text-only gate in
+        // `parse_update_message` can never see them and they used to slip
+        // through unconditionally. See #6229.
+        let gated_caption =
+            self.check_media_mention_gate(message, attachment.caption.as_deref())?;
 
         let chat_id = message
             .get("chat")
@@ -1281,12 +1278,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        // Apply mention_only gate before downloading. Photo / document
-        // updates carry no `text` field, so the text-only gate in
-        // `parse_update_message` can never see them and they used to slip
-        // through unconditionally. See #6229.
-        let gated_caption =
-            self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+        // Apply mention_only gate before downloading. Voice notes typically
+        // have no caption, so under `mention_only = true` they are rejected
+        // here unless the caption contains a mention. See #6229.
+        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
+        self.check_media_mention_gate(message, voice_caption)?;
 
         let chat_id = message
             .get("chat")
