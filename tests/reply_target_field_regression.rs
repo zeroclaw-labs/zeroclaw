@@ -10,8 +10,15 @@ const SCAN_PATHS: &[&str] = &["src", "examples"];
 const FORBIDDEN_PATTERNS: &[&str] = &[".reply_to", "reply_to:"];
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|err| panic!("Failed to read directory {}: {err}", dir.display()));
+    // Tolerate missing directories — `examples/` was removed in the V3
+    // restructure but the regression guard still scans it for completeness
+    // if it comes back. Treating "not found" as "no files" keeps the test
+    // green without weakening its forbidden-pattern check.
+    let entries = match fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("Failed to read directory {}: {e}", dir.display()),
+    };
 
     for entry in entries {
         let entry =

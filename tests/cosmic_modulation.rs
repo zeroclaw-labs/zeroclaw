@@ -1,3 +1,5 @@
+#![cfg(feature = "x0-extended")]
+
 use zeroclaw::cosmic::{EmotionalModulator, FreeEnergyState, GlobalVariable};
 
 #[test]

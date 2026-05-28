@@ -10,12 +10,16 @@ use zeroclaw::memory::{Memory, MemoryCategory, markdown::MarkdownMemory, sqlite:
 
 // ── Helpers ────────────────────────────────────────────────────
 
+// `default` matches the V3 single-agent default alias when no agent is named;
+// this is a head-to-head backend test, not a multi-agent isolation test.
+const TEST_ALIAS: &str = "default";
+
 fn sqlite_backend(dir: &std::path::Path) -> SqliteMemory {
-    SqliteMemory::new(dir).expect("SQLite init failed")
+    SqliteMemory::new(TEST_ALIAS, dir).expect("SQLite init failed")
 }
 
 fn markdown_backend(dir: &std::path::Path) -> MarkdownMemory {
-    MarkdownMemory::new(dir)
+    MarkdownMemory::new(TEST_ALIAS, dir)
 }
 
 // ── Test 1: Store performance ──────────────────────────────────
@@ -147,8 +151,8 @@ async fn compare_recall_quality() {
     println!("RECALL QUALITY (10 entries seeded):\n");
 
     for (query, desc) in &queries {
-        let sq_results = sq.recall(query, 10, None).await.unwrap();
-        let md_results = md.recall(query, 10, None).await.unwrap();
+        let sq_results = sq.recall(query, 10, None, None, None).await.unwrap();
+        let md_results = md.recall(query, 10, None, None, None).await.unwrap();
 
         println!("  Query: \"{query}\" — {desc}");
         println!("    SQLite:   {} results", sq_results.len());
@@ -202,11 +206,11 @@ async fn compare_recall_speed() {
 
     // Benchmark recall
     let start = Instant::now();
-    let sq_results = sq.recall("Rust systems", 10, None).await.unwrap();
+    let sq_results = sq.recall("Rust systems", 10, None, None, None).await.unwrap();
     let sq_dur = start.elapsed();
 
     let start = Instant::now();
-    let md_results = md.recall("Rust systems", 10, None).await.unwrap();
+    let md_results = md.recall("Rust systems", 10, None, None, None).await.unwrap();
     let md_dur = start.elapsed();
 
     println!("\n============================================================");
@@ -312,7 +316,7 @@ async fn compare_upsert() {
     let md_count = md.count().await.unwrap();
 
     let sq_entry = sq.get("pref").await.unwrap();
-    let md_results = md.recall("loves Rust", 5, None).await.unwrap();
+    let md_results = md.recall("loves Rust", 5, None, None, None).await.unwrap();
 
     println!("\n============================================================");
     println!("UPSERT (store same key twice):");

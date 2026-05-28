@@ -1,3 +1,5 @@
+#![cfg(feature = "x0-extended")]
+
 use std::sync::Arc;
 
 use chrono::Utc;

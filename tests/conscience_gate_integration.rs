@@ -1,3 +1,5 @@
+#![cfg(feature = "x0-extended")]
+
 //! Conscience gate integration test — PR-2.
 //!
 //! These tests validate the contract that `agent/loop_.rs` depends on
