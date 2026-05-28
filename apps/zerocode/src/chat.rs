@@ -739,6 +739,13 @@ impl Chat {
             KeyCode::Down if state.in_browse_mode() => {
                 state.browse_move_down(1, false);
             }
+            // Sympathetic scroll when not in browse mode but scrolled up.
+            KeyCode::Up if !state.pinned_to_bottom => {
+                state.scroll_up(1);
+            }
+            KeyCode::Down if !state.pinned_to_bottom => {
+                state.scroll_down(1);
+            }
             // ── Browse mode: range extend (Shift+↑/↓) ───────────
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if state.in_browse_mode() {
@@ -784,14 +791,21 @@ impl Chat {
             {
                 state.browse_move_down(1, false);
             }
-            // ── Browse mode: yank selection ──────────────────────
-            KeyCode::Char('y') if state.in_browse_mode() => {
-                if let Some((lo, hi)) = state.browse_range() {
-                    let text = state.entries[lo..=hi]
-                        .iter()
-                        .map(clipboard_text)
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+            // ── Yank selection ──────────────────────────────────
+            KeyCode::Char('y') if state.has_selection() => {
+                let text = state.yank_selection();
+                if !text.is_empty() {
+                    crate::mouse::copy_osc52(&text);
+                }
+            }
+            KeyCode::Char('C')
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    && state.has_selection() =>
+            {
+                let text = state.yank_selection();
+                if !text.is_empty() {
                     crate::mouse::copy_osc52(&text);
                 }
             }
@@ -853,9 +867,88 @@ impl Chat {
                 return;
             }
 
+            use crossterm::event::{KeyModifiers as KM, MouseButton};
+            let col = mouse.column;
+            let row = mouse.row;
             match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Scrollbar track click → start drag, jump scroll.
+                    if let Some(track) = state.scrollbar_track_rect
+                        && mouse::in_rect(col, row, track)
+                    {
+                        state.scrollbar_drag = Some(ScrollbarDrag {
+                            start_scroll: state.scroll_offset,
+                            start_row: row,
+                        });
+                        let max = state
+                            .last_total_rows
+                            .saturating_sub(state.last_inner_height);
+                        if track.height > 0 {
+                            let rel = row.saturating_sub(track.y) as u32;
+                            let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
+                            state.scroll_offset = new_off.min(max);
+                            state.pinned_to_bottom = state.scroll_offset >= max;
+                        }
+                        return;
+                    }
+                    // Entry click → selection.
+                    let hit = state
+                        .entry_rects
+                        .iter()
+                        .find(|(_, r)| mouse::in_rect(col, row, *r))
+                        .map(|(idx, _)| *idx);
+                    let shift = mouse.modifiers.contains(KM::SHIFT);
+                    let ctrl = mouse.modifiers.contains(KM::CONTROL);
+                    if let Some(idx) = hit {
+                        if ctrl {
+                            if !state.browse_multi.remove(&idx) {
+                                state.browse_multi.insert(idx);
+                            }
+                            state.mark_dirty_full();
+                        } else if shift {
+                            if state.browse_cursor.is_none() {
+                                state.browse_cursor = Some(idx);
+                            }
+                            state.browse_anchor = state.browse_cursor;
+                            state.browse_cursor = Some(idx);
+                            state.mark_dirty_full();
+                        } else {
+                            state.browse_multi.clear();
+                            state.browse_cursor = Some(idx);
+                            state.browse_anchor = None;
+                            state.mark_dirty_full();
+                        }
+                    } else {
+                        // Click in empty conv area → clear selection.
+                        state.browse_multi.clear();
+                        state.browse_cursor = None;
+                        state.browse_anchor = None;
+                        state.mark_dirty_full();
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(drag) = state.scrollbar_drag {
+                        let max = state
+                            .last_total_rows
+                            .saturating_sub(state.last_inner_height);
+                        let track_h = state
+                            .scrollbar_track_rect
+                            .map(|r| r.height)
+                            .unwrap_or(0)
+                            .max(1);
+                        let dy = row as i32 - drag.start_row as i32;
+                        let scroll_delta = dy * max as i32 / track_h as i32;
+                        let new_off =
+                            (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
+                        state.scroll_offset = new_off as u16;
+                        state.pinned_to_bottom = state.scroll_offset >= max;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    state.scrollbar_drag = None;
+                }
                 _ => {}
             }
         }
@@ -1179,22 +1272,24 @@ fn render_tool_entry(
     name: &str,
     input_json: &str,
     result: Option<&str>,
+    is_selected: bool,
 ) {
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
     lines.push(Line::from(vec![Span::styled(
         format!("[tool: {name}] "),
-        theme::tool_label_style(),
+        theme::tool_label_style().add_modifier(sel_mod),
     )]));
 
-    // `file_edit` / `file_write` need to peek inside the input
-    // structure to render diffs / file content. Re-parse from the
-    // pre-serialised JSON string — the per-entry storage on
-    // `ChatEntry::Tool` is `Arc<str>` rather than a parsed `Value`
-    // so we trade a parse on render for a smaller per-entry footprint.
     let parsed: Option<serde_json::Value> = match name {
         "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
         _ => None,
     };
 
+    let body_start = lines.len();
     match name {
         "file_edit" => {
             let input = parsed.as_ref();
@@ -1226,7 +1321,7 @@ fn render_tool_entry(
             };
             lines.push(Line::from(Span::styled(
                 format!("  {truncated}"),
-                theme::dim_style(),
+                theme::dim_style().add_modifier(sel_mod),
             )));
         }
     }
@@ -1239,8 +1334,20 @@ fn render_tool_entry(
         };
         lines.push(Line::from(Span::styled(
             format!("  → {truncated}"),
-            theme::dim_style(),
+            theme::dim_style().add_modifier(sel_mod),
         )));
+    }
+
+    // Apply REVERSED to every body line that came from `diff_lines`/
+    // `write_lines` so the whole tool block visually pops when selected.
+    if is_selected {
+        for line in &mut lines[body_start..] {
+            let spans = std::mem::take(&mut line.spans);
+            line.spans = spans
+                .into_iter()
+                .map(|s| s.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
+                .collect();
+        }
     }
 }
 
@@ -1330,6 +1437,7 @@ fn render_entry_into(
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
+                is_selected,
             );
         }
     }
@@ -1404,6 +1512,32 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.last_inner_height = inner_height;
     state.scroll_offset = scroll;
 
+    // Hit-rect cache: project each entry's unwrapped-line range into
+    // screen coordinates given the current scroll. Lines that fall
+    // outside the viewport get a zero-sized rect so mouse routing
+    // ignores them.
+    let body_x = area.x + 1;
+    let body_y = area.y + 1;
+    let body_w = inner_width;
+    let body_h = inner_height;
+    state.entry_rects.clear();
+    for &(entry_idx, lo, hi) in &state.cached_line_ranges {
+        let lo = lo as u16;
+        let hi = hi as u16;
+        let visible_lo = lo.max(scroll);
+        let visible_hi = hi.min(scroll + body_h);
+        if visible_hi <= visible_lo {
+            continue;
+        }
+        let rect = Rect::new(
+            body_x,
+            body_y + (visible_lo - scroll),
+            body_w,
+            visible_hi - visible_lo,
+        );
+        state.entry_rects.push((entry_idx, rect));
+    }
+
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -1414,6 +1548,18 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         area,
         &mut scrollbar_state,
     );
+    // Scrollbar track rect: right-most column of `area`, excluding the
+    // border rows. ratatui's Scrollbar paints in `area.right() - 1`.
+    if area.height > 2 {
+        state.scrollbar_track_rect = Some(Rect::new(
+            area.x + area.width.saturating_sub(1),
+            area.y + 1,
+            1,
+            area.height - 2,
+        ));
+    } else {
+        state.scrollbar_track_rect = None;
+    }
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -1745,6 +1891,13 @@ enum LinesDirty {
     Full,
 }
 
+/// Scrollbar drag captured on mouse-down on the track.
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    start_scroll: u16,
+    start_row: u16,
+}
+
 #[derive(Debug)]
 pub struct ChatState {
     pub session_id: String,
@@ -1778,6 +1931,14 @@ pub struct ChatState {
     /// Anchor for range selection; set when Shift+↑/↓ is first pressed.
     /// Range is `min(anchor, cursor)..=max(anchor, cursor)`.
     browse_anchor: Option<usize>,
+    /// Ctrl+click multi-select set, independent of cursor/anchor range.
+    browse_multi: std::collections::BTreeSet<usize>,
+    /// Per-entry hit rects from the last draw.
+    entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Scrollbar track rect from the last draw.
+    scrollbar_track_rect: Option<ratatui::layout::Rect>,
+    /// Active scrollbar drag anchor.
+    scrollbar_drag: Option<ScrollbarDrag>,
     session_overlay: SessionOverlay,
     scroll_offset: u16,
     pinned_to_bottom: bool,
@@ -1785,6 +1946,9 @@ pub struct ChatState {
     last_inner_height: u16,
     /// Cached rendered lines from committed entries.
     cached_lines: Vec<Line<'static>>,
+    /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
+    /// start, end_exclusive)`. Used by mouse hit-testing.
+    cached_line_ranges: Vec<(usize, usize, usize)>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -1820,12 +1984,17 @@ impl ChatState {
             show_thoughts: true,
             browse_cursor: None,
             browse_anchor: None,
+            browse_multi: std::collections::BTreeSet::new(),
+            entry_rects: Vec::new(),
+            scrollbar_track_rect: None,
+            scrollbar_drag: None,
             session_overlay: SessionOverlay::None,
             scroll_offset: 0,
             pinned_to_bottom: true,
             last_total_rows: 0,
             last_inner_height: 0,
             cached_lines: Vec::new(),
+            cached_line_ranges: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
             cached_render_start: 0,
@@ -1850,6 +2019,33 @@ impl ChatState {
     /// True when browse mode is active (cursor is set).
     fn in_browse_mode(&self) -> bool {
         self.browse_cursor.is_some()
+    }
+
+    /// True when anything is selected — cursor, range, or multi.
+    fn has_selection(&self) -> bool {
+        self.browse_cursor.is_some() || !self.browse_multi.is_empty()
+    }
+
+    /// Build the clipboard string. Single-entry → body only. Multi-entry →
+    /// each entry prefixed by its role label, blank line between.
+    fn yank_selection(&self) -> String {
+        let sel = self.selected_entries();
+        let count = sel.len();
+        if count == 0 {
+            return String::new();
+        }
+        let with_label = count > 1;
+        sel.into_iter()
+            .filter_map(|i| self.entries.get(i))
+            .map(|e| {
+                if with_label {
+                    labelled_clipboard_text(e)
+                } else {
+                    clipboard_text(e)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Enter browse mode: jump cursor to last entry, clear anchor.
@@ -1918,57 +2114,90 @@ impl ChatState {
             .is_some_and(|(lo, hi)| idx >= lo && idx <= hi)
     }
 
+    /// True when `idx` should render highlighted: in range, in multi-select,
+    /// or matches the lone cursor.
+    fn is_entry_highlighted(&self, idx: usize) -> bool {
+        if self.browse_multi.contains(&idx) {
+            return true;
+        }
+        if self.is_in_browse_range(idx) {
+            return true;
+        }
+        self.browse_cursor == Some(idx)
+    }
+
+    /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
+    fn selected_entries(&self) -> std::collections::BTreeSet<usize> {
+        let mut out = self.browse_multi.clone();
+        if let Some((lo, hi)) = self.browse_range() {
+            for i in lo..=hi {
+                out.insert(i);
+            }
+        } else if let Some(c) = self.browse_cursor {
+            out.insert(c);
+        }
+        out
+    }
+
     /// Rebuild (or incrementally extend) the cached rendered lines from committed entries.
     fn rebuild_lines(&mut self) {
-        // Cap the render window so cached_lines (and its per-frame clone) stays
-        // bounded regardless of conversation length.  Selected entries are always
-        // included even if they fall before the window.
         const MAX_RENDERED_ENTRIES: usize = 1_000;
         let total = self.entries.len();
         let natural_start = total.saturating_sub(MAX_RENDERED_ENTRIES);
-        // Ensure the browse selection range is always visible.
         let start = if let Some((lo, _hi)) = self.browse_range() {
             natural_start.min(lo)
         } else {
             natural_start
         };
 
-        // ── Incremental append path ───────────────────────────────
-        // When only new tail entries were appended and the window hasn't shifted,
-        // extend the existing cache instead of rebuilding from scratch.  This avoids
-        // re-running markdown_to_lines on every prior AgentMessage.
+        // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
             let render_from = start + self.cached_entry_count;
             let show_thoughts = self.show_thoughts;
             let mut new_lines = Vec::new();
+            let mut new_ranges = Vec::new();
             for (rel_idx, entry) in self.entries[render_from..].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
+                let before = new_lines.len();
                 render_entry_into(
                     entry,
-                    self.is_in_browse_range(abs_idx),
+                    self.is_entry_highlighted(abs_idx),
                     show_thoughts,
                     &mut new_lines,
                 );
+                let after = new_lines.len();
+                if after > before {
+                    let base = self.cached_lines.len();
+                    new_ranges.push((abs_idx, base + before, base + after));
+                }
             }
             self.cached_lines.extend(new_lines);
+            self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = total - start;
             self.dirty = LinesDirty::Clean;
             return;
         }
 
-        // ── Full rebuild path ─────────────────────────────────────
+        // Full rebuild path.
         let mut lines = Vec::new();
+        let mut ranges = Vec::new();
         let show_thoughts = self.show_thoughts;
         for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
             let abs_idx = start + rel_idx;
+            let before = lines.len();
             render_entry_into(
                 entry,
-                self.is_in_browse_range(abs_idx),
+                self.is_entry_highlighted(abs_idx),
                 show_thoughts,
                 &mut lines,
             );
+            let after = lines.len();
+            if after > before {
+                ranges.push((abs_idx, before, after));
+            }
         }
         self.cached_lines = lines;
+        self.cached_line_ranges = ranges;
         self.cached_entry_count = total - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
@@ -2251,6 +2480,7 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.browse_cursor = None;
         self.browse_anchor = None;
+        self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
         self.git_branch_last_fetch = None;
@@ -2262,22 +2492,23 @@ impl ChatState {
     }
 }
 
+/// Body-only clipboard text (no role label). Used for single-entry yank.
 fn clipboard_text(entry: &ChatEntry) -> String {
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
             let base = text.as_deref().unwrap_or("");
             if attachments.is_empty() {
-                format!("You: {base}")
+                base.to_string()
             } else {
                 let label = attachments
                     .iter()
                     .map(|a| a.as_ref())
                     .collect::<Vec<&str>>()
                     .join(", ");
-                format!("You: {base} [{label}]")
+                format!("{base} [{label}]")
             }
         }
-        ChatEntry::AgentMessage(t) => format!("Agent: {t}"),
+        ChatEntry::AgentMessage(t) => t.to_string(),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::SystemMessage(t) => t.to_string(),
         ChatEntry::Tool {
@@ -2289,6 +2520,16 @@ fn clipboard_text(entry: &ChatEntry) -> String {
             Some(r) => format!("[tool: {name}] {input_json}\n  \u{2514}\u{2500} {r}"),
             None => format!("[tool: {name}] {input_json}"),
         },
+    }
+}
+
+/// Clipboard text with role label prefix. Used for multi-entry yank so the
+/// reader can tell speakers apart in the joined transcript.
+fn labelled_clipboard_text(entry: &ChatEntry) -> String {
+    match entry {
+        ChatEntry::UserMessage { .. } => format!("You: {}", clipboard_text(entry)),
+        ChatEntry::AgentMessage(_) => format!("Agent: {}", clipboard_text(entry)),
+        _ => clipboard_text(entry),
     }
 }
 
