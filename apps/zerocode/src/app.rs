@@ -281,16 +281,15 @@ pub async fn run(
                     continue;
                 }
 
-                let switch_to: Option<Mode> =
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        match key.code {
-                            KeyCode::Left => Some(mode.cycle(-1)),
-                            KeyCode::Right => Some(mode.cycle(1)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                let switch_to: Option<Mode> = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Left => Some(mode.cycle(-1)),
+                        KeyCode::Right => Some(mode.cycle(1)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if let Some(next) = switch_to {
                     if mode == Mode::Quickstart && next != Mode::Quickstart {
                         quickstart.dismiss_beacon().await;

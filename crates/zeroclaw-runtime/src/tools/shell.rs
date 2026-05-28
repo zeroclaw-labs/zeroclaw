@@ -356,11 +356,7 @@ impl Tool for ShellTool {
                 tokio::time::timeout(POST_EXIT_DRAIN, drain_stdout),
                 tokio::time::timeout(POST_EXIT_DRAIN, drain_stderr),
             );
-            Ok::<_, std::io::Error>((
-                status,
-                out.unwrap_or_default(),
-                err.unwrap_or_default(),
-            ))
+            Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
         };
 
         match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {

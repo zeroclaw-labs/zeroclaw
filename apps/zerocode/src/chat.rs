@@ -1363,10 +1363,7 @@ fn render_entry_into(
     };
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
-            let label_span = Span::styled(
-                "You: ",
-                theme::user_label_style().add_modifier(sel_mod),
-            );
+            let label_span = Span::styled("You: ", theme::user_label_style().add_modifier(sel_mod));
             let body_style = theme::body_style().add_modifier(sel_mod);
             let mut text_lines: Vec<&str> = match text {
                 Some(t) => t.split('\n').collect(),

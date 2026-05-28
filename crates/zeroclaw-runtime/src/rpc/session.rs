@@ -293,10 +293,7 @@ impl SessionStore {
             return 0;
         }
         {
-            let mut tokens = self
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
             for id in &stale {
                 if let Some(token) = tokens.remove(id) {
                     token.cancel();
