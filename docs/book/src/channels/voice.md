@@ -30,9 +30,9 @@ from_number = "+14155550123"
 webhook_port = 8090                            # default 8090; embedded webhook server
 require_outbound_approval = true               # default true; require operator approval before dialing
 transcription_logging = true                   # default true; persist call transcripts
-tts_voice = ""                                 # optional voice ID override (provider-specific)
+# tts_voice = ""                               # optional voice ID override (provider-specific); omit to use provider default
 max_call_duration_secs = 3600                  # default 3600 (1 hour cap)
-webhook_base_url = ""                          # optional public base URL when behind a tunnel/proxy
+# webhook_base_url = ""                        # optional public base URL when behind a tunnel/proxy; omit to use the localhost fallback
 ```
 
 Traditional carrier voice — the agent picks up, transcribes the caller, replies with TTS. Higher latency than ClawdTalk but works with any regular phone number and doesn't require SIP trunk provisioning. Outbound calls hit `from_number` and require operator approval when `require_outbound_approval` is on.
