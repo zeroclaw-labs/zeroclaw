@@ -4844,9 +4844,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
 
     let mut updated = config.clone();
     if !updated.channels.telegram.contains_key("default") {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `zeroclaw onboard channels` first"
-        );
+        anyhow::bail!("Telegram channel is not configured. Run `zeroclaw onboard channels` first");
     }
 
     // Locate (or create) the peer group bound to telegram.default. The
