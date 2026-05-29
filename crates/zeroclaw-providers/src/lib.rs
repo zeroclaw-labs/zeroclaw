@@ -786,7 +786,8 @@ pub fn provider_runtime_options_for_alias(
 
 /// Options to use when building a provider from a name that may be either
 /// a bare family or a dotted alias. Dotted names yield alias-resolved
-/// options; bare names return `fallback` unchanged.
+/// options; bare names inherit only provider-agnostic settings from
+/// `fallback`.
 pub fn options_for_provider_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -797,6 +798,7 @@ pub fn options_for_provider_ref(
         None => {
             let mut options = fallback.clone();
             options.provider_kind = None;
+            options.provider_api_url = None;
             options
         }
     }
@@ -2485,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn route_provider_options_clear_inherited_provider_kind_for_bare_routes() {
+    fn route_provider_options_clear_primary_only_state_for_bare_routes() {
         let inherited = ModelProviderRuntimeOptions {
             provider_kind: Some("openai-compatible".to_string()),
             provider_api_url: Some("http://primary.example/v1".to_string()),
@@ -2496,10 +2498,33 @@ mod tests {
         let route_options = options_for_provider_ref(&config, "openrouter", &inherited);
 
         assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_api_url, None);
+    }
+
+    #[test]
+    fn routed_bare_provider_does_not_inherit_primary_endpoint() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("http://primary.example/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
         assert_eq!(
-            route_options.provider_api_url.as_deref(),
+            options.provider_api_url.as_deref(),
             Some("http://primary.example/v1")
         );
+
+        let route_options = options_for_provider_ref(&config, "openrouter", &options);
+
+        assert_eq!(route_options.provider_kind, None);
+        assert_eq!(route_options.provider_api_url, None);
     }
 
     #[test]
