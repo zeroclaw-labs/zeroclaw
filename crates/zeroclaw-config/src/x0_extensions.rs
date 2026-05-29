@@ -954,12 +954,18 @@ pub fn default_conscience_norms() -> Vec<NormConfigSerde> {
 
 impl Default for ConscienceConfig {
     fn default() -> Self {
-        // Mirrors crate::conscience::types::Thresholds::default().
+        // Calibrated against the conscience gate's scoring formula, whose
+        // score ceiling is 0.80 for the most pro-act tool — at the prior
+        // defaults (allow=0.80, ask=0.55, block=0.45) nothing actually
+        // crossed into Allow because the comparison is strictly above.
+        // Lowered to 0.70/0.50/0.30 so default-shaped low-harm tools
+        // (file_read, glob_search, …) actually pass, write/edit lands in
+        // Ask, and shell/pay/delete lands in Block.
         Self {
             gate_enabled: false,
-            allow_threshold: 0.80,
-            ask_threshold: 0.55,
-            block_threshold: 0.45,
+            allow_threshold: 0.70,
+            ask_threshold: 0.50,
+            block_threshold: 0.30,
             default_norms: default_conscience_norms(),
         }
     }

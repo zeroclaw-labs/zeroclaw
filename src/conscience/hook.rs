@@ -30,6 +30,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::x0_extensions::{ConscienceConfig, NormConfigSerde};
@@ -38,6 +39,9 @@ use zeroclaw_runtime::hooks::{HookHandler, HookResult};
 use super::gate::evaluate_tool_call;
 use super::ledger::IntegrityLedger;
 use super::types::{GateVerdict, Norm, NormAction, NormConfig, Thresholds};
+
+/// Filename of the persisted integrity ledger under `<data_dir>/conscience/`.
+const LEDGER_FILENAME: &str = "ledger.json";
 
 /// Per-Agent hook that wraps the conscience module's gate evaluation.
 ///
@@ -55,10 +59,36 @@ pub struct ConscienceHook {
     thresholds: Thresholds,
     norms: Vec<Norm>,
     ledger: Arc<Mutex<IntegrityLedger>>,
+    /// File path the ledger autosaves to after each recorded violation.
+    /// `None` for in-memory-only operation (tests and the convenience
+    /// `ConscienceHook::new` constructor).
+    ledger_path: Option<PathBuf>,
 }
 
 impl ConscienceHook {
+    /// In-memory hook with no disk persistence. Convenient for tests
+    /// and one-off usage; production code in `register_hook_factory`
+    /// goes through [`Self::with_persistence`] instead.
     pub fn new(cfg: &ConscienceConfig) -> Self {
+        Self::build(cfg, None, IntegrityLedger::new())
+    }
+
+    /// Hook that loads its starting ledger from `<data_dir>/conscience/ledger.json`
+    /// and autosaves back to it after every recorded violation. A missing
+    /// or corrupt file falls back to a fresh healthy ledger so a first
+    /// boot — or a deliberate ledger wipe — doesn't make the gate refuse
+    /// to load.
+    pub fn with_persistence(cfg: &ConscienceConfig, data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("conscience").join(LEDGER_FILENAME);
+        let ledger = IntegrityLedger::load_or_default(&path);
+        Self::build(cfg, Some(path), ledger)
+    }
+
+    fn build(
+        cfg: &ConscienceConfig,
+        ledger_path: Option<PathBuf>,
+        ledger: IntegrityLedger,
+    ) -> Self {
         Self {
             thresholds: Thresholds {
                 allow_above: cfg.allow_threshold,
@@ -70,7 +100,8 @@ impl ConscienceHook {
                 .iter()
                 .map(|s| convert_norm(s).into_runtime_norm())
                 .collect(),
-            ledger: Arc::new(Mutex::new(IntegrityLedger::new())),
+            ledger: Arc::new(Mutex::new(ledger)),
+            ledger_path,
         }
     }
 
@@ -126,8 +157,30 @@ impl HookHandler for ConscienceHook {
         // the gate is rejecting on.
         if !matches!(verdict, GateVerdict::Allow) {
             let harm = (1.0 - score).clamp(0.0, 1.0);
-            if let Ok(mut guard) = self.ledger.lock() {
+            // Take a clone of the path so we can write to disk
+            // *outside* the mutex critical section — file I/O on the
+            // hot path would otherwise stall every subsequent gate
+            // call queued on the lock.
+            let path = self.ledger_path.clone();
+            let snapshot: Option<IntegrityLedger> = if let Ok(mut guard) = self.ledger.lock() {
                 guard.record_violation(&name, harm);
+                path.is_some().then(|| guard.clone())
+            } else {
+                None
+            };
+            if let (Some(path), Some(snap)) = (path, snapshot)
+                && let Err(err) = snap.save(&path)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "path": path.display().to_string(),
+                            "error": err.to_string(),
+                        })),
+                    "IntegrityLedger autosave failed; in-memory state still authoritative"
+                );
             }
         }
 
@@ -185,7 +238,13 @@ impl NormConfig {
 pub fn register_hook_factory() {
     zeroclaw_runtime::hooks::registry::register_factory(Box::new(|cfg: &Config| {
         if cfg.conscience.gate_enabled {
-            vec![Box::new(ConscienceHook::new(&cfg.conscience))]
+            // Production path: persist to <data_dir>/conscience/ledger.json
+            // so violations survive restarts. Tests construct the hook
+            // via ConscienceHook::new directly to keep state in memory.
+            vec![Box::new(ConscienceHook::with_persistence(
+                &cfg.conscience,
+                &cfg.data_dir,
+            ))]
         } else {
             Vec::new()
         }
@@ -196,24 +255,12 @@ pub fn register_hook_factory() {
 mod tests {
     use super::*;
 
-    fn permissive_cfg() -> ConscienceConfig {
-        // The gate's harm map keeps every tool's max possible score at
-        // 0.80, which exactly equals the default allow_threshold — at
-        // those defaults nothing ever crosses into Allow territory.
-        // Tests that exercise the Allow path lower the threshold so
-        // realistic low-harm tools can actually pass.
-        let mut cfg = ConscienceConfig::default();
-        cfg.allow_threshold = 0.70;
-        cfg.ask_threshold = 0.50;
-        cfg.block_threshold = 0.30;
-        cfg
-    }
-
     #[tokio::test]
     async fn allow_path_passes_args_through() {
-        let hook = ConscienceHook::new(&permissive_cfg());
-        // file_read is a low-harm tool name; at the relaxed thresholds
-        // (allow_threshold=0.70) its 0.74 score falls in Allow.
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::new(&cfg);
+        // file_read is a low-harm tool name (scores 0.74); at the shipped
+        // defaults (allow_above=0.70) it falls in Allow.
         let result = hook
             .before_tool_call("file_read".into(), Value::Null)
             .await;
@@ -268,7 +315,8 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_call_does_not_record_a_violation() {
-        let hook = ConscienceHook::new(&permissive_cfg());
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::new(&cfg);
         let ledger_handle = hook.ledger();
 
         let _ = hook
@@ -299,6 +347,86 @@ mod tests {
             state.recent_violations >= 3,
             "three blocked calls should leave at least three violations; got {}",
             state.recent_violations
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_autosaves_to_disk_on_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::with_persistence(&cfg, tmp.path());
+        let path = tmp.path().join("conscience").join("ledger.json");
+
+        // No file yet — first violation should create it.
+        let _ = hook
+            .before_tool_call("shell".into(), Value::Null)
+            .await;
+
+        assert!(
+            path.exists(),
+            "violation must autosave the ledger to disk at {}",
+            path.display()
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "saved file must not be empty");
+        let reloaded: IntegrityLedger = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !reloaded.violations.is_empty(),
+            "reloaded ledger should carry the violation we just produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_state_survives_a_simulated_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ConscienceConfig::default();
+
+        // First "process": land two violations.
+        {
+            let hook = ConscienceHook::with_persistence(&cfg, tmp.path());
+            for _ in 0..2 {
+                let _ = hook
+                    .before_tool_call("shell".into(), Value::Null)
+                    .await;
+            }
+        }
+
+        // Second "process": a fresh hook should pick up the saved ledger.
+        let hook2 = ConscienceHook::with_persistence(&cfg, tmp.path());
+        let state = hook2.ledger().lock().unwrap().to_self_state();
+        assert!(
+            state.recent_violations >= 2,
+            "ledger must reload from disk; saw {} recent_violations",
+            state.recent_violations,
+        );
+        assert!(
+            state.integrity_score < 1.0,
+            "integrity_score must reflect the persisted violations; got {}",
+            state.integrity_score,
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_load_falls_back_when_file_is_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Plant a junk file at the expected path.
+        std::fs::create_dir_all(tmp.path().join("conscience")).unwrap();
+        std::fs::write(
+            tmp.path().join("conscience").join("ledger.json"),
+            b"not valid json",
+        )
+        .unwrap();
+
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::with_persistence(&cfg, tmp.path());
+        let state = hook.ledger().lock().unwrap().to_self_state();
+        assert_eq!(
+            state.recent_violations, 0,
+            "corrupt persisted ledger must fall back to a fresh healthy state"
+        );
+        assert_eq!(
+            state.integrity_score, 1.0,
+            "corrupt file → fresh ledger → score 1.0"
         );
     }
 }

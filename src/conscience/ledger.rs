@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use super::types::{RepairPlan, SelfState};
 
@@ -56,6 +57,49 @@ impl Default for IntegrityLedger {
 impl IntegrityLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read a serialised ledger from `path`. Returns `Self::default()`
+    /// (i.e. a fresh healthy ledger) when the file is missing, empty,
+    /// or unparseable — fresh-start semantics rather than failing closed.
+    /// The error path is intentionally silent here; callers that need a
+    /// hard failure should call [`Self::load`] (TODO when wanted).
+    pub fn load_or_default(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() => {
+                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "path": path.display().to_string(),
+                                "error": e.to_string(),
+                            })),
+                        "IntegrityLedger: corrupt persistence file, starting fresh"
+                    );
+                    Self::default()
+                })
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Atomically persist this ledger to `path`. Writes to `path.tmp`
+    /// first, then renames so partial writes don't leave the file in
+    /// a half-serialised state. Creates the parent directory if missing.
+    /// Returns an `io::Error` on filesystem failure; callers in the hot
+    /// path typically `.ok()` it so a temporarily-unwritable disk
+    /// doesn't break tool dispatch.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     pub fn record_violation(&mut self, action_name: &str, harm_level: f64) -> String {

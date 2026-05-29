@@ -136,10 +136,15 @@ impl NormConfig {
 
 impl Default for Thresholds {
     fn default() -> Self {
+        // Kept in sync with ConscienceConfig::default in
+        // crates/zeroclaw-config/src/x0_extensions.rs. The gate's score
+        // formula caps at 0.80 for the most pro-act tool, so allow_above
+        // of 0.70 lets default-shaped low-harm tools (file_read, etc.)
+        // actually cross into Allow.
         Self {
-            allow_above: 0.80,
-            ask_above: 0.55,
-            block_below: 0.45,
+            allow_above: 0.70,
+            ask_above: 0.50,
+            block_below: 0.30,
         }
     }
 }
