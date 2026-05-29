@@ -487,7 +487,25 @@ pub async fn run_gateway(
         None
     };
 
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "host": host,
+                        "port": port,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: host:port did not parse as a SocketAddr; falling back to \
+                 127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
+                 POST /admin/reload."
+            );
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
@@ -501,8 +519,8 @@ pub async fn run_gateway(
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
     let model_provider_name = boot_family.as_str();
-    let model_provider: Arc<dyn ModelProvider> = Arc::from(
-        zeroclaw_providers::create_resilient_model_provider_from_ref(
+    let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
+        match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
             model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
@@ -513,8 +531,29 @@ pub async fn run_gateway(
                 &boot_family,
                 &boot_alias,
             ),
-        )?,
-    );
+        ) {
+            Ok(p) => (Arc::from(p), false),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": model_provider_name,
+                            "alias": boot_alias,
+                            "error": format!("{e}"),
+                        })),
+                    "Gateway: seed model_provider failed to construct; booting in \
+                     needs_quickstart mode so /quickstart and /admin/reload stay \
+                     reachable. Fix the [providers.models.<type>.<alias>] entry \
+                     and POST /admin/reload."
+                );
+                (
+                    Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
+                    true,
+                )
+            }
+        };
     // Model resolution (1) the first-model_provider's `model`,
     // (2) the first configured `[providers.models.<type>.<alias>]`
     // model with a WARN naming what to set, (3) leave the model empty so
@@ -528,14 +567,16 @@ pub async fn run_gateway(
     // `?agent=` parameter; this resolution is purely the seed value the
     // gateway uses for boot-time logging and the AppState default model
     // string.
-    let model = match fallback
-        .and_then(|e| e.model.as_deref())
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        Some(m) => m.to_string(),
-        None => {
-            match config.resolve_default_model() {
+    let model = if boot_provider_failed {
+        String::new()
+    } else {
+        match fallback
+            .and_then(|e| e.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.resolve_default_model() {
                 Some(m) => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set \
@@ -553,7 +594,7 @@ pub async fn run_gateway(
                     );
                     String::new()
                 }
-            }
+            },
         }
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
@@ -571,16 +612,47 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
+        match zeroclaw_memory::create_memory_with_storage_and_routes(
             &config.memory,
             &config.embedding_routes,
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
-        )?)
+        ) {
+            Ok(m) => Arc::from(m),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "Gateway: memory backend failed to construct; falling back to \
+                     NoneMemory so the gateway can still boot. Fix [memory] and \
+                     POST /admin/reload."
+                );
+                Arc::new(zeroclaw_memory::NoneMemory::new("none"))
+            }
+        }
     };
-    let runtime: Arc<dyn platform::RuntimeAdapter> =
-        Arc::from(platform::create_runtime(&config.runtime)?);
+    let runtime: Arc<dyn platform::RuntimeAdapter> = match platform::create_runtime(&config.runtime)
+    {
+        Ok(r) => Arc::from(r),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "runtime_kind": config.runtime.kind,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: runtime adapter failed to construct; falling back to \
+                     NativeRuntime so the gateway can still boot. Fix [runtime] and \
+                     POST /admin/reload."
+            );
+            Arc::new(platform::NativeRuntime::new())
+        }
+    };
     // Gateway is infrastructure — it doesn't run as an agent. Endpoints
     // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
     // ACP `session/new`, agent-scoped tools/memory) take it from the
@@ -1013,7 +1085,23 @@ pub async fn run_gateway(
         .filter(|p| !p.is_empty());
 
     // ── Tunnel ────────────────────────────────────────────────
-    let tunnel = zeroclaw_runtime::tunnel::create_tunnel(&config.tunnel)?;
+    let tunnel = match zeroclaw_runtime::tunnel::create_tunnel(&config.tunnel) {
+        Ok(t) => t,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": config.tunnel.tunnel_provider,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel adapter failed to construct; booting without a \
+                 tunnel. Fix [tunnel] and POST /admin/reload."
+            );
+            None
+        }
+    };
     let mut tunnel_url: Option<String> = None;
 
     if let Some(ref tun) = tunnel {
@@ -1868,6 +1956,38 @@ struct GatewayChatOutcome {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cost_usd: Option<f64>,
+}
+
+struct UnconfiguredModelProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for UnconfiguredModelProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "needs_quickstart: gateway booted without a working model_provider. \
+             Complete browser quickstart at /quickstart, or fix \
+             [providers.models.<type>.<alias>] and POST /admin/reload."
+        )
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for UnconfiguredModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "unconfigured"
+    }
 }
 
 /// Returns a structured `needs_quickstart` error when `model` is empty
@@ -3448,6 +3568,48 @@ mod tests {
             panic!(
                 "gateway exited during boot when agent.risk_profile was unresolved \
                  — must stay up so operator can fix via /admin/reload or /quickstart: {:?}",
+                result
+            );
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("anthropic/claude-sonnet-4-6".to_string()),
+                    api_key: Some("sk-test-openai-shaped-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            &mut Box::pin(async {
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => panic!("test setup timed out before checking gateway state"),
+        }
+
+        if handle.is_finished() {
+            let result = handle.await.expect("task did not panic");
+            panic!(
+                "gateway exited during boot when seed provider API key was \
+                 mismatched — must stay up so operator can fix via /admin/reload \
+                 or /quickstart: {:?}",
                 result
             );
         }
