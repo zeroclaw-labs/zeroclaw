@@ -1,4 +1,4 @@
-import { getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
+import { apiFetch, getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
 
 export interface AgentSummary {
   alias: string;
@@ -23,6 +23,47 @@ export interface AgentSummary {
   monthCostUsd: number | null;
   /** Persisted memory rows attributed to this agent via `agent_alias`. */
   memoryCount: number;
+  /** Full URL (`http://host:port`) for the agent's dedicated gateway when
+   * [agents.<alias>].gateway_port is set; `null` when the agent shares
+   * the global gateway. Sourced from `/api/agents/summary`. */
+  gatewayUrl: string | null;
+  /** Effective gateway port — per-agent override when set, else the
+   * global `gateway.port`. */
+  gatewayPort: number | null;
+  /** True when the daemon spawned a dedicated supervised gateway for
+   * this agent. Lets the dashboard render an "isolated" badge without
+   * re-parsing the URL string. */
+  dedicatedGateway: boolean;
+}
+
+/** Shape returned by the gateway's `/api/agents/summary` endpoint. The
+ *  field names mirror the Rust `AgentSummary` struct in
+ *  `crates/zeroclaw-gateway/src/api_agents.rs`. */
+interface ApiAgentSummaryRow {
+  alias: string;
+  enabled: boolean;
+  channel_count: number;
+  workspace_dir: string;
+  gateway_url: string | null;
+  gateway_port: number;
+  dedicated_gateway: boolean;
+}
+
+interface ApiAgentsSummaryResponse {
+  global_gateway_url: string;
+  agents: ApiAgentSummaryRow[];
+}
+
+/** One round-trip wrapper for the per-agent gateway info. Falls back to
+ *  an empty map on error so dashboard rendering doesn't break — the
+ *  legacy fields populated via `listProps` still surface. */
+async function loadAgentGatewayInfo(): Promise<Map<string, ApiAgentSummaryRow>> {
+  try {
+    const res = await apiFetch<ApiAgentsSummaryResponse>('/api/agents/summary');
+    return new Map(res.agents.map((row) => [row.alias, row]));
+  } catch {
+    return new Map();
+  }
 }
 
 function entryValue(entry: { populated?: boolean; value?: unknown }): unknown {
@@ -65,6 +106,7 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const sessionsPromise = getSessions().catch(() => []);
   const costPromise = getCost().catch(() => null);
   const memoriesPromise = getMemory().catch(() => []);
+  const gatewayInfoPromise = loadAgentGatewayInfo();
 
   // Reverse-build agent → peer-groups in parallel with the per-agent walks.
   // listProps('peer-groups.<alias>.agents') is the field that names members.
@@ -114,15 +156,19 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         lastActivity: null,
         monthCostUsd: null,
         memoryCount: 0,
+        gatewayUrl: null,
+        gatewayPort: null,
+        dedicatedGateway: false,
       };
     }),
   );
 
-  const [sessions, cost, peerGroups, memories] = await Promise.all([
+  const [sessions, cost, peerGroups, memories, gatewayInfo] = await Promise.all([
     sessionsPromise,
     costPromise,
     peerGroupsPromise,
     memoriesPromise,
+    gatewayInfoPromise,
   ]);
   const memoriesByAgent = memories.reduce<Record<string, number>>((acc, m) => {
     if (m.agent_alias) {
@@ -142,6 +188,13 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
     summary.monthCostUsd = agentCost ? agentCost.cost_usd : null;
     summary.peerGroups = peerGroups[summary.alias] ?? [];
     summary.memoryCount = memoriesByAgent[summary.alias] ?? 0;
+
+    const gw = gatewayInfo.get(summary.alias);
+    if (gw) {
+      summary.gatewayUrl = gw.gateway_url;
+      summary.gatewayPort = gw.gateway_port;
+      summary.dedicatedGateway = gw.dedicated_gateway;
+    }
   }
 
   return summaries;

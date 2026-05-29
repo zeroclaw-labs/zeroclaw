@@ -7,10 +7,12 @@ import {
   Clock,
   Database,
   DollarSign,
+  ExternalLink,
   MessageSquare,
   Pencil,
   Plug,
   Power,
+  Server,
   Shield,
   Sparkles,
   Users,
@@ -145,6 +147,40 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
       </div>
 
       <div className="flex flex-col gap-1.5 mb-4">
+        {/* Gateway info — dedicated per-agent gateway (PR #10) gets an
+            "isolated" badge + click-through to its URL; shared agents
+            get a compact "shared :port" chip. Hidden when no gateway
+            info has been resolved (older daemons without /api/agents/summary). */}
+        {agent.gatewayPort !== null && (
+          <ChipRow icon={Server}>
+            {agent.dedicatedGateway && agent.gatewayUrl ? (
+              <a
+                href={agent.gatewayUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+                className={`${CHIP_CLASS} inline-flex items-center gap-1`}
+                style={{
+                  ...CHIP_STYLE,
+                  color: 'var(--color-status-success)',
+                  background: 'var(--color-status-success-alpha-08)',
+                }}
+                title={`Dedicated per-agent gateway listening on ${agent.gatewayUrl}`}
+              >
+                <span>isolated · :{agent.gatewayPort}</span>
+                <ExternalLink className="h-2.5 w-2.5" />
+              </a>
+            ) : (
+              <span
+                className={CHIP_CLASS}
+                style={CHIP_STYLE}
+                title="Sharing the global gateway port"
+              >
+                shared · :{agent.gatewayPort}
+              </span>
+            )}
+          </ChipRow>
+        )}
+
         {channelCount === 0 ? (
           <ChipRow icon={Wifi}>
             <span>No channels bound</span>
