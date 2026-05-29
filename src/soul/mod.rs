@@ -14,8 +14,9 @@
 pub mod alignment;
 pub mod constitution;
 pub mod model;
-// References removed ModelStrategyConfig; gated behind x0-broken-legacy
-// until the soul model-routing strategy is rebuilt against V3 providers.
+// References removed ModelStrategyConfig; still gated behind
+// x0-broken-legacy until the soul model-routing strategy is rebuilt
+// against V3 providers.
 #[cfg(feature = "x0-broken-legacy")]
 pub mod model_strategy;
 pub mod parser;

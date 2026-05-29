@@ -108,8 +108,7 @@ pub mod verifiable_intent;
 pub mod plugins;
 
 // --- X0 fork modules (require `x0-extended` feature + API porting) ---
-// cognitive depends on consciousness types; gated alongside it.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-extended")]
 pub mod cognitive;
 #[cfg(feature = "x0-extended")]
 pub mod conscience;
@@ -117,8 +116,7 @@ pub mod conscience;
 // are themselves gated to x0-broken-legacy.
 #[cfg(feature = "x0-broken-legacy")]
 pub mod consciousness;
-// continuity depends on consciousness; same gate.
-#[cfg(feature = "x0-broken-legacy")]
+#[cfg(feature = "x0-extended")]
 pub mod continuity;
 // control depends on AppState fields (control_store, control_events_tx)
 // that don't exist in the V3 gateway. Gated behind x0-broken-legacy.

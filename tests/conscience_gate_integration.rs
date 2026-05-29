@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-broken-legacy")]
+#![cfg(feature = "x0-extended")]
 
 //! Conscience gate integration test — PR-2.
 //!

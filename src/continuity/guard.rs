@@ -3,6 +3,12 @@ use std::collections::VecDeque;
 use super::types::{DriftLimits, Identity, IdentityCore};
 
 pub struct ContinuityGuard {
+    // Stored for future drift-limit enforcement against `drift_samples`.
+    // Currently `recent_drift_samples` is observed by external readers
+    // but the guard itself doesn't yet consult the limits; #[allow] keeps
+    // the field reachable for serialisation + clippy quiet under
+    // -D warnings.
+    #[allow(dead_code)]
     drift_limits: DriftLimits,
     whiplash_threshold: f64,
     conservative_mode: bool,

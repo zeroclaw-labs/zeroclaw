@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-broken-legacy")]
+#![cfg(feature = "x0-extended")]
 
 use zeroclaw::continuity::{DriftLimits, PreferenceCategory, PreferenceModel};
 

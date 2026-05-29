@@ -37,14 +37,14 @@ impl HebbianGraph {
     pub fn query_associated(&self, concept: &str, threshold: f64) -> Vec<HebbianEdge> {
         self.edges
             .iter()
-            .filter(|((s, _), &w)| s == concept && w >= threshold)
-            .map(|((s, t), &w)| HebbianEdge {
+            .filter(|((s, _), w)| s == concept && **w >= threshold)
+            .map(|((s, t), w)| HebbianEdge {
                 source: s.clone(),
                 target: t.clone(),
-                strength: w,
+                strength: *w,
                 source_id: String::new(),
                 timestamp: 0,
-                confidence: w,
+                confidence: *w,
             })
             .collect()
     }
