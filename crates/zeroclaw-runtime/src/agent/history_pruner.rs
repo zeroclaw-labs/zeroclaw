@@ -125,8 +125,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
             continue;
         }
 
-        let doomed_ids =
-            extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
+        let doomed_ids = extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
         outcome
             .orphan_tool_call_ids
             .extend(doomed_ids.iter().cloned());
@@ -754,8 +753,7 @@ mod tests {
         // The assistant first emits a brief preamble, then dispatches the
         // tool, then the tool returns. This is the normal flow of a real
         // tool-using turn — Pass 1 must NOT touch it.
-        let tool_calls_assistant =
-            r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
@@ -780,10 +778,8 @@ mod tests {
         // sitting between them. The earlier dispatch is unresolved, so
         // the later assistant + its results are removed to restore a
         // well-formed turn.
-        let first_dispatch =
-            r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
-        let second_dispatch =
-            r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+        let first_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_LOST","name":"shell","arguments":"{}"}]}"#;
+        let second_dispatch = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),

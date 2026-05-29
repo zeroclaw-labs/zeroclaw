@@ -116,7 +116,12 @@ fn hl_color_for_name(name: &str) -> Color {
 fn hl_colors() -> &'static [Color] {
     use std::sync::OnceLock;
     static COLORS: OnceLock<Vec<Color>> = OnceLock::new();
-    COLORS.get_or_init(|| HIGHLIGHT_NAMES.iter().map(|n| hl_color_for_name(n)).collect())
+    COLORS.get_or_init(|| {
+        HIGHLIGHT_NAMES
+            .iter()
+            .map(|n| hl_color_for_name(n))
+            .collect()
+    })
 }
 
 /// Map a file extension to an inkjet `Language`. Returns `None` for
@@ -171,7 +176,12 @@ fn with_highlighter<R>(f: impl FnOnce(&mut Highlighter) -> R) -> R {
 /// Returns one `Vec<Span<'static>>` per line, with `bg` forced as the
 /// background on every span. Falls back to a single plain span per line
 /// when highlighting fails.
-fn highlight_all(text: &str, lang: Language, bg: Color, plain_fg: Color) -> Vec<Vec<Span<'static>>> {
+fn highlight_all(
+    text: &str,
+    lang: Language,
+    bg: Color,
+    plain_fg: Color,
+) -> Vec<Vec<Span<'static>>> {
     let colors = hl_colors();
 
     let events: Vec<HighlightEvent> = match with_highlighter(|hl| {

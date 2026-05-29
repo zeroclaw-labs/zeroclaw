@@ -17,11 +17,7 @@ const PERSIST_CALLS: &[&str] = &[
 ];
 
 /// Evidence that a file isolates its config writes.
-const ISOLATION_MARKERS: &[&str] = &[
-    "config_path",
-    "ZEROCLAW_CONFIG_DIR",
-    "set_var(\"HOME\"",
-];
+const ISOLATION_MARKERS: &[&str] = &["config_path", "ZEROCLAW_CONFIG_DIR", "set_var(\"HOME\""];
 
 #[test]
 fn tests_that_persist_config_isolate_the_path() {
