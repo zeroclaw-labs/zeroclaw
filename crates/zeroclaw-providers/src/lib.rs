@@ -3311,4 +3311,54 @@ mod tests {
             result.err().unwrap()
         );
     }
+
+    /// Regression test: any dotted alias name ("openai.<anything>") must route through
+    /// the alias-aware factory path so the typed config's `requires_openai_auth = true`
+    /// flag is visible to `OpenAIModelProviderConfig::create_provider`. Without this,
+    /// the bare-family path is taken, `dispatch_family_factory` receives `config = None`,
+    /// falls back to the default `OpenAIModelProviderConfig` (where
+    /// `requires_openai_auth = false`), and routes to the standard OpenAI provider
+    /// instead of `OpenAiCodexModelProvider`. The alias can be any user-chosen name —
+    /// it is not hard-coded to "codex" or any other specific string.
+    #[test]
+    fn dotted_alias_routes_openai_codex_via_requires_openai_auth() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        // Use an intentionally arbitrary alias to prove the routing is alias-agnostic.
+        let arbitrary_alias = "qwertfoozp";
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            arbitrary_alias.to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Verify the alias-aware factory path sees `requires_openai_auth = true`
+        // and routes to OpenAiCodexModelProvider. `dispatch_family_factory` is
+        // called directly (no ReliableModelProvider wrapper) so `capabilities()`
+        // reflects the inner provider's values.
+        let result = factory::dispatch_family_factory(
+            Some(&config),
+            "openai",
+            arbitrary_alias,
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "codex alias construction should succeed: {}",
+            result.err().unwrap()
+        );
+        assert!(
+            result.unwrap().capabilities().native_tool_calling,
+            "openai.{arbitrary_alias} with requires_openai_auth=true must route to \
+             OpenAiCodexModelProvider (native_tool_calling=true), not the standard provider"
+        );
+    }
 }

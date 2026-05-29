@@ -16,6 +16,7 @@ use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
 
 use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
 use crate::agent::personality_templates::{TemplateContext, render as render_personality};
+use crate::i18n;
 
 const CUSTOM_OPENAI_COMPAT_LABEL: &str = "Custom OpenAI-compatible endpoint";
 const OPENAI_COMPAT_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1042,6 +1043,13 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
         let api_key_path = format!("{prefix}.api-key");
         if let Some(api_key) = &flags.api_key {
             persist(cfg, &api_key_path, api_key).await?;
+            // An explicit --api-key flag means the user wants standard API-key
+            // auth. If this alias was previously configured for Codex subscription
+            // auth, clear that flag so runtime dispatch stops routing to
+            // OpenAiCodexModelProvider.
+            if picked == "openai" {
+                persist(cfg, &format!("{prefix}.requires-openai-auth"), "false").await?;
+            }
         }
         if let Some(model) = &flags.model {
             persist(cfg, &format!("{prefix}.model"), model).await?;
@@ -1053,18 +1061,76 @@ async fn model_providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags
         // model_provider subsection so the panel reads "Providers › Authentication".
         if flags.api_key.is_none() {
             ui.heading(2, &format!("{display_name} › Authentication"));
-            match prompt_field(cfg, ui, &api_key_path, None).await? {
-                Nav::Back => {
-                    if flags.model_provider.is_some() {
-                        return Ok(Nav::Back);
+
+            // OpenAI supports two auth modes: standard API key (platform.openai.com)
+            // and Codex subscription (ChatGPT Plus/Pro OAuth, no API key needed).
+            // Offer the choice before prompting for credentials.
+            if picked == "openai" {
+                let currently_codex = cfg
+                    .providers
+                    .models
+                    .find("openai", &alias)
+                    .map(|c| c.requires_openai_auth)
+                    .unwrap_or(false);
+                ui.note(&i18n::get_required_cli_string("onboard-openai-auth-note"));
+                let auth_prompt = i18n::get_required_cli_string("onboard-openai-auth-prompt");
+                let auth_items = [
+                    SelectItem::new(i18n::get_required_cli_string("onboard-openai-auth-api-key")),
+                    SelectItem::new(i18n::get_required_cli_string("onboard-openai-auth-codex")),
+                ];
+                let auth_default = if currently_codex { Some(1) } else { Some(0) };
+                let codex_chosen = match ui.select(&auth_prompt, &auth_items, auth_default).await? {
+                    Answer::Back => {
+                        if flags.model_provider.is_some() {
+                            return Ok(Nav::Back);
+                        }
+                        if is_new_entry {
+                            cfg.providers.models.remove_alias(&picked, &alias);
+                            cfg.mark_dirty(&format!("providers.models.{picked}.{alias}"));
+                        }
+                        continue;
                     }
-                    if is_new_entry {
-                        cfg.providers.models.remove_alias(&picked, &alias);
-                        cfg.mark_dirty(&format!("providers.models.{picked}.{alias}"));
+                    Answer::Value(1) => true,
+                    Answer::Value(_) => false,
+                };
+                if codex_chosen {
+                    persist(cfg, &format!("{prefix}.requires-openai-auth"), "true").await?;
+                    persist(cfg, &format!("{prefix}.wire-api"), "responses").await?;
+                    ui.note(&i18n::get_required_cli_string(
+                        "onboard-openai-codex-followup",
+                    ));
+                } else {
+                    if currently_codex {
+                        persist(cfg, &format!("{prefix}.requires-openai-auth"), "false").await?;
                     }
-                    continue;
+                    match prompt_field(cfg, ui, &api_key_path, None).await? {
+                        Nav::Back => {
+                            if flags.model_provider.is_some() {
+                                return Ok(Nav::Back);
+                            }
+                            if is_new_entry {
+                                cfg.providers.models.remove_alias(&picked, &alias);
+                                cfg.mark_dirty(&format!("providers.models.{picked}.{alias}"));
+                            }
+                            continue;
+                        }
+                        Nav::Done => {}
+                    }
                 }
-                Nav::Done => {}
+            } else {
+                match prompt_field(cfg, ui, &api_key_path, None).await? {
+                    Nav::Back => {
+                        if flags.model_provider.is_some() {
+                            return Ok(Nav::Back);
+                        }
+                        if is_new_entry {
+                            cfg.providers.models.remove_alias(&picked, &alias);
+                            cfg.mark_dirty(&format!("providers.models.{picked}.{alias}"));
+                        }
+                        continue;
+                    }
+                    Nav::Done => {}
+                }
             }
             ui.heading(2, display_name);
         }
@@ -2034,7 +2100,9 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
-    use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+    use zeroclaw_config::schema::{
+        AnthropicModelProviderConfig, Config, ModelProviderConfig, WireApi,
+    };
 
     #[test]
     fn next_agent_alias_suggestion_handles_empty_collision_and_growth() {
@@ -2914,6 +2982,170 @@ mod tests {
     // value, regardless of `available`'s ordering. Probe via a recorder
     // that captures the `current: Option<usize>` the picker passes to
     // `ui.select`, and uses Answer::Back to bail without persisting.
+    /// Codex subscription auth: picking "Codex subscription" for an OpenAI provider
+    /// must set `requires_openai_auth = true` and `wire_api = responses`, without
+    /// prompting for an API key.
+    #[tokio::test]
+    async fn openai_codex_subscription_auth_sets_flags() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        let flags = Flags {
+            model: Some("codex-mini-latest".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new()
+            .with("ModelProvider", "OpenAI")
+            // Accept "default" alias via placeholder fallback (no scripted answer needed)
+            .with(
+                i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                i18n::get_required_cli_string("onboard-openai-auth-codex"),
+            );
+
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
+
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default entry should be seeded");
+        assert!(
+            entry.requires_openai_auth,
+            "requires_openai_auth must be true for Codex subscription"
+        );
+        assert_eq!(
+            entry.wire_api,
+            Some(WireApi::Responses),
+            "wire_api must be Responses for Codex subscription"
+        );
+        assert_eq!(entry.model.as_deref(), Some("codex-mini-latest"));
+        assert!(
+            entry.api_key.is_none(),
+            "Codex subscription must not prompt for or store an API key"
+        );
+    }
+
+    /// Switching an existing Codex subscription alias back to API key auth must
+    /// clear `requires_openai_auth` and prompt for the key.
+    #[tokio::test]
+    async fn openai_api_key_auth_clears_codex_flags() {
+        use zeroclaw_config::schema::OpenAIModelProviderConfig;
+
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        // Pre-seed an alias that was previously set up with Codex subscription auth.
+        cfg.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    wire_api: Some(WireApi::Responses),
+                    model: Some("codex-mini-latest".into()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let flags = Flags {
+            model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new()
+            .with("ModelProvider", "OpenAI")
+            .with("Alias", "default")
+            .with(
+                i18n::get_required_cli_string("onboard-openai-auth-prompt"),
+                i18n::get_required_cli_string("onboard-openai-auth-api-key"),
+            )
+            .with("api-key", "sk-test-key");
+
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
+
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default entry should remain configured");
+        assert!(
+            !entry.requires_openai_auth,
+            "requires_openai_auth must be false after switching to API key"
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-key"));
+    }
+
+    /// Regression: `zeroclaw onboard --model-provider openai --api-key sk-...` must
+    /// clear `requires_openai_auth` even when the alias was previously configured for
+    /// Codex subscription auth (forced-flag path, no interactive auth phase).
+    #[tokio::test]
+    async fn openai_forced_api_key_flag_clears_codex_auth() {
+        use zeroclaw_config::schema::OpenAIModelProviderConfig;
+
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+
+        // Pre-seed an alias that was previously set up with Codex subscription auth.
+        cfg.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    wire_api: Some(WireApi::Responses),
+                    model: Some("codex-mini-latest".into()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Rerun onboarding with --model-provider openai --api-key sk-... (forced path).
+        // The interactive auth picker is skipped; requires_openai_auth must still be cleared.
+        let flags = Flags {
+            model_provider: Some("openai".into()),
+            api_key: Some("sk-forced-key".into()),
+            model: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new();
+
+        Box::pin(run(
+            &mut cfg,
+            &mut ui,
+            Some(Section::ModelProviders),
+            &flags,
+        ))
+        .await
+        .unwrap();
+
+        let entry = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default entry should remain configured");
+        assert!(
+            !entry.requires_openai_auth,
+            "requires_openai_auth must be cleared when --api-key flag is used on a Codex alias"
+        );
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("sk-forced-key"),
+            "forced api_key must be persisted"
+        );
+    }
+
     #[tokio::test]
     async fn agent_alias_picker_preselects_stored_value() {
         use zeroclaw_config::schema::AliasedAgentConfig;
