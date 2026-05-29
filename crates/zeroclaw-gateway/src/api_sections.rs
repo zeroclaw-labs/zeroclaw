@@ -1366,7 +1366,7 @@ mod tests {
                 .any(|m| m == "Choose a model for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop_persistent("providers.models.anthropic.default.model", "claude-sonnet")
+        cfg.set_prop("providers.models.anthropic.default.model", "claude-sonnet")
             .unwrap();
         let resp = derive_section_status(&cfg);
         assert!(
@@ -1379,7 +1379,7 @@ mod tests {
                 .any(|m| m == "Set credential/auth for model provider `anthropic.default`.")
         );
 
-        cfg.set_prop_persistent("providers.models.anthropic.default.api_key", "sk-test")
+        cfg.set_prop("providers.models.anthropic.default.api_key", "sk-test")
             .unwrap();
         let resp = derive_section_status(&cfg);
         assert!(!resp.needs_quickstart);
