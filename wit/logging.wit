@@ -46,7 +46,9 @@ interface logging {
         read,
         write,
         delete,
-        list,
+        /// The name of this variant in rust is `list` but that is a reserved
+        /// name in wit-bindgen.
+        list-action,
         query,
         invoke,
         dispatch,
