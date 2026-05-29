@@ -1,0 +1,95 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Centralized logging interface used by all ZeroClaw plugin types.
+///
+/// Plugins call `log-record` to emit structured log events back to the host.
+/// The call is fire-and-forget: `log-record` returns nothing and the host
+/// absorbs all errors silently so that a failed log write can never crash
+/// plugin execution.
+interface logging {
+    use types.{json-string};
+
+    /// Severity level for a log record. Mirrors `Severity` in zeroclaw-log.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Closed taxonomy of actions a plugin may report. Mirrors the `Action`
+    /// enum in zeroclaw-log; no escape hatch variant is provided on purpose.
+    enum plugin-action {
+        start,
+        complete,
+        fail,
+        cancel,
+        skip,
+        timeout,
+        retry,
+        inbound,
+        outbound,
+        send,
+        receive,
+        connect,
+        disconnect,
+        reconnect,
+        spawn,
+        kill,
+        tick,
+        trigger,
+        schedule,
+        approve,
+        reject,
+        defer,
+        read,
+        write,
+        delete,
+        list,
+        query,
+        invoke,
+        dispatch,
+        resolve,
+        register,
+        unregister,
+        load,
+        save,
+        migrate,
+        validate,
+        note,
+    }
+
+    /// Binary outcome reported alongside an action. Absent maps to
+    /// `EventOutcome::Unknown` on the host.
+    enum plugin-outcome {
+        success,
+        failure,
+    }
+
+    /// A structured log event emitted by a plugin.
+    record plugin-event {
+        /// Namespace-qualified function path where the event occurred
+        /// (e.g. `"my_plugin::tool::execute"`). Clarifies the `name` field
+        /// intent from the host-side `Event` type.
+        function-name: string,
+        /// The action being reported.
+        action: plugin-action,
+        /// Optional outcome; absent is interpreted as `EventOutcome::Unknown`.
+        outcome: option<plugin-outcome>,
+        /// Elapsed time for the operation in milliseconds, when known.
+        duration-ms: option<u64>,
+        /// JSON-encoded extra data. The host may parse this based on `action`.
+        /// Use `none` when no supplemental data is available.
+        attrs: option<json-string>,
+        /// Human-readable description of the event. Required.
+        message: string,
+    }
+
+    /// Emit a structured log record to the host runtime.
+    ///
+    /// This function is fire-and-forget: it has no return value and the host
+    /// absorbs all errors silently. A failed log write must never crash or
+    /// interrupt plugin execution.
+    log-record: func(level: log-level, event: plugin-event);
+}

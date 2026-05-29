@@ -293,6 +293,7 @@ interface channel {
 /// All other methods are capability-gated; see `channel-capabilities` for the
 /// Rust trait default each unset flag resolves to.
 world channel-plugin {
+    import logging;
     export plugin-info;
     export channel;
 }
