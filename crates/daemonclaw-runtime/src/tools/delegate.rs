@@ -1289,7 +1289,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -1307,7 +1307,7 @@ mod tests {
                 max_depth: 2,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -1454,7 +1454,7 @@ mod tests {
         }
     }
 
-    fn agentic_config(allowed_tools: Vec<String>, max_iterations: usize) -> DelegateAgentConfig {
+    fn agentic_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
         DelegateAgentConfig {
             provider: "openrouter".to_string(),
             model: "model-test".to_string(),
@@ -1464,7 +1464,6 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools,
-            max_iterations,
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
@@ -1580,7 +1579,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -1694,7 +1693,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -1735,7 +1734,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -1782,7 +1781,7 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_rejects_empty_allowed_tools() {
         let mut agents = HashMap::new();
-        agents.insert("agentic".to_string(), agentic_config(Vec::new(), 10));
+        agents.insert("agentic".to_string(), agentic_config(Vec::new()));
 
         let tool = DelegateTool::new(agents, None, test_security());
         let result = tool
@@ -1805,7 +1804,7 @@ mod tests {
         let mut agents = HashMap::new();
         agents.insert(
             "agentic".to_string(),
-            agentic_config(vec!["missing_tool".to_string()], 10),
+            agentic_config(vec!["missing_tool".to_string()]),
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
@@ -1827,7 +1826,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let config = agentic_config(vec!["echo_tool".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
             Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
@@ -1848,7 +1847,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
-        let config = agentic_config(vec!["delegate".to_string()], 10);
+        let config = agentic_config(vec!["delegate".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
             Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
@@ -1874,30 +1873,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_agentic_respects_max_iterations() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 2);
-        let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
-
-        let provider = InfiniteToolCallProvider;
-        let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2)
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("maximum tool iterations (2)")
-        );
-    }
-
-    #[tokio::test]
     async fn execute_agentic_propagates_provider_errors() {
-        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let config = agentic_config(vec!["echo_tool".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
@@ -1991,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
-        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let config = agentic_config(vec!["mcp_fake".to_string()]);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
 
@@ -2024,7 +2001,7 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
@@ -2078,7 +2055,7 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools: vec!["shell".to_string()],
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
@@ -2149,7 +2126,7 @@ mod tests {
             max_depth: 3,
             agentic: false,
             allowed_tools: Vec::new(),
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
@@ -2178,7 +2155,7 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
@@ -2212,7 +2189,7 @@ mod tests {
             max_depth: 3,
             agentic: false,
             allowed_tools: Vec::new(),
-            max_iterations: 10,
+
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
             skills_directory: None,
@@ -2268,7 +2245,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: Some(0),
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -2296,7 +2273,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
@@ -2324,7 +2301,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: Some(7200),
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -2352,7 +2329,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
@@ -2380,7 +2357,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: Some(3600),
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
@@ -2404,7 +2381,7 @@ mod tests {
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
+
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
@@ -2437,7 +2414,7 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
@@ -2484,7 +2461,7 @@ mod tests {
             max_depth: 3,
             agentic: true,
             allowed_tools: vec!["echo_tool".to_string()],
-            max_iterations: 10,
+
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,

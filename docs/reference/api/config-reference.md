@@ -81,7 +81,6 @@ Operational note for container users:
 | Key | Default | Purpose |
 |---|---|---|
 | `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
-| `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
@@ -90,8 +89,6 @@ Operational note for container users:
 
 Notes:
 
-- Setting `max_tool_iterations = 0` falls back to safe default `10`.
-- If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
 - In CLI, gateway, and channel tool loops, multiple independent tool calls are executed concurrently by default when the pending calls do not require approval gating; result order remains stable.
 - `parallel_tools` applies to the `Agent::turn()` API surface. It does not gate the runtime loop used by CLI, gateway, or channel handlers.
 - `tool_call_dedup_exempt` accepts an array of exact tool names. Tools listed here are allowed to be called multiple times with identical arguments in the same turn, bypassing the dedup check. Example: `tool_call_dedup_exempt = ["browser"]`.
@@ -152,15 +149,15 @@ Pacing controls for slow/local LLM workloads (Ollama, llama.cpp, vLLM). All keys
 | `step_timeout_secs` | _none_ | Per-step timeout: maximum seconds for a single LLM inference turn. Catches a truly hung model without terminating the overall task loop |
 | `loop_detection_min_elapsed_secs` | _none_ | Minimum elapsed seconds before loop detection activates. Tasks completing under this threshold get aggressive loop protection; longer-running tasks receive a grace period |
 | `loop_ignore_tools` | `[]` | Tool names excluded from identical-output loop detection. Useful for browser workflows where `browser_screenshot` structurally resembles a loop |
-| `message_timeout_scale_max` | `4` | Override for the hardcoded timeout scaling cap. The channel message timeout budget is `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)` |
+| `message_timeout_scale_max` | `4` | Override for the hardcoded timeout scaling cap. The channel message timeout budget is `message_timeout_secs * message_timeout_scale_max` |
 
 Notes:
 
 - These settings are intended for local/slow LLM deployments. Cloud-provider users typically do not need them.
 - `step_timeout_secs` operates independently of the total channel message timeout budget. A step timeout abort does not consume the overall budget; the loop simply stops.
 - `loop_detection_min_elapsed_secs` delays loop-detection counting, not the task itself. Loop protection remains fully active for short tasks (the default).
-- `loop_ignore_tools` only suppresses tool-output-based loop detection for the listed tools. Other safety features (max iterations, overall timeout) remain active.
-- `message_timeout_scale_max` must be >= 1. Setting it higher than `max_tool_iterations` has no additional effect (the formula uses `min()`).
+- `loop_ignore_tools` only suppresses tool-output-based loop detection for the listed tools. Other safety features (loop detector, overall timeout, cost budget) remain active.
+- `message_timeout_scale_max` must be >= 1.
 - Example configuration for a slow local Ollama deployment:
 
 ```toml
@@ -294,7 +291,6 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `max_depth` | `3` | Max recursion depth for nested delegation |
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
-| `max_iterations` | `10` | Max tool-call iterations for agentic mode |
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 | `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
@@ -315,7 +311,6 @@ system_prompt = "You are a research assistant."
 max_depth = 2
 agentic = true
 allowed_tools = ["web_search", "http_request", "file_read"]
-max_iterations = 8
 agentic_timeout_secs = 600
 
 [agents.coder]
@@ -706,7 +701,7 @@ Examples:
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
-- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, cap)` and a minimum of `1`. The default cap is `4`; override with `[pacing].message_timeout_scale_max`.
+- Runtime timeout budget is `message_timeout_secs * message_timeout_scale_max`. The default cap is `4`; override with `[pacing].message_timeout_scale_max`.
 - This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.

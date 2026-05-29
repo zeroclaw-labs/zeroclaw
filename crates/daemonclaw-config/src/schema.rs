@@ -621,9 +621,6 @@ pub struct DelegateAgentConfig {
     /// Allowlist of tool names available to the sub-agent in agentic mode.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-    /// Maximum tool-call iterations in agentic mode.
-    #[serde(default = "default_max_tool_iterations")]
-    pub max_iterations: usize,
     /// Optional timeout in seconds for non-agentic sub-agent provider calls.
     /// When `None`, falls back to `[delegate].timeout_secs` (default: 120).
     #[serde(default)]
@@ -745,9 +742,6 @@ fn default_max_depth() -> u32 {
     3
 }
 
-fn default_max_tool_iterations() -> usize {
-    10
-}
 
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
@@ -5689,6 +5683,12 @@ pub struct AutonomyConfig {
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
 
+    /// Allow background shell commands (single `&`).
+    /// When false (default), commands containing `&` are rejected to prevent
+    /// processes that outlive the shell timeout.
+    #[serde(default)]
+    pub allow_background_commands: bool,
+
     /// Additional environment variables allowed for shell tool subprocesses.
     ///
     /// These names are explicitly allowlisted and merged with the built-in safe
@@ -5838,6 +5838,7 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_background_commands: false,
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
@@ -11957,6 +11958,7 @@ auto_save = true
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                allow_background_commands: false,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
@@ -12740,7 +12742,6 @@ default_temperature = 0.7
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
-                max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
