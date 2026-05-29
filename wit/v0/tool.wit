@@ -1,6 +1,7 @@
 package zeroclaw:plugin@0.1.0;
 
 /// Plugin interface for a single callable tool exposed to the ZeroClaw agent loop.
+@unstable(feature = plugins-wit-v0)
 interface tool {
     use types.{json-string};
 
@@ -33,6 +34,7 @@ interface tool {
 ///
 /// Note: `spec()` is a host-side convenience that composes the three metadata
 /// functions above; it is not part of this interface.
+@unstable(feature = plugins-wit-v0)
 world tool-plugin {
     import logging;
     export plugin-info;

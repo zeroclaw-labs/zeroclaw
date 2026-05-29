@@ -1,6 +1,7 @@
 package zeroclaw:plugin@0.1.0;
 
 /// Plugin interface for a messaging platform channel.
+@unstable(feature = plugins-wit-v0)
 interface channel {
     use types.{json-string};
 
@@ -292,6 +293,7 @@ interface channel {
 ///
 /// All other methods are capability-gated; see `channel-capabilities` for the
 /// Rust trait default each unset flag resolves to.
+@unstable(feature = plugins-wit-v0)
 world channel-plugin {
     import logging;
     export plugin-info;

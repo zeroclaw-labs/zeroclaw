@@ -6,6 +6,7 @@ package zeroclaw:plugin@0.1.0;
 /// The call is fire-and-forget: `log-record` returns nothing and the host
 /// absorbs all errors silently so that a failed log write can never crash
 /// plugin execution.
+@unstable(feature = plugins-wit-v0)
 interface logging {
     use types.{json-string};
 
