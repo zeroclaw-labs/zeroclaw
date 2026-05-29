@@ -42,6 +42,14 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Whether this tool's results come from an untrusted external source
+    /// (web, browser, MCP servers, user-provided URLs). When true, the loop
+    /// wraps tool results in `<untrusted_tool_result>` tags as a prompt
+    /// injection defense layer.
+    fn is_untrusted_source(&self) -> bool {
+        self.name().starts_with("mcp_")
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {

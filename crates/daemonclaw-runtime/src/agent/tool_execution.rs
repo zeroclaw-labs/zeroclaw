@@ -100,7 +100,14 @@ pub async fn execute_one_tool(
                 } else {
                     &r.output
                 };
-                let output = scrub_credentials(normalized_output);
+                let scrubbed = scrub_credentials(normalized_output);
+                let output = if tool.is_untrusted_source() {
+                    format!(
+                        "<untrusted_tool_result source=\"{call_name}\">\n{scrubbed}\n</untrusted_tool_result>"
+                    )
+                } else {
+                    scrubbed
+                };
                 let receipt = receipt_generator.map(|receipt_gen| {
                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                 });

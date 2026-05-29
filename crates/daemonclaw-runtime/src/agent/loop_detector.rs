@@ -111,9 +111,12 @@ pub struct LoopDetector {
     window: VecDeque<ToolCallRecord>,
     pre_compaction_hash: Option<u64>,
     post_compaction_matches: u32,
+    output_token_history: VecDeque<u64>,
 }
 
 const POST_COMPACTION_MATCH_LIMIT: u32 = 3;
+const DIMINISHING_RETURNS_WINDOW: usize = 4;
+const DIMINISHING_RETURNS_MIN_TOKENS: u64 = 50;
 
 impl LoopDetector {
     pub fn new(config: LoopDetectorConfig) -> Self {
@@ -122,7 +125,58 @@ impl LoopDetector {
             config,
             pre_compaction_hash: None,
             post_compaction_matches: 0,
+            output_token_history: VecDeque::with_capacity(DIMINISHING_RETURNS_WINDOW + 1),
         }
+    }
+
+    /// Record a failed iteration (all tool calls failed or timed out).
+    /// After N consecutive idle iterations, returns a Break signal.
+    pub fn record_idle_iteration(&mut self, all_failed: bool) -> LoopDetectionResult {
+        if !self.config.enabled {
+            return LoopDetectionResult::Ok;
+        }
+        if all_failed {
+            self.output_token_history.push_back(0);
+        } else {
+            self.output_token_history.clear();
+            return LoopDetectionResult::Ok;
+        }
+        if self.output_token_history.len() > DIMINISHING_RETURNS_WINDOW {
+            self.output_token_history.pop_front();
+        }
+        if self.output_token_history.len() >= DIMINISHING_RETURNS_WINDOW
+            && self.output_token_history.iter().all(|&t| t == 0)
+        {
+            return LoopDetectionResult::Break(format!(
+                "Idle timeout: {} consecutive iterations with all tool calls failing",
+                DIMINISHING_RETURNS_WINDOW
+            ));
+        }
+        LoopDetectionResult::Ok
+    }
+
+    /// Record output tokens for this iteration. When the last N iterations
+    /// all produced fewer than the minimum threshold, returns a Break signal.
+    pub fn record_output_tokens(&mut self, tokens: u64) -> LoopDetectionResult {
+        if !self.config.enabled {
+            return LoopDetectionResult::Ok;
+        }
+        self.output_token_history.push_back(tokens);
+        if self.output_token_history.len() > DIMINISHING_RETURNS_WINDOW {
+            self.output_token_history.pop_front();
+        }
+        if self.output_token_history.len() >= DIMINISHING_RETURNS_WINDOW
+            && self
+                .output_token_history
+                .iter()
+                .all(|&t| t < DIMINISHING_RETURNS_MIN_TOKENS)
+        {
+            return LoopDetectionResult::Break(format!(
+                "Diminishing returns: last {} iterations each produced <{} output tokens",
+                DIMINISHING_RETURNS_WINDOW, DIMINISHING_RETURNS_MIN_TOKENS
+            ));
+        }
+        LoopDetectionResult::Ok
     }
 
     /// Snapshot the current tool-call pattern before compaction.
