@@ -915,6 +915,36 @@ pub async fn run_tool_call_loop(
     let retry_policy = crate::agent::retry::RetryPolicy::default();
     let mut consecutive_retries: u32 = 0;
 
+    // Preflight: if history already exceeds the model's context window on
+    // entry (e.g. after a model switch to a smaller window), compact now.
+    {
+        let preflight_budget = if context_token_budget == 0 {
+            daemonclaw_providers::model_limits::resolve_context_window(
+                provider.context_window_for_model(model),
+                model,
+            )
+        } else {
+            context_token_budget
+        };
+        let estimated = estimate_history_tokens(history);
+        if estimated > preflight_budget {
+            tracing::info!(
+                estimated,
+                budget = preflight_budget,
+                "Preflight: history exceeds model context, compacting before loop entry"
+            );
+            context_pipeline.run(
+                history,
+                &crate::agent::context_pipeline::PipelineContext {
+                    token_budget: preflight_budget,
+                    iteration: 0,
+                    model,
+                    state_dir: None,
+                },
+            );
+        }
+    }
+
     for iteration in 0usize.. {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -950,6 +980,7 @@ pub async fn run_tool_call_loop(
                 token_budget: effective_budget,
                 iteration,
                 model,
+                state_dir: None,
             },
         );
 
@@ -1441,6 +1472,24 @@ pub async fn run_tool_call_loop(
                     let dropped = emergency_history_trim(history, 4);
                     if dropped > 0 {
                         tracing::info!(dropped, "Context recovery: dropped old messages, retrying");
+                        continue;
+                    }
+
+                    // Step 3: reactive compact — run full pipeline aggressively
+                    let freed = context_pipeline.run(
+                        history,
+                        &crate::agent::context_pipeline::PipelineContext {
+                            token_budget: effective_budget / 2,
+                            iteration,
+                            model,
+                            state_dir: None,
+                        },
+                    );
+                    if freed > 0 {
+                        tracing::info!(
+                            tokens_freed = freed,
+                            "Context recovery: reactive compact freed tokens, retrying"
+                        );
                         continue;
                     }
 

@@ -6,6 +6,8 @@
 //!
 //! New stages slot in by priority — lower numbers run first.
 
+use std::path::PathBuf;
+
 use daemonclaw_providers::ChatMessage;
 
 /// Parameters available to every pipeline stage.
@@ -16,6 +18,9 @@ pub struct PipelineContext<'a> {
     pub iteration: usize,
     /// Model name (for provider-specific decisions).
     pub model: &'a str,
+    /// Workspace state directory for persisting large tool results.
+    /// When None, tool-result budget stage is skipped.
+    pub state_dir: Option<&'a PathBuf>,
 }
 
 /// Result from a single pipeline stage.
@@ -50,6 +55,11 @@ impl ContextPipeline {
     /// Build the default pipeline with the standard preemptive stages.
     pub fn default_preemptive() -> Self {
         let mut pipeline = Self::new();
+        pipeline.add(Stage {
+            name: "tool_result_budget",
+            priority: 25,
+            run: stage_tool_result_budget,
+        });
         pipeline.add(Stage {
             name: "microcompact",
             priority: 50,
@@ -106,6 +116,67 @@ impl ContextPipeline {
 }
 
 // ── Built-in stages ─────────────────────────────────────────────────────
+
+const TOOL_RESULT_BUDGET_THRESHOLD: usize = 8000;
+const TOOL_RESULT_BUDGET_PREVIEW_LEN: usize = 200;
+const TOOL_RESULT_BUDGET_PROTECT_LAST: usize = 4;
+
+fn stage_tool_result_budget(
+    history: &mut Vec<ChatMessage>,
+    ctx: &PipelineContext<'_>,
+) -> StageResult {
+    let Some(state_dir) = ctx.state_dir else {
+        return StageResult::default();
+    };
+    let estimated = super::history::estimate_history_tokens(history);
+    if estimated <= ctx.token_budget {
+        return StageResult::default();
+    }
+
+    let results_dir = state_dir.join("tool-results");
+    if std::fs::create_dir_all(&results_dir).is_err() {
+        return StageResult::default();
+    }
+
+    let cutoff = history.len().saturating_sub(TOOL_RESULT_BUDGET_PROTECT_LAST);
+    let mut chars_saved: usize = 0;
+
+    for msg in &mut history[..cutoff] {
+        if msg.role != "tool" || msg.content.len() <= TOOL_RESULT_BUDGET_THRESHOLD {
+            continue;
+        }
+        let id = uuid::Uuid::new_v4();
+        let path = results_dir.join(format!("{id}.txt"));
+        if std::fs::write(&path, &msg.content).is_err() {
+            continue;
+        }
+        let preview = if msg.content.len() > TOOL_RESULT_BUDGET_PREVIEW_LEN {
+            &msg.content[..msg.content
+                .char_indices()
+                .nth(TOOL_RESULT_BUDGET_PREVIEW_LEN)
+                .map_or(msg.content.len(), |(i, _)| i)]
+        } else {
+            &msg.content
+        };
+        let original_len = msg.content.len();
+        msg.content = format!(
+            "{preview}...\n\n[Full result persisted to: {}]",
+            path.display()
+        );
+        chars_saved += original_len.saturating_sub(msg.content.len());
+    }
+
+    if chars_saved > 0 {
+        tracing::info!(
+            chars_saved,
+            "context pipeline: tool_result_budget persisted oversized results"
+        );
+    }
+    StageResult {
+        modified: chars_saved > 0,
+        tokens_freed: chars_saved / 4,
+    }
+}
 
 const MICROCOMPACT_CLEARED: &str = "[Tool result cleared]";
 const MICROCOMPACT_PROTECT_LAST: usize = 6;
