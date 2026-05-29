@@ -79,6 +79,19 @@ pub struct Agent {
     channel_handles: AgentChannelHandles,
 }
 
+#[derive(Debug)]
+pub struct StreamedTurnSuccess {
+    pub response: String,
+    pub new_messages: Vec<ConversationMessage>,
+}
+
+#[derive(Debug)]
+pub struct StreamedTurnError {
+    pub error: anyhow::Error,
+    pub committed_response: String,
+    pub new_messages: Vec<ConversationMessage>,
+}
+
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
 /// cheap (Arc clones); the underlying maps are shared with the live tools.
 #[derive(Clone, Default)]
@@ -498,6 +511,121 @@ impl Agent {
         self.history.clear();
     }
 
+    fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
+        let mut transcript = String::new();
+        for message in messages.iter().filter(|message| message.role != "system") {
+            transcript.push_str("role=");
+            transcript.push_str(&message.role.len().to_string());
+            transcript.push(':');
+            transcript.push_str(&message.role);
+            transcript.push_str(";content=");
+            transcript.push_str(&message.content.len().to_string());
+            transcript.push(':');
+            transcript.push_str(&message.content);
+            transcript.push('\n');
+        }
+        transcript
+    }
+
+    fn response_cache_key_for_messages(
+        &self,
+        messages: &[ChatMessage],
+        effective_model: &str,
+    ) -> Option<String> {
+        if self.temperature != 0.0 || self.response_cache.is_none() {
+            return None;
+        }
+
+        let system = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .map(|message| message.content.as_str());
+        let transcript = Self::encode_response_cache_transcript(messages);
+
+        Some(zeroclaw_memory::response_cache::ResponseCache::cache_key(
+            effective_model,
+            system,
+            &transcript,
+        ))
+    }
+
+    fn drain_steering_messages(
+        steering_rx: &mut Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> Vec<String> {
+        let Some(rx) = steering_rx.as_deref_mut() else {
+            return Vec::new();
+        };
+
+        let mut messages = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        messages
+    }
+
+    async fn append_streamed_user_message_to_history(
+        &mut self,
+        user_message: &str,
+        new_msgs: &mut Vec<ConversationMessage>,
+    ) {
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let _ = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+        }
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {user_message}")
+        } else {
+            format!("{context}[{now}] {user_message}")
+        };
+
+        let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
+        new_msgs.push(user_msg.clone());
+        self.history.push(user_msg);
+    }
+
+    fn marked_partial_response(partial: &str, marker: &str) -> String {
+        if partial.is_empty() {
+            marker.to_string()
+        } else {
+            format!("{partial}\n\n{marker}")
+        }
+    }
+
+    fn append_streamed_assistant_message_to_history(
+        &mut self,
+        content: String,
+        new_msgs: &mut Vec<ConversationMessage>,
+        committed_response: &mut String,
+    ) {
+        let assistant_msg = ConversationMessage::Chat(ChatMessage::assistant(content.clone()));
+        new_msgs.push(assistant_msg.clone());
+        self.history.push(assistant_msg);
+        committed_response.push_str(&content);
+    }
+
     fn should_send_tool_specs(&self) -> bool {
         self.tool_dispatcher.should_send_tool_specs() && !self.tool_specs.is_empty()
     }
@@ -683,7 +811,7 @@ impl Agent {
             policy
         });
 
-        let (provider_name, _provider_alias, agent_model_provider) =
+        let (provider_name, provider_alias, agent_model_provider) =
             match config.resolved_model_provider_for_agent(agent_alias) {
                 Some(resolved) => (resolved.0, resolved.1, Some(resolved.2)),
                 None => {
@@ -845,13 +973,17 @@ impl Agent {
             ),
         };
 
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_from_config(config);
+        let provider_ref = format!("{provider_name}.{provider_alias}");
+        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+            config,
+            provider_name,
+            provider_alias,
+        );
 
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 config,
-                provider_name,
+                &provider_ref,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
                 agent_model_provider.and_then(|e| e.uri.as_deref()),
                 &config.reliability,
@@ -1393,28 +1525,13 @@ impl Agent {
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let prepared_messages = self.prepare_provider_messages(&messages).await?;
 
-            // Response cache: check before LLM call (only for deterministic, text-only prompts)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    zeroclaw_memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
+            // Response cache: check before LLM call (only for deterministic, text-only prompts).
+            // The key must include the whole provider-visible transcript, not just the last user
+            // message, otherwise distinct conversations can collide when their final prompt matches.
+            let cache_key =
+                self.response_cache_key_for_messages(&prepared_messages, &effective_model);
 
             if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
@@ -1559,51 +1676,41 @@ impl Agent {
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(String, Vec<ConversationMessage>)> {
+        self.turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
+            .await
+            .map(|outcome| (outcome.response, outcome.new_messages))
+            .map_err(|err| err.error)
+    }
+
+    pub async fn turn_streamed_with_steering_state(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
+            let system_prompt = self
+                .build_system_prompt()
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                })?;
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
-        if self.auto_save {
-            let _ = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
-
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
-        new_msgs.push(user_msg.clone());
-        self.history.push(user_msg);
+        self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
+            .await;
 
         let effective_model = self.classify_model(user_message);
         let turn_started_at = std::time::Instant::now();
+        let mut committed_response = String::new();
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
@@ -1612,32 +1719,38 @@ impl Agent {
                 .as_ref()
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
-                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                self.append_streamed_assistant_message_to_history(
+                    "[interrupted by user]".to_string(),
+                    &mut new_msgs,
+                    &mut committed_response,
+                );
+                return Err(StreamedTurnError {
+                    error: crate::agent::loop_::ToolLoopCancelled.into(),
+                    committed_response,
+                    new_messages: new_msgs,
+                });
+            }
+
+            for steering_message in Self::drain_steering_messages(&mut steering_rx) {
+                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
+                    .await;
             }
 
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-
-            // Response cache check (same as turn)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    zeroclaw_memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
+            let prepared_messages = match self.prepare_provider_messages(&messages).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return Err(StreamedTurnError {
+                        error,
+                        committed_response,
+                        new_messages: new_msgs,
+                    });
+                }
             };
+
+            // Response cache check (same as turn): include the full provider-visible transcript.
+            let cache_key =
+                self.response_cache_key_for_messages(&prepared_messages, &effective_model);
 
             if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
@@ -1658,14 +1771,16 @@ impl Agent {
                         tokens_used: None,
                         cost_usd: None,
                     });
-                    return Ok((cached, new_msgs));
+                    committed_response.push_str(&cached);
+                    return Ok(StreamedTurnSuccess {
+                        response: committed_response,
+                        new_messages: new_msgs,
+                    });
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
                     cache_type: "response".into(),
                 });
             }
-
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
 
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the model_provider returns content we
@@ -1792,7 +1907,27 @@ impl Agent {
                         }
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
-                    Err(_) => break,
+                    Err(error) => {
+                        if got_stream || !committed_response.is_empty() {
+                            if !streamed_text.is_empty() {
+                                let partial = Self::marked_partial_response(
+                                    &streamed_text,
+                                    "[stream interrupted]",
+                                );
+                                self.append_streamed_assistant_message_to_history(
+                                    partial,
+                                    &mut new_msgs,
+                                    &mut committed_response,
+                                );
+                            }
+                            return Err(StreamedTurnError {
+                                error: anyhow::Error::msg(error.to_string()),
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
+                        break;
+                    }
                 }
             }
             // Drop the stream so we release the borrow on model_provider.
@@ -1802,16 +1937,18 @@ impl Agent {
             // the interruption marker appended. The caller (ws.rs) will
             // persist this truncated message and send an abort frame.
             if was_cancelled {
-                let partial = if streamed_text.is_empty() {
-                    "[interrupted by user]".to_string()
-                } else {
-                    format!("{streamed_text}\n\n[interrupted by user]")
-                };
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        partial.clone(),
-                    )));
-                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                let partial =
+                    Self::marked_partial_response(&streamed_text, "[interrupted by user]");
+                self.append_streamed_assistant_message_to_history(
+                    partial,
+                    &mut new_msgs,
+                    &mut committed_response,
+                );
+                return Err(StreamedTurnError {
+                    error: crate::agent::loop_::ToolLoopCancelled.into(),
+                    committed_response,
+                    new_messages: new_msgs,
+                });
             }
 
             // If streaming produced text, use it as the response and
@@ -1851,7 +1988,16 @@ impl Agent {
                     tokio::select! {
                         biased;
                         () = token.cancelled() => {
-                            return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                            self.append_streamed_assistant_message_to_history(
+                                "[interrupted by user]".to_string(),
+                                &mut new_msgs,
+                                &mut committed_response,
+                            );
+                            return Err(StreamedTurnError {
+                                error: crate::agent::loop_::ToolLoopCancelled.into(),
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
                         }
                         result = chat_fut => result,
                     }
@@ -1860,8 +2006,8 @@ impl Agent {
                 };
                 match chat_result {
                     Ok(resp) => resp,
-                    Err(err) => {
-                        let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    Err(error) => {
+                        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
                         self.observer.record_event(&ObserverEvent::LlmResponse {
                             model_provider: self.model_provider_name.clone(),
                             model: effective_model.clone(),
@@ -1871,7 +2017,11 @@ impl Agent {
                             input_tokens: None,
                             output_tokens: None,
                         });
-                        return Err(err);
+                        return Err(StreamedTurnError {
+                            error,
+                            committed_response,
+                            new_messages: new_msgs,
+                        });
                     }
                 }
             };
@@ -1913,6 +2063,27 @@ impl Agent {
                     text
                 };
 
+                let steering_messages = Self::drain_steering_messages(&mut steering_rx);
+                if !steering_messages.is_empty() {
+                    if !final_text.is_empty() {
+                        let assistant_msg =
+                            ConversationMessage::Chat(ChatMessage::assistant(final_text.clone()));
+                        new_msgs.push(assistant_msg.clone());
+                        self.history.push(assistant_msg);
+                        committed_response.push_str(&final_text);
+                        self.trim_history();
+                    }
+
+                    for steering_message in steering_messages {
+                        self.append_streamed_user_message_to_history(
+                            &steering_message,
+                            &mut new_msgs,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+
                 // Store in response cache
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
@@ -1940,6 +2111,7 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                committed_response.push_str(&final_text);
                 self.trim_history();
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 self.observer.record_event(&ObserverEvent::AgentEnd {
@@ -1949,7 +2121,10 @@ impl Agent {
                     tokens_used: None,
                     cost_usd: None,
                 });
-                return Ok((final_text, new_msgs));
+                return Ok(StreamedTurnSuccess {
+                    response: committed_response,
+                    new_messages: new_msgs,
+                });
             }
 
             // Pre-assign stable IDs to tool calls that don't have one
@@ -2000,10 +2175,14 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        Err(StreamedTurnError {
+            error: anyhow::Error::msg(format!(
+                "Agent exceeded maximum tool iterations ({})",
+                self.config.max_tool_iterations
+            )),
+            committed_response,
+            new_messages: new_msgs,
+        })
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
@@ -2073,9 +2252,8 @@ pub async fn run(
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
     let provider_name = effective_config
-        .first_model_provider_type()
-        .unwrap_or("openrouter")
-        .to_string();
+        .first_model_provider_alias()
+        .unwrap_or_else(|| "openrouter.default".to_string());
     // `Agent::from_config` above has already errored if no model could be resolved,
     // so this telemetry line should always find one. We keep `resolve_default_model`
     // as a cheap secondary lookup and emit "<unresolved>" only if nothing matches —
@@ -2220,6 +2398,170 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "ModelCaptureModelProvider"
+        }
+    }
+
+    struct TranscriptCaptureModelProvider {
+        responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+        seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TranscriptCaptureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.seen_messages.lock().push(request.messages.to_vec());
+            let mut responses = self.responses.lock();
+            if responses.is_empty() {
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(responses.remove(0))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TranscriptCaptureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "TranscriptCaptureModelProvider"
+        }
+    }
+
+    struct StreamingSteeringModelProvider {
+        seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        call_count: AtomicUsize,
+        fail_on_call: Option<usize>,
+        fail_after_delta_on_call: Option<usize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamingSteeringModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.seen_messages.lock().push(request.messages.to_vec());
+            if self.fail_on_call == Some(call) {
+                anyhow::bail!("synthetic provider failure on call {call}");
+            }
+            if self.fail_after_delta_on_call == Some(call) {
+                anyhow::bail!("synthetic provider failure after delta on call {call}");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(if call == 1 { "draft" } else { "final" }.into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.seen_messages.lock().push(request.messages.to_vec());
+            let should_fail = self.fail_on_call == Some(call);
+            let should_fail_after_delta = self.fail_after_delta_on_call == Some(call);
+            let delta = if call == 1 { "draft" } else { "final" }.to_string();
+            futures_util::stream::unfold(0, move |step| {
+                let delta = delta.clone();
+                async move {
+                    match step {
+                        0 if should_fail => Some((
+                            Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                                "synthetic provider failure".into(),
+                            )),
+                            1,
+                        )),
+                        0 => Some((
+                            Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                                zeroclaw_providers::traits::StreamChunk {
+                                    delta,
+                                    is_final: false,
+                                    reasoning: None,
+                                    token_count: 0,
+                                },
+                            )),
+                            1,
+                        )),
+                        1 if should_fail_after_delta => Some((
+                            Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                                "synthetic provider failure after delta".into(),
+                            )),
+                            2,
+                        )),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            Some((Ok(zeroclaw_providers::traits::StreamEvent::Final), 2))
+                        }
+                        _ => None,
+                    }
+                }
+            })
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamingSteeringModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamingSteeringModelProvider"
         }
     }
 
@@ -3179,6 +3521,57 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn from_config_accepts_openai_alias_with_requires_openai_auth() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig, WireApi,
+        };
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5.4".to_string()),
+                    requires_openai_auth: true,
+                    wire_api: Some(WireApi::Responses),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                risk_profile: "test-profile".to_string(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let result = Agent::from_config(&config, "test-agent").await;
+
+        assert!(
+            result.is_ok(),
+            "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
+            result.err().unwrap()
+        );
     }
 
     #[test]
@@ -4164,6 +4557,381 @@ mod tests {
                  AssistantToolCalls — duplicate narration push was not removed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn response_cache_key_uses_full_provider_visible_transcript() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem_a: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let mem_b: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let provider_a = Box::new(TranscriptCaptureModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("from prior transcript".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+            seen_messages: seen_a.clone(),
+        });
+        let provider_b = Box::new(TranscriptCaptureModelProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("from fresh transcript".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+            seen_messages: seen_b.clone(),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent_a = Agent::builder()
+            .model_provider(provider_a)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem_a)
+            .observer(observer.clone())
+            .response_cache(Some(cache.clone()))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .temperature(0.0)
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent_a.seed_history(&[
+            ChatMessage::user("earlier turn"),
+            ChatMessage::assistant("earlier answer"),
+        ]);
+
+        let mut agent_b = Agent::builder()
+            .model_provider(provider_b)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem_b)
+            .observer(observer)
+            .response_cache(Some(cache))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .temperature(0.0)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert_eq!(
+            agent_a.turn("same final prompt").await.unwrap(),
+            "from prior transcript"
+        );
+        assert_eq!(
+            agent_b.turn("same final prompt").await.unwrap(),
+            "from fresh transcript"
+        );
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(
+            seen_b.lock().len(),
+            1,
+            "fresh transcript must not reuse a cache entry written for a different prior transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_commits_streamed_output_before_continuing() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = tokio::spawn(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send("second".into())
+                        .await
+                        .expect("steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "draftfinal");
+
+        let new_chat_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|msg| match msg {
+                ConversationMessage::Chat(message) => {
+                    Some((message.role.as_str(), message.content.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            new_chat_messages
+                .iter()
+                .any(|(role, content)| { *role == "assistant" && *content == "draft" }),
+            "already streamed output must be committed before the steering continuation"
+        );
+        assert!(
+            new_chat_messages
+                .iter()
+                .any(|(role, content)| { *role == "user" && content.contains("second") }),
+            "accepted steering must be retained as its own user turn"
+        );
+
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 2);
+        let second_call = &seen[1];
+        assert!(
+            second_call
+                .iter()
+                .any(|msg| msg.role == "assistant" && msg.content == "draft"),
+            "second provider call must see the committed streamed assistant text"
+        );
+        assert!(
+            second_call
+                .iter()
+                .filter(|msg| msg.role == "user")
+                .any(|msg| msg.content.contains("second")),
+            "second provider call must include the accepted steering user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_error_returns_committed_partial_output() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: Some(2),
+            fail_after_delta_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = tokio::spawn(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send("second".into())
+                        .await
+                        .expect("steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let err = handle
+            .await
+            .expect("turn task should finish")
+            .expect_err("second provider call should fail");
+        assert_eq!(err.committed_response, "draft");
+        assert!(
+            err.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "draft")
+            }),
+            "committed partial assistant output should be returned for persistence after continuation failure"
+        );
+        assert!(
+            err.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "user" && message.content.contains("second"))
+            }),
+            "accepted steering user message should still be returned after continuation failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_error_after_delta_returns_visible_partial_output() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: Some(1),
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let handle = tokio::spawn(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, None)
+                .await
+        });
+
+        assert!(
+            matches!(
+                event_rx.recv().await,
+                Some(TurnEvent::Chunk { delta }) if delta == "draft"
+            ),
+            "the client should see the streamed text before the provider error"
+        );
+
+        let err = handle
+            .await
+            .expect("turn task should finish")
+            .expect_err("provider stream failure should be returned");
+        assert!(
+            err.error
+                .to_string()
+                .contains("synthetic provider failure after delta"),
+            "unexpected error: {}",
+            err.error
+        );
+        assert!(
+            err.committed_response.contains("draft"),
+            "visible streamed text should be committed after a provider stream error"
+        );
+        assert!(
+            err.committed_response.contains("[stream interrupted]"),
+            "persisted partial text should mark that the stream did not complete"
+        );
+        assert!(
+            err.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains("draft"))
+            }),
+            "new messages should carry the visible assistant partial for gateway persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_cancel_before_output_returns_interruption_message() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+
+        let err = agent
+            .turn_streamed_with_steering_state("first", event_tx, Some(cancel_token), None)
+            .await
+            .expect_err("pre-cancelled turn should return cancellation");
+
+        assert!(
+            crate::agent::loop_::is_tool_loop_cancelled(&err.error),
+            "unexpected error: {}",
+            err.error
+        );
+        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert!(
+            err.new_messages.iter().any(|msg| {
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+            }),
+            "cancelled turn should include an assistant interruption marker for persistence"
+        );
     }
 
     // ── Skill tool registration & excluded_tools filtering ──────────

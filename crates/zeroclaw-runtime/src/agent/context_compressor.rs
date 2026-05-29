@@ -318,12 +318,16 @@ impl ContextCompressor {
             return Ok(false);
         }
 
+        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
+        let preserve_media_markers =
+            self.config.summary_model.is_none() && model_provider.supports_vision();
+
         // Build transcript from the middle section
         let middle = &history[start..end];
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            model_provider.supports_vision(),
+            preserve_media_markers,
         );
 
         if transcript.is_empty() {
@@ -331,7 +335,6 @@ impl ContextCompressor {
         }
 
         let message_count = end - start;
-        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
 
         let identifier_note = if self.config.identifier_policy == "strict" {
             "\nIMPORTANT: Preserve all identifiers exactly as they appear."
@@ -515,30 +518,25 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
+fn build_full_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
         let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
     }
-
-    if transcript.len() > max_chars {
-        truncate_chars(&transcript, max_chars)
-    } else {
-        transcript
-    }
+    transcript
 }
 
 fn build_summarizer_transcript(
     messages: &[ChatMessage],
     max_chars: usize,
-    supports_vision: bool,
+    preserve_media_markers: bool,
 ) -> String {
-    let transcript = build_transcript(messages, max_chars);
-    if supports_vision {
+    let transcript = build_full_transcript(messages);
+    if preserve_media_markers {
         // Vision-capable summarizer can read media markers; preserve them so
         // visual content is reflected in the summary (per #6189 contract).
-        return transcript;
+        return truncate_owned_if_needed(transcript, max_chars);
     }
 
     // Non-vision summarizer cannot consume media markers. Strip ALL inbound
@@ -546,7 +544,15 @@ fn build_summarizer_transcript(
     // AUDIO — case-insensitive) instead of just `[IMAGE:...]`, otherwise a
     // local filesystem path can leak into the auxiliary `chat_with_system`
     // payload and the upstream API rejects it as a malformed `image_url.url`.
-    multimodal::strip_media_markers(&transcript)
+    truncate_owned_if_needed(multimodal::strip_media_markers(&transcript), max_chars)
+}
+
+fn truncate_owned_if_needed(s: String, max: usize) -> String {
+    if s.len() > max {
+        truncate_chars(&s, max)
+    } else {
+        s
+    }
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -772,7 +778,7 @@ mod tests {
     #[test]
     fn test_build_transcript() {
         let messages = vec![msg("user", "hello"), msg("assistant", "hi there")];
-        let t = build_transcript(&messages, 10_000);
+        let t = build_full_transcript(&messages);
         assert!(t.contains("USER: hello"));
         assert!(t.contains("ASSISTANT: hi there"));
     }
@@ -815,9 +821,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_summarizer_transcript_strips_media_markers_before_truncation() {
+        let long_path = format!(
+            "/private/tmp/zeroclaw/signal_inbound/{}",
+            "nested-directory/".repeat(12)
+        );
+        let messages = vec![msg(
+            "user",
+            &format!("Please summarize [IMAGE:{long_path}photo.png] after text"),
+        )];
+
+        let transcript = build_summarizer_transcript(&messages, 64, false);
+
+        assert!(
+            !transcript.contains("[IMAGE:"),
+            "non-vision transcript should not retain a split image marker: {transcript}"
+        );
+        assert!(
+            !transcript.contains("/private/tmp"),
+            "non-vision transcript should not leak local path fragments: {transcript}"
+        );
+        assert!(
+            transcript.contains("[media attachment]"),
+            "non-vision transcript should preserve an attachment placeholder: {transcript}"
+        );
+    }
+
+    #[test]
     fn test_build_transcript_truncates() {
         let messages = vec![msg("user", &"x".repeat(1000))];
-        let t = build_transcript(&messages, 100);
+        let t = truncate_owned_if_needed(build_full_transcript(&messages), 100);
         assert!(t.len() <= 103); // 100 + "..."
     }
 
@@ -909,6 +942,39 @@ mod tests {
         let prompt = seen.last().expect("summarizer should be invoked");
         assert!(!prompt.contains("[IMAGE:"));
         assert!(!prompt.contains("/tmp/example.png"));
+    }
+
+    #[tokio::test]
+    async fn compress_if_needed_strips_image_markers_when_summary_model_overrides() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            threshold_ratio: 0.01,
+            summary_model: Some("text-summary-model".to_string()),
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 64);
+        let model_provider = CaptureSummarizerModelProvider {
+            supports_vision: true,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let mut history = vec![
+            msg("system", "sys"),
+            msg("user", "Earlier question [IMAGE:/tmp/summary-override.png]"),
+            msg("assistant", "Earlier answer"),
+            msg("user", "Newest question"),
+        ];
+
+        let result = compressor
+            .compress_if_needed(&mut history, &model_provider, "default-vision-model", None)
+            .await
+            .expect("compression should succeed");
+
+        assert!(result.compressed);
+        let seen = model_provider.seen_messages.lock();
+        let prompt = seen.last().expect("summarizer should be invoked");
+        assert!(!prompt.contains("[IMAGE:"));
+        assert!(!prompt.contains("/tmp/summary-override.png"));
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────────
