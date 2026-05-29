@@ -1424,7 +1424,8 @@ pub async fn run_tool_call_loop(
                     && consecutive_retries < retry_policy.max_retries
                 {
                     consecutive_retries += 1;
-                    let delay = retry_policy.delay_for_attempt(consecutive_retries);
+                    let delay = crate::agent::retry::parse_retry_after(&e)
+                        .unwrap_or_else(|| retry_policy.delay_for_attempt(consecutive_retries));
                     tracing::warn!(
                         error_class = ?error_class,
                         attempt = consecutive_retries,
@@ -1547,6 +1548,43 @@ pub async fn run_tool_call_loop(
                     )))
                     .await;
             }
+        }
+
+        // ── Empty response retry ────────────────────────────────────
+        // If the LLM returned nothing (no text, no tool calls), retry up to 3x.
+        if tool_calls.is_empty()
+            && response_text.trim().is_empty()
+            && consecutive_retries < 3
+        {
+            consecutive_retries += 1;
+            tracing::warn!(
+                attempt = consecutive_retries,
+                iteration = iteration + 1,
+                "Empty LLM response, retrying"
+            );
+            continue;
+        }
+
+        // ── Truncated response continuation ─────────────────────────
+        // If response has no tool calls and appears truncated (long text
+        // ending mid-sentence), inject a continuation prompt and retry.
+        if tool_calls.is_empty()
+            && consecutive_retries < 3
+            && response_text.len() > 500
+            && !response_text.trim_end().ends_with(|c: char| ".!?」】\n".contains(c))
+        {
+            tracing::info!(
+                response_len = response_text.len(),
+                iteration = iteration + 1,
+                "Response appears truncated, requesting continuation"
+            );
+            history.push(ChatMessage::assistant(response_text.clone()));
+            history.push(ChatMessage::user(
+                "[System: your previous response was cut off. Resume directly from where you stopped — do not repeat.]".to_string()
+            ));
+            accumulated_display_text.push_str(&display_text);
+            consecutive_retries += 1;
+            continue;
         }
 
         if tool_calls.is_empty() {
