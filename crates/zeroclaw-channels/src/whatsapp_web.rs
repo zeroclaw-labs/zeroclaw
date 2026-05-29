@@ -1302,9 +1302,6 @@ impl Channel for WhatsAppWebChannel {
                                     is_group,
                                     mapped_phone.as_deref(),
                                 );
-                                if reply_target != chat {
-                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": chat, "to": reply_target})), "LID→phone reply target");
-                                }
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -1525,9 +1522,9 @@ impl Channel for WhatsAppWebChannel {
                                         channel: "whatsapp".to_string(),
                                         channel_alias: Some((*alias).clone()),
                                         sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        // For DMs with LID JIDs, this is the resolved
-                                        // phone JID (see LID→phone resolution above).
+                                        // Reply to the originating chat JID (DM or group),
+                                        // passed through unchanged (library handles
+                                        // LID addressing internally).
                                         reply_target,
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
