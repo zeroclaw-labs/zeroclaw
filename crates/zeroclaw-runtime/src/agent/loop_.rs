@@ -1114,6 +1114,122 @@ async fn consume_provider_streaming_response(
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
 #[allow(clippy::too_many_arguments)]
+/// Bundled call context for [`run_tool_call_loop`].
+///
+/// `run_tool_call_loop` historically takes ~29 positional parameters,
+/// the vast majority of which are propagated unchanged from the caller.
+/// `LoopContext` is the preferred way to call it from new code: fields
+/// are named (so argument-position bugs are caught at compile time),
+/// optional cross-cutting concerns (snapshot, integrity ledger, etc.)
+/// can be added without touching every existing call site, and the
+/// 29-arg form remains available for backward compatibility.
+///
+/// Pattern adapted from `Plans/glimmering-mixing-moore-v2.md` Slice B.
+/// Migrate call sites one at a time — the wrapper [`run_tool_call_loop_ctx`]
+/// destructures the context and forwards into the existing positional
+/// entry point so behaviour stays identical during migration.
+pub struct LoopContext<'a> {
+    pub model_provider: &'a dyn ModelProvider,
+    pub history: &'a mut Vec<ChatMessage>,
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub observer: &'a dyn Observer,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub temperature: Option<f64>,
+    pub silent: bool,
+    pub approval: Option<&'a ApprovalManager>,
+    pub channel_name: &'a str,
+    pub channel_reply_target: Option<&'a str>,
+    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
+    pub max_tool_iterations: usize,
+    pub cancellation_token: Option<CancellationToken>,
+    pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
+    pub hooks: Option<&'a crate::hooks::HookRunner>,
+    pub excluded_tools: &'a [String],
+    pub dedup_exempt_tools: &'a [String],
+    pub activated_tools:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    pub model_switch_callback: Option<ModelSwitchCallback>,
+    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
+    pub strict_tool_parsing: bool,
+    pub max_tool_result_chars: usize,
+    pub context_token_budget: usize,
+    pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub channel: Option<&'a dyn Channel>,
+    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
+    pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
+}
+
+/// Run the agentic tool-call loop using a bundled [`LoopContext`].
+///
+/// Preferred entry point for new code. Destructures the context and
+/// forwards into the legacy positional [`run_tool_call_loop`] so the
+/// 29-arg function remains the single source of truth for loop
+/// behaviour during the gradual call-site migration.
+pub async fn run_tool_call_loop_ctx(ctx: LoopContext<'_>) -> Result<String> {
+    let LoopContext {
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        hooks,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        pacing,
+        strict_tool_parsing,
+        max_tool_result_chars,
+        context_token_budget,
+        shared_budget,
+        channel,
+        receipt_generator,
+        collected_receipts,
+    } = ctx;
+    run_tool_call_loop(
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        hooks,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        pacing,
+        strict_tool_parsing,
+        max_tool_result_chars,
+        context_token_budget,
+        shared_budget,
+        channel,
+        receipt_generator,
+        collected_receipts,
+    )
+    .await
+}
+
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
@@ -1135,7 +1251,10 @@ pub async fn agent_turn(
     strict_tool_parsing: bool,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
-    run_tool_call_loop(
+    // First migrated call site for `LoopContext` (Plan v2 Slice B).
+    // Field order matches the struct definition so future additions stay
+    // easy to spot.
+    run_tool_call_loop_ctx(LoopContext {
         model_provider,
         history,
         tools_registry,
@@ -1149,22 +1268,22 @@ pub async fn agent_turn(
         channel_reply_target,
         multimodal_config,
         max_tool_iterations,
-        None,
-        None,
-        None,
+        cancellation_token: None,
+        on_delta: None,
+        hooks: None,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
         model_switch_callback,
-        &zeroclaw_config::schema::PacingConfig::default(),
+        pacing: &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
-        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
-        0,    // context_token_budget: 0 = disabled (legacy callers)
-        None, // shared_budget: no shared budget for legacy callers
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        shared_budget: None,
         channel,
-        None, // receipt_generator
-        None, // collected_receipts
-    )
+        receipt_generator: None,
+        collected_receipts: None,
+    })
     .await
 }
 
