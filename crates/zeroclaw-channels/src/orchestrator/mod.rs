@@ -2517,6 +2517,34 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     }
 }
 
+/// Shown when the agent turn completes but no visible text remains after sanitization.
+const EMPTY_CHANNEL_REPLY_FALLBACK: &str =
+    "I couldn't produce a visible reply for that message. Please try again.";
+
+/// Ensure channel outbound text is never empty so users don't see typing with no message.
+fn ensure_nonempty_channel_reply(
+    delivered_response: String,
+    outbound_response: &str,
+    channel: &str,
+    reply_target: &str,
+) -> String {
+    if !delivered_response.trim().is_empty() {
+        return delivered_response;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "channel": channel,
+                "reply_target": reply_target,
+                "outbound_len": outbound_response.len(),
+            })),
+        "channel_reply_empty; substituting fallback"
+    );
+    EMPTY_CHANNEL_REPLY_FALLBACK.to_string()
+}
+
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
 ///
 /// Only strips lines from the very beginning of the message that match common
@@ -4081,6 +4109,12 @@ async fn process_channel_message_body(
             } else {
                 sanitized_response
             };
+            delivered_response = ensure_nonempty_channel_reply(
+                delivered_response,
+                &outbound_response,
+                &msg.channel,
+                &msg.reply_target,
+            );
 
             // Append a footer when the response was served by a different model_provider family.
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
@@ -8524,6 +8558,28 @@ mod tests {
             strip_tool_summary_prefix(input),
             "The command output is 42."
         );
+    }
+
+    #[test]
+    fn ensure_nonempty_channel_reply_substitutes_fallback_when_empty() {
+        let result = ensure_nonempty_channel_reply(
+            String::new(),
+            "   ",
+            "whatsapp",
+            "15551234567@s.whatsapp.net",
+        );
+        assert_eq!(result, EMPTY_CHANNEL_REPLY_FALLBACK);
+    }
+
+    #[test]
+    fn ensure_nonempty_channel_reply_preserves_nonempty_text() {
+        let result = ensure_nonempty_channel_reply(
+            "Hello".to_string(),
+            "Hello",
+            "whatsapp",
+            "15551234567@s.whatsapp.net",
+        );
+        assert_eq!(result, "Hello");
     }
 
     #[test]
