@@ -40,7 +40,18 @@ function getPlatform() {
     return { artifact: 'zeroclaw-aarch64-unknown-linux-gnu', ext: '', archive: '.tar.gz' };
   }
   if (platform === 'darwin' && arch === 'x64') {
-    return { artifact: 'zeroclaw-x86_64-apple-darwin', ext: '', archive: '.tar.gz' };
+    throw new Error(
+      'Intel Mac (darwin/x64) prebuilt binaries are not currently published — ' +
+      'the GitHub-hosted macos-13 runner pool stays queued for hours and was ' +
+      'removed from the release matrix in 2026-05.\n' +
+      'Options:\n' +
+      '  1) Build from source: https://github.com/' + REPO + '#build\n' +
+      "  2) If you're on an Apple Silicon Mac running Rosetta, run a fresh shell " +
+      'under arm64 and install again (the aarch64-apple-darwin tarball runs ' +
+      'natively).\n' +
+      '  3) Set ZEROCLAW_SKIP_POSTINSTALL=1 and drop a local zeroclaw binary into ' +
+      'npm/native/zeroclaw.',
+    );
   }
   if (platform === 'darwin' && arch === 'arm64') {
     return { artifact: 'zeroclaw-aarch64-apple-darwin', ext: '', archive: '.tar.gz' };

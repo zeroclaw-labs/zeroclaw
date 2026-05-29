@@ -254,10 +254,12 @@ jobs:
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: zeroclaw
-            ext: tar.gz
+          # x86_64-apple-darwin removed 2026-05-29: GitHub-hosted macos-13
+          # runners are heavily oversubscribed and jobs sit queued for
+          # hours blocking the release. Intel Mac users can build locally
+          # from source or grab a community build until a less-scarce
+          # runner story exists. Re-add when GitHub provisions x86_64
+          # macOS runners reliably or when a dedicated runner is wired in.
           - os: ubuntu-latest
             target: aarch64-linux-android
             artifact: zeroclaw
