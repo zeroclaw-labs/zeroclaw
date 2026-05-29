@@ -96,6 +96,7 @@ pub async fn run(
     let mut mode = Mode::Dashboard;
     let mut show_help = false;
     let mut reload_confirm = false;
+    let mut quit_confirm = false;
     let mut reload_status: Option<String> = None;
     let mut bar_area = Rect::default();
     let mut content_area = Rect::default();
@@ -191,6 +192,9 @@ pub async fn run(
             if reload_confirm {
                 draw_reload_confirm_modal(frame, frame.area());
             }
+            if quit_confirm {
+                draw_quit_confirm_modal(frame, frame.area());
+            }
             if let Some(msg) = &reload_status {
                 draw_reload_status_toast(frame, frame.area(), msg);
             }
@@ -238,8 +242,32 @@ pub async fn run(
                 };
                 let global = GlobalAction::from_chord(&key);
 
+                // Quit-confirm modal. The first exit chord closes any open
+                // transient widgets and arms the modal; a second exit chord —
+                // or an explicit confirm — actually quits. Cancel dismisses.
+                if quit_confirm {
+                    match ModalAction::from_chord(&key) {
+                        Some(ModalAction::Confirm) => break,
+                        Some(ModalAction::Cancel) => {
+                            quit_confirm = false;
+                        }
+                        _ => {
+                            if global == Some(GlobalAction::Quit) {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if global == Some(GlobalAction::Quit) {
-                    break;
+                    // Close all transient widgets, then arm the confirm modal
+                    // rather than exiting outright.
+                    show_help = false;
+                    reload_confirm = false;
+                    reload_status = None;
+                    quit_confirm = true;
+                    continue;
                 }
 
                 // Reload-daemon confirmation modal — intercepts all keys
@@ -681,6 +709,84 @@ fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
         )),
         footer_rect,
     );
+}
+
+fn draw_quit_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
+    let body_lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Quit zerocode?",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The TUI closes. The daemon keeps running; reconnect anytime.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let box_w = area.width.saturating_sub(8).min(60);
+    let box_h = (body_lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let x = area.x + area.width.saturating_sub(box_w) / 2;
+    let y = area.y + area.height.saturating_sub(box_h) / 2;
+    let rect = Rect::new(x, y, box_w, box_h);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Quit? ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let body = Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: false });
+    let body_rect = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(1),
+    );
+    frame.render_widget(body, body_rect);
+
+    let footer_rect = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y + inner.height.saturating_sub(1),
+        inner.width.saturating_sub(2),
+        1,
+    );
+    let footer = format!(
+        "{} = {confirm}   {} = {quit}   {} = {cancel}",
+        chords_for(ModalAction::bindings(), ModalAction::Confirm),
+        chords_for(GlobalAction::bindings(), GlobalAction::Quit),
+        chords_for(ModalAction::bindings(), ModalAction::Cancel),
+        confirm = ModalAction::Confirm.label(),
+        quit = GlobalAction::Quit.label(),
+        cancel = ModalAction::Cancel.label(),
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+        footer_rect,
+    );
+}
+
+/// Render every chord bound to `action` from its `bindings()` table as a
+/// `a/b` display string. Surfaces read the harness; no key literals.
+fn chords_for<ActionType: PartialEq>(
+    bindings: Vec<(crate::keymap::Chord, ActionType)>,
+    action: ActionType,
+) -> String {
+    bindings
+        .into_iter()
+        .filter(|(_, bound_action)| *bound_action == action)
+        .map(|(chord, _)| chord.display())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
