@@ -109,14 +109,37 @@ fn hash_str(s: &str) -> u64 {
 pub struct LoopDetector {
     config: LoopDetectorConfig,
     window: VecDeque<ToolCallRecord>,
+    pre_compaction_hash: Option<u64>,
+    post_compaction_matches: u32,
 }
+
+const POST_COMPACTION_MATCH_LIMIT: u32 = 3;
 
 impl LoopDetector {
     pub fn new(config: LoopDetectorConfig) -> Self {
         Self {
             window: VecDeque::with_capacity(config.window_size),
             config,
+            pre_compaction_hash: None,
+            post_compaction_matches: 0,
         }
+    }
+
+    /// Snapshot the current tool-call pattern before compaction.
+    /// After compaction, if the same pattern re-emerges, the detector
+    /// will abort to prevent infinite compress→loop→compress cycles.
+    pub fn checkpoint_before_compaction(&mut self) {
+        if self.window.is_empty() {
+            self.pre_compaction_hash = None;
+            return;
+        }
+        let mut hasher = DefaultHasher::new();
+        for record in &self.window {
+            record.name.hash(&mut hasher);
+            record.args_hash.hash(&mut hasher);
+        }
+        self.pre_compaction_hash = Some(hasher.finish());
+        self.post_compaction_matches = 0;
     }
 
     /// Record a completed tool call and check for loop patterns.
@@ -145,6 +168,28 @@ impl LoopDetector {
             self.window.pop_front();
         }
         self.window.push_back(record);
+
+        // Post-compaction loop guard: detect re-entry into the same pattern.
+        if let Some(pre_hash) = self.pre_compaction_hash {
+            let mut hasher = DefaultHasher::new();
+            for r in &self.window {
+                r.name.hash(&mut hasher);
+                r.args_hash.hash(&mut hasher);
+            }
+            if hasher.finish() == pre_hash {
+                self.post_compaction_matches += 1;
+                if self.post_compaction_matches >= POST_COMPACTION_MATCH_LIMIT {
+                    return LoopDetectionResult::Break(
+                        "Post-compaction loop guard: agent re-entered the same tool pattern \
+                         after context compaction"
+                            .to_string(),
+                    );
+                }
+            } else {
+                self.post_compaction_matches = 0;
+                self.pre_compaction_hash = None;
+            }
+        }
 
         // Run detectors in escalation order (most severe first).
         if let Some(result) = self.detect_exact_repeat() {

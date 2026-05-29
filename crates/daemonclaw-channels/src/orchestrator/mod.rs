@@ -2774,7 +2774,7 @@ async fn process_channel_message(
     // and preserving key decisions through LLM-driven summarization.
     {
         let cc_config = ctx.prompt_config.agent.context_compression.clone();
-        let compressor = daemonclaw_runtime::agent::context_compressor::ContextCompressor::new(
+        let mut compressor = daemonclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
             ctx.context_token_budget,
         )

@@ -51,6 +51,11 @@ impl ContextPipeline {
     pub fn default_preemptive() -> Self {
         let mut pipeline = Self::new();
         pipeline.add(Stage {
+            name: "microcompact",
+            priority: 50,
+            run: stage_microcompact,
+        });
+        pipeline.add(Stage {
             name: "fast_trim",
             priority: 100,
             run: stage_fast_trim,
@@ -101,6 +106,36 @@ impl ContextPipeline {
 }
 
 // ── Built-in stages ─────────────────────────────────────────────────────
+
+const MICROCOMPACT_CLEARED: &str = "[Tool result cleared]";
+const MICROCOMPACT_PROTECT_LAST: usize = 6;
+const MICROCOMPACT_MIN_CHARS: usize = 500;
+
+fn stage_microcompact(history: &mut Vec<ChatMessage>, ctx: &PipelineContext<'_>) -> StageResult {
+    let estimated = super::history::estimate_history_tokens(history);
+    if estimated <= ctx.token_budget {
+        return StageResult::default();
+    }
+    let cutoff = history.len().saturating_sub(MICROCOMPACT_PROTECT_LAST);
+    let mut chars_saved: usize = 0;
+    for msg in &mut history[..cutoff] {
+        if msg.role == "tool" && msg.content.len() > MICROCOMPACT_MIN_CHARS {
+            chars_saved += msg.content.len() - MICROCOMPACT_CLEARED.len();
+            msg.content = MICROCOMPACT_CLEARED.to_string();
+        }
+    }
+    if chars_saved > 0 {
+        tracing::info!(
+            chars_saved,
+            cleared_before = cutoff,
+            "context pipeline: microcompact cleared old tool results"
+        );
+    }
+    StageResult {
+        modified: chars_saved > 0,
+        tokens_freed: chars_saved / 4,
+    }
+}
 
 fn stage_fast_trim(history: &mut Vec<ChatMessage>, ctx: &PipelineContext<'_>) -> StageResult {
     let estimated = super::history::estimate_history_tokens(history);

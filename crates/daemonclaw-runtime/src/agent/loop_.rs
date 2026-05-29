@@ -3273,7 +3273,7 @@ pub async fn run(
 
             // Context compression before hard trimming to preserve long-context signal.
             {
-                let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                let mut compressor = crate::agent::context_compressor::ContextCompressor::new(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
                 )
