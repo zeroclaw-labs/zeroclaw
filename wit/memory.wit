@@ -279,5 +279,6 @@ interface memory {
 /// which optional methods are live. The default trait implementation is used
 /// for optional methods which are not enabled.
 world memory-plugin {
+    export plugin-info;
     export memory;
 }

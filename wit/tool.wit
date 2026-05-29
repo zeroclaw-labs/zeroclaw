@@ -34,5 +34,6 @@ interface tool {
 /// Note: `spec()` is a host-side convenience that composes the three metadata
 /// functions above; it is not part of this interface.
 world tool-plugin {
+    export plugin-info;
     export tool;
 }
