@@ -1,4 +1,6 @@
-use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{
+    LoopContext, TOOL_LOOP_SESSION_KEY, run_tool_call_loop, run_tool_call_loop_ctx,
+};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -1684,36 +1686,36 @@ impl DelegateTool {
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
+            run_tool_call_loop_ctx(LoopContext {
                 model_provider,
-                &mut history,
-                &sub_tools,
-                &noop_observer,
-                provider_type,
+                history: &mut history,
+                tools_registry: &sub_tools,
+                observer: &noop_observer,
+                provider_name: provider_type,
                 model,
                 temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                max_iterations,
-                Some(self.cancellation_token.child_token()),
-                None,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                agent_config.strict_tool_parsing,
-                0,    // max_tool_result_chars: inherit from parent config in future
-                0,    // context_token_budget: 0 = disabled for subagents
-                None, // shared_budget: TODO thread from parent in future
-                None, // channel: delegate subagents don't support approval
+                silent: true,
+                approval: None,
+                channel_name: "delegate",
+                channel_reply_target: None,
+                multimodal_config: &self.multimodal_config,
+                max_tool_iterations: max_iterations,
+                cancellation_token: Some(self.cancellation_token.child_token()),
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: agent_config.strict_tool_parsing,
+                max_tool_result_chars: 0, // inherit from parent config in future
+                context_token_budget: 0,  // 0 = disabled for subagents
+                shared_budget: None,      // TODO thread from parent in future
+                channel: None,            // delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
-            ),
+            }),
         )
         .await;
 
