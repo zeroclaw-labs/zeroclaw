@@ -22,7 +22,8 @@ pub struct OpenAiModelProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -65,7 +66,8 @@ impl ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,8 +388,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let mut messages = Vec::new();
 
@@ -457,8 +459,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -529,8 +531,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let adjusted_temperature =
+            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -675,7 +677,7 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -692,7 +694,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.0,
+            temperature: Some(0.0),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();

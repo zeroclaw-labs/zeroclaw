@@ -30,7 +30,8 @@ const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -112,7 +113,8 @@ struct ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -561,8 +563,6 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-
         let mut messages = Vec::new();
 
         if let Some(sys) = system_prompt {
@@ -641,8 +641,6 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-
         let api_messages: Vec<Message> = messages
             .iter()
             .map(|m| Message {
@@ -714,8 +712,6 @@ impl ModelProvider for OpenRouterModelProvider {
                 "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
             )
         })?;
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -811,8 +807,6 @@ impl ModelProvider for OpenRouterModelProvider {
                 .boxed();
             }
         };
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -913,8 +907,6 @@ impl ModelProvider for OpenRouterModelProvider {
                 "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
             )
         })?;
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         // Convert tool JSON values to NativeToolSpec
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -1136,7 +1128,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
             messages: vec![],
-            temperature: 0.0,
+            temperature: Some(0.0),
             tools: None,
             tool_choice: None,
             max_tokens: None,
@@ -1151,7 +1143,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
             messages: vec![],
-            temperature: 0.0,
+            temperature: Some(0.0),
             tools: None,
             tool_choice: None,
             max_tokens: None,
@@ -1248,7 +1240,7 @@ mod tests {
                     content: MessageContent::Text("Summarize this".into()),
                 },
             ],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -1282,7 +1274,7 @@ mod tests {
                     content: MessageContent::Text(msg.content.clone()),
                 })
                 .collect(),
-            temperature: 0.0,
+            temperature: Some(0.0),
             max_tokens: None,
         };
 
@@ -1972,7 +1964,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -1988,7 +1980,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2004,7 +1996,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2025,7 +2017,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2041,7 +2033,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2062,7 +2054,7 @@ mod tests {
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![],
-            temperature: 0.7,
+            temperature: Some(0.7),
             tools: None,
             tool_choice: None,
             max_tokens: None,

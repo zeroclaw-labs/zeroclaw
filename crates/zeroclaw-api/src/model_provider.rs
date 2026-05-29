@@ -371,13 +371,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     }
 
     // ── ModelProvider-family defaults ────────────────────────────────────────────
-    // Called by every chat/stream method's `temperature.unwrap_or(self.default_temperature())`
-    // and by `zeroclaw onboard` to prefill prompts with a visible default.
-    // Baselines are the industry-neutral fallback; override per family where
-    // the API docs disagree (Anthropic → 1.0, Ollama → 0.0 for deterministic
-    // local inference).
+    // `temperature` is `Option<f64>` end-to-end on the wire. `None` from the
+    // caller means "do not send a `temperature` field"; serialization handles
+    // that via `#[serde(skip_serializing_if)]`. The `default_temperature()`
+    // method below documents the family's preferred default for non-wire uses
+    // (introspection, tests). It is NOT consulted to substitute a value for
+    // `None` in chat methods.
 
-    /// Temperature used when the caller passes `None`. Override per family.
+    /// Family-preferred temperature default. Override per family. Documented
+    /// for introspection only; never use to convert `None` into a wire value.
     fn default_temperature(&self) -> f64 {
         BASELINE_TEMPERATURE
     }
@@ -416,8 +418,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
     ///
-    /// `temperature == None` means "use `self.default_temperature()`". The
-    /// unwrap lives inside each model_provider impl, not at every call site.
+    /// `temperature == None` means the field is omitted on the wire.
     async fn simple_chat(
         &self,
         message: &str,
@@ -625,12 +626,12 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().capabilities()
     }
 
-    fn default_temperature(&self) -> f64 {
-        self.as_ref().default_temperature()
-    }
-
     fn default_max_tokens(&self) -> u32 {
         self.as_ref().default_max_tokens()
+    }
+
+    fn default_temperature(&self) -> f64 {
+        self.as_ref().default_temperature()
     }
 
     fn default_timeout_secs(&self) -> u64 {

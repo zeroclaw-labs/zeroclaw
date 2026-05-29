@@ -532,19 +532,29 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             }
 
             // Temperature range
-            let temperature = entry.temperature.unwrap_or(0.7);
-            if (0.0..=2.0).contains(&temperature) {
-                items.push(DiagItem::ok(
-                    cat,
-                    format!("{label}: temperature {temperature:.1} (valid range 0.0\u{2013}2.0)"),
-                ));
-            } else {
-                items.push(DiagItem::error(
-                    cat,
-                    format!(
-                        "{label}: temperature {temperature:.1} is out of range (expected 0.0\u{2013}2.0)"
-                    ),
-                ));
+            match entry.temperature {
+                Some(temperature) if (0.0..=2.0).contains(&temperature) => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} (valid range 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                Some(temperature) => {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} is out of range (expected 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                None => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!("{label}: temperature unset (provider default)"),
+                    ));
+                }
             }
         }
         if !found_any {

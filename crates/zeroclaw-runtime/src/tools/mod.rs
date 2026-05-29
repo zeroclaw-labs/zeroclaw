@@ -541,7 +541,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            entry.temperature.unwrap_or(0.7),
+            entry.temperature,
             entry.api_key.clone(),
             llm_task_runtime_options,
         )));

@@ -37,7 +37,7 @@ pub struct Agent {
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
-    temperature: f64,
+    temperature: Option<f64>,
     workspace_dir: std::path::PathBuf,
     /// Per-agent persona workspace (`<install>/agents/<alias>/workspace/`).
     /// Holds IDENTITY.md / SOUL.md / USER.md / AGENTS.md. Distinct from
@@ -285,8 +285,8 @@ impl AgentBuilder {
         self
     }
 
-    pub fn temperature(mut self, temperature: f64) -> Self {
-        self.temperature = Some(temperature);
+    pub fn temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
         self
     }
 
@@ -498,7 +498,7 @@ impl AgentBuilder {
             model_provider_name: self
                 .model_provider_name
                 .unwrap_or_else(|| "<unconfigured>".into()),
-            temperature: self.temperature.unwrap_or(0.7),
+            temperature: self.temperature,
             workspace_dir: self
                 .workspace_dir
                 .clone()
@@ -580,7 +580,7 @@ impl Agent {
         messages: &[ChatMessage],
         effective_model: &str,
     ) -> Option<String> {
-        if self.temperature != 0.0 || self.response_cache.is_none() {
+        if self.temperature != Some(0.0) || self.response_cache.is_none() {
             return None;
         }
 
@@ -697,7 +697,7 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
-    pub fn set_temperature(&mut self, temperature: f64) {
+    pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
 
@@ -1165,11 +1165,7 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .model_name(model_name)
             .model_provider_name(provider_name.to_string())
-            .temperature(
-                agent_model_provider
-                    .and_then(|e| e.temperature)
-                    .unwrap_or(0.7),
-            )
+            .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
@@ -1848,7 +1844,7 @@ impl Agent {
                         thinking: None,
                     },
                     &effective_model,
-                    Some(self.temperature),
+                    self.temperature,
                 )
                 .await
             {
@@ -2114,7 +2110,7 @@ impl Agent {
                     thinking: None,
                 },
                 &effective_model,
-                Some(self.temperature),
+                self.temperature,
                 stream_opts,
             );
 
@@ -2288,7 +2284,7 @@ impl Agent {
                         thinking: None,
                     },
                     &effective_model,
-                    Some(self.temperature),
+                    self.temperature,
                 );
                 let chat_result = if let Some(ref token) = cancel_token {
                     tokio::select! {
@@ -2526,7 +2522,7 @@ pub async fn run(
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
-    temperature: f64,
+    temperature: Option<f64>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -2551,7 +2547,7 @@ pub async fn run(
         if let Some(m) = model_override {
             entry.model = Some(m);
         }
-        entry.temperature = Some(temperature);
+        entry.temperature = temperature;
     }
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
@@ -5059,7 +5055,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
-            .temperature(0.0)
+            .temperature(Some(0.0))
             .build()
             .expect("agent builder should succeed with valid config");
         agent_a.seed_history(&[
@@ -5076,7 +5072,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
-            .temperature(0.0)
+            .temperature(Some(0.0))
             .build()
             .expect("agent builder should succeed with valid config");
 

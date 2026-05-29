@@ -31,7 +31,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[cfg(test)]
@@ -80,15 +81,6 @@ struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
     budget_tokens: u32,
-}
-
-/// Claude opus-4-7 rejects `temperature` with a 400 on the native Anthropic API,
-/// matching the Bedrock behavior fixed in #6144. Omit `temperature` for the
-/// opus-4-7 family so that confirmed #6147 requests use the model default.
-/// Substring match covers any future inference-profile or version-suffix
-/// variants.
-fn anthropic_model_omits_temperature(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
 }
 
 /// Whether a model accepts the fixed-budget native-thinking request shape
@@ -1025,7 +1017,6 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
-    // ── ModelProvider-family defaults ──
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -1078,11 +1069,7 @@ impl ModelProvider for AnthropicModelProvider {
                     cache_control: None,
                 }],
             }],
-            temperature: if anthropic_model_omits_temperature(model) {
-                None
-            } else {
-                temperature
-            },
+            temperature,
             tools: None,
             tool_choice: None,
             stream: None,
@@ -1178,11 +1165,7 @@ impl ModelProvider for AnthropicModelProvider {
             max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature: if anthropic_model_omits_temperature(model) {
-                None
-            } else {
-                effective_temperature
-            },
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: None,
@@ -1373,11 +1356,7 @@ impl ModelProvider for AnthropicModelProvider {
                 max_tokens: effective_max_tokens,
                 system: system_prompt,
                 messages,
-                temperature: if anthropic_model_omits_temperature(model) {
-                    None
-                } else {
-                    effective_temperature
-                },
+                temperature: effective_temperature,
                 tools: native_tools,
                 tool_choice,
                 stream: None,
@@ -1473,11 +1452,7 @@ impl ModelProvider for AnthropicModelProvider {
             max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature: if anthropic_model_omits_temperature(model) {
-                None
-            } else {
-                effective_temperature
-            },
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: Some(true),
@@ -1852,7 +1827,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -1873,7 +1848,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"system\":\"You are ZeroClaw\""));
@@ -1913,29 +1888,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                 max_tokens: 4096,
                 system: None,
                 messages: vec![],
-                temperature: temp,
+                temperature: Some(temp),
             };
             let json = serde_json::to_string(&req).unwrap();
             assert!(json.contains(&format!("{temp}")));
         }
-    }
-
-    // ── Opus 4.7 temperature-omission tests (issue #6147) ────────
-
-    #[test]
-    fn anthropic_model_omits_temperature_matches_opus_4_7() {
-        assert!(anthropic_model_omits_temperature("claude-opus-4-7"));
-        assert!(anthropic_model_omits_temperature(
-            "claude-opus-4-7-20260101"
-        ));
-    }
-
-    #[test]
-    fn anthropic_model_omits_temperature_skips_other_models() {
-        assert!(!anthropic_model_omits_temperature("claude-opus-4-6"));
-        assert!(!anthropic_model_omits_temperature("claude-sonnet-4-6"));
-        assert!(!anthropic_model_omits_temperature("claude-haiku-4-5"));
-        assert!(!anthropic_model_omits_temperature("claude-3-opus"));
     }
 
     #[test]

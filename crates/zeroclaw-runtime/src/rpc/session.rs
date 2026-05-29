@@ -139,8 +139,8 @@ impl SessionStore {
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
         }
-        if let Some(t) = overrides.temperature {
-            guard.set_temperature(t);
+        if overrides.temperature.is_some() {
+            guard.set_temperature(overrides.temperature);
         }
         Some(overrides)
     }
