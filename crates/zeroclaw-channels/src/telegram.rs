@@ -551,7 +551,13 @@ impl TelegramChannel {
     /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            match super::tts::TtsManager::from_config(config) {
+            // Bind the TTS manager to the agent that owns THIS channel so the
+            // voice reply uses that agent's `tts_provider`. Without this the
+            // shared manager resolves the lexicographically-smallest enabled
+            // agent, which silently breaks TTS when that agent has no
+            // `tts_provider` set (e.g. a background/delegate agent).
+            let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
+            match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,

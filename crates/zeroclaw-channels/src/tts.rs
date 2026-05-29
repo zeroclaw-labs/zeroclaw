@@ -583,6 +583,19 @@ impl TtsManager {
     /// so when no agent-bound resolution is available the manager refuses
     /// to silently pick a provider (`synthesize` fails loud).
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_for_agent(config, None)
+    }
+
+    /// Build a `TtsManager` bound to a specific agent's `tts_provider`.
+    ///
+    /// `agent_alias` is the channel-owning agent (resolve via
+    /// [`Config::agent_for_channel`]). When `None`, falls back to the
+    /// runtime-active agent ([`Config::resolved_runtime_agent_alias`]) for
+    /// callers that cannot determine the owning agent. Binding to the
+    /// owning agent is what lets a channel owned by e.g. `primary` use
+    /// `primary`'s `tts_provider` instead of whichever enabled agent
+    /// happens to sort first.
+    pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
@@ -633,12 +646,12 @@ impl TtsManager {
             config.tts.max_text_length
         };
 
-        // Per-agent join: the runtime-active agent's `tts_provider` is the
-        // resolved alias for this manager instance. Empty (or no resolved
+        // Per-agent join: bind to the channel-owning agent's `tts_provider`
+        // when known, else the runtime-active agent. Empty (or no resolved
         // agent) = no TTS; `synthesize` fails loud rather than silently
         // pick a provider.
-        let agent_tts_provider = config
-            .resolved_runtime_agent_alias()
+        let agent_tts_provider = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
             .map(|a| a.tts_provider.as_str().to_string())
             .unwrap_or_default();
@@ -842,6 +855,47 @@ mod tests {
         let cfg = config_with_edge_alias();
         let manager = TtsManager::from_config(&cfg).unwrap();
         assert_eq!(manager.available_providers(), vec!["edge.default"]);
+    }
+
+    /// Regression for #7001: a channel-owning agent's `tts_provider` must win
+    /// over a lexicographically-earlier enabled agent that has none. Binding
+    /// the manager to the owner (`from_config_for_agent(cfg, Some("primary"))`)
+    /// resolves `primary`'s provider, not the first-sorting agent's empty one.
+    #[test]
+    fn tts_manager_binds_owning_agent_provider() {
+        // Reuse the edge.default provider registration, but install two agents:
+        // `primary` (the channel owner, has the provider) and a
+        // lexicographically-earlier `background` agent with no `tts_provider`.
+        let mut cfg = config_with_edge_alias();
+        cfg.agents.clear();
+        cfg.agents.insert(
+            "primary".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                tts_provider: "edge.default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "background".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                ..Default::default()
+            },
+        );
+
+        // Owner-bound resolution picks primary's provider...
+        let owner_bound = TtsManager::from_config_for_agent(&cfg, Some("primary")).unwrap();
+        assert_eq!(
+            owner_bound.agent_tts_provider, "edge.default",
+            "owner-bound manager must resolve the channel owner's tts_provider"
+        );
+
+        // ...while binding to the provider-less first-sorting agent stays empty,
+        // proving the binding is per-agent and not a global/first-sorting pick.
+        let background_bound = TtsManager::from_config_for_agent(&cfg, Some("background")).unwrap();
+        assert!(
+            background_bound.agent_tts_provider.is_empty(),
+            "an agent with no tts_provider must not inherit another agent's provider"
+        );
     }
 
     #[tokio::test]
