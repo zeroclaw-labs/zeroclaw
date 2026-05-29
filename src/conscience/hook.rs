@@ -30,20 +30,31 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::x0_extensions::{ConscienceConfig, NormConfigSerde};
 use zeroclaw_runtime::hooks::{HookHandler, HookResult};
 
 use super::gate::evaluate_tool_call;
-use super::types::{GateVerdict, Norm, NormAction, NormConfig, SelfState, Thresholds};
+use super::ledger::IntegrityLedger;
+use super::types::{GateVerdict, Norm, NormAction, NormConfig, Thresholds};
 
 /// Per-Agent hook that wraps the conscience module's gate evaluation.
 ///
 /// Cloned out of the loaded `ConscienceConfig` at Agent build time so the
-/// hot path doesn't lock against config-reload writers.
+/// hot path doesn't lock against config-reload writers. Carries an
+/// `Arc<Mutex<IntegrityLedger>>` so the `SelfState` driving the gate
+/// reflects accumulated violation history — without it, every call sees
+/// `integrity_score: 1.0, recent_violations: 0`, which makes the
+/// threshold-aware scoring degenerate to "purely tool-dependent".
+///
+/// A fresh ledger is constructed per hook instance (i.e. per Agent
+/// build); restoring the ledger across process restarts is future work
+/// tracked alongside the rest of Plan v2 Slice A finish.
 pub struct ConscienceHook {
     thresholds: Thresholds,
     norms: Vec<Norm>,
+    ledger: Arc<Mutex<IntegrityLedger>>,
 }
 
 impl ConscienceHook {
@@ -59,7 +70,15 @@ impl ConscienceHook {
                 .iter()
                 .map(|s| convert_norm(s).into_runtime_norm())
                 .collect(),
+            ledger: Arc::new(Mutex::new(IntegrityLedger::new())),
         }
+    }
+
+    /// Borrow the ledger for diagnostics or testing. Holding the lock
+    /// stalls the gate, so callers should drop the guard quickly.
+    #[cfg(test)]
+    pub(super) fn ledger(&self) -> Arc<Mutex<IntegrityLedger>> {
+        Arc::clone(&self.ledger)
     }
 }
 
@@ -78,16 +97,17 @@ impl HookHandler for ConscienceHook {
     }
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
-        // Self-state defaults are intentionally "healthy" — IntegrityLedger
-        // wiring (Plan v2 Slice A step 8) is a follow-up.
-        let self_state = SelfState {
-            integrity_score: 1.0,
-            recent_violations: 0,
-            active_repairs: 0,
-            arousal: None,
-            confidence: None,
-            risk_level: None,
-            free_energy: None,
+        // Read the live SelfState from the ledger so accumulated
+        // violations drag the integrity score down across turns. The
+        // lock is held only for the to_self_state() snapshot, not
+        // through evaluate_tool_call.
+        let self_state = match self.ledger.lock() {
+            Ok(guard) => guard.to_self_state(),
+            // Poisoned mutex: another thread panicked while holding the
+            // ledger. Fall through with healthy defaults so the gate
+            // still runs and the agent can make progress; the next
+            // successful record_violation will recover.
+            Err(poisoned) => poisoned.into_inner().to_self_state(),
         };
 
         let (verdict, score) = evaluate_tool_call(
@@ -98,6 +118,18 @@ impl HookHandler for ConscienceHook {
             /* llm_risk_override */ None,
             /* tool_affinity */ None,
         );
+
+        // Non-Allow verdicts record a violation so the score erodes for
+        // subsequent calls (Plan v2 Slice A step 8). The harm magnitude
+        // is approximated as `1 - score` — the gate's score is "how
+        // pro-act this call looks"; its complement is the residual harm
+        // the gate is rejecting on.
+        if !matches!(verdict, GateVerdict::Allow) {
+            let harm = (1.0 - score).clamp(0.0, 1.0);
+            if let Ok(mut guard) = self.ledger.lock() {
+                guard.record_violation(&name, harm);
+            }
+        }
 
         match verdict {
             GateVerdict::Allow => HookResult::Continue((name, args)),
@@ -164,12 +196,24 @@ pub fn register_hook_factory() {
 mod tests {
     use super::*;
 
+    fn permissive_cfg() -> ConscienceConfig {
+        // The gate's harm map keeps every tool's max possible score at
+        // 0.80, which exactly equals the default allow_threshold — at
+        // those defaults nothing ever crosses into Allow territory.
+        // Tests that exercise the Allow path lower the threshold so
+        // realistic low-harm tools can actually pass.
+        let mut cfg = ConscienceConfig::default();
+        cfg.allow_threshold = 0.70;
+        cfg.ask_threshold = 0.50;
+        cfg.block_threshold = 0.30;
+        cfg
+    }
+
     #[tokio::test]
     async fn allow_path_passes_args_through() {
-        let cfg = ConscienceConfig::default();
-        let hook = ConscienceHook::new(&cfg);
-        // file_read is a low-harm tool name; with default thresholds the
-        // gate should let it through.
+        let hook = ConscienceHook::new(&permissive_cfg());
+        // file_read is a low-harm tool name; at the relaxed thresholds
+        // (allow_threshold=0.70) its 0.74 score falls in Allow.
         let result = hook
             .before_tool_call("file_read".into(), Value::Null)
             .await;
@@ -195,5 +239,66 @@ mod tests {
             }
             HookResult::Continue(_) => panic!("shell must NOT pass the gate at defaults"),
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_call_records_a_violation_in_the_ledger() {
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::new(&cfg);
+        let ledger_handle = hook.ledger();
+
+        assert_eq!(
+            ledger_handle.lock().unwrap().to_self_state().recent_violations,
+            0,
+            "fresh ledger reports no violations"
+        );
+
+        // Drive a non-Allow verdict.
+        let _ = hook
+            .before_tool_call("shell".into(), Value::Null)
+            .await;
+
+        let state_after = ledger_handle.lock().unwrap().to_self_state();
+        assert!(
+            state_after.recent_violations >= 1,
+            "blocked/ask/revise call must persist a ledger entry; got {} violations",
+            state_after.recent_violations
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_call_does_not_record_a_violation() {
+        let hook = ConscienceHook::new(&permissive_cfg());
+        let ledger_handle = hook.ledger();
+
+        let _ = hook
+            .before_tool_call("file_read".into(), Value::Null)
+            .await;
+
+        assert_eq!(
+            ledger_handle.lock().unwrap().to_self_state().recent_violations,
+            0,
+            "Allow path must not write to the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_state_persists_across_consecutive_calls() {
+        let cfg = ConscienceConfig::default();
+        let hook = ConscienceHook::new(&cfg);
+        let ledger_handle = hook.ledger();
+
+        for _ in 0..3 {
+            let _ = hook
+                .before_tool_call("shell".into(), Value::Null)
+                .await;
+        }
+
+        let state = ledger_handle.lock().unwrap().to_self_state();
+        assert!(
+            state.recent_violations >= 3,
+            "three blocked calls should leave at least three violations; got {}",
+            state.recent_violations
+        );
     }
 }

@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-extended")]
+#![cfg(feature = "x0-broken-legacy")]
 
 use zeroclaw::cosmic::{
     BeliefSource, CausalGraph, ConsolidationEngine, CosmicMemoryGraph, CosmicPersistence,
