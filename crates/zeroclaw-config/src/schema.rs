@@ -2869,6 +2869,10 @@ pub struct AliasedAgentConfig {
     #[nested]
     #[serde(default)]
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
+    /// Reply-intent precheck configuration for channel messages.
+    #[nested]
+    #[serde(default)]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
     /// Enable context-aware tool filtering (only surface relevant tools per iteration).
     #[serde(default)]
     pub context_aware_tools: bool,
@@ -2959,6 +2963,7 @@ impl Default for AliasedAgentConfig {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
@@ -14921,6 +14926,14 @@ impl Config {
                 );
             }
 
+            if agent.precheck.timeout_secs == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.precheck.timeout_secs"),
+                    "agents.{alias}.precheck.timeout_secs must be greater than 0",
+                );
+            }
+
             // workspace.access: keys must point at OTHER agents, never
             // self, and every target must be a configured agent.
             for (target, mode) in &agent.workspace.access {
@@ -22149,10 +22162,22 @@ allowed_users = []
             "agent nested history-pruning fields should be emitted under the agent alias"
         );
         assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "agents.bob.precheck.enabled"),
+            "agent nested precheck fields should be emitted under the agent alias"
+        );
+        assert!(
             !fields
                 .iter()
                 .any(|field| field.name.starts_with("agents.bob.agent.history-pruning")),
             "agent nested fields must not leak the legacy global agent prefix"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|field| field.name.starts_with("agents.bob.agent.precheck")),
+            "agent nested precheck fields must not leak the legacy global agent prefix"
         );
 
         config
@@ -22163,6 +22188,16 @@ allowed_users = []
                 .get_prop("agents.bob.history-pruning.enabled")
                 .expect("get_prop should accept the emitted per-agent nested path"),
             "true"
+        );
+
+        config
+            .set_prop("agents.bob.precheck.enabled", "false")
+            .expect("set_prop should accept the emitted per-agent precheck path");
+        assert_eq!(
+            config
+                .get_prop("agents.bob.precheck.enabled")
+                .expect("get_prop should accept the emitted per-agent precheck path"),
+            "false"
         );
     }
 
@@ -22328,6 +22363,34 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn validate_accepts_per_agent_precheck_controls() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.precheck.enabled = false;
+        alpha.precheck.timeout_secs = 5;
+
+        config
+            .validate()
+            .expect("precheck enabled/timeout controls should validate");
+    }
+
+    #[test]
+    async fn validate_rejects_per_agent_precheck_zero_timeout() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.precheck.timeout_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero precheck timeout must fail validation")
+            .to_string();
+        assert!(
+            err.contains("agents.alpha.precheck.timeout_secs"),
+            "expected precheck timeout field path, got: {err}"
+        );
     }
 
     #[test]
