@@ -83,7 +83,7 @@ interface memory {
     ///   `ensure-agent-uuid`       → host echoes the alias unchanged
     ///   `recall-namespaced`       → host calls `recall` and post-filters by namespace
     ///   `export-entries`          → host calls `list-entries` and post-filters
-    ///   `store-with-metadata`     → host delegates to `store` (drops namespace/importance)
+    ///   `store-with-metadata`     → host delegates to `store-entry` (drops namespace/importance)
     ///
     /// All corresponding functions must still be exported by the plugin
     /// (stub implementations are sufficient); the runtime simply never calls
@@ -112,7 +112,10 @@ interface memory {
     get-memory-capabilities: func() -> memory-capabilities;
 
     /// Store a memory entry, optionally scoped to a session.
-    store: func(
+    ///
+    /// The name of this function in the trait is `store` but that is a reserved
+    /// type in wit-bindgen.
+    store-entry: func(
         key: string,
         content: string,
         category: memory-category,
