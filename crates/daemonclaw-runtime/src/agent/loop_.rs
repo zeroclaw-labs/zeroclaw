@@ -431,8 +431,8 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    ToolBatch, ToolExecutionOutcome, execute_tools_batched, execute_tools_parallel,
+    execute_tools_sequential, partition_tool_calls, should_execute_tools_in_parallel,
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -910,6 +910,11 @@ pub async fn run_tool_call_loop(
     let mut turn_tool_records: Vec<daemonclaw_api::agent::ToolCallRecord> = Vec::new();
     let mut turn_active_skill: Option<String> = None;
 
+    let context_pipeline =
+        crate::agent::context_pipeline::ContextPipeline::default_preemptive();
+    let retry_policy = crate::agent::retry::RetryPolicy::default();
+    let mut consecutive_retries: u32 = 0;
+
     for iteration in 0usize.. {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -930,9 +935,7 @@ pub async fn run_tool_call_loop(
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Preemptive context management: trim history before it overflows.
-        // When context_token_budget is 0 ("unlimited"), resolve the real limit
-        // from the provider or the static model table.
+        // Preemptive context management via ordered pipeline (cheap→expensive).
         let effective_budget = if context_token_budget == 0 {
             daemonclaw_providers::model_limits::resolve_context_window(
                 provider.context_window_for_model(model),
@@ -941,47 +944,14 @@ pub async fn run_tool_call_loop(
         } else {
             context_token_budget
         };
-        {
-            let estimated = estimate_history_tokens(history);
-            if estimated > effective_budget {
-                tracing::info!(
-                    estimated,
-                    budget = effective_budget,
-                    iteration = iteration + 1,
-                    "Preemptive context trim: estimated tokens exceed budget"
-                );
-                let chars_saved = fast_trim_tool_results(history, 4);
-                if chars_saved > 0 {
-                    tracing::info!(chars_saved, "Preemptive fast-trim applied");
-                }
-                let recheck = estimate_history_tokens(history);
-                if recheck > effective_budget {
-                    let stats = crate::agent::history_pruner::prune_history(
-                        history,
-                        &crate::agent::history_pruner::HistoryPrunerConfig {
-                            enabled: true,
-                            max_tokens: effective_budget,
-                            keep_recent: 4,
-                            collapse_tool_results: true,
-                        },
-                    );
-                    if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
-                        tracing::info!(
-                            collapsed = stats.collapsed_pairs,
-                            dropped = stats.dropped_messages,
-                            "Preemptive history prune applied"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Remove orphaned tool-role messages whose assistant (tool_calls)
-        // counterpart was dropped by proactive trimming, context compression,
-        // or session history reloading.  Without this, providers like MiniMax
-        // reject the request with "tool result's tool id not found" (bug #5743).
-        crate::agent::history_pruner::remove_orphaned_tool_messages(history);
-        normalize_system_messages(history);
+        context_pipeline.run(
+            history,
+            &crate::agent::context_pipeline::PipelineContext {
+                token_budget: effective_budget,
+                iteration,
+                model,
+            },
+        );
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -1415,8 +1385,43 @@ pub async fn run_tool_call_loop(
                     }),
                 );
 
+                // Classify error for retry decisions
+                let error_class = crate::agent::retry::classify_error(&e);
+
+                // Transient errors: retry with backoff
+                if retry_policy.should_retry(error_class)
+                    && consecutive_retries < retry_policy.max_retries
+                {
+                    consecutive_retries += 1;
+                    let delay = retry_policy.delay_for_attempt(consecutive_retries);
+                    tracing::warn!(
+                        error_class = ?error_class,
+                        attempt = consecutive_retries,
+                        delay_ms = delay.as_millis(),
+                        iteration = iteration + 1,
+                        "Transient LLM error, retrying after backoff"
+                    );
+                    runtime_trace::record_event(
+                        "llm_retry",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(&format!("{error_class:?}: retry {consecutive_retries}")),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "attempt": consecutive_retries,
+                            "delay_ms": delay.as_millis() as u64,
+                            "error_class": format!("{error_class:?}"),
+                        }),
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
                 // Context overflow recovery: trim history and retry
-                if daemonclaw_providers::reliable::is_context_window_exceeded(&e) {
+                if matches!(error_class, crate::agent::retry::ErrorClass::ContextOverflow) {
                     tracing::warn!(
                         iteration = iteration + 1,
                         "Context window exceeded, attempting in-loop recovery"
@@ -1446,6 +1451,9 @@ pub async fn run_tool_call_loop(
                 return Err(e);
             }
         };
+
+        // Reset retry counter on successful LLM call.
+        consecutive_retries = 0;
 
         // ── Token budget enforcement ────────────────────────────
         if max_turn_tokens > 0 && cumulative_tokens >= max_turn_tokens {

@@ -150,7 +150,7 @@ impl HookHandler for DialecticHook {
         -120
     }
 
-    async fn on_turn_complete(&self, result: &TurnResult) {
+    async fn on_turn_complete(&self, result: &TurnResult) -> crate::hooks::traits::TurnCompleteAction {
         let turn_num = self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let snippet = if result.final_response.len() > 200 {
@@ -182,6 +182,7 @@ impl HookHandler for DialecticHook {
         } else if should_update {
             self.run_update().await;
         }
+        crate::hooks::traits::TurnCompleteAction::Continue
     }
 }
 

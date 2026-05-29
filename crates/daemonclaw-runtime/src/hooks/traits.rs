@@ -20,6 +20,20 @@ impl<T> HookResult<T> {
     }
 }
 
+/// Control signal returned by `on_turn_complete` hooks.
+#[derive(Debug, Clone, Default)]
+pub enum TurnCompleteAction {
+    /// No opinion — let the loop proceed normally.
+    #[default]
+    Continue,
+    /// Prevent the loop from ending — force another iteration.
+    PreventStop,
+    /// Inject an error message into history and continue the loop.
+    InjectError(String),
+    /// Force the loop to stop immediately.
+    Stop,
+}
+
 /// Trait for hook handlers. All methods have default no-op implementations.
 /// Implement only the events you care about.
 #[async_trait]
@@ -39,7 +53,9 @@ pub trait HookHandler: Send + Sync {
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
-    async fn on_turn_complete(&self, _result: &TurnResult) {}
+    async fn on_turn_complete(&self, _result: &TurnResult) -> TurnCompleteAction {
+        TurnCompleteAction::Continue
+    }
 
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(

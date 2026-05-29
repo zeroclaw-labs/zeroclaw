@@ -123,13 +123,35 @@ impl HookRunner {
         join_all(futs).await;
     }
 
-    pub async fn fire_turn_complete(&self, result: &TurnResult) {
+    pub async fn fire_turn_complete(
+        &self,
+        result: &TurnResult,
+    ) -> super::traits::TurnCompleteAction {
+        use super::traits::TurnCompleteAction;
+
         let futs: Vec<_> = self
             .handlers
             .iter()
             .map(|h| h.on_turn_complete(result))
             .collect();
-        join_all(futs).await;
+        let actions = join_all(futs).await;
+
+        let mut final_action = TurnCompleteAction::Continue;
+        for action in actions {
+            match action {
+                TurnCompleteAction::Continue => {}
+                TurnCompleteAction::Stop => return TurnCompleteAction::Stop,
+                TurnCompleteAction::InjectError(_) => {
+                    final_action = action;
+                }
+                TurnCompleteAction::PreventStop => {
+                    if matches!(final_action, TurnCompleteAction::Continue) {
+                        final_action = TurnCompleteAction::PreventStop;
+                    }
+                }
+            }
+        }
+        final_action
     }
 
     // ---------------------------------------------------------------
