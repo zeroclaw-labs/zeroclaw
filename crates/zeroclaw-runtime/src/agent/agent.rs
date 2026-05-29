@@ -848,14 +848,7 @@ impl Agent {
             None
         };
 
-        let (
-            mut tools,
-            delegate_handle,
-            reaction_handle,
-            poll_handle,
-            ask_user_handle,
-            escalate_handle,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -874,12 +867,50 @@ impl Agent {
             None,
             false,
         );
+        let mut tools = all_tools_result.tools;
+        let delegate_handle = all_tools_result.delegate_handle;
+        let reaction_handle = all_tools_result.reaction_handle;
+        let poll_handle = all_tools_result.channel_map_handle;
+        let ask_user_handle = all_tools_result.ask_user_handle;
+        let escalate_handle = all_tools_result.escalate_handle;
+
+        // ── Built-in SecurityPolicy tool gate (parity with agent::run) ──
+        // Apply the agent's allowlist (`allowed_tools`) AND denylist
+        // (`excluded_tools`) to the built-in registry *before* MCP tools and
+        // skill tools are added. `from_config` (ws.rs / daemon) bypasses the
+        // channel orchestrator and previously enforced only the risk-profile
+        // denylist (further below) on this path — never the allowlist — so an
+        // agent allowlisted to e.g. `file_read` still kept raw `shell` /
+        // `file_write`. Filtering here, before skill registration, is also
+        // what lets a scoped elevation wrapper survive: the raw target is
+        // removed while the distinct prefixed `{skill}__{tool}` wrapper is
+        // appended later. MCP tools are injected after this gate and are
+        // intentionally exempt from the built-in allow/deny filter (a
+        // restrictive allowlist must not silently drop all MCP tools); the
+        // risk-profile denylist below still applies to them.
+        let before_policy_filter = tools.len();
+        crate::agent::loop_::apply_policy_tool_filter(&mut tools, Some(security.as_ref()), None);
+        if tools.len() != before_policy_filter {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "before": before_policy_filter,
+                        "retained": tools.len(),
+                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
+                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
+                    })),
+                "Applied SecurityPolicy built-in tool filter (from_config path)"
+            );
+        }
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -892,6 +923,7 @@ impl Agent {
             match tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -1034,7 +1066,20 @@ impl Agent {
         // through to `[skill_bundles.<alias>].directory` (defaulting to
         // `<install>/shared/skills/<alias>/`).
         let skills = crate::skills::load_skills_for_agent(&config.data_dir, config, agent_alias);
-        tools::register_skill_tools(&mut tools, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
+        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
+        let skill_resolution_registry: Vec<Arc<dyn tools::Tool>> = all_tools_result
+            .unfiltered_tool_arcs
+            .iter()
+            .cloned()
+            .chain(mcp_elevation_arcs.iter().cloned())
+            .collect();
+        tools::register_skill_tools_with_context(
+            &mut tools,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let approval_manager = if approval_backchannel {
             ApprovalManager::for_non_interactive_backchannel(risk_profile)
@@ -5242,6 +5287,8 @@ mod tests {
                     kind: "shell".to_string(),
                     command: format!("echo {t}"),
                     args: std::collections::HashMap::new(),
+                    target: None,
+                    locked_args: std::collections::HashMap::new(),
                 })
                 .collect(),
             prompts: vec![],
@@ -5273,6 +5320,82 @@ mod tests {
         // Should still be just 1 tool — the duplicate was skipped.
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "my_skill__run");
+    }
+
+    #[test]
+    fn from_config_policy_filter_blocks_raw_target_but_keeps_scoped_wrapper() {
+        // Path-level boundary for the from_config (ws.rs / daemon) path. The
+        // SecurityPolicy allow/deny gate now runs over the built-in registry
+        // before skill tools are registered (parity with agent::run), so an
+        // agent allowlisted to `file_read` does NOT keep raw `shell`, while the
+        // skill's scoped wrapper — distinct prefixed name — remains the only
+        // callable path to that capability. This exercises the exact
+        // apply_policy_tool_filter + register_skill_tools_with_context sequence
+        // from_config performs.
+        use crate::skills::{Skill, SkillTool};
+
+        let shell: Arc<dyn Tool> = Arc::new(NamedMockTool::new("shell"));
+        let file_read: Arc<dyn Tool> = Arc::new(NamedMockTool::new("file_read"));
+        // The resolution registry retains the raw tool so the wrapper can
+        // delegate to it even after the policy filter removes it below.
+        let resolution: Vec<Arc<dyn Tool>> = vec![Arc::clone(&shell), Arc::clone(&file_read)];
+
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::ArcToolRef(Arc::clone(&shell))),
+            Box::new(crate::tools::ArcToolRef(Arc::clone(&file_read))),
+        ];
+
+        // Allowlist the agent to `file_read` only — the gate from_config now
+        // applies to built-ins before skills register. (Pre-fix, from_config
+        // honored only the denylist, so raw `shell` leaked through.)
+        let policy = crate::security::SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..crate::security::SecurityPolicy::default()
+        };
+        crate::agent::loop_::apply_policy_tool_filter(&mut tools, Some(&policy), None);
+        assert!(
+            !tools.iter().any(|t| t.name() == "shell"),
+            "raw shell must be removed by the allowlist on the from_config path"
+        );
+        assert!(
+            tools.iter().any(|t| t.name() == "file_read"),
+            "allowlisted file_read must survive the filter"
+        );
+
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            version: "1".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![SkillTool {
+                name: "use_shell".to_string(),
+                description: "scoped shell".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: std::collections::HashMap::new(),
+                target: Some("shell".to_string()),
+                locked_args: std::collections::HashMap::new(),
+            }],
+            prompts: vec![],
+            location: None,
+        };
+        tools::register_skill_tools_with_context(
+            &mut tools,
+            &[skill],
+            Arc::new(crate::security::SecurityPolicy::default()),
+            &resolution,
+        );
+
+        assert!(
+            !tools.iter().any(|t| t.name() == "shell"),
+            "raw shell must STILL be unavailable after skill registration"
+        );
+        assert!(
+            tools.iter().any(|t| t.name() == "ops__use_shell"),
+            "the scoped elevation wrapper must remain the only callable path to shell"
+        );
     }
 
     #[test]

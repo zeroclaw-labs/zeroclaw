@@ -3037,14 +3037,7 @@ pub async fn run(
         } else {
             (None, None)
         };
-        let (
-            mut tools_registry,
-            delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -3063,6 +3056,9 @@ pub async fn run(
             None,
             is_subagent_caller,
         );
+        let mut tools_registry = all_tools_result.tools;
+        let delegate_handle = all_tools_result.delegate_handle;
+        let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
 
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
@@ -3120,6 +3116,8 @@ pub async fn run(
         let mut activated_handle: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3132,6 +3130,7 @@ pub async fn run(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         // Deferred path: build stubs and register tool_search
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
@@ -3331,7 +3330,19 @@ pub async fn run(
 
         // Register skill-defined tools as callable tool specs in the tool registry
         // so the LLM can invoke them via native function calling, not just XML prompts.
-        tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
+        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
+        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs
+            .iter()
+            .cloned()
+            .chain(mcp_elevation_arcs.iter().cloned())
+            .collect();
+        tools::register_skill_tools_with_context(
+            &mut tools_registry,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -4388,14 +4399,7 @@ pub async fn process_message(
         } else {
             (None, None)
         };
-        let (
-            mut tools_registry,
-            delegate_handle_pm,
-            _reaction_handle_pm,
-            _channel_map_handle_pm,
-            _ask_user_handle_pm,
-            _escalate_handle_pm,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -4416,6 +4420,9 @@ pub async fn process_message(
             None,
             false,
         );
+        let mut tools_registry = all_tools_result_pm.tools;
+        let delegate_handle_pm = all_tools_result_pm.delegate_handle;
+        let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
         let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
             f(config.peripherals.clone()).await.unwrap_or_default()
         } else {
@@ -4439,6 +4446,8 @@ pub async fn process_message(
         let mut activated_handle_pm: Option<
             std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
         > = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -4451,6 +4460,7 @@ pub async fn process_message(
             match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -4590,7 +4600,18 @@ pub async fn process_message(
         let skills = crate::skills::load_skills_for_agent(&config.data_dir, &config, agent_alias);
 
         // Register skill-defined tools as callable tool specs (process_message path).
-        tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers.
+        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs_pm
+            .iter()
+            .cloned()
+            .chain(mcp_elevation_arcs.iter().cloned())
+            .collect();
+        tools::register_skill_tools_with_context(
+            &mut tools_registry,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),

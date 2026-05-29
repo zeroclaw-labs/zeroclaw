@@ -7569,14 +7569,7 @@ pub async fn start_channels(
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
 
-        let (
-            mut built_tools,
-            delegate_handle_ch,
-            reaction_handle_ch,
-            _channel_map_handle,
-            ask_user_handle_ch,
-            escalate_handle_ch,
-        ) = tools::all_tools_with_runtime(
+        let all_tools_result_ch = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -7595,6 +7588,11 @@ pub async fn start_channels(
             canvas_store.clone(),
             false,
         );
+        let mut built_tools = all_tools_result_ch.tools;
+        let delegate_handle_ch = all_tools_result_ch.delegate_handle;
+        let reaction_handle_ch = all_tools_result_ch.reaction_handle;
+        let ask_user_handle_ch = all_tools_result_ch.ask_user_handle;
+        let escalate_handle_ch = all_tools_result_ch.escalate_handle;
 
         // Wire MCP tools into the per-agent registry before freezing —
         // non-fatal. When `mcp.deferred_loading` is enabled, MCP tools are
@@ -7603,6 +7601,9 @@ pub async fn start_channels(
         let mut ch_activated_handle: Option<
             std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>,
         > = None;
+        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
+        let mut ch_mcp_elevation_arcs: Vec<std::sync::Arc<dyn zeroclaw_runtime::tools::Tool>> =
+            Vec::new();
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -7616,6 +7617,8 @@ pub async fn start_channels(
             match zeroclaw_runtime::tools::McpRegistry::connect_all(&config.mcp.servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    ch_mcp_elevation_arcs =
+                        zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
                     if config.mcp.deferred_loading {
                         let deferred_set =
                             zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
@@ -7689,7 +7692,20 @@ pub async fn start_channels(
         // Skill tools share the workspace-loaded `skills` Vec but each
         // agent gets its own `ToolBox` so per-agent security policies
         // gate execution.
-        zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+        // Resolution registry = built-in arcs + resolution-only MCP wrappers.
+        let skill_resolution_registry: Vec<std::sync::Arc<dyn zeroclaw_runtime::tools::Tool>> =
+            all_tools_result_ch
+                .unfiltered_tool_arcs
+                .iter()
+                .cloned()
+                .chain(ch_mcp_elevation_arcs.iter().cloned())
+                .collect();
+        zeroclaw_runtime::tools::register_skill_tools_with_context(
+            &mut built_tools,
+            &skills,
+            security.clone(),
+            &skill_resolution_registry,
+        );
 
         let tool_specs: Vec<(String, String)> = built_tools
             .iter()
@@ -13295,6 +13311,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -13333,6 +13351,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -13381,6 +13401,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                target: None,
+                locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,

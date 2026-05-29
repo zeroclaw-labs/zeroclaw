@@ -632,14 +632,7 @@ pub async fn run_gateway(
 
     let (mut tools_registry_raw, delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
-            let (
-                tools_registry_raw,
-                delegate_handle_gw,
-                _reaction_handle_gw,
-                _channel_map_handle,
-                _ask_user_handle_gw,
-                _escalate_handle_gw,
-            ) = tools::all_tools_with_runtime(
+            let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
                 &risk_profile,
@@ -660,7 +653,7 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
             );
-            (tools_registry_raw, delegate_handle_gw)
+            (all_tools_result.tools, all_tools_result.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
