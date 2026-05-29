@@ -15210,6 +15210,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rand 0.10.1",
+ "rand_core 0.10.1",
  "ratatui",
  "rcgen",
  "regex",

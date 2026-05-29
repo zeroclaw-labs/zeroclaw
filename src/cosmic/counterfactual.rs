@@ -131,7 +131,7 @@ impl CounterfactualEngine {
     pub fn path_integral_select(
         &mut self,
         scenarios: &[Scenario],
-        rng: &mut dyn rand::RngCore,
+        rng: &mut dyn rand_core::RngCore,
     ) -> Option<SimulationResult> {
         if scenarios.is_empty() {
             return None;

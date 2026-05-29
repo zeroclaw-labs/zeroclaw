@@ -158,6 +158,7 @@ hex = "0.4"
 
 # CSPRNG for secure token generation
 rand = "0.10"
+rand_core = "0.10"
 
 # Portable atomic fallbacks for targets without native 64-bit atomics
 portable-atomic = "1"
@@ -365,6 +366,11 @@ embedded-web = ["zeroclaw-gateway/embedded-web"]
 x0-extended = [
     "agent-runtime", "wallet", "quantum", "runtime-wasm",
 ]
+# Legacy X0 fork modules whose imports reference pre-V3 schema items
+# (DelegateAgentConfig, TreasuryConfig, providers::Provider,
+# channels::traits, LifeConfig, …). Not part of x0-extended; opt in
+# only if you're actively rewriting these modules against the V3 API.
+x0-broken-legacy = ["x0-extended"]
 # Placeholder features for integration tests that target API surfaces not yet
 # present in the V3 schema. Defining them as empty no-ops registers the names
 # so `#![cfg(feature = "…")]` gates compile cleanly under `-D warnings`. When

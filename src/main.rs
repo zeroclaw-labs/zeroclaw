@@ -257,6 +257,22 @@ mod util;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent;
 
+// X0 fork modules visible to the binary (mirror of src/lib.rs).
+// Needed so binary-local code in src/tools/* can reach them via
+// `crate::soul`, `crate::wallet`, `crate::conscience`, … the same way
+// the agent-runtime modules above do.
+#[cfg(feature = "x0-extended")]
+mod conscience;
+// conscience::cosmic_bridge expects `crate::cosmic` to resolve, so the
+// bin needs the cosmic module visible too (even though it's mostly
+// no-op without x0-broken-legacy's gated sub-modules).
+#[cfg(feature = "x0-extended")]
+mod cosmic;
+#[cfg(feature = "x0-extended")]
+mod soul;
+#[cfg(feature = "x0-extended")]
+mod wallet;
+
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
@@ -1334,6 +1350,16 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     crate::i18n::init(&crate::i18n::detect_locale());
+
+    // Install the conscience-gate hook factory so every Agent built
+    // after this point picks up the gate when config.conscience.gate_enabled
+    // is true. Idempotent at the registry layer; we call it once at
+    // startup before any Agent spawns. See:
+    //   crates/zeroclaw-runtime/src/hooks/registry.rs (factory chain)
+    //   src/conscience/hook.rs (HookHandler implementation)
+    //   Plans/glimmering-mixing-moore-v2.md Slice A
+    #[cfg(feature = "x0-extended")]
+    crate::conscience::register_hook_factory();
 
     let cmd = apply_i18n_to_command(Cli::command());
 

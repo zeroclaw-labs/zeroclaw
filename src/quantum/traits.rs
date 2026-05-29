@@ -281,7 +281,7 @@ pub trait QuantumBrain: Send + Sync {
     fn decide_quantum(
         &mut self,
         superposition: &mut ProposalSuperposition,
-        rng: &mut dyn rand::RngCore,
+        rng: &mut dyn rand_core::RngCore,
     ) -> Option<Proposal>;
 
     fn learn_quantum(&mut self, outcome: &ActionOutcome, superposition: &ProposalSuperposition);

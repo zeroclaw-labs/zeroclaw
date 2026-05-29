@@ -50,7 +50,7 @@ impl QuantumBrainEngine {
         superposition: &mut super::traits::ProposalSuperposition,
         iterations: usize,
         initial_temp: f64,
-        rng: &mut dyn rand::RngCore,
+        rng: &mut dyn rand_core::RngCore,
     ) -> Option<super::traits::QuantumProposal> {
         if superposition.proposals.is_empty() {
             return None;
@@ -130,7 +130,7 @@ impl QuantumBrain for QuantumBrainEngine {
     fn decide_quantum(
         &mut self,
         superposition: &mut ProposalSuperposition,
-        rng: &mut dyn rand::RngCore,
+        rng: &mut dyn rand_core::RngCore,
     ) -> Option<Proposal> {
         self.anneal();
 
