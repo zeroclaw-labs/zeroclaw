@@ -1,6 +1,6 @@
 {
   "name": "zeroclaw",
-  "version": "0.8.0-beta.2",
+  "version": "0.8.0-beta-2",
   "description": "100% Rust autonomous AI agent runtime — multi-provider, multi-channel, deploys from Raspberry Pi to Kubernetes",
   "license": "MIT OR Apache-2.0",
   "repository": {
