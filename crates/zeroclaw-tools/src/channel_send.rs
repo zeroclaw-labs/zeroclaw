@@ -196,7 +196,23 @@ impl Tool for ChannelSendTool {
         // Resolve the recipient: validate against configured default_target.
         let to = {
             let targets = self.default_targets.read();
-            let configured_target = targets.get(&resolved_key).cloned();
+
+            // Canonicalize the resolved key for target enforcement: if the
+            // channel map contained a bare singleton key (e.g. "telegram") but
+            // the target map only has the composite key (e.g. "telegram.default"),
+            // fall back to the composite key so the configured target is found.
+            let target_key = if !resolved_key.contains('.') {
+                let composite = format!("{resolved_key}.default");
+                if !targets.contains_key(&resolved_key) && targets.contains_key(&composite) {
+                    composite
+                } else {
+                    resolved_key.clone()
+                }
+            } else {
+                resolved_key.clone()
+            };
+
+            let configured_target = targets.get(&target_key).cloned();
 
             match (provided_to, configured_target) {
                 (Some(provided), Some(configured)) => {
@@ -206,7 +222,7 @@ impl Tool for ChannelSendTool {
                             output: String::new(),
                             error: Some(format!(
                                 "Recipient '{}' does not match the configured default_target '{}' for channel '{}'. Arbitrary recipients are not allowed.",
-                                provided, configured, resolved_key
+                                provided, configured, target_key
                             )),
                         });
                     }
@@ -222,7 +238,7 @@ impl Tool for ChannelSendTool {
                         output: String::new(),
                         error: Some(format!(
                             "No default_target configured for channel '{}'. Cannot send to arbitrary recipient '{}'.",
-                            resolved_key, provided
+                            target_key, provided
                         )),
                     });
                 }
@@ -232,7 +248,7 @@ impl Tool for ChannelSendTool {
                         output: String::new(),
                         error: Some(format!(
                             "No default_target configured for channel '{}'. Either configure a default_target or provide a matching recipient.",
-                            resolved_key
+                            target_key
                         )),
                     });
                 }
@@ -543,5 +559,33 @@ mod tests {
                 .unwrap()
                 .contains("Cannot send to arbitrary recipient")
         );
+    }
+
+    /// Regression: bare singleton channel key resolves target from composite key.
+    /// When the channel map contains both "telegram" (bare singleton) and
+    /// "telegram.default" (composite), but the target map only has
+    /// "telegram.default", a send with channel="telegram" and omitted "to"
+    /// must succeed using the configured target.
+    #[tokio::test]
+    async fn bare_singleton_key_resolves_target_from_composite() {
+        let map: PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert(
+            "telegram".to_string(),
+            Arc::new(StubChannel::new("telegram")),
+        );
+        map.write().insert(
+            "telegram.default".to_string(),
+            Arc::new(StubChannel::new("telegram.default")),
+        );
+        let mut targets = HashMap::new();
+        targets.insert("telegram.default".to_string(), "chat_123".to_string());
+        let tool = make_tool(map, targets);
+        let result = tool
+            .execute(serde_json::json!({
+                "channel": "telegram",
+                "body": "hello"
+            }))
+            .await;
+        assert!(result.unwrap().success);
     }
 }
