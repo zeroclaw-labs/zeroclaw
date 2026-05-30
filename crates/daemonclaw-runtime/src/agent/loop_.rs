@@ -563,6 +563,7 @@ async fn consume_provider_streaming_response(
     temperature: f64,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    mut streaming_executor: Option<&mut crate::agent::streaming_executor::StreamingToolExecutor>,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = provider.stream_chat(
         ChatRequest {
@@ -596,7 +597,11 @@ async fn consume_provider_streaming_response(
         match event {
             StreamEvent::Final => break,
             StreamEvent::ToolCall(tool_call) => {
-                outcome.tool_calls.push(tool_call);
+                if let Some(ref mut executor) = streaming_executor {
+                    executor.add_tool(tool_call);
+                } else {
+                    outcome.tool_calls.push(tool_call);
+                }
                 suppress_forwarding = true;
             }
             StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
@@ -1150,6 +1155,7 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
+                None,
             )
             .await
             {
@@ -7406,6 +7412,7 @@ Let me check the result."#;
             0.2,
             None,
             None,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -7484,6 +7491,7 @@ Let me check the result."#;
             None,
             "deepseek-v4-flash",
             0.2,
+            None,
             None,
             None,
         )
