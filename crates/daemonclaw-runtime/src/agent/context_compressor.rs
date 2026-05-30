@@ -607,7 +607,7 @@ mod tests {
             _system_prompt: Option<&str>,
             message: &str,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<String> {
             self.seen_messages.lock().push(message.to_string());
             Ok("summary".to_string())
@@ -617,7 +617,7 @@ mod tests {
             &self,
             _request: daemonclaw_api::provider::ChatRequest<'_>,
             _model: &str,
-            _temperature: Option<f64>,
+            _temperature: f64,
         ) -> Result<daemonclaw_api::provider::ChatResponse> {
             unreachable!("context compressor uses chat_with_system")
         }

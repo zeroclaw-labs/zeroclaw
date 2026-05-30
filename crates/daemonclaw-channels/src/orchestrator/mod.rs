@@ -5793,19 +5793,16 @@ mod tests {
     }
 
     #[test]
-    fn channel_message_timeout_budget_scales_with_tool_iterations() {
-        assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
-        assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
-        assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
+    fn channel_message_timeout_budget_scales_with_cap() {
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 1), 300);
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 2), 600);
+        assert_eq!(channel_message_timeout_budget_secs_with_cap(300, 4), 1200);
     }
 
     #[test]
-    fn channel_message_timeout_budget_uses_safe_defaults_and_cap() {
-        // 0 iterations falls back to 1x timeout budget.
-        assert_eq!(channel_message_timeout_budget_secs(300, 0), 300);
-        // Large iteration counts are capped to avoid runaway waits.
+    fn channel_message_timeout_budget_default_cap() {
         assert_eq!(
-            channel_message_timeout_budget_secs(300, 10),
+            channel_message_timeout_budget_secs(300),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }
@@ -5813,15 +5810,11 @@ mod tests {
     #[test]
     fn channel_message_timeout_budget_with_custom_scale_cap() {
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 8, 8),
+            channel_message_timeout_budget_secs_with_cap(300, 8),
             300 * 8
         );
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 20, 8),
-            300 * 8
-        );
-        assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 10, 1),
+            channel_message_timeout_budget_secs_with_cap(300, 1),
             300
         );
     }
@@ -5839,16 +5832,12 @@ mod tests {
     fn pacing_message_timeout_scale_max_overrides_default_cap() {
         // Custom cap of 8 scales budget proportionally
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(300, 10, 8),
+            channel_message_timeout_budget_secs_with_cap(300, 8),
             300 * 8
         );
         // Default cap produces the standard behavior
         assert_eq!(
-            channel_message_timeout_budget_secs_with_cap(
-                300,
-                10,
-                CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
-            ),
+            channel_message_timeout_budget_secs_with_cap(300, CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP),
             300 * CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP
         );
     }
