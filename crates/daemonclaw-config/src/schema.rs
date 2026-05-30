@@ -1593,6 +1593,13 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Maximum consecutive hook-forced continuations (PreventStop / InjectError)
+    /// without intervening tool calls before the loop halts. Prevents unbounded
+    /// spin when a hook persistently overrides the natural exit. `None` uses the
+    /// default of 5. The counter resets when tool calls occur between hook firings.
+    #[serde(default)]
+    pub max_hook_continuations: Option<u32>,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -1617,6 +1624,7 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            max_hook_continuations: None,
         }
     }
 }

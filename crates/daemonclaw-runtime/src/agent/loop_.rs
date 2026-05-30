@@ -920,7 +920,9 @@ pub async fn run_tool_call_loop(
     let retry_policy = crate::agent::retry::RetryPolicy::default();
     let mut consecutive_retries: u32 = 0;
     let mut hook_continuation_count: u32 = 0;
-    const MAX_HOOK_CONTINUATIONS: u32 = 5;
+    let max_hook_continuations: u32 = pacing
+        .max_hook_continuations
+        .unwrap_or(5);
 
     // Preflight: if history already exceeds the model's context window on
     // entry (e.g. after a model switch to a smaller window), compact now.
@@ -1671,8 +1673,25 @@ pub async fn run_tool_call_loop(
                     }
                     crate::hooks::TurnCompleteAction::PreventStop => {
                         hook_continuation_count += 1;
-                        if hook_continuation_count > MAX_HOOK_CONTINUATIONS {
-                            tracing::warn!("Hook PreventStop exhausted continuation budget, exiting");
+                        if hook_continuation_count > max_hook_continuations {
+                            tracing::warn!(
+                                count = hook_continuation_count,
+                                "Hook PreventStop exhausted continuation budget, halting"
+                            );
+                            runtime_trace::record_event(
+                                "hook_continuation_budget_exhausted",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some("PreventStop exhausted continuation budget"),
+                                serde_json::json!({
+                                    "action": "PreventStop",
+                                    "count": hook_continuation_count,
+                                    "max": max_hook_continuations,
+                                }),
+                            );
                             break;
                         }
                         history.push(ChatMessage::assistant(response_text.clone()));
@@ -1680,8 +1699,26 @@ pub async fn run_tool_call_loop(
                     }
                     crate::hooks::TurnCompleteAction::InjectError(msg) => {
                         hook_continuation_count += 1;
-                        if hook_continuation_count > MAX_HOOK_CONTINUATIONS {
-                            tracing::warn!("Hook InjectError exhausted continuation budget, exiting");
+                        if hook_continuation_count > max_hook_continuations {
+                            tracing::warn!(
+                                count = hook_continuation_count,
+                                "Hook InjectError exhausted continuation budget, halting"
+                            );
+                            runtime_trace::record_event(
+                                "hook_continuation_budget_exhausted",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some("InjectError exhausted continuation budget"),
+                                serde_json::json!({
+                                    "action": "InjectError",
+                                    "count": hook_continuation_count,
+                                    "max": max_hook_continuations,
+                                    "message": msg,
+                                }),
+                            );
                             break;
                         }
                         history.push(ChatMessage::assistant(response_text.clone()));
@@ -1699,6 +1736,9 @@ pub async fn run_tool_call_loop(
                 collected_receipts,
             ));
         }
+
+        // Tool calls present — legitimate continuation resets the hook-thrash counter.
+        hook_continuation_count = 0;
 
         // Accumulate text from this iteration (tool calls present, loop continues).
         accumulated_display_text.push_str(&display_text);
