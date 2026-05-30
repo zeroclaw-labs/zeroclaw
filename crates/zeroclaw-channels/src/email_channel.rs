@@ -9,7 +9,6 @@
 #![allow(clippy::unnecessary_map_or)]
 
 use anyhow::{Context, Result};
-use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
 use async_trait::async_trait;
@@ -23,73 +22,23 @@ use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use std::collections::HashSet;
-use std::fmt;
-use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 use uuid::Uuid;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_tools::email_imap::{ImapSession, TlsStreamTolerant};
 
 pub use zeroclaw_config::scattered_types::EmailConfig;
 
-/// Wraps a rustls TLS stream and converts missing-`close_notify` errors into
-/// EOF. Many servers (including Microsoft Exchange) close TLS connections
-/// without the `close_notify` alert; rustls 0.23+ treats this as a fatal error.
-/// The wrapper makes it a graceful EOF so IMAP session reconnect handles it.
-struct TlsStreamTolerant(TlsStream<TcpStream>);
-
-impl AsyncRead for TlsStreamTolerant {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.0).poll_read(cx, buf) {
-            Poll::Ready(Err(e)) if is_tls_close_notify(&e) => Poll::Ready(Ok(())),
-            other => other,
-        }
-    }
-}
-
-impl AsyncWrite for TlsStreamTolerant {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
-    }
-}
-
-impl fmt::Debug for TlsStreamTolerant {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("TlsStreamTolerant")
-    }
-}
-
-fn is_tls_close_notify(e: &io::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("close_notify") || msg.contains("UnexpectedEof")
-}
-
-type ImapSession = Session<TlsStreamTolerant>;
+// `TlsStreamTolerant` (the rustls wrapper that turns Exchange's missing
+// `close_notify` into a graceful EOF) and the `ImapSession` alias live in
+// `zeroclaw_tools::email_imap`, the canonical IMAP utility shared by the
+// read-only email tools. Imported here so there is a single definition.
 
 /// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound.
 ///

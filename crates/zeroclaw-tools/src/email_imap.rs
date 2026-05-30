@@ -55,9 +55,12 @@ impl fmt::Debug for TlsStreamTolerant {
     }
 }
 
-fn is_tls_close_notify(e: &io::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains("close_notify") || msg.contains("UnexpectedEof")
+/// Detects the missing-`close_notify` truncation that Exchange-hosted IMAP
+/// servers produce. `ErrorKind::UnexpectedEof` is the stable signal; the
+/// string match is a fallback for rustls variants that only surface it in the
+/// display text.
+pub fn is_tls_close_notify(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof || e.to_string().contains("close_notify")
 }
 
 pub type ImapSession = Session<TlsStreamTolerant>;

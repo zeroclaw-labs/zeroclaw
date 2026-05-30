@@ -100,6 +100,17 @@ impl Tool for EmailSearchTool {
             .unwrap_or(10)
             .min(50) as usize;
 
+        // Reject injection in agent-supplied filters before any network round
+        // trip. IMAP SEARCH criteria are built by string concatenation below,
+        // so an unvalidated value could escape its quoted group and widen the
+        // result set.
+        if let Some(f) = from_filter {
+            validate_search_filter("from", f)?;
+        }
+        if let Some(s) = subject_filter {
+            validate_search_filter("subject", s)?;
+        }
+
         let (alias, cfg) = resolve_channel(&self.email_configs, channel_alias)?;
 
         let mut session = imap_connect(&cfg, self.auth_service.as_ref(), &alias).await?;
@@ -115,10 +126,10 @@ impl Tool for EmailSearchTool {
             criteria_parts.push("ALL".into());
         }
         if let Some(f) = from_filter {
-            criteria_parts.push(format!("FROM \"{}\"", f.replace('"', "")));
+            criteria_parts.push(format!("FROM \"{}\"", f));
         }
         if let Some(s) = subject_filter {
-            criteria_parts.push(format!("SUBJECT \"{}\"", s.replace('"', "")));
+            criteria_parts.push(format!("SUBJECT \"{}\"", s));
         }
         if let Some(d) = since
             && let Some(imap_date) = to_imap_date(d)
@@ -254,4 +265,50 @@ pub fn to_imap_date(s: &str) -> Option<String> {
     };
     let day = parts[2].trim_start_matches('0');
     Some(format!("{}-{}-{}", day, month, parts[0]))
+}
+
+/// Allowlist-validates an agent-supplied IMAP SEARCH filter value. The search
+/// criteria string is assembled by concatenation, so a value containing `(`,
+/// `)`, `"`, or IMAP keywords (`OR`, `NOT`, `ALL`, `UNSEEN`) could escape its
+/// quoted group and change the search semantics. We accept only the characters
+/// that occur in real addresses and subject keywords and reject anything else
+/// with a descriptive error, so a crafted filter fails loudly rather than
+/// silently returning a different message set.
+fn validate_search_filter(field: &str, value: &str) -> anyhow::Result<()> {
+    if let Some(bad) = value
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || matches!(c, '@' | '.' | '-' | '_' | '+' | ' ' | '*')))
+    {
+        return Err(anyhow::Error::msg(format!(
+            "invalid character {:?} in '{}' filter; allowed: letters, digits, and @ . - _ + space *",
+            bad, field
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_search_filter;
+
+    #[test]
+    fn validate_search_filter_accepts_addresses_and_keywords() {
+        assert!(validate_search_filter("from", "alice.smith+tag@example.com").is_ok());
+        assert!(validate_search_filter("subject", "Q3 report *2026*").is_ok());
+        // Unicode letters in names/subjects are alphanumeric and allowed.
+        assert!(validate_search_filter("from", "Élisa Müller").is_ok());
+        assert!(validate_search_filter("subject", "").is_ok());
+    }
+
+    #[test]
+    fn validate_search_filter_rejects_imap_metacharacters() {
+        // Quotes and parens are the escape vectors for the FROM "…" group.
+        for bad in ["\"", "(", ")", "a\" OR ALL (", "x)(NOT UNSEEN"] {
+            let err = validate_search_filter("subject", bad)
+                .expect_err("expected rejection")
+                .to_string();
+            assert!(err.contains("invalid character"), "got: {err}");
+            assert!(err.contains("subject"), "field name in message: {err}");
+        }
+    }
 }
