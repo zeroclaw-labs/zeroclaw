@@ -1114,7 +1114,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
-        );
+        )
+        .unwrap();
         let long_text = "x".repeat(10_000);
         let result = tool.truncate_response(&long_text);
         assert_eq!(result.len(), 10_000, "zero limit must not truncate");
@@ -1161,7 +1162,8 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
-        );
+        )
+        .unwrap();
 
         // Bypass SSRF-guarded execute() — call standard_fetch directly so
         // wiremock on 127.0.0.1 is reachable.
