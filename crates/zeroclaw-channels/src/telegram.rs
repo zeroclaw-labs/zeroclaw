@@ -363,6 +363,32 @@ fn is_image_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Map a TTS audio output format to the Telegram send method, multipart field
+/// name, upload filename, and MIME type.
+///
+/// Telegram `sendVoice` only renders OGG/Opus as a true voice note, so only
+/// `opus`/`ogg` takes that path. Every other format (WAV from Groq Orpheus or
+/// Piper, MP3 from ElevenLabs/Google/Edge, …) is uploaded via `sendAudio` with
+/// its real MIME type so it stays playable instead of being mislabeled.
+fn telegram_audio_send_spec(
+    format: &str,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "opus" | "ogg" => ("sendVoice", "voice", "voice.ogg", "audio/ogg"),
+        "mp3" | "mpeg" => ("sendAudio", "audio", "voice.mp3", "audio/mpeg"),
+        "wav" => ("sendAudio", "audio", "voice.wav", "audio/wav"),
+        "aac" => ("sendAudio", "audio", "voice.aac", "audio/aac"),
+        "flac" => ("sendAudio", "audio", "voice.flac", "audio/flac"),
+        "pcm" => ("sendAudio", "audio", "voice.wav", "audio/wav"),
+        _ => (
+            "sendAudio",
+            "audio",
+            "voice.bin",
+            "application/octet-stream",
+        ),
+    }
+}
+
 /// Build the user-facing content string for an incoming attachment.
 ///
 /// Photos with a recognized image extension use `[IMAGE:/path]` so the
@@ -730,6 +756,32 @@ impl TelegramChannel {
                         .with_attrs(::serde_json::json!({"e": e.to_string()})),
                     "transcription manager init failed, voice transcription disabled"
                 );
+            }
+        }
+        self
+    }
+
+    /// Set the agent transcription provider alias on the internal TranscriptionManager.
+    /// Must be called after `with_transcription`. No-op if transcription was not configured.
+    /// The alias should be the provider type key ("groq", "openai", etc.) registered in
+    /// the TranscriptionManager, or the full "type.alias" form (the type prefix is extracted).
+    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        if alias.is_empty() {
+            return self;
+        }
+        // Resolve "groq.default" → "groq" (TranscriptionManager keys by type, not full alias)
+        let key = alias.split('.').next().unwrap_or(&alias).to_string();
+        if let Some(manager) = self.transcription_manager.take() {
+            match std::sync::Arc::try_unwrap(manager) {
+                Ok(m) => {
+                    self.transcription_manager = Some(std::sync::Arc::new(
+                        m.with_agent_transcription_provider(key),
+                    ));
+                }
+                Err(arc) => {
+                    self.transcription_manager = Some(arc);
+                }
             }
         }
         self
@@ -1197,16 +1249,22 @@ impl TelegramChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        let url = format!("{api_base}/bot{bot_token}/sendVoice");
+        // Telegram `sendVoice` only accepts OGG/Opus; any other format must go
+        // through `sendAudio` with its real MIME type. Mislabeling (e.g. Groq
+        // Orpheus WAV bytes sent as `audio/ogg`) produces an unplayable note.
+        let format = tts_manager.agent_output_format().unwrap_or("opus");
+        let (method, field, filename, mime) = telegram_audio_send_spec(format);
+
+        let url = format!("{api_base}/bot{bot_token}/{method}");
         let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .part(
-                "voice",
+                field,
                 reqwest::multipart::Part::bytes(audio_bytes)
-                    .file_name("voice.ogg")
-                    .mime_str("audio/ogg; codecs=opus")?,
+                    .file_name(filename)
+                    .mime_str(mime)?,
             );
 
         if let Some(tid) = thread_id {
@@ -1217,7 +1275,7 @@ impl TelegramChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sendVoice failed: status={status}, body={body}");
+            anyhow::bail!("{method} failed: status={status}, body={body}");
         }
 
         ::zeroclaw_log::record!(
@@ -4211,6 +4269,50 @@ mod tests {
             ch.is_voice_chat("@alice"),
             "live-resolved voice peer must remain active after voice_chats removal"
         );
+    }
+
+    #[test]
+    fn audio_send_spec_opus_is_voice_note() {
+        // Only OGG/Opus becomes a real Telegram voice note.
+        let (method, field, filename, mime) = telegram_audio_send_spec("opus");
+        assert_eq!(method, "sendVoice");
+        assert_eq!(field, "voice");
+        assert_eq!(filename, "voice.ogg");
+        assert_eq!(mime, "audio/ogg");
+        // "ogg" is an accepted alias for the same path.
+        assert_eq!(telegram_audio_send_spec("ogg").0, "sendVoice");
+    }
+
+    #[test]
+    fn audio_send_spec_wav_uses_send_audio_with_real_mime() {
+        // Groq Orpheus / Piper emit WAV — must not be mislabeled as audio/ogg.
+        let (method, field, filename, mime) = telegram_audio_send_spec("wav");
+        assert_eq!(method, "sendAudio");
+        assert_eq!(field, "audio");
+        assert_eq!(filename, "voice.wav");
+        assert_eq!(mime, "audio/wav");
+    }
+
+    #[test]
+    fn audio_send_spec_mp3_uses_send_audio() {
+        let (method, _field, filename, mime) = telegram_audio_send_spec("mp3");
+        assert_eq!(method, "sendAudio");
+        assert_eq!(filename, "voice.mp3");
+        assert_eq!(mime, "audio/mpeg");
+    }
+
+    #[test]
+    fn audio_send_spec_is_case_and_whitespace_insensitive() {
+        assert_eq!(telegram_audio_send_spec("  WAV ").2, "voice.wav");
+        assert_eq!(telegram_audio_send_spec("Opus").0, "sendVoice");
+    }
+
+    #[test]
+    fn audio_send_spec_unknown_format_falls_back_to_octet_stream() {
+        let (method, _field, filename, mime) = telegram_audio_send_spec("speex");
+        assert_eq!(method, "sendAudio");
+        assert_eq!(filename, "voice.bin");
+        assert_eq!(mime, "application/octet-stream");
     }
 
     #[test]
