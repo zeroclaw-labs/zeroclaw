@@ -1551,8 +1551,6 @@ impl Agent {
                 });
             }
 
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
-
             let llm_started_at = Instant::now();
             self.observer.record_event(&ObserverEvent::LlmRequest {
                 model_provider: self.model_provider_name.clone(),
