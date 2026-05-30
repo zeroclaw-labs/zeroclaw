@@ -5818,7 +5818,7 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_for_task = cancel_token.clone();
 
-        let canceller = tokio::spawn(async move {
+        let canceller = zeroclaw_spawn::spawn!(async move {
             while let Some(event) = event_rx.recv().await {
                 if matches!(event, TurnEvent::Chunk { ref delta } if delta == "draft") {
                     cancel_for_task.cancel();
