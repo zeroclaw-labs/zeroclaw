@@ -1,0 +1,8 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Shared primitive type aliases used across ZeroClaw plugin interfaces.
+interface types {
+    /// Semantic alias: a JSON-encoded string value.
+    /// Callers must produce valid JSON; receivers must parse it as JSON.
+    type json-string = string;
+}
