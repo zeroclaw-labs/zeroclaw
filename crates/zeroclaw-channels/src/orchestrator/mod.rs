@@ -6848,27 +6848,32 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-email")]
-    for (alias, email_cfg) in &config.channels.email {
-        if !active_channel_aliases.contains(&format!("email.{alias}")) {
-            continue;
+    {
+        // Construct once and share across all email channel instances.
+        let auth_service = Arc::new(zeroclaw_providers::auth::AuthService::from_config(&config));
+
+        for (alias, email_cfg) in &config.channels.email {
+            if !active_channel_aliases.contains(&format!("email.{alias}")) {
+                continue;
+            }
+            if !email_cfg.enabled {
+                continue;
+            }
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
+            };
+            let mut channel = EmailChannel::new(email_cfg.clone(), alias.clone(), peer_resolver);
+            if email_cfg.oauth2.is_some() {
+                channel = channel.with_auth_service(auth_service.clone());
+            }
+            channels.push(ConfiguredChannel {
+                display_name: "Email",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            });
         }
-        if !email_cfg.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            alias: Some(alias.clone()),
-            channel: Arc::new(EmailChannel::new(
-                email_cfg.clone(),
-                alias.clone(),
-                peer_resolver,
-            )),
-        });
     }
 
     #[cfg(feature = "channel-email")]
