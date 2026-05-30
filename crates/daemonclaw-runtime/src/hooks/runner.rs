@@ -154,6 +154,30 @@ impl HookRunner {
         final_action
     }
 
+    /// Fire background post-turn extraction hooks. Non-blocking — callers
+    /// can spawn this in a detached task if they don't want to await.
+    pub async fn fire_extract_post_turn(&self, result: &TurnResult) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.extract_post_turn(result))
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_between_turns(
+        &self,
+        iteration: usize,
+    ) -> Vec<daemonclaw_providers::ChatMessage> {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.between_turns(iteration))
+            .collect();
+        let results = join_all(futs).await;
+        results.into_iter().flatten().collect()
+    }
+
     // ---------------------------------------------------------------
     // Modifying dispatchers (sequential by priority, short-circuit on Cancel)
     // ---------------------------------------------------------------

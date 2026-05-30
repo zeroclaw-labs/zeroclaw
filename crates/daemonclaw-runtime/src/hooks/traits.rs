@@ -57,6 +57,45 @@ pub trait HookHandler: Send + Sync {
         TurnCompleteAction::Continue
     }
 
+    /// Called between loop iterations (after tool results, before next LLM call).
+    /// Returns messages to inject into history (file changes, memory, notifications).
+    async fn between_turns(&self, _iteration: usize) -> Vec<ChatMessage> {
+        Vec::new()
+    }
+
+    /// Called after a turn completes for background fact extraction.
+    /// Unlike on_turn_complete, this runs in a spawned task and does not
+    /// block the next turn. Use for memory extraction, learning, analytics.
+    async fn extract_post_turn(&self, _result: &TurnResult) {}
+
+    /// Generate a follow-up prompt suggestion after a turn completes.
+    /// Returns None if no suggestion is appropriate. The suggestion is
+    /// surfaced to the UI (MoonWhisp, CLI) but never auto-executed.
+    async fn suggest_prompt(&self, _result: &TurnResult) -> Option<String> {
+        None
+    }
+
+    /// Generate a cheap-model summary of tool usage for the current turn.
+    /// Used by UI clients (MoonWhisp) to show progress without full context.
+    async fn summarize_tool_use(
+        &self,
+        _tool_name: &str,
+        _tool_args: &serde_json::Value,
+        _tool_output: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Called when a delegate sub-agent completes its task.
+    async fn on_teammate_task_completed(
+        &self,
+        _agent_name: &str,
+        _result: &str,
+    ) {}
+
+    /// Called when a delegate sub-agent becomes idle (no pending work).
+    async fn on_teammate_idle(&self, _agent_name: &str) {}
+
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(
         &self,
