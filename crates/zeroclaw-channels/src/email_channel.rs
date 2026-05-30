@@ -346,7 +346,7 @@ impl EmailChannel {
             impl async_imap::Authenticator for XOAuth2 {
                 type Response = String;
                 fn process(&mut self, _challenge: &[u8]) -> String {
-                    format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.token)
+                    xoauth2_sasl_response(&self.user, &self.token)
                 }
             }
             client
@@ -1015,8 +1015,39 @@ fn resolve_attachment_data(file_name: &str, data: &[u8]) -> anyhow::Result<Vec<u
     }
 }
 
+/// Build the SASL XOAUTH2 initial client response for IMAP `AUTHENTICATE`.
+///
+/// Format per the XOAUTH2 spec: `user=<user>^Aauth=Bearer <token>^A^A`,
+/// where `^A` is the `0x01` control byte. The transport base64-encodes this.
+fn xoauth2_sasl_response(user: &str, token: &str) -> String {
+    format!("user={user}\x01auth=Bearer {token}\x01\x01")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::xoauth2_sasl_response;
+
+    #[test]
+    fn xoauth2_sasl_response_matches_spec() {
+        let got = xoauth2_sasl_response("alice@example.com", "ya29.TOKEN");
+        assert_eq!(
+            got,
+            "user=alice@example.com\x01auth=Bearer ya29.TOKEN\x01\x01"
+        );
+        // Exactly three 0x01 separators, none trailing beyond the spec.
+        assert_eq!(got.matches('\x01').count(), 3);
+        assert!(got.starts_with("user="));
+        assert!(got.ends_with("\x01\x01"));
+    }
+
+    #[test]
+    fn observer_mode_defaults_off() {
+        // observer_mode is opt-in: default false keeps the normal flag-changing
+        // read path; only when explicitly enabled does the channel switch to
+        // the uid-threshold, BODY.PEEK, zero-flag-change behavior.
+        assert!(!super::EmailConfig::default().observer_mode);
+    }
+
     fn default_imap_port() -> u16 {
         993
     }
