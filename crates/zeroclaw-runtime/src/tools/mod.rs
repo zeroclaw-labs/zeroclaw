@@ -61,6 +61,8 @@ pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+pub use zeroclaw_tools::email_read::EmailReadTool;
+pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_download::FileDownloadTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
@@ -579,6 +581,39 @@ pub fn all_tools_with_runtime(
                     "discord_search: failed to open discord.db"
                 );
             }
+        }
+    }
+
+    // email_search — registered when at least one email channel is enabled
+    {
+        let email_configs: std::collections::HashMap<
+            String,
+            zeroclaw_config::scattered_types::EmailConfig,
+        > = root_config
+            .channels
+            .email
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if !email_configs.is_empty() {
+            let auth_service = if email_configs.values().any(|c| c.oauth2.is_some()) {
+                Some(Arc::new(
+                    zeroclaw_providers::auth::AuthService::from_config(root_config),
+                ))
+            } else {
+                None
+            };
+            let configs = Arc::new(email_configs);
+            tool_arcs.push(Arc::new(EmailSearchTool::new(
+                Arc::clone(&configs),
+                auth_service.clone(),
+            )));
+            tool_arcs.push(Arc::new(EmailReadTool::new(
+                Arc::clone(&configs),
+                auth_service,
+            )));
         }
     }
 

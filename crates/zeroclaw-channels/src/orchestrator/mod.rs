@@ -8224,6 +8224,16 @@ pub async fn start_channels(
                 "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
             ));
         }
+        if config.channels.email.values().any(|c| c.enabled) {
+            tool_descs.push((
+                "email_search",
+                "Search the IMAP inbox by sender, subject, or date. Returns a list of matching emails with UID, sender, subject, and date. Use when asked about email. Follow up with email_read to fetch the full body.",
+            ));
+            tool_descs.push((
+                "email_read",
+                "Fetch the full content of an email by its UID (from email_search). Returns sender, to, date, subject, body text, and attachments.",
+            ));
+        }
 
         // Filter out tools excluded for non-CLI channels so this agent's
         // system prompt does not advertise them for channel-driven runs.
