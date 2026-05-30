@@ -2408,6 +2408,92 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
     AssistantChannelOutcome::Reply(String::new())
 }
 
+/// Resolve a per-agent `classifier_provider` ref to a (provider, model, temperature)
+/// triple for `classify_channel_reply_intent`. Returns `None` when the
+/// ref is empty or unresolvable; the caller MUST then fall back to the
+/// main agent's `active_model_provider` + `route.model` + `runtime_defaults.temperature`.
+///
+/// Per AGENTS.md SINGLE SOURCE OF TRUTH: this function reads the
+/// referenced `[providers.models.<type>.<alias>]` entry on every call
+/// (no field cache on `ChannelRuntimeContext`). The provider instance
+/// itself is deduped through the existing `provider_cache` LRU.
+async fn resolve_classifier_route(
+    ctx: &ChannelRuntimeContext,
+    provider_ref: &zeroclaw_config::providers::ModelProviderRef,
+) -> Option<(Arc<dyn ModelProvider>, String, Option<f64>)> {
+    let provider_str = provider_ref.as_str().trim();
+    if provider_str.is_empty() {
+        return None;
+    }
+
+    let (type_key, alias_key) = match provider_str.split_once('.') {
+        Some(parts) => parts,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "classifier_provider must be dotted `<type>.<alias>`; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model_cfg = match ctx.prompt_config.providers.models.find(type_key, alias_key) {
+        Some(cfg) => cfg,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "classifier_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model = model_cfg.model.clone().unwrap_or_default();
+    let temperature = model_cfg.temperature;
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
+        );
+        return None;
+    }
+
+    let provider = match get_or_create_provider(ctx, provider_str, model_cfg.api_key.as_deref())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                "Failed to initialize classifier_provider; falling back to main agent provider"
+            );
+            return None;
+        }
+    };
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"provider": provider_str, "model": model.as_str()})),
+        "classifier_provider override active"
+    );
+
+    Some((provider, model, temperature))
+}
+
 /// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
 /// the `Informational` kind only. When the classifier emits `NO_REPLY[INFO]`
 /// with a reason that restates its own rubric (the only failure mode observed
@@ -3592,12 +3678,26 @@ async fn process_channel_message_body(
     let classifier_intent = if explicit_channel_address {
         AssistantChannelOutcome::Reply(String::new())
     } else {
+        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+            Arc<dyn ModelProvider>,
+            String,
+            Option<f64>,
+        ) = resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider)
+            .await
+            .unwrap_or_else(|| {
+                (
+                    Arc::clone(&active_model_provider),
+                    route.model.clone(),
+                    None,
+                )
+            });
+
         classify_channel_reply_intent(
-            active_model_provider.as_ref(),
+            classifier_provider_arc.as_ref(),
             history[0].content.as_str(),
             &history,
-            route.model.as_str(),
-            runtime_defaults.temperature,
+            classifier_model_owned.as_str(),
+            classifier_temperature.or(runtime_defaults.temperature),
         )
         .await
         .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
@@ -7121,6 +7221,9 @@ fn collect_configured_channels(
                 wh.send_method.clone(),
                 wh.auth_header.clone(),
                 wh.secret.clone(),
+                wh.max_retries,
+                wh.retry_base_delay_ms,
+                wh.retry_max_delay_ms,
             )),
         });
     }
@@ -8460,6 +8563,9 @@ pub async fn deliver_announcement(
                 wh.send_method.clone(),
                 wh.auth_header.clone(),
                 wh.secret.clone(),
+                wh.max_retries,
+                wh.retry_base_delay_ms,
+                wh.retry_max_delay_ms,
             );
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
@@ -8823,6 +8929,54 @@ mod tests {
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_none_for_empty_ref() {
+        let ctx = router_test_ctx();
+        let empty = zeroclaw_config::providers::ModelProviderRef::default();
+        let result = resolve_classifier_route(ctx.as_ref(), &empty).await;
+        assert!(result.is_none(), "empty ref must fall back to main agent");
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_none_for_unresolvable_ref() {
+        let ctx = router_test_ctx();
+        let bogus = zeroclaw_config::providers::ModelProviderRef::from("custom.does-not-exist");
+        let result = resolve_classifier_route(ctx.as_ref(), &bogus).await;
+        assert!(result.is_none(), "unresolvable ref must soft-fail to None");
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_alias_temperature() {
+        // Build a config where `openai.my-classifier` has `temperature = 0.0`.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.models.openai.insert(
+            "my-classifier".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let base_ctx = (*router_test_ctx()).clone();
+        let ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(cfg),
+            ..base_ctx
+        });
+
+        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
+        let result = resolve_classifier_route(ctx.as_ref(), &alias_ref).await;
+
+        let (_, _, temp) = result.expect("must resolve to alias");
+        assert_eq!(
+            temp,
+            Some(0.0),
+            "alias temperature must be returned, not runtime_defaults.temperature"
+        );
     }
 
     #[test]

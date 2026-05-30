@@ -1594,6 +1594,13 @@ impl Agent {
                 });
             }
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let response = match self
                 .model_provider
                 .chat(
@@ -1611,8 +1618,36 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let (resp_input_tokens, resp_output_tokens) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens: resp_input_tokens,
+                        output_tokens: resp_output_tokens,
+                    });
+                    resp
+                }
+                Err(err) => {
+                    let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        model_provider: self.model_provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_started_at.elapsed(),
+                        success: false,
+                        error_message: Some(safe_error),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.parse_response_for_effective_tools(&response);
@@ -1793,6 +1828,13 @@ impl Agent {
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            let llm_started_at = Instant::now();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+            });
+
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
                 self.model_provider.supports_streaming(),
             );
@@ -1919,6 +1961,17 @@ impl Agent {
                                     &mut committed_response,
                                 );
                             }
+                            let safe_error =
+                                zeroclaw_providers::sanitize_api_error(&error.to_string());
+                            self.observer.record_event(&ObserverEvent::LlmResponse {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some(safe_error),
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
                             return Err(StreamedTurnError {
                                 error: anyhow::Error::msg(error.to_string()),
                                 committed_response,
@@ -1943,6 +1996,15 @@ impl Agent {
                     &mut new_msgs,
                     &mut committed_response,
                 );
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    model_provider: self.model_provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some("request cancelled by user".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -1992,6 +2054,15 @@ impl Agent {
                                 &mut new_msgs,
                                 &mut committed_response,
                             );
+                            self.observer.record_event(&ObserverEvent::LlmResponse {
+                                model_provider: self.model_provider_name.clone(),
+                                model: effective_model.clone(),
+                                duration: llm_started_at.elapsed(),
+                                success: false,
+                                error_message: Some("request cancelled by user".into()),
+                                input_tokens: None,
+                                output_tokens: None,
+                            });
                             return Err(StreamedTurnError {
                                 error: crate::agent::loop_::ToolLoopCancelled.into(),
                                 committed_response,
@@ -2006,6 +2077,16 @@ impl Agent {
                 match chat_result {
                     Ok(resp) => resp,
                     Err(error) => {
+                        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            model_provider: self.model_provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(safe_error),
+                            input_tokens: None,
+                            output_tokens: None,
+                        });
                         return Err(StreamedTurnError {
                             error,
                             committed_response,
@@ -2014,6 +2095,21 @@ impl Agent {
                     }
                 }
             };
+
+            let (resp_input_tokens, resp_output_tokens) = response
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens))
+                .unwrap_or((None, None));
+            self.observer.record_event(&ObserverEvent::LlmResponse {
+                model_provider: self.model_provider_name.clone(),
+                model: effective_model.clone(),
+                duration: llm_started_at.elapsed(),
+                success: true,
+                error_message: None,
+                input_tokens: resp_input_tokens,
+                output_tokens: resp_output_tokens,
+            });
 
             // Forward per-call token usage so the WS gateway (and any other
             // consumer) can include aggregated usage in the final done frame
@@ -2288,6 +2384,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::observability_traits::ObserverMetric;
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
@@ -2554,6 +2651,25 @@ mod tests {
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for CapturingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn name(&self) -> &str {
+            "capturing"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
     }
 
     struct MultimodalCaptureProvider {
@@ -4928,6 +5044,213 @@ mod tests {
             }),
             "cancelled turn should include an assistant interruption marker for persistence"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_stream_error_after_delta_emits_llm_response_failure() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: Some(1),
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let err = agent
+            .turn_streamed_with_steering_state("test", event_tx, None, None)
+            .await
+            .expect_err("provider stream failure should be returned");
+
+        assert!(
+            err.committed_response.contains("draft")
+                && err.committed_response.contains("[stream interrupted]"),
+            "unexpected committed_response: {}",
+            err.committed_response
+        );
+
+        let events = capturing.events.lock();
+        let request = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("LlmRequest should have been recorded");
+        let response = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+            .expect("LlmResponse should have been recorded");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+                .count(),
+            1,
+            "exactly one LlmRequest expected"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+                .count(),
+            1,
+            "exactly one LlmResponse expected"
+        );
+
+        let (
+            ObserverEvent::LlmRequest {
+                model_provider: req_provider,
+                model: req_model,
+                ..
+            },
+            ObserverEvent::LlmResponse {
+                model_provider: resp_provider,
+                model: resp_model,
+                success,
+                error_message,
+                ..
+            },
+        ) = (request, response)
+        else {
+            panic!("matched event variants should be LlmRequest and LlmResponse");
+        };
+
+        assert!(!success, "LlmResponse on stream error must be a failure");
+        assert!(
+            error_message.as_deref().is_some_and(|m| !m.is_empty()),
+            "failure LlmResponse must carry a non-empty error_message"
+        );
+        assert_eq!(req_provider, resp_provider, "provider should match");
+        assert_eq!(req_model, resp_model, "model should match");
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_cancel_during_stream_emits_llm_response_failure() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_after_delta_on_call: None,
+        });
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_for_task = cancel_token.clone();
+
+        let canceller = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event, TurnEvent::Chunk { ref delta } if delta == "draft") {
+                    cancel_for_task.cancel();
+                    break;
+                }
+            }
+            while event_rx.recv().await.is_some() {}
+        });
+
+        let err = agent
+            .turn_streamed_with_steering_state("test", event_tx, Some(cancel_token), None)
+            .await
+            .expect_err("cancelled turn should return cancellation");
+
+        canceller.await.expect("canceller task should finish");
+
+        assert!(
+            crate::agent::loop_::is_tool_loop_cancelled(&err.error),
+            "cancelled turn should carry the cancellation error: {}",
+            err.error
+        );
+
+        let events = capturing.events.lock();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+                .count(),
+            1,
+            "exactly one LlmRequest expected"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+                .count(),
+            1,
+            "exactly one LlmResponse expected"
+        );
+
+        let request = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("LlmRequest should have been recorded");
+        let response = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::LlmResponse { .. }))
+            .expect("LlmResponse should have been recorded");
+
+        let (
+            ObserverEvent::LlmRequest {
+                model_provider: req_provider,
+                model: req_model,
+                ..
+            },
+            ObserverEvent::LlmResponse {
+                model_provider: resp_provider,
+                model: resp_model,
+                success,
+                error_message,
+                ..
+            },
+        ) = (request, response)
+        else {
+            panic!("matched event variants should be LlmRequest and LlmResponse");
+        };
+
+        assert!(!success, "cancellation LlmResponse must be a failure");
+        assert_eq!(
+            error_message.as_deref(),
+            Some("request cancelled by user"),
+            "cancellation LlmResponse must carry the fixed cancel message"
+        );
+        assert_eq!(req_provider, resp_provider, "provider should match");
+        assert_eq!(req_model, resp_model, "model should match");
     }
 
     // ── Skill tool registration & excluded_tools filtering ──────────

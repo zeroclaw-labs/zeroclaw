@@ -642,6 +642,12 @@ pub struct ModelProviderConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Provider implementation to instantiate for this profile. Use this
+    /// when a canonical typed slot should run through a compatible
+    /// implementation, e.g. `[providers.models.openai.proxy] kind =
+    /// "openai-compatible"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
@@ -2781,6 +2787,33 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
+    /// Optional override for the per-message LLM reply-intent classifier
+    /// (`classify_channel_reply_intent` in zeroclaw-channels). When non-empty,
+    /// the channel orchestrator routes the "should this message be replied to?"
+    /// classification call to `[providers.models.<type>.<alias>]` referenced
+    /// here, instead of reusing the main agent's `model_provider`.
+    ///
+    /// Source of truth for api_key / uri / model / temperature etc. is the
+    /// referenced `[providers.models.<type>.<alias>]` entry. This field is
+    /// a reference only (NEVER a copy) — per AGENTS.md SINGLE SOURCE OF TRUTH.
+    ///
+    /// Empty (`Default`) = inherit the main agent's resolved provider+model
+    /// (preserves pre-PR behavior; backward compatible).
+    ///
+    /// Use case: classification is a cheap REPLY/NO_REPLY decision, doesn't
+    /// need a high-end model. Point this at a fast/free small model
+    /// (e.g. `kimi-k2.5`, `qwen-turbo`) while `model_provider` stays on the
+    /// expensive answering model (e.g. `qwen3.6-plus`).
+    ///
+    /// Note: TOML table names cannot contain `.`, so alias `kimi-k2.5`
+    /// must be written as `[providers.models.custom.kimi-k2-5]`. The
+    /// underlying `model = "kimi-k2.5"` string can still contain dots.
+    ///
+    /// ACP channels (IDE-direct) always reply and skip the classifier
+    /// entirely — this field has no effect on ACP traffic.
+    #[serde(default)]
+    pub classifier_provider: crate::providers::ModelProviderRef,
+
     // ── Agent loop / runtime tunables (folded from `[agent]` ──────
     // These are per-agent. Defaults preserve the legacy single-agent
     // behavior so an unconfigured agent runs identically to a config
@@ -2913,6 +2946,7 @@ impl Default for AliasedAgentConfig {
             cron_jobs: Vec::new(),
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
+            classifier_provider: crate::providers::ModelProviderRef::default(),
             compact_context: default_agent_compact_context(),
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
@@ -10686,6 +10720,19 @@ pub struct WebhookConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Maximum number of retry attempts for outbound sends on transient failures
+    /// (network errors, 429, 5xx). Set to `0` to disable retries. Default: `3`.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Base delay in milliseconds for exponential backoff between retries. Default: `500`.
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_base_delay_ms: Option<u64>,
+    /// Maximum delay cap in milliseconds for any single retry wait. Default: `30000` (30s).
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -14825,6 +14872,12 @@ impl Config {
                     "transcription_provider",
                     agent.transcription_provider.trim(),
                 ),
+                // NEW in this PR (kanmars.req.20260522.001):
+                (
+                    "providers.models",
+                    "classifier_provider",
+                    agent.classifier_provider.trim(),
+                ),
             ];
             for (section_prefix, field, value) in typed_provider_refs {
                 if value.is_empty() {
@@ -17895,6 +17948,44 @@ bot_token = "xoxb-tok"
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.secret.is_none());
         assert_eq!(parsed.port, 8080);
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_default_to_none() {
+        let json = r#"{"port":8080}"#;
+        let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.max_retries.is_none());
+        assert!(parsed.retry_base_delay_ms.is_none());
+        assert!(parsed.retry_max_delay_ms.is_none());
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_roundtrip() {
+        let wc = WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: Some("https://example.com/cb".into()),
+            send_method: None,
+            auth_header: None,
+            secret: None,
+            excluded_tools: vec![],
+            max_retries: Some(5),
+            retry_base_delay_ms: Some(250),
+            retry_max_delay_ms: Some(10_000),
+        };
+
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
     }
 
     // ── WhatsApp config ──────────────────────────────────────
@@ -22499,5 +22590,106 @@ allowed_users = []
         config
             .validate()
             .expect("two-member same-channel peer group must validate cleanly");
+    }
+
+    #[test]
+    async fn config_validate_rejects_classifier_provider_pointing_at_missing_alias() {
+        // Use the SHARED `typed_provider_refs` validation loop — same error
+        // surface as tts_provider / transcription_provider.
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            classifier_provider = "custom.does-not-exist"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("missing alias must fail validate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("classifier_provider")
+                && msg.contains("does-not-exist")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference error mentioning field + alias + section, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_classifier_provider_pointing_at_existing_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k1"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [providers.models.custom.kimi-k2-5]
+            api_key = "k2"
+            model = "kimi-k2.5"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            classifier_provider = "custom.kimi-k2-5"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("validate must succeed for resolvable ref");
+        assert_eq!(
+            cfg.agents
+                .get("default")
+                .unwrap()
+                .classifier_provider
+                .as_str(),
+            "custom.kimi-k2-5"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_empty_classifier_provider_as_inheritance_signal() {
+        // No classifier_provider field at all → must validate, must remain
+        // the empty default. This pins backward compatibility.
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("missing classifier_provider must validate");
+        assert!(
+            cfg.agents
+                .get("default")
+                .unwrap()
+                .classifier_provider
+                .is_empty()
+        );
     }
 }

@@ -1381,6 +1381,9 @@ mod tests {
                 auth_header: None,
                 secret: None,
                 excluded_tools: vec![],
+                max_retries: None,
+                retry_base_delay_ms: None,
+                retry_max_delay_ms: None,
             },
         );
         assert!(has_supervised_channels(&config));
