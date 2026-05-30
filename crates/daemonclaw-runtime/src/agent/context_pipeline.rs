@@ -125,8 +125,15 @@ fn stage_tool_result_budget(
     history: &mut Vec<ChatMessage>,
     ctx: &PipelineContext<'_>,
 ) -> StageResult {
-    let Some(state_dir) = ctx.state_dir else {
-        return StageResult::default();
+    let state_dir = match ctx.state_dir {
+        Some(dir) => dir.clone(),
+        None => {
+            if let Ok(cwd) = std::env::current_dir() {
+                cwd.join("state")
+            } else {
+                return StageResult::default();
+            }
+        }
     };
     let estimated = super::history::estimate_history_tokens(history);
     if estimated <= ctx.token_budget {

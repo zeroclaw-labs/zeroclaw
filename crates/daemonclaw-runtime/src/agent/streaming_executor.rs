@@ -133,11 +133,15 @@ impl StreamingToolExecutor {
                 continue;
             }
             let can_run = if self.tools[i].is_safe {
-                // Safe tools can run if no exclusive tool is running
-                !*self.has_exclusive.blocking_lock()
+                self.has_exclusive
+                    .try_lock()
+                    .map(|g| !*g)
+                    .unwrap_or(false)
             } else {
-                // Exclusive tools can run only if nothing else is executing
-                *self.executing_count.blocking_lock() == 0
+                self.executing_count
+                    .try_lock()
+                    .map(|g| *g == 0)
+                    .unwrap_or(false)
             };
 
             if !can_run {

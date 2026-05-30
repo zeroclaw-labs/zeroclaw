@@ -1300,7 +1300,8 @@ pub async fn run_tool_call_loop(
                         + usage.output_tokens.unwrap_or(0);
                 }
 
-                let response_text = resp.text_or_empty().to_string();
+                let response_text =
+                    crate::agent::retry::sanitize_response(&resp.text_or_empty());
                 // First try native structured tool calls (OpenAI-format).
                 // Fall back to text-based parsing (XML tags, markdown blocks,
                 // GLM format) only if the provider returned no native calls —
@@ -1658,7 +1659,28 @@ pub async fn run_tool_call_loop(
                     final_response: display_text.clone(),
                     turn_number,
                 };
-                hooks.fire_turn_complete(&turn_result).await;
+                let action = hooks.fire_turn_complete(&turn_result).await;
+                match action {
+                    crate::hooks::TurnCompleteAction::Stop => {
+                        return Ok(append_receipt_footer(
+                            accumulated_display_text,
+                            collected_receipts,
+                        ));
+                    }
+                    crate::hooks::TurnCompleteAction::PreventStop => {
+                        // Hook wants another iteration — don't return yet.
+                        history.push(ChatMessage::assistant(response_text.clone()));
+                        continue;
+                    }
+                    crate::hooks::TurnCompleteAction::InjectError(msg) => {
+                        history.push(ChatMessage::assistant(response_text.clone()));
+                        history.push(ChatMessage::user(format!("[Hook error] {msg}")));
+                        continue;
+                    }
+                    crate::hooks::TurnCompleteAction::Continue => {}
+                }
+                // Background post-turn extraction (non-blocking)
+                hooks.fire_extract_post_turn(&turn_result).await;
             }
 
             return Ok(append_receipt_footer(
@@ -1951,8 +1973,14 @@ pub async fn run_tool_call_loop(
         }
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
+            let batches = partition_tool_calls(
                 &executable_calls,
+                tools_registry,
+                activated_tools,
+            );
+            execute_tools_batched(
+                &executable_calls,
+                &batches,
                 tools_registry,
                 activated_tools,
                 observer,
@@ -2163,6 +2191,41 @@ pub async fn run_tool_call_loop(
                     "Agent loop aborted: identical tool output detected {} consecutive times",
                     consecutive_identical_outputs
                 );
+            }
+        }
+
+        // ── Diminishing returns + idle detection ──────────────────
+        {
+            let all_failed = turn_tool_records
+                .iter()
+                .all(|r| !r.success);
+            let output_tokens = detection_relevant_output.len() as u64 / 4;
+            match loop_detector.record_output_tokens(output_tokens) {
+                crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                    anyhow::bail!("Agent loop aborted: {msg}");
+                }
+                _ => {}
+            }
+            match loop_detector.record_idle_iteration(all_failed) {
+                crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                    anyhow::bail!("Agent loop aborted: {msg}");
+                }
+                _ => {}
+            }
+        }
+
+        // ── Between-turn hook injection ──────────────────────────
+        if let Some(hooks) = hooks {
+            let injected = hooks.fire_between_turns(iteration).await;
+            if !injected.is_empty() {
+                tracing::debug!(
+                    count = injected.len(),
+                    "Between-turn hook injected {} message(s)",
+                    injected.len()
+                );
+                for msg in injected {
+                    history.push(msg);
+                }
             }
         }
 
