@@ -117,46 +117,71 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     Ok(config)
 }
 
-/// Persist the selected theme name back to disk via a serde roundtrip set.
-pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
-    let path = config_path(config_dir);
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut config: ZerocodeConfig = toml::from_str(&raw).unwrap_or_default();
-    set_prop(&mut config, "theme.name", theme_name)?;
-    let body = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+/// Load the on-disk file as a raw `toml::Table`. A missing or empty file
+/// yields an empty table; any other section the running struct does not
+/// model is carried through untouched so a partial write never clobbers it.
+fn load_document(path: &Path) -> Result<toml::Table> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(toml::Table::new());
+    }
+    toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Fully overwrite the `[keybindings]` table from a resolved override
-/// table (preset pick). Sparse: only overridden actions are written;
-/// everything else falls back to compile-time defaults on next load.
+/// Serialize a mutated document table back to disk.
+fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
+    let body = toml::to_string_pretty(doc).context("serializing config")?;
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
+fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
+    doc.entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
+}
+
+/// Persist the selected theme name, editing only the `[theme]` section.
+pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "theme")?.insert(
+        "name".to_string(),
+        toml::Value::String(theme_name.to_string()),
+    );
+    write_document(&path, &doc)
+}
+
+/// Overwrite the `[keybindings]` section from a resolved override table
+/// (preset pick). Sparse: only overridden actions are written; everything
+/// else falls back to compile-time defaults on next load. Only the
+/// `[keybindings]` section is touched; other sections are preserved.
 pub(crate) fn persist_keybindings(config_dir: &Path, table: &OverrideTable) -> Result<()> {
     let path = config_path(config_dir);
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut config: ZerocodeConfig = toml::from_str(&raw).unwrap_or_default();
-    config.keybindings = flatten_table(table);
-    let body = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let mut doc = load_document(&path)?;
+    let rows = flatten_table(table);
+    let serialized = toml::Value::try_from(&rows)
+        .context("serializing keybindings")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+    doc.insert("keybindings".to_string(), toml::Value::Table(serialized));
+    write_document(&path, &doc)
 }
 
 /// Insert or replace a single `"<tag>.<variant>"` row (capture-modal
-/// save), leaving the rest of `[keybindings]` intact.
+/// save), leaving the rest of `[keybindings]` and all other sections intact.
 pub(crate) fn persist_keybind_row(
     config_dir: &Path,
     action_key: &str,
     chords: Vec<Chord>,
 ) -> Result<()> {
     let path = config_path(config_dir);
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut config: ZerocodeConfig = toml::from_str(&raw).unwrap_or_default();
-    config
-        .keybindings
-        .insert(action_key.to_string(), ChordSpec::Many(chords));
-    let body = toml::to_string_pretty(&config).context("serializing config")?;
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let mut doc = load_document(&path)?;
+    let value = toml::Value::try_from(ChordSpec::Many(chords)).context("serializing chords")?;
+    section_mut(&mut doc, "keybindings")?.insert(action_key.to_string(), value);
+    write_document(&path, &doc)
 }
 
 /// Collapse a nested `tag -> variant -> chords` table into the flat
@@ -277,5 +302,79 @@ mod tests {
             let resolved = c.resolve_theme().expect("empty theme recovers to default");
             assert_eq!(resolved.title, theme::default_theme().title);
         }
+    }
+
+    fn seed(dir: &Path, body: &str) {
+        std::fs::write(config_path(dir), body).unwrap();
+    }
+
+    fn read(dir: &Path) -> String {
+        std::fs::read_to_string(config_path(dir)).unwrap()
+    }
+
+    #[test]
+    fn persist_theme_preserves_unmodeled_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nfield = 42\nnested = [\"a\", \"b\"]\n",
+        );
+        persist_theme(dir.path(), "gruvbox").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+        assert_eq!(doc["future"]["field"].as_integer(), Some(42));
+        assert_eq!(
+            doc["future"]["nested"].as_array().unwrap().len(),
+            2,
+            "unmodeled section must survive a theme write"
+        );
+    }
+
+    #[test]
+    fn persist_keybind_row_preserves_theme_and_unmodeled() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_keybind_row(dir.path(), "dashboard.up", vec![Chord::char('z')]).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert!(
+            doc["keybindings"]
+                .as_table()
+                .unwrap()
+                .contains_key("dashboard.up")
+        );
+    }
+
+    #[test]
+    fn persist_keybindings_replaces_only_its_section() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[keybindings]\nold = \"x\"\n\n[future]\nkeep = 1\n",
+        );
+        let mut table: OverrideTable = OverrideTable::new();
+        table
+            .entry("dashboard".to_string())
+            .or_default()
+            .insert("up".to_string(), vec![Chord::char('z')]);
+        persist_keybindings(dir.path(), &table).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+        let kb = doc["keybindings"].as_table().unwrap();
+        assert!(kb.contains_key("dashboard.up"));
+        assert!(!kb.contains_key("old"), "preset pick replaces the section");
+    }
+
+    #[test]
+    fn persist_theme_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
     }
 }
