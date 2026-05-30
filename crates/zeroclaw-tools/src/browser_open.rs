@@ -11,11 +11,14 @@ pub struct BrowserOpenTool {
 }
 
 impl BrowserOpenTool {
-    pub fn new(security: Arc<SecurityPolicy>, allowed_domains: Vec<String>) -> Self {
-        Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains),
-        }
+            allowed_domains: normalize_allowed_domains(allowed_domains)?,
+        })
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -237,43 +240,66 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
     let mut normalized = domains
         .into_iter()
-        .filter_map(|d| normalize_domain(&d))
+        .filter_map(|d| {
+            normalize_domain(&d).or_else(|| {
+                rejected.push(d.clone());
+                None
+            })
+        })
         .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid browser.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
+            rejected.join(", ")
+        );
+    }
     normalized.sort_unstable();
     normalized.dedup();
-    normalized
+    Ok(normalized)
 }
 
 fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
         return None;
     }
 
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
+    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
+        (true, true) => &input[1..input.len() - 1],
+        (false, false) => input,
+        _ => return None,
+    };
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
     }
 
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
 
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return None;
     }
 
-    Some(d)
+    let host = parsed.host_str()?;
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    };
+    let normalized = host_no_brackets
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_lowercase())
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -390,6 +416,7 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -399,12 +426,29 @@ mod tests {
     }
 
     #[test]
+    fn normalize_domain_rejects_userinfo() {
+        assert!(normalize_domain("https://user@example.com").is_none());
+        assert!(normalize_domain("user@example.com").is_none());
+        assert!(normalize_domain("https://user:pass@example.com").is_none());
+        assert!(normalize_domain("user:pass@example.com").is_none());
+    }
+
+    #[test]
+    fn normalize_domain_rejects_unmatched_brackets() {
+        assert!(normalize_domain("[::1").is_none());
+        assert!(normalize_domain("::1]").is_none());
+        assert!(normalize_domain("[127.0.0.1").is_none());
+        assert!(normalize_domain("127.0.0.1]").is_none());
+    }
+
+    #[test]
     fn normalize_allowed_domains_deduplicates() {
         let got = normalize_allowed_domains(vec![
             "example.com".into(),
             "EXAMPLE.COM".into(),
             "https://example.com/".into(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(got, vec!["example.com".to_string()]);
     }
 
@@ -500,7 +544,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserOpenTool::new(security, vec![]);
+        let tool = BrowserOpenTool::new(security, vec![]).unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -526,7 +570,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -541,7 +585,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
