@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -1135,7 +1136,8 @@ pub async fn handle_api_channels(
         .into_iter()
         .map(|info| {
             let composite = format!("{}.{}", info.channel_type, info.alias);
-            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(&info.channel_type);
+            let compiled_key = compiled_readiness_key_for_alias(&config, &info);
+            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(compiled_key);
             let (status, health) = match (compiled, info.enabled) {
                 (false, _) => ("not_compiled", "unavailable"),
                 (true, false) => ("disabled", "disabled"),
@@ -1157,6 +1159,20 @@ pub async fn handle_api_channels(
         .collect();
 
     Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
+fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
+    if info.channel_type == "whatsapp"
+        && config
+            .channels
+            .whatsapp
+            .get(&info.alias)
+            .is_some_and(|whatsapp| whatsapp.backend_type() == "web")
+    {
+        "whatsapp-web"
+    } else {
+        info.channel_type.as_str()
+    }
 }
 
 /// GET /api/health — component health snapshot
@@ -1857,6 +1873,83 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[test]
+    fn api_channels_readiness_key_tracks_whatsapp_backend_type() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "cloud".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                ..Default::default()
+            },
+        );
+        config.channels.whatsapp.insert(
+            "ambiguous".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("token".into()),
+                phone_number_id: Some("phone-id".into()),
+                verify_token: Some("verify".into()),
+                session_path: Some("~/.zeroclaw/state/whatsapp-web/session.db".into()),
+                ..Default::default()
+            },
+        );
+
+        let web = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "web".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let cloud = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "cloud".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let ambiguous = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "whatsapp".to_string(),
+            alias: "ambiguous".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+        let discord = zeroclaw_config::schema::ChannelAliasInfo {
+            channel_type: "discord".to_string(),
+            alias: "default".to_string(),
+            owning_agent: None,
+            enabled: true,
+        };
+
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &web),
+            "whatsapp-web"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &cloud),
+            "whatsapp"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &ambiguous),
+            "whatsapp",
+            "ambiguous WhatsApp configs follow runtime Cloud precedence"
+        );
+        assert_eq!(
+            compiled_readiness_key_for_alias(&config, &discord),
+            "discord"
+        );
     }
 
     #[cfg(not(feature = "channel-nextcloud"))]
