@@ -732,6 +732,53 @@ fn strip_think_tags(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// OpenAI Chat Completions may return assistant `message.content` as a string,
+/// null, or an array of typed parts. Normalize it before storing the internal
+/// response shape so compatible gateways that preserve typed parts still work,
+/// while unsupported top-level content shapes still fail deserialization.
+fn openai_assistant_content_plaintext(content: Option<OpenAiAssistantContent>) -> Option<String> {
+    match content? {
+        OpenAiAssistantContent::Text(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        OpenAiAssistantContent::Parts(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                if part.kind.as_deref() != Some("text") {
+                    continue;
+                }
+                let Some(part_text) = part.text.filter(|text| !text.is_empty()) else {
+                    continue;
+                };
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&part_text);
+            }
+
+            if text.is_empty() { None } else { Some(text) }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OpenAiAssistantContent {
+    Text(String),
+    Parts(Vec<OpenAiAssistantContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiAssistantContentPart {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(from = "RawResponseMessage")]
 struct ResponseMessage {
@@ -757,7 +804,7 @@ struct ResponseMessage {
 #[derive(Debug, Deserialize)]
 struct RawResponseMessage {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<OpenAiAssistantContent>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -772,7 +819,7 @@ impl From<RawResponseMessage> for ResponseMessage {
         // when the canonical name is absent or null.
         let reasoning_content = raw.reasoning_content.or(raw.reasoning);
         ResponseMessage {
-            content: raw.content,
+            content: openai_assistant_content_plaintext(raw.content),
             reasoning_content,
             tool_calls: raw.tool_calls,
         }
@@ -3121,6 +3168,34 @@ mod tests {
             resp.choices[0].message.content,
             Some("Hello from Venice!".to_string())
         );
+    }
+
+    #[test]
+    fn response_deserializes_content_as_openai_text_parts_array() {
+        let json =
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"Hello array"}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("Hello array")
+        );
+    }
+
+    #[test]
+    fn response_deserializes_multiple_text_parts_with_newlines() {
+        let json = r#"{"choices":[{"message":{"content":[{"type":"text","text":"Hello"},{"type":"image_url","image_url":{"url":"https://example.com/image.png"}},{"type":"text","text":"array"}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("Hello\narray")
+        );
+    }
+
+    #[test]
+    fn response_rejects_unsupported_top_level_content_shape() {
+        let json = r#"{"choices":[{"message":{"content":{"type":"text","text":"Hello object"}}}]}"#;
+        serde_json::from_str::<ApiChatResponse>(json)
+            .expect_err("object-shaped assistant content must remain an invalid payload");
     }
 
     #[test]

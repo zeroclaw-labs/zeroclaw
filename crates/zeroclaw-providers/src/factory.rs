@@ -1244,6 +1244,92 @@ mod tests {
         assert!(!provider.capabilities().native_tool_calling);
     }
 
+    #[tokio::test]
+    async fn zai_and_glm_factory_path_honors_api_url_override() {
+        use axum::{Json, Router, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            uri: Uri,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(uri.path().to_string());
+            Json(json!({
+                "choices": [{"message": {"content": "ok"}}]
+            }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route(
+                "/zai/api/paas/v4/chat/completions",
+                post(capture_chat_request),
+            )
+            .route(
+                "/glm/api/paas/v4/chat/completions",
+                post(capture_chat_request),
+            )
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}");
+        let zai_url = format!("{base_url}/zai/api/paas/v4");
+        let zai = ZaiModelProviderConfig::default()
+            .create_provider(
+                "cn",
+                Some("id.secret"),
+                Some(&zai_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("zai provider should build");
+        assert_eq!(
+            zai.chat_with_system(None, "hello", "glm-5-turbo", Some(0.7))
+                .await
+                .expect("zai chat should use overridden URL"),
+            "ok"
+        );
+
+        let glm_url = format!("{base_url}/glm/api/paas/v4");
+        let glm = GlmModelProviderConfig::default()
+            .create_provider(
+                "global",
+                Some("id.secret"),
+                Some(&glm_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("glm provider should build");
+        assert!(glm.capabilities().vision);
+        assert_eq!(
+            glm.chat_with_system(None, "hello", "glm-4.5", Some(0.7))
+                .await
+                .expect("glm chat should use overridden URL"),
+            "ok"
+        );
+
+        let paths = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(
+            paths,
+            vec![
+                "/zai/api/paas/v4/chat/completions".to_string(),
+                "/glm/api/paas/v4/chat/completions".to_string(),
+            ]
+        );
+        server.abort();
+    }
+
     #[test]
     fn ollama_factory_uses_no_credential_when_key_absent() {
         let provider = build_ollama_compat_provider(
